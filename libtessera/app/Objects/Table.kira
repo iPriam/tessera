@@ -1,0 +1,228 @@
+import Foundation
+import Heap
+
+// The process's objects and the handles that name them (§3).
+//
+// An object is one slot in `library.objects`; a handle is one slot in `library.handles`
+// pointing at an object with a set of rights. Duplicates share the object, and
+// the object is destroyed when its last handle is closed. Every object keeps
+// the kernel objects behind it in `backing` and `backing2`, the type's state in four
+// words, and a pointer for the memory it owns.
+
+struct ObjectEntry {
+    var live: Bool
+    var state: ObjectState
+    var backing: Number?
+    var refs: Number
+    var id: U64
+    var name: String
+}
+
+struct HandleEntry {
+    var live: Bool
+    var object: Number
+    var rights: Rights
+    var generation: U64
+}
+
+let handleLimit: Number = 65536
+
+// A new object holding `backing`, with no handle yet.
+function objectCreate(state: ObjectState, backing: Number) -> Number {
+    return objectInsert(move state, .Some(backing))
+}
+
+// A new object the kernel keeps nothing for, as a port or a thread.
+function objectCreateUnbacked(state: ObjectState) -> Number {
+    return objectInsert(move state, .None)
+}
+
+function objectInsert(state: ObjectState, backing: Number?) -> Number {
+    let entry = ObjectEntry {
+        live: true,
+        state: move state,
+        backing: backing,
+        refs: 0,
+        id: library.nextObjectId,
+        name: "",
+    }
+    library.nextObjectId += U64(1)
+    for index in 0..library.objects.count {
+        if !library.objects[index].live {
+            library.objects[index] = entry
+            return index
+        }
+    }
+    library.objects.append(entry)
+    return library.objects.count - 1
+}
+
+function handleSlotOf(handle: Handle) -> Number? {
+    let low = handle.raw & U64(0xFFFFFFFF)
+    if low == U64(0) { return .None }
+    let slot = low - 1
+    if slot >= library.handles.count { return .None }
+    if !library.handles[slot].live { return .None }
+    if library.handles[slot].generation != (handle.raw >> U64(32)) { return .None }
+    return .Some(slot)
+}
+
+function handleOfSlot(slot: Number) -> Handle {
+    return Handle((library.handles[slot].generation << U64(32)) | U64(slot + 1))
+}
+
+// A new handle to `object` carrying `rights`. Invalid when the table is full.
+function handleMint(object: Number, rights: Rights) -> Result<Handle, TesseraError> {
+    if library.openHandles >= handleLimit { return .Error(failure(.TooManyHandles)) }
+    library.objects[object].refs += 1
+    library.openHandles += 1
+    for index in 0..library.handles.count {
+        if !library.handles[index].live {
+            library.handles[index].live = true
+            library.handles[index].object = object
+            library.handles[index].rights = rights
+            return .Ok(handleOfSlot(index))
+        }
+    }
+    library.handles.append(
+        HandleEntry { live: true, object: object, rights: rights, generation: U64(1) }
+    )
+    return .Ok(handleOfSlot(library.handles.count - 1))
+}
+
+// A new object's first handle, or `TooManyHandles` after destroying it.
+function handleForNew(object: Number, rights: Rights) -> Result<Handle, TesseraError> {
+    return match handleMint(object, rights) {
+        Ok(handle) -> .Ok(handle)
+        Error(failed) -> {
+            objectDestroy(object)
+            return .Error(failed)
+        }
+    }
+}
+
+// A handle to a new object for a call that answers a bare `Handle`: a full
+// table answers `Handle.invalid`, which every call refuses, and the object
+// goes.
+function mintOrInvalid(object: Number, rights: Rights) -> Handle {
+    return match handleForNew(object, rights) {
+        Ok(handle) -> handle
+        Error(failed) -> {
+            absorb failed
+            return Handle.invalid
+        }
+    }
+}
+
+// The handle slot for `handle` when it names an object of `kind` (`None` for
+// any) and carries every right in `rights`.
+function resolve(
+    handle: Handle,
+    kind: borrow ObjectType,
+    rights: Rights
+) -> Result<Number, TesseraError> {
+    let slot = try handleSlotOf(handle) otherwise return .Error(failure(.InvalidHandle))
+    let object = library.handles[slot].object
+    if kind != .None && kindOf(library.objects[object].state) != kind {
+        return .Error(failure(.WrongType))
+    }
+    if !library.handles[slot].rights.has(rights) { return .Error(failure(.AccessDenied)) }
+    return .Ok(slot)
+}
+
+// The object behind `handle`, checked as `resolve` checks it.
+function resolveObject(
+    handle: Handle,
+    kind: borrow ObjectType,
+    rights: Rights
+) -> Result<Number, TesseraError> {
+    return match resolve(handle, kind, rights) {
+        Ok(slot) -> .Ok(library.handles[slot].object)
+        Error(failed) -> .Error(failed)
+    }
+}
+
+function objectOfSlot(slot: Number) -> Number { return library.handles[slot].object }
+
+// Closes the handle in `slot`: its pending operations end `Cancelled`, and the
+// object goes with its last handle.
+function handleRelease(slot: Number) {
+    let object = library.handles[slot].object
+    library.handles[slot].live = false
+    library.handles[slot].generation += U64(1)
+    if library.handles[slot].generation > U64(0xFFFFFFFF) {
+        library.handles[slot].generation = U64(1)
+    }
+    library.openHandles -= 1
+    pendingCancelHandle(slot)
+    library.objects[object].refs -= 1
+    if library.objects[object].refs <= 0 { objectDestroy(object) }
+}
+
+// Moves the handle in `slot` to a fresh slot with `rights`, invalidating it.
+function handleRemint(slot: Number, rights: Rights) -> Result<Handle, TesseraError> {
+    let object = library.handles[slot].object
+    library.objects[object].refs += 1
+    handleRelease(slot)
+    library.objects[object].refs -= 1
+    return match handleMint(object, rights) {
+        Ok(handle) -> .Ok(handle)
+        Error(failed) -> {
+            // The handle it moved from is gone, so nothing holds the object.
+            if library.objects[object].refs <= 0 { objectDestroy(object) }
+            return .Error(failed)
+        }
+    }
+}
+
+// Releases everything the object holds. The type's own teardown runs first.
+function objectDestroy(object: Number) {
+    if !library.objects[object].live { return }
+    match objectTeardown(object) {
+        Ok -> {}
+        Error(failed) -> log warn("an object could not be fully torn down", error: errorName(failed))
+    }
+    objectRelease(object)
+    library.objects[object].live = false
+    library.objects[object].name = ""
+}
+
+// The kernel object behind `object`. One the kernel keeps nothing for, or
+// whose connection was dropped, answers as the kernel answers a closed
+// descriptor.
+function backingOf(object: Number) -> Result<Number, TesseraError> {
+    return match library.objects[object].backing {
+        Some(backing) -> .Ok(backing)
+        None -> .Error(failure(.InvalidHandle))
+    }
+}
+
+// Lets go of the kernel object behind `object`, keeping the object.
+function objectRelease(object: Number) {
+    match library.objects[object].backing {
+        Some(backing) -> kernelRelease(backing)
+        None -> {}
+    }
+    library.objects[object].backing = .None
+}
+
+// Puts `backing` behind `object` in place of what was there.
+function objectRebind(object: Number, backing: Number) {
+    objectRelease(object)
+    library.objects[object].backing = .Some(backing)
+}
+
+function objectTeardown(object: Number) -> Result<Void, TesseraError> {
+    match library.objects[object].state {
+        Port -> portTeardown(object)
+        Event(event) -> eventTeardown(event)
+        Channel -> channelTeardown(object)
+        Stream -> streamTeardown(object)
+        WakeLock -> wakeLockTeardown(object)
+        Watch(watch) -> watchTeardown(object, watch)
+        Process(process) -> processTeardown(object, process)
+        Job(job) -> return jobTeardown(job)
+        None, EventPair, Timer, Memory, Thread, Node, File, Endpoint, Presence -> {}
+    }
+    return .Ok
+}

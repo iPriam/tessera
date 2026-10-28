@@ -1,0 +1,233 @@
+import Foundation
+
+// The applications on the machine, found as a Mac finds them: a bundle named
+// `<Name>.app` in /System/Applications, which the system ships, or in
+// /Applications, where the person installs them, with its executable at
+// `Contents/MacOS/<Name>`. A folder without one is not an application. A disk
+// image, a volume in /Volumes that cannot be written, offers the bundles at
+// its top as well, and they open from there. An application installed from
+// one is the image itself, a file named `<Name>.app` in /Applications, which
+// PID 1 mounts to open it.
+
+// Where an application opens from.
+public enum ApplicationPlace {
+    // A bundle the system ships, in /System/Applications.
+    System
+    // A bundle in /Applications.
+    Applications
+    // An image installed in /Applications from a disk image.
+    InstalledImage
+    // A bundle at the top of the disk image at this path, not installed.
+    DiskImage(String)
+}
+
+public struct Application {
+    let name: String
+    let place: ApplicationPlace
+    // The category its bundle's Info.plist names, such as `Utilities`; none
+    // when the bundle names none, as an installed image's does not.
+    let category: String?
+}
+
+// A disk image opened in /Volumes, as Finder shows a mounted .dmg: its name,
+// where it is, and every application on it, with the names of those already
+// installed. Installing copies an application, so the image still holds it.
+public struct DiskImage {
+    let name: String
+    let path: String
+    let applications: [Application]
+    let installed: [String] = []
+}
+
+extend DiskImage {
+    // Whether `application`, on this image, is installed already.
+    function isInstalled(borrow self, application: borrow Application) -> Bool {
+        return installed.contains(application.name)
+    }
+}
+
+extend Application {
+    // The bundle, or installed image, this application is.
+    function path(borrow self) -> String {
+        let file = name + ".app"
+        return match place {
+            System -> "/" + SystemDirectory.systemApplications + "/" + file
+            Applications, InstalledImage -> "/" + SystemDirectory.applications + "/" + file
+            DiskImage(volume) -> volume + "/" + file
+        }
+    }
+
+    // What PID 1 starts to open it: the bundle's executable, or the image,
+    // which PID 1 mounts first.
+    function opened(borrow self) -> String {
+        return match place {
+            System, Applications, DiskImage -> path() + "/Contents/MacOS/" + name
+            InstalledImage -> path()
+        }
+    }
+}
+
+// The names in `path`. A folder that is not there, or a file where the
+// folder belongs, holds nothing: that is how a fresh system without
+// /Applications or /Volumes reads. Listing a folder fails in no other way.
+function folderEntries(path: borrow String) -> [String] {
+    return match listDirectory(path) {
+        Ok(listing) -> listing.entries
+        Error(failure) -> match failure {
+            Missing, NotDirectory, NotFile, ReadFailed, InvalidText, WriteFailed, CreateFailed,
+                RenameFailed, RemoveFailed, InvalidRange -> []
+        }
+    }
+}
+
+// The bundle names in `directory`: the entries named `<Name>.app`.
+function bundleNames(directory: borrow String) -> [String] {
+    var names: [String] = []
+    for entry in folderEntries(directory) {
+        if entry.endsWith(".app") && entry.count > 4 {
+            names.append(entry.substring(0, entry.count - 4))
+        }
+    }
+    return names
+}
+
+function isBundle(directory: borrow String, name: borrow String) -> Bool {
+    return pathExists(directory + "/" + name + ".app/Contents/MacOS/" + name)
+}
+
+namespace BundleCategory {
+    let plist: String = "/Contents/Info.plist"
+    let key: String = "<key>LSApplicationCategoryType</key>"
+    let open: String = "<string>"
+    let close: String = "</string>"
+}
+
+// The category `bundle`'s Info.plist names, which the build writes as the
+// text between the `<string>` after its key, or nothing when it names none.
+function bundleCategory(bundle: borrow String) -> String? {
+    let text = match readFile(bundle + BundleCategory.plist) {
+        Ok(contents) -> contents.text
+        Error(failure) -> {
+            absorb failure
+            return .None
+        }
+    }
+    let keyAt = match text.indexOf(BundleCategory.key) {
+        Some(at) -> at + BundleCategory.key.count
+        None -> return .None
+    }
+    let rest = text.substring(keyAt, text.count)
+    let openAt = match rest.indexOf(BundleCategory.open) {
+        Some(at) -> at + BundleCategory.open.count
+        None -> return .None
+    }
+    let tail = rest.substring(openAt, rest.count)
+    let closeAt = match tail.indexOf(BundleCategory.close) {
+        Some(at) -> at
+        None -> return .None
+    }
+    return .Some(tail.substring(0, closeAt))
+}
+
+// The applications in `directory`, placed at `place`. In /Applications an
+// installed image, a file, is one too.
+function applicationsIn(directory: borrow String, place: ApplicationPlace) -> [Application] {
+    var found: [Application] = []
+    for name in bundleNames(directory) {
+        if isBundle(directory, name) {
+            let category = bundleCategory(directory + "/" + name + ".app")
+            found.append(Application { name: name, place: copy place, category: category })
+        } else if isInstalledImageIn(directory, name) {
+            found.append(Application { name: name, place: .InstalledImage, category: .None })
+        }
+    }
+    return found
+}
+
+function isInstalledImageIn(directory: borrow String, name: borrow String) -> Bool {
+    let path = directory + "/" + name + ".app"
+    return directory == "/" + SystemDirectory.applications && pathExists(path) && !isDirectory(path)
+}
+
+function isListed(applications: borrow [Application], name: borrow String) -> Bool {
+    for application in applications {
+        if application.name == name { return true }
+    }
+    return false
+}
+
+// Every installed application, by name in alphabetical order. A name in both
+// places is listed once: the system's copy is the one that opens.
+public function installedApplications() -> [Application] {
+    var installed = applicationsIn("/" + SystemDirectory.systemApplications, .System)
+    for application in applicationsIn("/" + SystemDirectory.applications, .Applications) {
+        if !isListed(installed, application.name) { installed.append(application) }
+    }
+    return installed.sorted({ left, right in nameComesBefore(left.name, right.name) })
+}
+
+// Every disk image opened in /Volumes, with the applications on it, in the
+// order of their names.
+public function openedDiskImages() -> [DiskImage] {
+    let installed = installedApplications()
+    var images: [DiskImage] = []
+    for volume in mountedVolumes() {
+        match volume.access {
+            ReadOnly -> {
+                let held = applicationsIn(volume.path, .DiskImage(copy volume.path))
+                var already: [String] = []
+                for application in held {
+                    if isListed(installed, application.name) {
+                        already.append(copy application.name)
+                    }
+                }
+                images.append(
+                    DiskImage {
+                        name: volume.name,
+                        path: volume.path,
+                        applications: held,
+                        installed: already
+                    }
+                )
+            }
+            // A volume that can be written holds documents, and nothing on it
+            // opens. One that cannot be asked about is not trusted as a disk
+            // image.
+            Writable, Unknown -> continue
+        }
+    }
+    return images
+}
+
+namespace CaseFold {
+    let upperA: Number = 65
+    let upperZ: Number = 90
+    let toLower: Number = 32
+}
+
+// A letter's code with its case folded, so `about` and `About` sort and match
+// alike.
+function folded(code: Number) -> Number {
+    return code >= CaseFold.upperA && code <= CaseFold.upperZ ? code + CaseFold.toLower : code
+}
+
+// Whether the name `left` comes before `right`, ignoring case.
+public function nameComesBefore(left: borrow String, right: borrow String) -> Bool {
+    let shorter = min(left.count, right.count)
+    for at in 0..shorter {
+        let a = folded(left.charAt(at))
+        let b = folded(right.charAt(at))
+        if a != b { return a < b }
+    }
+    return left.count < right.count
+}
+
+// Whether `name` begins with `prefix`, ignoring case, as Launchpad's search
+// narrows its grid.
+public function nameBeginsWith(name: borrow String, prefix: borrow String) -> Bool {
+    if prefix.count > name.count { return false }
+    for at in 0..prefix.count {
+        if folded(name.charAt(at)) != folded(prefix.charAt(at)) { return false }
+    }
+    return true
+}

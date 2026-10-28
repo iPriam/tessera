@@ -1,0 +1,49 @@
+import Foundation
+import LibTessera
+
+// The directories a person sees at the root that live on the data volume.
+//
+// `/Applications`, `/Documents`, `/Cache` and `/BuildCache` have no prefix, as
+// on macOS, but the root is not where they are kept: it is read-only once the
+// system volume is the root, and these change. Each is a directory on the data volume,
+// bound onto the root path at boot, the way macOS firmlinks its Data volume.
+//
+// `/Cache` is every cache on the machine and the system may empty it whenever
+// it likes; `/BuildCache` is what builds made that is slow to remake, and only
+// the person empties it. Keeping both in one known place each is what lets the
+// system and the person clear them without hunting (roadmap/05).
+namespace RootDirectory {
+    let names: [String] = [
+        SystemDirectory.applications, SystemDirectory.documents, SystemDirectory.cache,
+        SystemDirectory.buildCache,
+    ]
+}
+
+// Creates each directory on the data volume, creates its mount point at the
+// root, and binds the one onto the other. A failure warns and moves on: a
+// machine without `/Cache` is slower, not broken, and a missing `/Applications`
+// only means nothing installed can be found, which the console then says.
+function bindRootDirectories(calls: Handle) {
+    for name in RootDirectory.names {
+        let source = "/" + SystemDirectory.data + "/" + name
+        let target = "/" + name
+        for path in [source, target] {
+            match ensureDirectory(calls, path) {
+                Ok -> {}
+                Error(failed) -> log warn(
+                    "could not create a root binding directory",
+                    path,
+                    error: errorName(failed)
+                )
+            }
+        }
+        match volumeMount(source, target, .None, VolumeOptions.bind) {
+            Ok -> log info("bound a data directory at the root", path: target)
+            Error(failed) -> log warn(
+                "could not bind a data directory at the root",
+                path: target,
+                error: errorName(failed)
+            )
+        }
+    }
+}

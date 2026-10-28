@@ -1,0 +1,352 @@
+//! The Settings service's wire, connections and requests: how settings are read, written and announced.
+import Foundation
+import Heap
+import LibTessera
+
+// Serving `tessera.settings`: every connection is read from as it becomes
+// readable, and each request answered at once. A write is the system's: a
+// program under `/bin`, or Settings.
+
+/// The wire the Settings service speaks: its operations, and how requests and answers are sent.
+namespace ServeWire {
+    let headerBytes: Number = 32
+    let messageBytes: Number = 4096
+    let alignment: Number = 16
+}
+
+/// The operations a client may ask of the Settings service.
+@Derive(Copy)
+@Derive(CaseIterable)
+enum ServeOperation: UN32 {
+    Read = 1
+    Write = 2
+    ListAll = 3
+    Remove = 4
+}
+
+/// What a write or a remove does to its key.
+enum SettingChange {
+    // A write sets the key to the value that follows it in the text.
+    Assign
+    // A remove forgets the key, and the whole text is the key.
+    Forget
+}
+
+/// What a completion on the service's port means.
+enum ServeWakeup {
+    Stop
+    Listener
+    // A connection the service accepted, named by its id.
+    Client(Number)
+}
+
+/// The keys the service's waits are made under.
+namespace ServeKey {
+    let listener: Number = 1
+    let termination: Number = 2
+    // A connection's key is its id plus this.
+    let clients: Number = 16
+    let batch: Number = 16
+}
+
+/// The application a person changes settings in, the one that is not under `/bin` and may write them.
+namespace SettingsApplication {
+    let program: String = "/" + SystemDirectory.systemApplications + "/Settings.app/Contents/MacOS/Settings"
+    // Home, which keeps the Dock's favourites as a person edits it.
+    let desktop: String = "/" + SystemDirectory.coreServices + "/Desktop.app/Contents/MacOS/Desktop"
+}
+
+/// A connection the Settings service is serving: its id and its channel.
+struct Served {
+    let id: Number
+    let channel: Handle
+    // Whether the program at the other end may write.
+    let writes: Bool
+}
+
+/// A request taken from a connection, ready to be performed.
+struct ServeRequest {
+    // The operation code the request carries; it may name no operation.
+    let operationCode: UN32
+    // The length of the key at the front of a write's text.
+    let keyLength: Number
+    let text: String
+}
+
+/// The Settings service's state: its store, its port and its connections.
+struct Server {
+    var store: Store
+    let listener: Handle
+}
+
+/// Decodes what a completion on the port means; a connection's key is its id plus `ServeKey.clients`.
+function serveWakeup(key: Number) -> ServeWakeup {
+    if key == ServeKey.termination { return .Stop }
+    if key == ServeKey.listener { return .Listener }
+    return .Client(key - ServeKey.clients)
+}
+
+/// Listens and serves until init asks it to stop.
+function serve(store: Store) -> Result<UN8, TesseraError> {
+    let port = try portCreate(.None)
+    try processWatchTermination(port, ServeKey.termination)
+    let listener = try serviceListen(SettingsWire.service)
+    try objectWaitAsync(listener, Signals.readable, .Repeat, port, ServeKey.listener)
+    log info("serving settings", count: store.settings.count, kept: store.kept)
+    var server = Server { store: move store, listener: listener }
+    var clients: [Served] = []
+    var next = 1
+    while true {
+        let completions = try portWait(port, ServeKey.batch, Deadline.infinite)
+        for completion in completions {
+            match serveWakeup(Number(completion.key)) {
+                Stop -> {
+                    log info("asked to stop")
+                    return .Ok(0)
+                }
+                Listener -> try acceptAll(listener, port, clients, next)
+                Client(id) -> serveClient(server, port, clients, id)
+            }
+        }
+    }
+    return .Ok(0)
+}
+
+/// Whether the program at the other end of `channel` is the system's.
+function mayWrite(channel: Handle) -> Result<Bool, TesseraError> {
+    let program = try servicePeerProgram(channel)
+    return .Ok(
+        program.startsWith(
+            "/" + SystemDirectory.programs + "/"
+        ) || program == SettingsApplication.program || program == SettingsApplication.desktop
+    )
+}
+
+/// Takes every connection waiting on the listener.
+function acceptAll(
+    listener: Handle,
+    port: Handle,
+    clients: borrow mut [Served],
+    next: borrow mut Number
+) -> Result<Void, TesseraError> {
+    while true {
+        let channel = match serviceAccept(listener) {
+            Ok(value) -> value
+            Error(failure) -> return failure.code == .ShouldWait ? .Ok : .Error(failure)
+        }
+        let id = next
+        next += 1
+        match objectWaitAsync(
+            channel,
+            Signals.readable | Signals.peerClosed,
+            .Repeat,
+            port,
+            UNumber(ServeKey.clients + id)
+        ) {
+            Ok -> {
+                let writes = match mayWrite(channel) {
+                    Ok(allowed) -> allowed
+                    // Fail closed: a peer we cannot identify may only read.
+                    Error(failure) -> {
+                        log warn(
+                            "a settings peer could not be identified",
+                            error: errorName(failure)
+                        )
+                        false
+                    }
+                }
+                clients.append(Served { id: id, channel: channel, writes: writes })
+            }
+            Error(failure) -> {
+                closeServed(channel)
+                return .Error(failure)
+            }
+        }
+    }
+    return .Ok
+}
+
+/// The position of the connection `id` in `clients`, if it is still held.
+function servedIndex(clients: borrow [Served], id: Number) -> Number? {
+    for index in 0..clients.count {
+        if clients[index].id == id { return .Some(index) }
+    }
+    return .None
+}
+
+/// Serves every request waiting on the connection `id`; one whose peer has gone is closed.
+function serveClient(
+    server: borrow mut Server,
+    port: Handle,
+    clients: borrow mut [Served],
+    id: Number
+) {
+    let index = match servedIndex(clients, id) {
+        Some(value) -> value
+        // A completion can outlive the connection it names.
+        None -> return
+    }
+    let client = clients[index]
+    while true {
+        match takeRequest(client.channel) {
+            Ok(request) -> perform(server, client, request)
+            Error(failed) -> {
+                if failed.code == .ShouldWait { return }
+                match portCancel(port, UNumber(ServeKey.clients + id)) {
+                    // The wait is gone; closing the channel below is what matters.
+                    Ok(cancelled) -> {}
+                    Error(cancelling) -> absorb cancelling
+                }
+                closeServed(client.channel)
+                var kept: [Served] = []
+                for other in clients {
+                    if other.id != id { kept.append(other) }
+                }
+                clients = kept
+                return
+            }
+        }
+    }
+}
+
+/// The next request on `channel`, or the error that stopped it being taken.
+function takeRequest(channel: Handle) -> Result<ServeRequest, TesseraError> {
+    let block = zeroedBlock(count: ServeWire.messageBytes, alignment: ServeWire.alignment)
+    let received = try channelRead(
+        channel,
+        Buffer { address: block.pointer(), length: ServeWire.messageBytes },
+        UNumber(0)
+    )
+    if received.bytes < ServeWire.headerBytes {
+        return .Ok(ServeRequest { operationCode: UN32(0), keyLength: 0, text: "" })
+    }
+    return .Ok(
+        ServeRequest {
+            operationCode: heapLoad<U32>(block.pointer(), 0),
+            keyLength: Number(heapLoad<U64>(block.pointer(), 8)),
+            text: stringFromCBytes(
+                heapOffset(block.pointer(), ServeWire.headerBytes),
+                received.bytes - ServeWire.headerBytes
+            )
+        }
+    )
+}
+
+/// Carries out one request from `client`, answering it on that connection.
+function perform(server: borrow mut Server, client: borrow Served, request: borrow ServeRequest) {
+    let channel = client.channel
+    let operation = match caseWithCode(allCases_ServeOperation(), request.operationCode) {
+        Some(value) -> value
+        None -> {
+            reply(channel, request.operationCode, .Unsupported, "no such request")
+            return
+        }
+    }
+    match operation {
+        Read -> {
+            if !settingKeyValid(request.text) {
+                reply(channel, request.operationCode, .InvalidArgument, "")
+                return
+            }
+            match storedValue(server.store, request.text) {
+                Some(value) -> reply(channel, request.operationCode, .Ok, value)
+                None -> reply(channel, request.operationCode, .NotFound, "")
+            }
+        }
+        ListAll -> reply(channel, request.operationCode, .Ok, settingsLines(server.store.settings))
+        Write -> changeSetting(server, client, request, .Assign)
+        Remove -> changeSetting(server, client, request, .Forget)
+    }
+}
+
+/// Applies a write or a remove: a write names its key in the first `keyLength` bytes of its text and sets the rest as the value; a remove names the whole text as its key.
+function changeSetting(
+    server: borrow mut Server,
+    client: borrow Served,
+    request: borrow ServeRequest,
+    change: SettingChange
+) {
+    let channel = client.channel
+    if !client.writes {
+        log warn("a program that is not the system's asked to change a setting")
+        reply(channel, request.operationCode, .NotEntitled, "only the system changes settings")
+        return
+    }
+    let length = match change {
+        Assign -> min(request.keyLength, request.text.count)
+        Forget -> request.text.count
+    }
+    let key = request.text.substring(0, length)
+    let value = request.text.substring(length, request.text.count)
+    if !settingKeyValid(key) || value.count > SettingsWire.longestValue || value.contains("\n") {
+        reply(channel, request.operationCode, .InvalidArgument, "")
+        return
+    }
+    let newValue: String? = match change {
+        Assign -> .Some(copy value)
+        Forget -> .None
+    }
+    match storeValue(server.store, key, move newValue) {
+        // The setting is saved, or held for this boot; the other arm says which.
+        Ok -> {}
+        Error(problem) -> match problem {
+            Write(reason) -> log warn("a setting is held for this boot only", reason: reason)
+            Replace(reason) -> log warn("a setting is held for this boot only", reason: reason)
+        }
+    }
+    match change {
+        Assign -> log info("a setting changed", key: key, value: value)
+        Forget -> log info("a setting was forgotten", key: key, value: value)
+    }
+    reply(channel, request.operationCode, .Ok, "")
+    announce(server.listener, key)
+}
+
+/// Posts `System/settingsChanged` to every process, naming `key`.
+function announce(listener: Handle, key: borrow String) {
+    let block = zeroedBlock(count: 8 + key.count, alignment: ServeWire.alignment)
+    heapStore<U64>(block.pointer(), 0, U64(key.count))
+    copyBytes(heapOffset(block.pointer(), 8), key.data, key.count)
+    match serviceNotify(
+        listener,
+        SettingsWire.changed,
+        Buffer { address: block.pointer(), length: 8 + key.count },
+        ""
+    ) {
+        // Posted to the programs that hold the channel; nothing waits on it.
+        Ok -> {}
+        Error(failed) -> log warn(
+            "cannot announce a changed setting",
+            key: key,
+            error: errorName(failed)
+        )
+    }
+}
+
+/// One answer. A caller that cannot be sent to has gone, and its channel's wait closes it.
+function reply(channel: Handle, operationCode: UN32, code: ErrorCode, text: borrow String) {
+    let length = min(text.count, ServeWire.messageBytes - ServeWire.headerBytes)
+    let block = zeroedBlock(count: ServeWire.headerBytes + length, alignment: ServeWire.alignment)
+    heapStore<U32>(block.pointer(), 0, operationCode)
+    heapStore<U32>(block.pointer(), 4, code.rawValue())
+    copyBytes(heapOffset(block.pointer(), ServeWire.headerBytes), text.data, length)
+    let noHandles: [Handle] = []
+    match channelWrite(
+        channel,
+        Buffer { address: block.pointer(), length: ServeWire.headerBytes + length },
+        noHandles
+    ) {
+        // The answer is sent.
+        Ok -> {}
+        Error(failed) -> log warn("a caller could not be answered", error: errorName(failed))
+    }
+}
+
+/// Closes the channel of a served connection.
+function closeServed(channel: Handle) {
+    match handleClose(channel) {
+        // Closed; there is nothing more to do with the channel.
+        Ok -> {}
+        Error(failed) -> absorb failed
+    }
+}

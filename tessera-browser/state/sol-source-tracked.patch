@@ -1,0 +1,2843 @@
+diff --git a/Source/ThirdParty/skia/CMakeLists.txt b/Source/ThirdParty/skia/CMakeLists.txt
+index 679b31f339..0ee5d94247 100644
+--- a/Source/ThirdParty/skia/CMakeLists.txt
++++ b/Source/ThirdParty/skia/CMakeLists.txt
+@@ -856,7 +856,7 @@ endif ()
+ if (USE_LIBEPOXY)
+     target_sources(Skia PRIVATE src/gpu/ganesh/gl/epoxy/GrGLMakeEpoxyEGLInterface.cpp)
+     target_link_libraries(Skia PRIVATE Epoxy::Epoxy)
+-else ()
++elseif (NOT TESSERA_NO_GL)
+     target_sources(Skia PRIVATE src/gpu/ganesh/gl/egl/GrGLMakeNativeInterface_egl.cpp)
+     target_sources(Skia PRIVATE src/gpu/ganesh/gl/egl/GrGLMakeEGLInterface.cpp)
+     if (USE_ANGLE_EGL)
+@@ -866,6 +866,68 @@ else ()
+     endif ()
+ endif ()
+ 
++#
++# The Ganesh Vulkan backend. Skia reaches Vulkan only through the procedure
++# lookup its client hands over, so it links no Vulkan library itself; the
++# headers are the system's, and memory comes from the Vulkan Memory Allocator.
++#
++if (USE_VULKAN)
++    # Skia's allocator follows VulkanMemoryAllocator past its last release, so the header
++    # comes at the revision Skia pins in its DEPS.
++    target_compile_definitions(Skia PRIVATE SK_VULKAN)
++    target_include_directories(Skia SYSTEM PRIVATE third_party/vulkanmemoryallocator/include)
++    target_sources(Skia PRIVATE
++        src/gpu/ganesh/vk/GrVkBackendSemaphore.cpp
++        src/gpu/ganesh/vk/GrVkBackendSurface.cpp
++        src/gpu/ganesh/vk/GrVkBuffer.cpp
++        src/gpu/ganesh/vk/GrVkCaps.cpp
++        src/gpu/ganesh/vk/GrVkCommandBuffer.cpp
++        src/gpu/ganesh/vk/GrVkCommandPool.cpp
++        src/gpu/ganesh/vk/GrVkContextThreadSafeProxy.cpp
++        src/gpu/ganesh/vk/GrVkDescriptorPool.cpp
++        src/gpu/ganesh/vk/GrVkDescriptorSet.cpp
++        src/gpu/ganesh/vk/GrVkDescriptorSetManager.cpp
++        src/gpu/ganesh/vk/GrVkDirectContext.cpp
++        src/gpu/ganesh/vk/GrVkFramebuffer.cpp
++        src/gpu/ganesh/vk/GrVkGpu.cpp
++        src/gpu/ganesh/vk/GrVkImage.cpp
++        src/gpu/ganesh/vk/GrVkImageView.cpp
++        src/gpu/ganesh/vk/GrVkMSAALoadManager.cpp
++        src/gpu/ganesh/vk/GrVkOpsRenderPass.cpp
++        src/gpu/ganesh/vk/GrVkPipeline.cpp
++        src/gpu/ganesh/vk/GrVkPipelineState.cpp
++        src/gpu/ganesh/vk/GrVkPipelineStateBuilder.cpp
++        src/gpu/ganesh/vk/GrVkPipelineStateCache.cpp
++        src/gpu/ganesh/vk/GrVkPipelineStateDataManager.cpp
++        src/gpu/ganesh/vk/GrVkRenderPass.cpp
++        src/gpu/ganesh/vk/GrVkRenderTarget.cpp
++        src/gpu/ganesh/vk/GrVkResourceProvider.cpp
++        src/gpu/ganesh/vk/GrVkSampler.cpp
++        src/gpu/ganesh/vk/GrVkSamplerYcbcrConversion.cpp
++        src/gpu/ganesh/vk/GrVkSecondaryCBDrawContext.cpp
++        src/gpu/ganesh/vk/GrVkSemaphore.cpp
++        src/gpu/ganesh/vk/GrVkTexture.cpp
++        src/gpu/ganesh/vk/GrVkTextureRenderTarget.cpp
++        src/gpu/ganesh/vk/GrVkTypesPriv.cpp
++        src/gpu/ganesh/vk/GrVkUniformHandler.cpp
++        src/gpu/ganesh/vk/GrVkUtil.cpp
++        src/gpu/ganesh/vk/GrVkVaryingHandler.cpp
++
++        src/gpu/MutableTextureState.cpp
++        src/gpu/ganesh/GrUniformDataManager.cpp
++        src/gpu/vk/VulkanExtensions.cpp
++        src/gpu/vk/VulkanInterface.cpp
++        src/gpu/vk/VulkanMemory.cpp
++        src/gpu/vk/VulkanMutableTextureState.cpp
++        src/gpu/vk/VulkanPreferredFeatures.cpp
++        src/gpu/vk/VulkanUtilsPriv.cpp
++
++        src/gpu/vk/vulkanmemoryallocator/VulkanAMDMemoryAllocator.cpp
++        src/gpu/vk/vulkanmemoryallocator/VulkanMemoryAllocatorWrapper.cpp
++        src/gpu/vk/vulkanmemoryallocator/VulkanMemoryAllocatorWebKit.cpp
++    )
++endif ()
++
+ if (USE_SKIA_ENCODERS)
+     target_sources(Skia PRIVATE
+         src/encode/SkEncoder.cpp
+@@ -1067,7 +1129,7 @@ endif ()
+ #
+ # FIXME: Support other combinations.
+ target_compile_definitions(Skia PRIVATE
+-    SK_GL
++    $<$<NOT:$<BOOL:${TESSERA_NO_GL}>>:SK_GL>
+     SK_GANESH
+     SK_GANESH_SMALL_PATH_DISTANCE_FIELD_ALWAYS
+ )
+diff --git a/Source/WebCore/CMakeLists.txt b/Source/WebCore/CMakeLists.txt
+index ffef402703..708fc37494 100644
+--- a/Source/WebCore/CMakeLists.txt
++++ b/Source/WebCore/CMakeLists.txt
+@@ -2289,7 +2289,7 @@ if (USE_ANGLE_EGL)
+     )
+ elseif (USE_LIBEPOXY)
+     list(APPEND WebCore_LIBRARIES Epoxy::Epoxy)
+-else ()
++elseif (NOT TESSERA_NO_GL)
+     list(APPEND WebCore_LIBRARIES OpenGL::GLES)
+ 
+     list(APPEND WebCore_SYSTEM_INCLUDE_DIRECTORIES
+@@ -3283,6 +3283,18 @@ list(APPEND WebCore_SOURCES ${WebCore_DERIVED_SOURCES_DIR}/NodeName.cpp)
+ GENERATE_DOM_NAME_ENUM(Namespace)
+ list(APPEND WebCore_SOURCES ${WebCore_DERIVED_SOURCES_DIR}/Namespace.cpp)
+ 
++# Tessera: no OpenGL, EGL, GBM or libepoxy display code (AGENTS.md, WebKit exception).
++if (TESSERA_NO_GL)
++    # Unified source lists are expanded inside WEBKIT_COMPUTE_SOURCES, after
++    # the explicit list filter. Exclude GL units from both input mechanisms.
++    list(APPEND WebCore_UNIFIED_SOURCE_EXCLUDES
++        "^platform/graphics/(android|gbm|egl)/"
++        "^platform/graphics/coordinated/GraphicsContextGLCoordinatedEpoxy[.]cpp"
++        "^platform/graphics/skia/GraphicsContextGLSkia[.]cpp"
++    )
++    list(FILTER WebCore_SOURCES EXCLUDE REGEX "platform/graphics/(android|gbm|egl)/|platform/graphics/coordinated/(GraphicsContextGLCoordinatedEpoxy)\\.cpp$")
++    list(APPEND WebCore_SOURCES platform/graphics/egl/BitmapTexturePool.cpp platform/graphics/skia/BitmapTextureVulkan.cpp platform/graphics/skia/SkiaVulkanExport.cpp)
++endif ()
+ WEBKIT_COMPUTE_SOURCES(WebCore)
+ 
+ WEBKIT_DEFINE_SUBTARGET_WITH_PREFIX(WebCore WebCoreJSBindings
+diff --git a/Source/WebCore/PlatformGTK.cmake b/Source/WebCore/PlatformGTK.cmake
+index 546ca64ce8..dcc5060fc9 100644
+--- a/Source/WebCore/PlatformGTK.cmake
++++ b/Source/WebCore/PlatformGTK.cmake
+@@ -195,5 +195,7 @@ if (USE_VULKAN)
+         platform/graphics/vulkan/VulkanTypes.h
+         platform/graphics/vulkan/VulkanUtilities.h
+         platform/graphics/vulkan/VulkanVolk.h
++
++        platform/graphics/skia/SkiaVulkanDevice.h
+     )
+ endif ()
+diff --git a/Source/WebCore/PlatformWPE.cmake b/Source/WebCore/PlatformWPE.cmake
+index a4040989f6..6d75f97620 100644
+--- a/Source/WebCore/PlatformWPE.cmake
++++ b/Source/WebCore/PlatformWPE.cmake
+@@ -178,6 +178,9 @@ if (USE_VULKAN)
+         platform/graphics/vulkan/VulkanTypes.h
+         platform/graphics/vulkan/VulkanUtilities.h
+         platform/graphics/vulkan/VulkanVolk.h
++
++        platform/graphics/skia/SkiaVulkanExport.h
++        platform/graphics/skia/SkiaVulkanDevice.h
+     )
+ endif ()
+ 
+diff --git a/Source/WebCore/page/scrolling/coordinated/ScrollerCoordinated.cpp b/Source/WebCore/page/scrolling/coordinated/ScrollerCoordinated.cpp
+index 286d09b121..37bf7b9d8d 100644
+--- a/Source/WebCore/page/scrolling/coordinated/ScrollerCoordinated.cpp
++++ b/Source/WebCore/page/scrolling/coordinated/ScrollerCoordinated.cpp
+@@ -32,7 +32,9 @@
+ #include "BitmapTexturePool.h"
+ #include "CoordinatedPlatformLayer.h"
+ #include "FontRenderOptions.h"
++#if !USE(TESSERA_VULKAN_ONLY)
+ #include "GLContext.h"
++#endif
+ #include "GLFence.h"
+ #include "GraphicsContextSkia.h"
+ #include "PlatformDisplay.h"
+diff --git a/Source/WebCore/platform/ProcessCapabilities.cpp b/Source/WebCore/platform/ProcessCapabilities.cpp
+index 2acf1cbf2f..059a4864b0 100644
+--- a/Source/WebCore/platform/ProcessCapabilities.cpp
++++ b/Source/WebCore/platform/ProcessCapabilities.cpp
+@@ -70,6 +70,9 @@ bool ProcessCapabilities::isHardwareAcceleratedDecodingDisabled()
+ 
+ void ProcessCapabilities::setCanUseAcceleratedBuffers(bool value)
+ {
++#if USE(TESSERA_VULKAN_ONLY)
++    RELEASE_ASSERT_WITH_MESSAGE(value, "Tessera cannot disable accelerated rendering");
++#endif
+     s_canUseAcceleratedBuffers = value;
+ }
+ 
+diff --git a/Source/WebCore/platform/SourcesSkia.txt b/Source/WebCore/platform/SourcesSkia.txt
+index 9de63367cd..9f07fba82e 100644
+--- a/Source/WebCore/platform/SourcesSkia.txt
++++ b/Source/WebCore/platform/SourcesSkia.txt
+@@ -59,6 +59,7 @@ platform/graphics/skia/PatternSkia.cpp
+ platform/graphics/skia/PlatformDisplaySkia.cpp @no-unify
+ platform/graphics/skia/ShareableBitmapSkia.cpp
+ platform/graphics/skia/SkiaBackingStore.cpp @no-unify
++platform/graphics/skia/SkiaVulkanDevice.cpp @no-unify
+ platform/graphics/skia/SkiaCompositingLayer.cpp
+ platform/graphics/skia/SkiaCompositingLayer3DRenderingContext.cpp
+ platform/graphics/skia/SkiaCompositingLayerFilters.cpp
+diff --git a/Source/WebCore/platform/graphics/ImageBuffer.cpp b/Source/WebCore/platform/graphics/ImageBuffer.cpp
+index df38f018be..501159c7ec 100644
+--- a/Source/WebCore/platform/graphics/ImageBuffer.cpp
++++ b/Source/WebCore/platform/graphics/ImageBuffer.cpp
+@@ -52,7 +52,9 @@
+ #endif
+ 
+ #if USE(SKIA)
++#if !USE(TESSERA_VULKAN_ONLY)
+ #include "GLContext.h"
++#endif
+ #include "ImageBufferSkiaAcceleratedBackend.h"
+ #include "PlatformDisplay.h"
+ #include "SkiaSerializedImageBuffer.h"
+@@ -88,6 +90,10 @@ RefPtr<ImageBuffer> ImageBuffer::create(const FloatSize& size, RenderingMode ren
+             return imageBuffer;
+     }
+ 
++#if USE(TESSERA_VULKAN_ONLY)
++    if (renderingMode == RenderingMode::Accelerated || renderingMode == RenderingMode::Unaccelerated)
++        return ImageBuffer::create<ImageBufferSkiaAcceleratedBackend>(size, resolutionScale, colorSpace, pixelFormat, purpose, { });
++#endif
+     switch (renderingMode) {
+     case RenderingMode::Accelerated:
+ #if HAVE(IOSURFACE)
+diff --git a/Source/WebCore/platform/graphics/PlatformDisplay.cpp b/Source/WebCore/platform/graphics/PlatformDisplay.cpp
+index 9b62362463..056a61833b 100644
+--- a/Source/WebCore/platform/graphics/PlatformDisplay.cpp
++++ b/Source/WebCore/platform/graphics/PlatformDisplay.cpp
+@@ -26,6 +26,45 @@
+ #include "config.h"
+ #include "PlatformDisplay.h"
+ 
++#if USE(TESSERA_VULKAN_ONLY)
++#include "SkiaVulkanDevice.h"
++#include <wtf/Lock.h>
++#include <wtf/MainThread.h>
++#include <wtf/TZoneMallocInlines.h>
++namespace WebCore {
++WTF_MAKE_TZONE_ALLOCATED_IMPL(PlatformDisplay);
++static PlatformDisplay* s_sharedDisplay;
++static Lock s_displayLock;
++class VulkanPlatformDisplay final : public PlatformDisplay {
++public:
++    Type type() const final { return Type::Vulkan; }
++};
++std::unique_ptr<PlatformDisplay> PlatformDisplay::createVulkan()
++{
++    RELEASE_ASSERT_WITH_MESSAGE(SkiaVulkanDevice::singleton(), "Tessera requires a hardware Vulkan device");
++    return makeUnique<VulkanPlatformDisplay>();
++}
++void PlatformDisplay::setSharedDisplay(std::unique_ptr<PlatformDisplay>&& display)
++{
++    RELEASE_ASSERT(!s_sharedDisplay);
++    s_sharedDisplay = display.release();
++}
++PlatformDisplay& PlatformDisplay::sharedDisplay()
++{
++    Locker locker { s_displayLock };
++    if (!s_sharedDisplay)
++        s_sharedDisplay = createVulkan().release();
++    return *s_sharedDisplay;
++}
++PlatformDisplay* PlatformDisplay::sharedDisplayIfExists() { return s_sharedDisplay; }
++void PlatformDisplay::destroySharedDisplay()
++{
++    RELEASE_ASSERT(isMainThread());
++    delete std::exchange(s_sharedDisplay, nullptr);
++}
++PlatformDisplay::~PlatformDisplay() = default;
++}
++#else
+ #include "BitmapTexturePool.h"
+ #include "GLContext.h"
+ #include <wtf/MainThread.h>
+@@ -165,3 +204,5 @@ const Vector<GLDisplay::BufferFormat>& PlatformDisplay::bufferFormatsForVideo()
+ #endif // USE(GBM) && USE(GSTREAMER)
+ 
+ } // namespace WebCore
++
++#endif // USE(TESSERA_VULKAN_ONLY)
+diff --git a/Source/WebCore/platform/graphics/PlatformDisplay.h b/Source/WebCore/platform/graphics/PlatformDisplay.h
+index e790f78f51..c10e0d5daa 100644
+--- a/Source/WebCore/platform/graphics/PlatformDisplay.h
++++ b/Source/WebCore/platform/graphics/PlatformDisplay.h
+@@ -25,7 +25,9 @@
+ 
+ #pragma once
+ 
++#if !USE(TESSERA_VULKAN_ONLY)
+ #include "GLDisplay.h"
++#endif
+ #include <wtf/Noncopyable.h>
+ #include <wtf/TZoneMalloc.h>
+ #include <wtf/TypeCasts.h>
+@@ -54,6 +56,9 @@ namespace WebCore {
+ class GLContext;
+ #if USE(SKIA)
+ class SkiaGLContext;
++#if USE(VULKAN)
++class SkiaVulkanContext;
++#endif
+ #endif
+ 
+ class PlatformDisplay {
+@@ -69,6 +74,9 @@ public:
+     virtual ~PlatformDisplay();
+ 
+     enum class Type {
++#if USE(TESSERA_VULKAN_ONLY)
++        Vulkan,
++#endif
+ #if PLATFORM(WIN)
+         Windows,
+ #endif
+@@ -89,6 +97,7 @@ public:
+ 
+     virtual Type type() const = 0;
+ 
++#if !USE(TESSERA_VULKAN_ONLY)
+     WEBCORE_EXPORT GLContext* sharingGLContext();
+     void clearGLContexts();
+     EGLDisplay eglDisplay() const;
+@@ -116,21 +125,42 @@ public:
+     GstGLContext* gstGLContext() const;
+     void clearGStreamerGLState();
+ #endif
++#endif
+ 
+ #if USE(SKIA)
++    // When Skia draws with Vulkan there is no Skia GL context on any thread: skiaGLContext()
++    // is null, and each thread gets a Vulkan context on first use instead, or is given one
++    // with setSkiaVulkanContextForCurrentThread().
++    WEBCORE_EXPORT bool skiaUsesVulkan() const;
++#if USE(VULKAN)
++    WEBCORE_EXPORT bool setSkiaVulkanContextForCurrentThread(bool);
++#endif
++    // Gets this thread's Skia GPU context ready to use, creating it on first use: makes the
++    // GL context current, or under Vulkan, where nothing needs making current, makes sure
++    // the thread has its context. False when the thread has no GPU context.
++    WEBCORE_EXPORT bool makeSkiaContextCurrent();
++#if !USE(TESSERA_VULKAN_ONLY)
+     GLContext* skiaGLContext();
+     void setSkiaGLContextForCurrentThread(std::unique_ptr<GLContext>&&);
++#endif
+     GrDirectContext* skiaGrContext() const;
+     unsigned msaaSampleCount() const;
+     size_t maxSkiaResourceCacheBytes() const;
+     void skiaReleaseUnusedResources(WTF::Critical);
+ #endif
+ 
++#if USE(TESSERA_VULKAN_ONLY)
++    WEBCORE_EXPORT static std::unique_ptr<PlatformDisplay> createVulkan();
++#endif
+ protected:
++#if USE(TESSERA_VULKAN_ONLY)
++    PlatformDisplay() = default;
++#else
+     explicit PlatformDisplay(Ref<GLDisplay>&&);
+ 
+     const Ref<GLDisplay> m_eglDisplay;
+     std::unique_ptr<GLContext> m_sharingGLContext;
++#endif
+ 
+ #if ENABLE(WEBGL) && !PLATFORM(WIN)
+     std::optional<int> m_anglePlatform;
+@@ -138,11 +168,13 @@ protected:
+ #endif
+ 
+ private:
+-#if USE(SKIA)
++#if USE(SKIA) && !USE(TESSERA_VULKAN_ONLY)
+     void clearSkiaGLContext();
+ #endif
+ 
++#if !USE(TESSERA_VULKAN_ONLY)
+     void terminateEGLDisplay();
++#endif
+ 
+ #if ENABLE(WEBGL) && !PLATFORM(WIN)
+     mutable EGLDisplay m_angleEGLDisplay { nullptr };
+@@ -153,7 +185,7 @@ private:
+     mutable GRefPtr<GstGLContext> m_gstGLContext;
+ #endif
+ 
+-#if USE(SKIA)
++#if USE(SKIA) && !USE(TESSERA_VULKAN_ONLY)
+     ThreadSafeWeakHashSet<SkiaGLContext> m_skiaGLContexts;
+ #endif
+ };
+diff --git a/Source/WebCore/platform/graphics/coordinated/CoordinatedBackingStoreProxy.cpp b/Source/WebCore/platform/graphics/coordinated/CoordinatedBackingStoreProxy.cpp
+index 0ef4b7b0de..bdbef386fd 100644
+--- a/Source/WebCore/platform/graphics/coordinated/CoordinatedBackingStoreProxy.cpp
++++ b/Source/WebCore/platform/graphics/coordinated/CoordinatedBackingStoreProxy.cpp
+@@ -408,7 +408,7 @@ IntSize CoordinatedBackingStoreProxy::computeTileSize(const IntSize& viewportSiz
+ 
+     IntSize tileSize;
+ #if USE(SKIA)
+-    if (ProcessCapabilities::canUseAcceleratedBuffers() && PlatformDisplay::sharedDisplay().skiaGLContext()) {
++    if (ProcessCapabilities::canUseAcceleratedBuffers() && PlatformDisplay::sharedDisplay().makeSkiaContextCurrent()) {
+ #else
+     if (ProcessCapabilities::canUseAcceleratedBuffers()) {
+ #endif
+diff --git a/Source/WebCore/platform/graphics/coordinated/CoordinatedPlatformLayerBufferVideo.cpp b/Source/WebCore/platform/graphics/coordinated/CoordinatedPlatformLayerBufferVideo.cpp
+index 6f9ead7c6a..3b1d8fc9d1 100644
+--- a/Source/WebCore/platform/graphics/coordinated/CoordinatedPlatformLayerBufferVideo.cpp
++++ b/Source/WebCore/platform/graphics/coordinated/CoordinatedPlatformLayerBufferVideo.cpp
+@@ -41,7 +41,9 @@ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_BEGIN
+ #include <skia/gpu/ganesh/GrYUVABackendTextures.h>
+ #include <skia/gpu/ganesh/SkImageGanesh.h>
+ #include <skia/gpu/ganesh/SkSurfaceGanesh.h>
++#if !USE(TESSERA_VULKAN_ONLY)
+ #include <skia/gpu/ganesh/gl/GrGLBackendSurface.h>
++#endif
+ #include <skia/private/chromium/GrPromiseImageTexture.h>
+ #include <skia/private/chromium/SkImageChromium.h>
+ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_END
+@@ -190,8 +192,13 @@ static bool isSinglePlaneGLMemory(GstGLMemory* memory, GstVideoInfo* videoInfo,
+ void CoordinatedPlatformLayerBufferVideo::createSkiaImageIfNeeded(const sk_sp<GrContextThreadSafeProxy>& threadSafeGrContext, bool gstGLEnabled, Origin origin)
+ {
+     const auto& sample = m_videoFrame->sample();
++#if USE(GBM) || USE(GSTREAMER_GL)
+     auto* buffer = gst_sample_get_buffer(sample.get());
+     auto* memory = gst_buffer_peek_memory(buffer, 0);
++#else
++    UNUSED_PARAM(threadSafeGrContext);
++    UNUSED_PARAM(origin);
++#endif
+ 
+ #if USE(GBM)
+     if (gst_is_fd_memory(memory) && m_videoDecoderPlatform && *m_videoDecoderPlatform == GstVideoDecoderPlatform::Qualcomm) {
+diff --git a/Source/WebCore/platform/graphics/coordinated/CoordinatedTileBuffer.cpp b/Source/WebCore/platform/graphics/coordinated/CoordinatedTileBuffer.cpp
+index 97343135c0..6784069ef8 100644
+--- a/Source/WebCore/platform/graphics/coordinated/CoordinatedTileBuffer.cpp
++++ b/Source/WebCore/platform/graphics/coordinated/CoordinatedTileBuffer.cpp
+@@ -33,7 +33,9 @@
+ 
+ #if USE(SKIA)
+ #include "FontRenderOptions.h"
++#if !USE(TESSERA_VULKAN_ONLY)
+ #include "GLContext.h"
++#endif
+ #include "GLFence.h"
+ #include "PlatformDisplay.h"
+ #include "ProcessCapabilities.h"
+@@ -42,16 +44,22 @@ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_BEGIN
+ #include <skia/core/SkColorSpace.h>
+ #include <skia/core/SkImage.h>
+ #include <skia/core/SkStream.h>
++#if !USE(TESSERA_VULKAN_ONLY)
+ #include <skia/gpu/ganesh/gl/GrGLDirectContext.h>
++#endif
+ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_END
+ #include <wtf/MainThread.h>
+ 
+ #if USE(LIBEPOXY)
++#if !USE(TESSERA_VULKAN_ONLY)
+ #include <epoxy/gl.h>
++#endif
+ #else
++#if !USE(TESSERA_VULKAN_ONLY)
+ #include <GLES3/gl3.h>
+ #endif
+ #endif
++#endif
+ 
+ namespace WebCore {
+ 
+@@ -133,6 +141,9 @@ CoordinatedUnacceleratedTileBuffer::~CoordinatedUnacceleratedTileBuffer()
+ #if USE(SKIA)
+ SkCanvas* CoordinatedUnacceleratedTileBuffer::canvas()
+ {
++#if USE(TESSERA_VULKAN_ONLY)
++    RELEASE_ASSERT_NOT_REACHED_WITH_MESSAGE("Raster tile canvas requested in Vulkan-only build");
++#else
+     if (!m_surface) {
+         auto alphaType = supportsAlpha() ? kPremul_SkAlphaType : kOpaque_SkAlphaType;
+         auto imageInfo = SkImageInfo::Make(m_size.width(), m_size.height(), kBGRA_8888_SkColorType, alphaType, SkColorSpace::MakeSRGB());
+@@ -141,6 +152,7 @@ SkCanvas* CoordinatedUnacceleratedTileBuffer::canvas()
+         m_surface = SkSurfaces::WrapPixels(imageInfo, data(), imageInfo.minRowBytes64(), &properties);
+     }
+     return m_surface->getCanvas();
++#endif
+ }
+ #endif
+ 
+diff --git a/Source/WebCore/platform/graphics/egl/BitmapTexture.h b/Source/WebCore/platform/graphics/egl/BitmapTexture.h
+index 25a3313907..7d284af3b3 100644
+--- a/Source/WebCore/platform/graphics/egl/BitmapTexture.h
++++ b/Source/WebCore/platform/graphics/egl/BitmapTexture.h
+@@ -47,6 +47,9 @@
+ #if USE(SKIA)
+ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_BEGIN
+ #include <skia/core/SkRefCnt.h>
++#if USE(TESSERA_VULKAN_ONLY)
++#include <skia/core/SkSurface.h>
++#endif
+ #include <skia/gpu/ganesh/GrBackendSurface.h>
+ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_END
+ class GrDirectContext;
+@@ -154,6 +157,9 @@ private:
+ 
+     OptionSet<Flags> m_flags;
+     IntSize m_size;
++#if USE(TESSERA_VULKAN_ONLY)
++    sk_sp<SkSurface> m_vulkanSurface;
++#endif
+     unsigned m_id { 0 };
+     unsigned m_renderTarget { 0 };
+     unsigned m_binding { 0 };
+diff --git a/Source/WebCore/platform/graphics/egl/BitmapTexturePool.cpp b/Source/WebCore/platform/graphics/egl/BitmapTexturePool.cpp
+index 3007f8a4a5..f36b3c3f2d 100644
+--- a/Source/WebCore/platform/graphics/egl/BitmapTexturePool.cpp
++++ b/Source/WebCore/platform/graphics/egl/BitmapTexturePool.cpp
+@@ -27,8 +27,10 @@
+ #include "config.h"
+ #include "BitmapTexturePool.h"
+ 
++#if !USE(TESSERA_VULKAN_ONLY)
+ #include "GLContext.h"
+ #include "GLContextWrapper.h"
++#endif
+ #include "PlatformDisplay.h"
+ #include <wtf/MainThread.h>
+ #include <wtf/TZoneMallocInlines.h>
+@@ -70,7 +72,11 @@ BitmapTexturePool::BitmapTexturePool()
+ 
+ Ref<BitmapTexture> BitmapTexturePool::acquireTexture(const IntSize& size, OptionSet<BitmapTexture::Flags> flags)
+ {
++#if USE(TESSERA_VULKAN_ONLY)
++    RELEASE_ASSERT(PlatformDisplay::sharedDisplay().makeSkiaContextCurrent());
++#else
+     ASSERT(GLContextWrapper::currentContext());
++#endif
+     Locker locker { m_lock };
+     Entry* selectedEntry = std::find_if(m_textures.begin(), m_textures.end(), [&](Entry& entry) {
+         return entry.texture->refCount() == 1
+@@ -104,7 +110,11 @@ Ref<BitmapTexture> BitmapTexturePool::acquireTexture(const IntSize& size, Option
+ #if USE(GBM)
+ Ref<BitmapTexture> BitmapTexturePool::createTextureForImage(EGLImage image, const IntSize& size, OptionSet<BitmapTexture::Flags> flags)
+ {
++#if USE(TESSERA_VULKAN_ONLY)
++    RELEASE_ASSERT(PlatformDisplay::sharedDisplay().makeSkiaContextCurrent());
++#else
+     ASSERT(GLContextWrapper::currentContext());
++#endif
+     Locker locker { m_lock };
+     auto texture = BitmapTexture::create(image, size, flags);
+     m_imageTextures.append(texture.copyRef());
+@@ -116,7 +126,11 @@ Ref<BitmapTexture> BitmapTexturePool::createTextureForImage(EGLImage image, cons
+ void BitmapTexturePool::releaseAllTextures()
+ {
+     ASSERT(isMainThread());
++#if USE(TESSERA_VULKAN_ONLY)
++    RELEASE_ASSERT(PlatformDisplay::sharedDisplay().makeSkiaContextCurrent());
++#else
+     ASSERT(GLContextWrapper::currentContext());
++#endif
+     Locker locker { m_lock };
+     m_releaseUnusedTexturesTimer.stop();
+     m_textures.clear();
+@@ -182,6 +196,9 @@ void BitmapTexturePool::releaseUnusedTexturesTimerFired()
+ #endif
+     };
+ 
++#if USE(TESSERA_VULKAN_ONLY)
++    releaseTexturesIfNeeded();
++#else
+     if (GLContextWrapper::currentContext())
+         releaseTexturesIfNeeded();
+ #if !PLATFORM(WIN)
+@@ -190,7 +207,7 @@ void BitmapTexturePool::releaseUnusedTexturesTimerFired()
+         releaseTexturesIfNeeded();
+     }
+ #endif
+-
++#endif
+     if (hasTextures())
+         scheduleReleaseUnusedTextures();
+ }
+diff --git a/Source/WebCore/platform/graphics/gstreamer/VideoFrameGStreamer.cpp b/Source/WebCore/platform/graphics/gstreamer/VideoFrameGStreamer.cpp
+index 3b8247a8ab..fcd456c230 100644
+--- a/Source/WebCore/platform/graphics/gstreamer/VideoFrameGStreamer.cpp
++++ b/Source/WebCore/platform/graphics/gstreamer/VideoFrameGStreamer.cpp
+@@ -25,7 +25,9 @@
+ #if ENABLE(VIDEO) && USE(GSTREAMER)
+ 
+ #include "BitmapImage.h"
++#if !USE(TESSERA_VULKAN_ONLY)
+ #include "GLContext.h"
++#endif
+ #include "GStreamerCommon.h"
+ #include "GStreamerVideoFrameConverter.h"
+ #include "GraphicsContext.h"
+@@ -187,7 +189,7 @@ RefPtr<VideoFrame> VideoFrame::fromNativeImage(NativeImage& image)
+ 
+     GRefPtr<GstBuffer> buffer;
+     if (platformImage->isTextureBacked()) {
+-        if (!PlatformDisplay::sharedDisplay().skiaGLContext()->makeContextCurrent())
++        if (!PlatformDisplay::sharedDisplay().makeSkiaContextCurrent())
+             return nullptr;
+ 
+         auto data = SkData::MakeUninitialized(size);
+diff --git a/Source/WebCore/platform/graphics/skia/GraphicsContextGLSkia.cpp b/Source/WebCore/platform/graphics/skia/GraphicsContextGLSkia.cpp
+index 22a0346f57..06960b6dd3 100644
+--- a/Source/WebCore/platform/graphics/skia/GraphicsContextGLSkia.cpp
++++ b/Source/WebCore/platform/graphics/skia/GraphicsContextGLSkia.cpp
+@@ -27,7 +27,9 @@
+ #include "GraphicsContextGL.h"
+ 
+ #if ENABLE(WEBGL) && USE(SKIA)
++#if !USE(TESSERA_VULKAN_ONLY)
+ #include "GLContext.h"
++#endif
+ #include "GraphicsContextGLImageExtractor.h"
+ #include "NativeImage.h"
+ #include "NotImplemented.h"
+@@ -97,7 +99,7 @@ bool GraphicsContextGLImageExtractor::extractImage(std::optional<AlphaPremultipl
+     if (platformImage->isTextureBacked() || !sourceFormat) {
+         auto data = SkData::MakeUninitialized(readInfo.computeMinByteSize());
+         bytesPerRow = readInfo.minRowBytes();
+-        if (platformImage->isTextureBacked() && !PlatformDisplay::sharedDisplay().skiaGLContext()->makeContextCurrent())
++        if (platformImage->isTextureBacked() && !PlatformDisplay::sharedDisplay().makeSkiaContextCurrent())
+             return false;
+ 
+         auto* grContext = m_image->grContext();
+diff --git a/Source/WebCore/platform/graphics/skia/GraphicsContextSkia.cpp b/Source/WebCore/platform/graphics/skia/GraphicsContextSkia.cpp
+index a3cb981bd7..1a023e1b1a 100644
+--- a/Source/WebCore/platform/graphics/skia/GraphicsContextSkia.cpp
++++ b/Source/WebCore/platform/graphics/skia/GraphicsContextSkia.cpp
+@@ -25,6 +25,11 @@
+ 
+ #include "config.h"
+ #include "GraphicsContextSkia.h"
++#if USE(TESSERA_VULKAN_ONLY)
++WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_BEGIN
++#include <skia/core/SkPixmap.h>
++WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_END
++#endif
+ 
+ #if USE(SKIA)
+ #include "AffineTransform.h"
+@@ -32,7 +37,9 @@
+ #include "FloatRect.h"
+ #include "FloatRoundedRect.h"
+ #include "FontRenderOptions.h"
++#if !USE(TESSERA_VULKAN_ONLY)
+ #include "GLContext.h"
++#endif
+ #include "ImageBuffer.h"
+ #include "IntRect.h"
+ #include "NativeImage.h"
+@@ -118,6 +125,12 @@ GraphicsContextSkia::GraphicsContextSkia(SkCanvas& canvas, RenderingMode renderi
+     , m_destroyNotify(WTF::move(destroyNotify))
+     , m_colorSpace(canvas.imageInfo().colorSpace() ? ColorSpace(canvas.imageInfo().refColorSpace()) : ColorSpace::SRGB())
+ {
++#if USE(TESSERA_VULKAN_ONLY)
++    // Recordings have no pixels; painting canvases must be GPU-backed. Reject an
++    // accidentally supplied raster canvas before any draw can reach it.
++    SkPixmap pixels;
++    RELEASE_ASSERT_WITH_MESSAGE(!canvas.peekPixels(&pixels), "Tessera forbids raster painting canvases");
++#endif
+ }
+ 
+ GraphicsContextSkia::~GraphicsContextSkia()
+@@ -158,7 +171,7 @@ bool GraphicsContextSkia::makeGLContextCurrentIfNeeded() const
+     if (m_renderingPurpose != RenderingPurpose::Canvas && m_renderingPurpose != RenderingPurpose::DOM)
+         return true;
+ 
+-    return PlatformDisplay::sharedDisplay().skiaGLContext()->makeContextCurrent();
++    return PlatformDisplay::sharedDisplay().makeSkiaContextCurrent();
+ }
+ 
+ void GraphicsContextSkia::pushSkiaState()
+@@ -248,8 +261,7 @@ sk_sp<SkImage> GraphicsContextSkia::imageForCurrentThread(const sk_sp<SkImage>&
+     if (!image->isTextureBacked())
+         return image;
+ 
+-    auto* glContext = PlatformDisplay::sharedDisplay().skiaGLContext();
+-    if (!glContext || !glContext->makeContextCurrent())
++    if (!PlatformDisplay::sharedDisplay().makeSkiaContextCurrent())
+         return image;
+ 
+     // Use the destination context (current thread's context), not nativeImage.grContext()
+@@ -265,7 +277,11 @@ sk_sp<SkImage> GraphicsContextSkia::imageForCurrentThread(const sk_sp<SkImage>&
+         return imageInThisThread;
+ 
+     // When drawing GPU-backed image on CPU-backed canvas we need to convert image to CPU-backed one.
++#if USE(TESSERA_VULKAN_ONLY)
++    RELEASE_ASSERT_NOT_REACHED_WITH_MESSAGE("CPU image drawing requested in Vulkan-only build");
++#else
+     return imageInThisThread->makeRasterImage(grContext);
++#endif
+ }
+ 
+ void GraphicsContextSkia::drawNativeImage(const NativeImage& nativeImage, const FloatRect& destRect, const FloatRect& srcRect, ImagePaintingOptions options)
+@@ -275,8 +291,8 @@ void GraphicsContextSkia::drawNativeImage(const NativeImage& nativeImage, const
+         return;
+ 
+     // Collect raster images for atlas batching during recording.
+-    if (m_contextMode == ContextMode::TileRecordingMode && m_renderingMode == RenderingMode::Accelerated && !image->isTextureBacked()) {
+-        ASSERT(m_atlasLayoutBuilder);
++    if (m_atlasLayoutBuilder && !image->isTextureBacked()) {
++        ASSERT(m_contextMode == ContextMode::TileRecordingMode && m_renderingMode == RenderingMode::Accelerated);
+         m_atlasLayoutBuilder->collectRasterImage(image);
+     }
+ 
+@@ -1116,8 +1132,7 @@ void GraphicsContextSkia::fillRectWithRoundedHole(const FloatRect& outerRect, co
+ // FIXME: Make this a GraphicsContextSkia static function, and use it throughout WebCore.
+ static sk_sp<SkSurface> createAcceleratedSurface(const IntSize& size)
+ {
+-    auto* glContext = PlatformDisplay::sharedDisplay().skiaGLContext();
+-    if (!glContext || !glContext->makeContextCurrent())
++    if (!PlatformDisplay::sharedDisplay().makeSkiaContextCurrent())
+         return nullptr;
+ 
+     auto* grContext = PlatformDisplay::sharedDisplay().skiaGrContext();
+@@ -1225,7 +1240,11 @@ void GraphicsContextSkia::beginRecording(RecordingMode recordingMode, const sk_s
+             ASSERT(threadSafeGrContext);
+ #endif
+             m_threadSafeGrContext = threadSafeGrContext;
+-            m_atlasLayoutBuilder = makeUnique<SkiaImageAtlasLayoutBuilder>();
++            // Atlases are uploaded on the main thread and drawn from the painting threads,
++            // which Vulkan contexts cannot share textures for yet: images are uploaded where
++            // they are drawn.
++            if (!PlatformDisplay::sharedDisplay().skiaUsesVulkan())
++                m_atlasLayoutBuilder = makeUnique<SkiaImageAtlasLayoutBuilder>();
+         } else
+             ASSERT(!m_atlasLayoutBuilder);
+         break;
+diff --git a/Source/WebCore/platform/graphics/skia/ImageBufferSkiaAcceleratedBackend.cpp b/Source/WebCore/platform/graphics/skia/ImageBufferSkiaAcceleratedBackend.cpp
+index 08acd805e2..628af21949 100644
+--- a/Source/WebCore/platform/graphics/skia/ImageBufferSkiaAcceleratedBackend.cpp
++++ b/Source/WebCore/platform/graphics/skia/ImageBufferSkiaAcceleratedBackend.cpp
+@@ -28,7 +28,9 @@
+ 
+ #if USE(SKIA)
+ #include "FontRenderOptions.h"
++#if !USE(TESSERA_VULKAN_ONLY)
+ #include "GLContext.h"
++#endif
+ #include "GLFence.h"
+ #include "GraphicsContextSkia.h"
+ #include "IntRect.h"
+@@ -108,13 +110,12 @@ std::unique_ptr<ImageBufferSkiaAcceleratedBackend> ImageBufferSkiaAcceleratedBac
+     if (parameters.purpose != RenderingPurpose::Canvas && !ProcessCapabilities::canUseAcceleratedBuffers())
+         return nullptr;
+ 
+-#if !PLATFORM(WIN)
++#if !PLATFORM(WIN) && !USE(TESSERA_VULKAN_ONLY)
+     if (!PlatformDisplay::sharedDisplayIfExists())
+         return nullptr;
+ #endif
+ 
+-    auto* glContext = PlatformDisplay::sharedDisplay().skiaGLContext();
+-    if (!glContext || !glContext->makeContextCurrent())
++    if (!PlatformDisplay::sharedDisplay().makeSkiaContextCurrent())
+         return nullptr;
+ 
+     auto* grContext = PlatformDisplay::sharedDisplay().skiaGrContext();
+@@ -202,7 +203,7 @@ void ImageBufferSkiaAcceleratedBackend::replayCanvasRecordingContextIfNeeded()
+     if (!grContext)
+         return;
+ 
+-    if (!PlatformDisplay::sharedDisplay().skiaGLContext()->makeContextCurrent())
++    if (!PlatformDisplay::sharedDisplay().makeSkiaContextCurrent())
+         return;
+ 
+     ASSERT(grContext == PlatformDisplay::sharedDisplay().skiaGrContext());
+@@ -242,7 +243,7 @@ void ImageBufferSkiaAcceleratedBackend::flushContext()
+     if (!grContext)
+         return;
+ 
+-    if (!PlatformDisplay::sharedDisplay().skiaGLContext()->makeContextCurrent())
++    if (!PlatformDisplay::sharedDisplay().makeSkiaContextCurrent())
+         return;
+ 
+     ASSERT(grContext == PlatformDisplay::sharedDisplay().skiaGrContext());
+@@ -265,7 +266,7 @@ void ImageBufferSkiaAcceleratedBackend::prepareForDisplay()
+     if (!grContext)
+         return;
+ 
+-    if (!PlatformDisplay::sharedDisplay().skiaGLContext()->makeContextCurrent())
++    if (!PlatformDisplay::sharedDisplay().makeSkiaContextCurrent())
+         return;
+ 
+     ASSERT(grContext == PlatformDisplay::sharedDisplay().skiaGrContext());
+@@ -312,7 +313,7 @@ RefPtr<NativeImage> ImageBufferSkiaAcceleratedBackend::createNativeImageReferenc
+     // because that call doesn't force the MSAA resolution, which can produce outdated results
+     // in the resulting SkImage.
+     auto& display = PlatformDisplay::sharedDisplay();
+-    if (grContext && display.msaaSampleCount() > 0 && display.skiaGLContext()->makeContextCurrent()) {
++    if (grContext && display.msaaSampleCount() > 0 && display.makeSkiaContextCurrent()) {
+         ASSERT(grContext == display.skiaGrContext());
+         grContext->flush(m_surface.get());
+     }
+@@ -322,7 +323,7 @@ RefPtr<NativeImage> ImageBufferSkiaAcceleratedBackend::createNativeImageReferenc
+ 
+ void ImageBufferSkiaAcceleratedBackend::getPixelBuffer(const IntRect& srcRect, PixelBuffer& destination)
+ {
+-    if (!PlatformDisplay::sharedDisplay().skiaGLContext()->makeContextCurrent())
++    if (!PlatformDisplay::sharedDisplay().makeSkiaContextCurrent())
+         return;
+ 
+     // CPU needs to read pixels now, replay the recording.
+@@ -333,7 +334,7 @@ void ImageBufferSkiaAcceleratedBackend::getPixelBuffer(const IntRect& srcRect, P
+ 
+ void ImageBufferSkiaAcceleratedBackend::putPixelBuffer(const PixelBufferSourceView& pixelBuffer, const IntRect& srcRect, const IntPoint& destPoint, AlphaPremultiplication destFormat)
+ {
+-    if (!PlatformDisplay::sharedDisplay().skiaGLContext()->makeContextCurrent())
++    if (!PlatformDisplay::sharedDisplay().makeSkiaContextCurrent())
+         return;
+ 
+     // CPU needs to write pixels now, replay the recording.
+diff --git a/Source/WebCore/platform/graphics/skia/ImageBufferSkiaUnacceleratedBackend.cpp b/Source/WebCore/platform/graphics/skia/ImageBufferSkiaUnacceleratedBackend.cpp
+index d736c13d5e..d4393567d5 100644
+--- a/Source/WebCore/platform/graphics/skia/ImageBufferSkiaUnacceleratedBackend.cpp
++++ b/Source/WebCore/platform/graphics/skia/ImageBufferSkiaUnacceleratedBackend.cpp
+@@ -42,6 +42,9 @@ std::unique_ptr<ImageBufferSkiaUnacceleratedBackend> ImageBufferSkiaUnaccelerate
+     if (backendSize.isEmpty())
+         return nullptr;
+ 
++#if USE(TESSERA_VULKAN_ONLY)
++    RELEASE_ASSERT_NOT_REACHED_WITH_MESSAGE("Raster image buffer requested in Vulkan-only build");
++#else
+     auto imageInfo = SkImageInfo::MakeN32Premul(backendSize.width(), backendSize.height(), parameters.colorSpace.platformColorSpace());
+     SkSurfaceProps properties = FontRenderOptions::singleton().createSurfaceProps();
+     auto surface = SkSurfaces::Raster(imageInfo, &properties);
+@@ -49,6 +52,7 @@ std::unique_ptr<ImageBufferSkiaUnacceleratedBackend> ImageBufferSkiaUnaccelerate
+         return nullptr;
+ 
+     return std::unique_ptr<ImageBufferSkiaUnacceleratedBackend>(new ImageBufferSkiaUnacceleratedBackend(parameters, WTF::move(surface)));
++#endif
+ }
+ 
+ ImageBufferSkiaUnacceleratedBackend::ImageBufferSkiaUnacceleratedBackend(const ImageBufferParameters& parameters, sk_sp<SkSurface>&& surface)
+diff --git a/Source/WebCore/platform/graphics/skia/ImageUtilitiesSkia.cpp b/Source/WebCore/platform/graphics/skia/ImageUtilitiesSkia.cpp
+index d39fe093c4..0ad53f989d 100644
+--- a/Source/WebCore/platform/graphics/skia/ImageUtilitiesSkia.cpp
++++ b/Source/WebCore/platform/graphics/skia/ImageUtilitiesSkia.cpp
+@@ -27,7 +27,9 @@
+ #include "ImageUtilities.h"
+ 
+ #if USE(SKIA)
++#if !USE(TESSERA_VULKAN_ONLY)
+ #include "GLContext.h"
++#endif
+ #include "MIMETypeRegistry.h"
+ #include "NativeImage.h"
+ #include "PlatformDisplay.h"
+@@ -81,7 +83,7 @@ static SkWebpEncoder::Options webpEncoderOptions(std::optional<double> quality)
+ 
+ static sk_sp<SkData> encodeAcceleratedImage(const NativeImage& nativeImage, const String& mimeType, std::optional<double> quality)
+ {
+-    if (!PlatformDisplay::sharedDisplay().skiaGLContext()->makeContextCurrent())
++    if (!PlatformDisplay::sharedDisplay().makeSkiaContextCurrent())
+         return nullptr;
+ 
+     auto* grContext = nativeImage.grContext();
+diff --git a/Source/WebCore/platform/graphics/skia/NativeImageSkia.cpp b/Source/WebCore/platform/graphics/skia/NativeImageSkia.cpp
+index ec1913422d..ba76237531 100644
+--- a/Source/WebCore/platform/graphics/skia/NativeImageSkia.cpp
++++ b/Source/WebCore/platform/graphics/skia/NativeImageSkia.cpp
+@@ -27,7 +27,9 @@
+ #include "NativeImage.h"
+ 
+ #if USE(SKIA)
++#if !USE(TESSERA_VULKAN_ONLY)
+ #include "GLContext.h"
++#endif
+ #include "GraphicsContextSkia.h"
+ #include "PixelBuffer.h"
+ #include "PlatformDisplay.h"
+@@ -175,7 +177,7 @@ NativeImage::UnpremultipliedPixels NativeImage::unpremultipliedPixels() const
+     if (!sizeInBytes || SkImageInfo::ByteSizeOverflowed(sizeInBytes))
+         return { };
+ 
+-    if (platformImage->isTextureBacked() && !PlatformDisplay::sharedDisplay().skiaGLContext()->makeContextCurrent())
++    if (platformImage->isTextureBacked() && !PlatformDisplay::sharedDisplay().makeSkiaContextCurrent())
+         return { };
+ 
+     Vector<uint8_t> pixels(sizeInBytes);
+@@ -193,7 +195,7 @@ std::optional<Color> NativeImage::singlePixelSolidColor() const
+ 
+     auto platformImage = this->platformImage();
+     if (platformImage->isTextureBacked()) {
+-        if (!PlatformDisplay::sharedDisplay().skiaGLContext()->makeContextCurrent())
++        if (!PlatformDisplay::sharedDisplay().makeSkiaContextCurrent())
+             return std::nullopt;
+ 
+         ASSERT(m_grContext);
+diff --git a/Source/WebCore/platform/graphics/skia/PlatformDisplaySkia.cpp b/Source/WebCore/platform/graphics/skia/PlatformDisplaySkia.cpp
+index 776466ea87..71ecf84b84 100644
+--- a/Source/WebCore/platform/graphics/skia/PlatformDisplaySkia.cpp
++++ b/Source/WebCore/platform/graphics/skia/PlatformDisplaySkia.cpp
+@@ -28,17 +28,26 @@
+ 
+ #if USE(SKIA)
+ #include "FontRenderOptions.h"
++#if !USE(TESSERA_VULKAN_ONLY)
++#if !USE(TESSERA_VULKAN_ONLY)
+ #include "GLContext.h"
++#endif
++#endif
++
++#if USE(VULKAN)
++#include "SkiaVulkanDevice.h"
++#include <atomic>
++#endif
+ 
+ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_BEGIN
+ #include <skia/core/SkColorSpace.h>
+ #include <skia/core/SkExecutor.h>
+ #include <skia/gpu/ganesh/GrBackendSurface.h>
+ #include <skia/gpu/ganesh/SkSurfaceGanesh.h>
++#if !USE(TESSERA_VULKAN_ONLY)
+ #include <skia/gpu/ganesh/gl/GrGLBackendSurface.h>
+ #include <skia/gpu/ganesh/gl/GrGLDirectContext.h>
+ #include <skia/gpu/ganesh/gl/GrGLInterface.h>
+-
+ #if USE(LIBEPOXY)
+ #include <epoxy/egl.h>
+ #include <skia/gpu/ganesh/gl/epoxy/GrGLMakeEpoxyEGLInterface.h>
+@@ -47,6 +56,7 @@ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_BEGIN
+ #include <EGL/eglext.h>
+ #include <skia/gpu/ganesh/gl/egl/GrGLMakeEGLInterface.h>
+ #endif
++#endif
+ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_END
+ 
+ #include <wtf/MemoryPressureHandler.h>
+@@ -80,6 +90,7 @@ static const unsigned s_defaultSampleCount = 0;
+ #endif
+ 
+ #if !(PLATFORM(PLAYSTATION) && USE(COORDINATED_GRAPHICS))
++#if !USE(TESSERA_VULKAN_ONLY)
+ static sk_sp<const GrGLInterface> skiaGLInterface()
+ {
+     static NeverDestroyed<sk_sp<const GrGLInterface>> grGLInterface {
+@@ -199,6 +210,7 @@ static bool shouldAllowMSAAOnNewIntel()
+ #endif
+ }
+ 
++#endif
+ static unsigned initializeMSAASampleCount(GrDirectContext* grContext)
+ {
+     static std::once_flag onceFlag;
+@@ -257,6 +269,7 @@ static size_t initializeMaxResourceCacheBytes(GrDirectContext* grContext)
+     return grContext->getResourceCacheLimit();
+ }
+ 
++#if !USE(TESSERA_VULKAN_ONLY)
+ class SkiaGLContext : public ThreadSafeRefCountedAndCanMakeThreadSafeWeakPtr<SkiaGLContext> {
+ public:
+     static Ref<SkiaGLContext> create(PlatformDisplay& display)
+@@ -367,9 +380,132 @@ private:
+ };
+ #endif
+ 
++#endif
++
++#if USE(VULKAN)
++// The resource budget of the Vulkan contexts. Tile recordings on the main thread are
++// characterized against the compositor's context, and the main thread has none of its own.
++static std::atomic<size_t> s_vulkanMaxResourceCacheBytes;
++
++// A thread's Skia context on the process's Vulkan device: what SkiaGLContext is to a GL
++// context, without the GL context, since a Vulkan GrDirectContext is current wherever it
++// is used.
++class SkiaVulkanContext : public ThreadSafeRefCounted<SkiaVulkanContext> {
++public:
++    static RefPtr<SkiaVulkanContext> create()
++    {
++        auto* device = SkiaVulkanDevice::singleton();
++        if (!device)
++            return nullptr;
++
++        GrContextOptions options;
++        options.fSharpenMipmappedTextures = false;
++        thread_local std::unique_ptr<SkExecutor> s_executor = SkExecutor::MakeFIFOThreadPool(2);
++        options.fExecutor = s_executor.get();
++        if (auto bytes = glyphCacheTextureMaximumBytes())
++            options.fGlyphCacheTextureMaximumBytes = *bytes;
++
++        auto grContext = device->createGrContext(options);
++#if USE(TESSERA_VULKAN_ONLY)
++        RELEASE_ASSERT_WITH_MESSAGE(grContext, "Tessera could not create a Vulkan Ganesh context");
++#endif
++        if (!grContext) {
++            WTFLogAlways("Failed to create a Skia context on the Vulkan device %s", device->deviceName());
++            return nullptr;
++        }
++        return adoptRef(*new SkiaVulkanContext(WTF::move(grContext)));
++    }
++
++    ~SkiaVulkanContext()
++    {
++        // Resources still in flight belong to submitted work: wait for it, so freeing them
++        // here does not pull memory out from under the GPU.
++        m_grContext->flushAndSubmit(GrSyncCpu::kYes);
++    }
++
++    GrDirectContext* grContext() const { return m_grContext.get(); }
++    unsigned sampleCount() const { return m_sampleCount; }
++    size_t maxResourceCacheBytes() const { return m_maxResourceCacheBytes; }
++
++    void releaseUnusedResources(WTF::Critical critical)
++    {
++        switch (critical) {
++        case Critical::No:
++            m_grContext->purgeUnlockedResources(GrPurgeResourceOptions::kScratchResourcesOnly);
++            break;
++        case Critical::Yes:
++            m_grContext->freeGpuResources();
++            break;
++        }
++    }
++
++private:
++    explicit SkiaVulkanContext(sk_sp<GrDirectContext>&& grContext)
++        : m_grContext(WTF::move(grContext))
++        , m_sampleCount(initializeMSAASampleCount(m_grContext.get()))
++        , m_maxResourceCacheBytes(initializeMaxResourceCacheBytes(m_grContext.get()))
++    {
++        s_vulkanMaxResourceCacheBytes = m_maxResourceCacheBytes;
++    }
++
++    sk_sp<GrDirectContext> m_grContext;
++    unsigned m_sampleCount { 0 };
++    size_t m_maxResourceCacheBytes { 0 };
++};
++
++static thread_local RefPtr<SkiaVulkanContext> s_skiaVulkanContext;
++#endif
++
++bool PlatformDisplay::skiaUsesVulkan() const
++{
++#if USE(VULKAN)
++    return SkiaVulkanDevice::singleton();
++#else
++    return false;
++#endif
++}
++
++#if USE(VULKAN)
++bool PlatformDisplay::setSkiaVulkanContextForCurrentThread(bool enabled)
++{
++    if (!enabled) {
++        s_skiaVulkanContext = nullptr;
++        return true;
++    }
++    ASSERT(!s_skiaVulkanContext);
++    s_skiaVulkanContext = SkiaVulkanContext::create();
++    return !!s_skiaVulkanContext;
++}
++
++static SkiaVulkanContext* skiaVulkanContextForCurrentThread()
++{
++    if (!s_skiaVulkanContext)
++        s_skiaVulkanContext = SkiaVulkanContext::create();
++    return s_skiaVulkanContext.get();
++}
++#endif
++
++bool PlatformDisplay::makeSkiaContextCurrent()
++{
++#if USE(VULKAN)
++    if (skiaUsesVulkan())
++        return skiaVulkanContextForCurrentThread();
++#endif
++#if !USE(TESSERA_VULKAN_ONLY)
++    auto* glContext = skiaGLContext();
++    return glContext && glContext->makeContextCurrent();
++#else
++    RELEASE_ASSERT_NOT_REACHED();
++#endif
++}
++
++#if !USE(TESSERA_VULKAN_ONLY)
+ GLContext* PlatformDisplay::skiaGLContext()
+ {
+ #if PLATFORM(GTK) || PLATFORM(WPE) || (PLATFORM(PLAYSTATION) && !USE(COORDINATED_GRAPHICS))
++    if (skiaUsesVulkan())
++        return nullptr;
++
+     if (!s_skiaGLContext) {
+         s_skiaGLContext = SkiaGLContext::create(*this);
+         m_skiaGLContexts.add(*s_skiaGLContext);
+@@ -393,32 +529,67 @@ void PlatformDisplay::setSkiaGLContextForCurrentThread(std::unique_ptr<GLContext
+     m_skiaGLContexts.add(*s_skiaGLContext);
+ }
+ 
++#endif
+ GrDirectContext* PlatformDisplay::skiaGrContext() const
+ {
++#if USE(VULKAN)
++    if (skiaUsesVulkan()) {
++        auto* context = skiaVulkanContextForCurrentThread();
++        return context ? context->grContext() : nullptr;
++    }
++#endif
++#if !USE(TESSERA_VULKAN_ONLY)
+     RELEASE_ASSERT(s_skiaGLContext);
+     return s_skiaGLContext->skiaGrContext();
++#else
++    RELEASE_ASSERT_NOT_REACHED();
++#endif
+ }
+ 
+ unsigned PlatformDisplay::msaaSampleCount() const
+ {
++#if USE(VULKAN)
++    if (s_skiaVulkanContext)
++        return s_skiaVulkanContext->sampleCount();
++#endif
++#if !USE(TESSERA_VULKAN_ONLY)
+     return s_skiaGLContext ? s_skiaGLContext->sampleCount() : 0;
++#else
++    return 0;
++#endif
+ }
+ 
+ size_t PlatformDisplay::maxSkiaResourceCacheBytes() const
+ {
++#if USE(VULKAN)
++    if (skiaUsesVulkan())
++        return s_skiaVulkanContext ? s_skiaVulkanContext->maxResourceCacheBytes() : s_vulkanMaxResourceCacheBytes.load();
++#endif
++#if !USE(TESSERA_VULKAN_ONLY)
+     return s_skiaGLContext ? s_skiaGLContext->maxResourceCacheBytes() : 0;
++#else
++    return 0;
++#endif
+ }
+ 
+ void PlatformDisplay::skiaReleaseUnusedResources(WTF::Critical critical)
+ {
++#if USE(VULKAN)
++    if (s_skiaVulkanContext)
++        s_skiaVulkanContext->releaseUnusedResources(critical);
++#endif
++#if !USE(TESSERA_VULKAN_ONLY)
+     if (s_skiaGLContext)
+         s_skiaGLContext->releaseUnusedResources(critical);
++#endif
+ }
+ 
++#if !USE(TESSERA_VULKAN_ONLY)
+ void PlatformDisplay::clearSkiaGLContext()
+ {
+     s_skiaGLContext = nullptr;
+ }
++#endif
+ 
+ } // namespace WebCore
+ 
+diff --git a/Source/WebCore/platform/graphics/skia/ShareableBitmapSkia.cpp b/Source/WebCore/platform/graphics/skia/ShareableBitmapSkia.cpp
+index 0e775b1d5e..f8beca22eb 100644
+--- a/Source/WebCore/platform/graphics/skia/ShareableBitmapSkia.cpp
++++ b/Source/WebCore/platform/graphics/skia/ShareableBitmapSkia.cpp
+@@ -69,6 +69,10 @@ CheckedUint32 ShareableBitmapConfiguration::calculateBytesPerRow(const IntSize&
+ 
+ sk_sp<SkSurface> ShareableBitmap::createSurface()
+ {
++#if USE(TESSERA_VULKAN_ONLY)
++    WTFLogAlways("Tessera cannot create a raster canvas from shared memory");
++    return nullptr;
++#else
+     ref();
+     SkSurfaceProps properties = FontRenderOptions::singleton().createSurfaceProps();
+     auto surface = SkSurfaces::WrapPixels(m_configuration.imageInfo(), mutableSpan().data(), bytesPerRow(), [](void*, void* context) {
+@@ -80,6 +84,7 @@ sk_sp<SkSurface> ShareableBitmap::createSurface()
+         return nullptr;
+ 
+     return surface;
++#endif
+ }
+ 
+ std::unique_ptr<GraphicsContext> ShareableBitmap::createGraphicsContext()
+diff --git a/Source/WebCore/platform/graphics/skia/SkiaBackingStore.cpp b/Source/WebCore/platform/graphics/skia/SkiaBackingStore.cpp
+index a5b72dddd6..ac20558ac7 100644
+--- a/Source/WebCore/platform/graphics/skia/SkiaBackingStore.cpp
++++ b/Source/WebCore/platform/graphics/skia/SkiaBackingStore.cpp
+@@ -36,20 +36,29 @@
+ #include "SkiaUtilities.h"
+ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_BEGIN
+ #include <skia/core/SkColorSpace.h>
++#include <skia/core/SkPixmap.h>
+ #include <skia/gpu/ganesh/GrBackendSurface.h>
+ #include <skia/gpu/ganesh/SkImageGanesh.h>
+ #include <skia/gpu/ganesh/SkSurfaceGanesh.h>
++#if !USE(TESSERA_VULKAN_ONLY)
+ #include <skia/gpu/ganesh/gl/GrGLBackendSurface.h>
++#endif
+ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_END
+ #include <wtf/SystemTracing.h>
+ #include <wtf/TZoneMallocInlines.h>
+ 
+ #if USE(LIBEPOXY)
++#if !USE(TESSERA_VULKAN_ONLY)
+ #include <epoxy/gl.h>
++#endif
+ #else
++#if !USE(TESSERA_VULKAN_ONLY)
+ #include <GLES2/gl2.h>
++#endif
++#if !USE(TESSERA_VULKAN_ONLY)
+ #include <GLES2/gl2ext.h>
+ #endif
++#endif
+ 
+ namespace WebCore {
+ 
+@@ -239,6 +248,7 @@ void SkiaBackingStore::Tile::processPendingUpdateIfNeeded()
+     m_pendingUpdates.clear();
+ }
+ 
++#if !USE(TESSERA_VULKAN_ONLY)
+ void SkiaBackingStore::Tile::ensureTexture(const IntSize& size, CoordinatedTileBuffer& buffer)
+ {
+     OptionSet<BitmapTexture::Flags> flags;
+@@ -266,8 +276,12 @@ void SkiaBackingStore::Tile::ensureTexture(const IntSize& size, CoordinatedTileB
+     m_cachedImage = nullptr;
+ }
+ 
++#endif
+ void SkiaBackingStore::Tile::update(const IntRect& dirtyRect, const IntRect& tileRect, CoordinatedTileBuffer& buffer)
+ {
++#if USE(TESSERA_VULKAN_ONLY)
++    UNUSED_PARAM(dirtyRect);
++#endif
+     WTFBeginSignpost(this, SkiaBackingStoreTileUpdate, "rect %ix%i+%i+%i %s", tileRect.x(), tileRect.y(), tileRect.width(), tileRect.height(), buffer.isBackedByOpenGL() ? "GPUToGPU" : "CPUToGPU");
+ 
+     FloatRect unscaledTileRect(tileRect);
+@@ -275,14 +289,18 @@ void SkiaBackingStore::Tile::update(const IntRect& dirtyRect, const IntRect& til
+ 
+     if (unscaledTileRect != m_rect) {
+         m_rect = unscaledTileRect;
++#if !USE(TESSERA_VULKAN_ONLY)
+         m_texture = nullptr;
++#endif
+         m_surface = nullptr;
+     }
+ 
+     if (buffer.isBackedByOpenGL()) {
+         auto& acceleratedBuffer = static_cast<CoordinatedAcceleratedTileBuffer&>(buffer);
+         if (auto displayList = acceleratedBuffer.takeDisplayList()) {
++#if !USE(TESSERA_VULKAN_ONLY)
+             ASSERT(!m_texture);
++#endif
+             ASSERT(!m_cachedImage);
+ 
+             auto* grContext = PlatformDisplay::sharedDisplay().skiaGrContext();
+@@ -295,14 +313,39 @@ void SkiaBackingStore::Tile::update(const IntRect& dirtyRect, const IntRect& til
+             if (!m_surface || !m_surface->isCompatible(characterization) || m_surface->imageInfo().alphaType() != characterization.imageInfo().alphaType())
+                 m_surface = SkSurfaces::RenderTarget(grContext, skgpu::Budgeted::kYes, characterization.imageInfo(), characterization.sampleCount(), characterization.origin(), &characterization.surfaceProps());
+ 
++            RELEASE_ASSERT(m_surface);
+             skgpu::ganesh::DrawDDL(m_surface.get(), displayList);
+         }
++#if USE(TESSERA_VULKAN_ONLY)
++    } else {
++        RELEASE_ASSERT_NOT_REACHED_WITH_MESSAGE("Raster tile supplied to Vulkan backing store");
++    }
++#else
++    } else if (PlatformDisplay::sharedDisplay().skiaUsesVulkan()) {
++        // There are no GL textures to upload into: the tile gets a GPU surface of its own
++        // and the painted pixels are written into it.
++        auto& unacceleratedBuffer = static_cast<CoordinatedUnacceleratedTileBuffer&>(buffer);
++        auto alphaType = buffer.supportsAlpha() ? kPremul_SkAlphaType : kOpaque_SkAlphaType;
++        if (!m_surface || m_surface->width() != tileRect.width() || m_surface->height() != tileRect.height() || m_surface->imageInfo().alphaType() != alphaType) {
++            auto* grContext = PlatformDisplay::sharedDisplay().skiaGrContext();
++            ASSERT(grContext);
++            auto imageInfo = SkImageInfo::Make(tileRect.width(), tileRect.height(), kRGBA_8888_SkColorType, alphaType, SkColorSpace::MakeSRGB());
++            auto properties = FontRenderOptions::singleton().createSurfaceProps();
++            m_surface = SkSurfaces::RenderTarget(grContext, skgpu::Budgeted::kYes, imageInfo, 0, kTopLeft_GrSurfaceOrigin, &properties);
++        }
++        if (m_surface) {
++            auto colorType = buffer.pixelFormat() == PixelFormat::BGRA8 ? kBGRA_8888_SkColorType : kRGBA_8888_SkColorType;
++            SkPixmap pixmap(SkImageInfo::Make(dirtyRect.width(), dirtyRect.height(), colorType, alphaType, SkColorSpace::MakeSRGB()), unacceleratedBuffer.data(), unacceleratedBuffer.stride());
++            m_surface->writePixels(pixmap, dirtyRect.x(), dirtyRect.y());
++        }
+     } else {
+         auto& unacceleratedBuffer = static_cast<CoordinatedUnacceleratedTileBuffer&>(buffer);
+         ensureTexture(tileRect.size(), buffer);
+         m_texture->updateContents(unacceleratedBuffer.data(), dirtyRect, { }, unacceleratedBuffer.stride(), buffer.pixelFormat());
+     }
+ 
++#endif
++
+     WTFEndSignpost(this, SkiaBackingStoreTileUpdate);
+ }
+ 
+@@ -311,6 +354,7 @@ sk_sp<SkImage> SkiaBackingStore::Tile::image() const
+     if (m_surface)
+         return m_surface->makeImageSnapshot();
+ 
++#if !USE(TESSERA_VULKAN_ONLY)
+     if (!m_cachedImage && m_texture) {
+         auto* grContext = PlatformDisplay::sharedDisplay().skiaGrContext();
+         ASSERT(grContext);
+@@ -332,6 +376,8 @@ sk_sp<SkImage> SkiaBackingStore::Tile::image() const
+             static_cast<BitmapTexture*>(userData)->deref();
+         }, m_texture.get());
+     }
++#endif
++
+     return m_cachedImage;
+ }
+ 
+@@ -341,11 +387,13 @@ SkRect SkiaBackingStore::Tile::imageSourceRect() const
+     if (m_surface)
+         return SkRect::MakeWH(m_surface->width(), m_surface->height());
+ 
++#if !USE(TESSERA_VULKAN_ONLY)
+     // The texture image spans allocatedSize() - only the top-left size() region is real content.
+     if (m_texture) {
+         auto size = m_texture->size();
+         return SkRect::MakeWH(size.width(), size.height());
+     }
++#endif
+ 
+     // Callers only reach imageSourceRect() after image() returned a valid image, which requires
+     // one of m_surface or m_texture to be set, so this fallback is never taken in practice.
+@@ -356,7 +404,11 @@ SkRect SkiaBackingStore::Tile::imageSourceRect() const
+ bool SkiaBackingStore::Tile::isPadded() const
+ {
+     // A surface snapshot is sized to the tile, so only a texture can be padded.
++#if USE(TESSERA_VULKAN_ONLY)
++    return false;
++#else
+     return m_texture && m_texture->size() != m_texture->allocatedSize();
++#endif
+ }
+ 
+ } // namespace WebCore
+diff --git a/Source/WebCore/platform/graphics/skia/SkiaBackingStore.h b/Source/WebCore/platform/graphics/skia/SkiaBackingStore.h
+index 56a753ce99..224f157cd9 100644
+--- a/Source/WebCore/platform/graphics/skia/SkiaBackingStore.h
++++ b/Source/WebCore/platform/graphics/skia/SkiaBackingStore.h
+@@ -101,7 +101,9 @@ private:
+         FloatRect m_rect;
+         Vector<Update> m_pendingUpdates;
+         sk_sp<SkSurface> m_surface;
++#if !USE(TESSERA_VULKAN_ONLY)
+         RefPtr<BitmapTexture> m_texture;
++#endif
+         mutable sk_sp<SkImage> m_cachedImage;
+     };
+ 
+diff --git a/Source/WebCore/platform/graphics/skia/SkiaCompositingLayer.cpp b/Source/WebCore/platform/graphics/skia/SkiaCompositingLayer.cpp
+index ad9f450ce5..d2613ad0d8 100644
+--- a/Source/WebCore/platform/graphics/skia/SkiaCompositingLayer.cpp
++++ b/Source/WebCore/platform/graphics/skia/SkiaCompositingLayer.cpp
+@@ -50,8 +50,12 @@ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_BEGIN
+ #include <skia/gpu/ganesh/GrBackendSurface.h>
+ #include <skia/gpu/ganesh/SkImageGanesh.h>
+ #include <skia/gpu/ganesh/SkSurfaceGanesh.h>
++#if !USE(TESSERA_VULKAN_ONLY)
+ #include <skia/gpu/ganesh/gl/GrGLBackendSurface.h>
++#endif
++#if !USE(TESSERA_VULKAN_ONLY)
+ #include <skia/gpu/ganesh/gl/GrGLDirectContext.h>
++#endif
+ #include <skia/utils/SkNoDrawCanvas.h>
+ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_END
+ #include <wtf/Scope.h>
+diff --git a/Source/WebCore/platform/graphics/skia/SkiaGPUAtlas.cpp b/Source/WebCore/platform/graphics/skia/SkiaGPUAtlas.cpp
+index 8909c13e17..415528daa5 100644
+--- a/Source/WebCore/platform/graphics/skia/SkiaGPUAtlas.cpp
++++ b/Source/WebCore/platform/graphics/skia/SkiaGPUAtlas.cpp
+@@ -28,7 +28,9 @@
+ 
+ #if USE(SKIA)
+ #include "BitmapTexture.h"
++#if !USE(TESSERA_VULKAN_ONLY)
+ #include "GLContext.h"
++#endif
+ #include "PlatformDisplay.h"
+ #include "SkiaImageAtlasLayout.h"
+ #if USE(GBM)
+@@ -130,7 +132,12 @@ void SkiaGPUAtlas::uploadImages()
+             m_atlasTexture->updateContents(pixels->first, entry.atlasRect, IntPoint::zero(), pixels->second, PixelFormat::BGRA8);
+     }
+ 
++#if USE(TESSERA_VULKAN_ONLY)
++    // Complete the Vulkan upload before a different thread's context can consume it.
++    PlatformDisplay::sharedDisplay().skiaGrContext()->flushAndSubmit(GrSyncCpu::kYes);
++#else
+     m_uploadFence = GLFence::create(PlatformDisplay::sharedDisplay().glDisplay());
++#endif
+ }
+ 
+ void SkiaGPUAtlas::waitForUpload() const
+@@ -161,8 +168,7 @@ sk_sp<SkImage> SkiaGPUAtlas::atlasImageForCurrentThread() const
+             }, const_cast<SkiaGPUAtlas*>(this));
+     }
+ 
+-    auto* glContext = PlatformDisplay::sharedDisplay().skiaGLContext();
+-    if (!glContext || !glContext->makeContextCurrent())
++    if (!PlatformDisplay::sharedDisplay().makeSkiaContextCurrent())
+         return nullptr;
+ 
+     waitForUpload();
+diff --git a/Source/WebCore/platform/graphics/skia/SkiaPaintingEngine.cpp b/Source/WebCore/platform/graphics/skia/SkiaPaintingEngine.cpp
+index ffcff7e0b0..f7c0efd8ff 100644
+--- a/Source/WebCore/platform/graphics/skia/SkiaPaintingEngine.cpp
++++ b/Source/WebCore/platform/graphics/skia/SkiaPaintingEngine.cpp
+@@ -32,7 +32,9 @@
+ #include "CoordinatedPlatformLayer.h"
+ #include "CoordinatedTileBuffer.h"
+ #include "FontRenderOptions.h"
++#if !USE(TESSERA_VULKAN_ONLY)
+ #include "GLContext.h"
++#endif
+ #include "GraphicsContextSkia.h"
+ #include "GraphicsLayerCoordinated.h"
+ #include "PlatformDisplay.h"
+@@ -67,7 +69,16 @@ WTF_MAKE_TZONE_ALLOCATED_IMPL(SkiaPaintingEngine);
+ 
+ static bool canPerformAcceleratedRendering()
+ {
+-    return ProcessCapabilities::canUseAcceleratedBuffers() && PlatformDisplay::sharedDisplay().skiaGLContext();
++    if (!ProcessCapabilities::canUseAcceleratedBuffers())
++        return false;
++
++    auto& display = PlatformDisplay::sharedDisplay();
++#if USE(TESSERA_VULKAN_ONLY)
++    RELEASE_ASSERT(display.skiaUsesVulkan());
++    return true;
++#else
++    return display.skiaUsesVulkan() || display.skiaGLContext();
++#endif
+ }
+ 
+ SkiaPaintingEngine::SkiaPaintingEngine(sk_sp<GrContextThreadSafeProxy>&& threadSafeGrContext)
+@@ -116,7 +127,7 @@ Ref<CoordinatedTileBuffer> SkiaPaintingEngine::createBuffer(RenderingMode render
+ {
+     if (renderingMode == RenderingMode::Accelerated) {
+ #if USE(TEXTURE_MAPPER)
+-        PlatformDisplay::sharedDisplay().skiaGLContext()->makeContextCurrent();
++        PlatformDisplay::sharedDisplay().makeSkiaContextCurrent();
+ 
+         OptionSet<BitmapTexture::Flags> textureFlags;
+         if (!contentsOpaque)
+@@ -129,7 +140,11 @@ Ref<CoordinatedTileBuffer> SkiaPaintingEngine::createBuffer(RenderingMode render
+ #endif
+     }
+ 
++#if USE(TESSERA_VULKAN_ONLY)
++    RELEASE_ASSERT_NOT_REACHED_WITH_MESSAGE("Unaccelerated tile requested in Vulkan-only build");
++#else
+     return CoordinatedUnacceleratedTileBuffer::create(size, contentsOpaque ? CoordinatedTileBuffer::NoFlags : CoordinatedTileBuffer::SupportsAlpha);
++#endif
+ }
+ 
+ RefPtr<SkiaGPUAtlas> SkiaPaintingEngine::createAtlas(const SkiaImageAtlasLayout& layout, AtlasUploadCondition& uploadCondition)
+@@ -211,7 +226,7 @@ Ref<SkiaRecordingResult> SkiaPaintingEngine::record(const GraphicsLayerCoordinat
+ 
+         // Fast path: reuse cached atlases if the image set is unchanged.
+         if (!tryReuseCachedAtlases(result.get(), fingerprint)) {
+-            PlatformDisplay::sharedDisplay().skiaGLContext()->makeContextCurrent();
++            PlatformDisplay::sharedDisplay().makeSkiaContextCurrent();
+ 
+             auto* grContext = PlatformDisplay::sharedDisplay().skiaGrContext();
+             RELEASE_ASSERT(grContext);
+diff --git a/Source/WebCore/platform/graphics/skia/SkiaReplayCanvas.cpp b/Source/WebCore/platform/graphics/skia/SkiaReplayCanvas.cpp
+index 80d02bf804..781a48fd5d 100644
+--- a/Source/WebCore/platform/graphics/skia/SkiaReplayCanvas.cpp
++++ b/Source/WebCore/platform/graphics/skia/SkiaReplayCanvas.cpp
+@@ -27,7 +27,9 @@
+ #include "SkiaReplayCanvas.h"
+ 
+ #if USE(SKIA)
++#if !USE(TESSERA_VULKAN_ONLY)
+ #include "GLContext.h"
++#endif
+ #include "GLFence.h"
+ #include "PlatformDisplay.h"
+ #include "SkiaUtilities.h"
+@@ -141,8 +143,7 @@ sk_sp<SkImage> SkiaReplayCanvas::waitForRenderingCompletionAndRewrapImageIfNeede
+     if (!image || !image->isTextureBacked())
+         return nullptr;
+ 
+-    auto* glContext = PlatformDisplay::sharedDisplay().skiaGLContext();
+-    if (!glContext || !glContext->makeContextCurrent())
++    if (!PlatformDisplay::sharedDisplay().makeSkiaContextCurrent())
+         return nullptr;
+ 
+     m_recording->waitForFenceIfNeeded(*image);
+diff --git a/Source/WebCore/platform/graphics/skia/SkiaSerializedImageBuffer.cpp b/Source/WebCore/platform/graphics/skia/SkiaSerializedImageBuffer.cpp
+index 5383933340..1981b314b9 100644
+--- a/Source/WebCore/platform/graphics/skia/SkiaSerializedImageBuffer.cpp
++++ b/Source/WebCore/platform/graphics/skia/SkiaSerializedImageBuffer.cpp
+@@ -27,7 +27,9 @@
+ #include "SkiaSerializedImageBuffer.h"
+ 
+ #if USE(SKIA)
++#if !USE(TESSERA_VULKAN_ONLY)
+ #include "GLContext.h"
++#endif
+ #include "GLFence.h"
+ #include "GraphicsContext.h"
+ #include "NativeImage.h"
+@@ -56,7 +58,11 @@ SkiaSerializedImageBuffer::SkiaSerializedImageBuffer(ImageBuffer& imageBuffer)
+     m_resolutionScale = imageBuffer.resolutionScale();
+     m_colorSpace = imageBuffer.colorSpace();
+     m_bufferFormat = { imageBuffer.pixelFormat() };
++#if USE(TESSERA_VULKAN_ONLY)
++    PlatformDisplay::sharedDisplay().skiaGrContext()->flushAndSubmit(GrSyncCpu::kYes);
++#else
+     m_fence = GLFence::create(PlatformDisplay::sharedDisplay().glDisplay());
++#endif
+ }
+ 
+ SkiaSerializedImageBuffer::~SkiaSerializedImageBuffer() = default;
+@@ -68,7 +74,7 @@ RefPtr<ImageBuffer> SkiaSerializedImageBuffer::sinkIntoImageBuffer()
+ 
+     ASSERT(m_image);
+ 
+-    if (!PlatformDisplay::sharedDisplay().skiaGLContext()->makeContextCurrent())
++    if (!PlatformDisplay::sharedDisplay().makeSkiaContextCurrent())
+         return nullptr;
+ 
+     auto copiedImageBuffer = ImageBuffer::create(m_logicalSize, RenderingMode::Accelerated, RenderingPurpose::Unspecified, m_resolutionScale, m_colorSpace, m_bufferFormat);
+diff --git a/Source/WebCore/platform/graphics/skia/SkiaUtilities.cpp b/Source/WebCore/platform/graphics/skia/SkiaUtilities.cpp
+index 1687fb34c2..57a496ee85 100644
+--- a/Source/WebCore/platform/graphics/skia/SkiaUtilities.cpp
++++ b/Source/WebCore/platform/graphics/skia/SkiaUtilities.cpp
+@@ -30,7 +30,9 @@
+ 
+ #include "BitmapTexture.h"
+ #include "ColorSpaceSkia.h"
++#if !USE(TESSERA_VULKAN_ONLY)
+ #include "GLContext.h"
++#endif
+ #include "GLFence.h"
+ #include "GraphicsTypes.h"
+ #include "NotImplemented.h"
+@@ -38,7 +40,9 @@
+ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_BEGIN
+ #include <skia/gpu/ganesh/SkImageGanesh.h>
+ #include <skia/gpu/ganesh/SkSurfaceGanesh.h>
++#if !USE(TESSERA_VULKAN_ONLY)
+ #include <skia/gpu/ganesh/gl/GrGLBackendSurface.h>
++#endif
+ #include <skia/private/chromium/GrPromiseImageTexture.h>
+ #include <skia/private/chromium/SkImageChromium.h>
+ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_END
+@@ -47,26 +51,32 @@ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_END
+ #include <wtf/ThreadSafeWeakPtr.h>
+ 
+ #if USE(LIBEPOXY)
++#if !USE(TESSERA_VULKAN_ONLY)
+ #include <epoxy/gl.h>
++#endif
+ #else
++#if !USE(TESSERA_VULKAN_ONLY)
+ #include <GLES3/gl3.h>
++#endif
++#if !USE(TESSERA_VULKAN_ONLY)
+ #include <GLES2/gl2ext.h>
+ #endif
++#endif
+ 
+ namespace WebCore {
+ namespace SkiaUtilities {
+ 
+ GrBackendTexture createBackendTexture(const BitmapTexture& texture)
+ {
+-    RELEASE_ASSERT(texture.id());
+-    RELEASE_ASSERT(!texture.size().isEmpty());
+-
+-    GrGLTextureInfo externalTexture;
+-    externalTexture.fTarget = GL_TEXTURE_2D;
+-    externalTexture.fID = texture.id();
+-    // EXT_texture_format_BGRA8888 (unsized form, matches BitmapTexture::textureFormat).
+-    externalTexture.fFormat = texture.flags().contains(BitmapTexture::Flags::UseBGRALayout) ? GL_BGRA8_EXT : GL_RGBA8;
+-    return GrBackendTextures::MakeGL(texture.size().width(), texture.size().height(), skgpu::Mipmapped::kNo, externalTexture);
++#if USE(TESSERA_VULKAN_ONLY)
++    return texture.createSkiaBackendTexture();
++#else
++    GrGLTextureInfo info;
++    info.fTarget = GL_TEXTURE_2D;
++    info.fID = texture.id();
++    info.fFormat = texture.flags().contains(BitmapTexture::Flags::UseBGRALayout) ? GL_BGRA8_EXT : GL_RGBA8;
++    return GrBackendTextures::MakeGL(texture.size().width(), texture.size().height(), skgpu::Mipmapped::kNo, info);
++#endif
+ }
+ 
+ sk_sp<SkSurface> createSurface(GrDirectContext* grContext, const BitmapTexture& texture, const SkSurfaceProps& properties, GrSurfaceOrigin origin, unsigned sampleCount)
+@@ -87,6 +97,10 @@ sk_sp<SkImage> rewrapImageForContext(GrDirectContext* grContext, const SkImage&
+ 
+ std::optional<unsigned> retrieveGLTextureID(const SkImage& image)
+ {
++#if USE(TESSERA_VULKAN_ONLY)
++    UNUSED_PARAM(image);
++    return std::nullopt;
++#else
+     GrBackendTexture backendTexture;
+     if (!SkImages::GetBackendTextureFromImage(&image, &backendTexture, false))
+         return std::nullopt;
+@@ -96,17 +110,23 @@ std::optional<unsigned> retrieveGLTextureID(const SkImage& image)
+         return std::nullopt;
+ 
+     return textureInfo.fID;
++#endif
+ }
+ 
+ static std::unique_ptr<GLFence> createFenceAfterFlush(GrDirectContext* grContext)
+ {
+-    auto& glDisplay = PlatformDisplay::sharedDisplay().glDisplay();
+-    if (GLFence::isSupported(glDisplay)) {
++    // A Vulkan context has no GL fence to hand over, so the work is finished before the
++    // texture is used from another thread's context.
++#if !USE(TESSERA_VULKAN_ONLY)
++    auto& display = PlatformDisplay::sharedDisplay();
++    auto& glDisplay = display.glDisplay();
++    if (!display.skiaUsesVulkan() && GLFence::isSupported(glDisplay)) {
+         grContext->submit(GrSyncCpu::kNo);
+ 
+         if (auto fence = GLFence::create(glDisplay))
+             return fence;
+     }
++#endif
+ 
+     grContext->submit(GrSyncCpu::kYes);
+     return nullptr;
+@@ -246,8 +266,7 @@ public:
+ 
+     sk_sp<GrPromiseImageTexture> promiseImageTexture()
+     {
+-        auto* glContext = PlatformDisplay::sharedDisplay().skiaGLContext();
+-        if (!glContext || !glContext->makeContextCurrent())
++        if (!PlatformDisplay::sharedDisplay().makeSkiaContextCurrent())
+             return nullptr;
+ 
+         if (m_fence) {
+diff --git a/Source/WebCore/platform/graphics/vulkan/VulkanTypes.cpp b/Source/WebCore/platform/graphics/vulkan/VulkanTypes.cpp
+index 5c751b419d..4e3c6f89d0 100644
+--- a/Source/WebCore/platform/graphics/vulkan/VulkanTypes.cpp
++++ b/Source/WebCore/platform/graphics/vulkan/VulkanTypes.cpp
+@@ -27,12 +27,21 @@
+ #include "VulkanTypes.h"
+ 
+ #if USE(VULKAN)
++#if !USE(TESSERA_VULKAN_ONLY)
+ #include "GLContext.h"
++#endif
+ #include "Logging.h"
+ #include "PlatformDisplay.h"
+ #include "VulkanUtilities.h"
++#if USE(TESSERA_VULKAN_ONLY)
++#include "SkiaVulkanDevice.h"
++#endif
++#if !USE(TESSERA_VULKAN_ONLY)
+ #include <epoxy/egl.h>
++#endif
++#if !USE(TESSERA_VULKAN_ONLY)
+ #include <epoxy/gl.h>
++#endif
+ #include <sys/stat.h>
+ #include <sys/sysmacros.h>
+ #include <wtf/Scope.h>
+@@ -371,11 +380,31 @@ Result<PhysicalDevice> Instance::deviceForDisplay(PlatformDisplay& display)
+     if (!devices)
+         return makeUnexpected(devices.error());
+ 
++#if USE(TESSERA_VULKAN_ONLY)
++    UNUSED_PARAM(display);
++    // Match the selected Ganesh GPU by UUID, not an EGL display or DRM node.
++    VkPhysicalDeviceIDProperties selected { };
++    selected.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
++    VkPhysicalDeviceProperties2 selectedProperties { };
++    selectedProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
++    selectedProperties.pNext = &selected;
++    vkGetPhysicalDeviceProperties2(SkiaVulkanDevice::singleton()->physicalDevice(), &selectedProperties);
++    for (auto& candidate : *devices) {
++        PhysicalDeviceProperties properties;
++        auto ids = properties.next<PhysicalDeviceIDProperties>();
++        candidate.fillProperties(properties);
++        if (properties->deviceType != VK_PHYSICAL_DEVICE_TYPE_CPU
++            && equalSpans(std::span(selected.deviceUUID), ids.deviceUUID()))
++            return candidate;
++    }
++    return makeUnexpected(VK_ERROR_DEVICE_LOST);
++#else
+     //
+     // The best (exact!) match can be found by comparing the unique device and driver
+     // identifiers provided by the GL_EXT_memory_object extension, because both OpenGL
+     // and Vulkan will report the same values.
+     //
++#if !USE(TESSERA_VULKAN_ONLY)
+     if (auto* context = display.sharingGLContext()) {
+         GLContext::ScopedGLContextCurrent scopedContext(*context);
+         RELEASE_LOG_DEBUG(Vulkan, "deviceForDisplay: GL_EXT_memory_object = %s", context->glExtensions().EXT_memory_object ? "yes" : "no");
+@@ -415,8 +444,11 @@ Result<PhysicalDevice> Instance::deviceForDisplay(PlatformDisplay& display)
+         drmFileDescriptor = drmFileDescriptorForGBMDisplay();
+ #endif
+ 
++#if USE(LIBDRM)
+     if (!drmFileDescriptor)
+         drmFileDescriptor = drmFileDescriptorForDisplay(display);
++#endif
++#endif
+ 
+ #if USE(LIBDRM)
+     if (drmFileDescriptor) {
+@@ -495,6 +527,7 @@ Result<PhysicalDevice> Instance::deviceForDisplay(PlatformDisplay& display)
+     }
+ 
+     return makeUnexpected(VK_ERROR_DEVICE_LOST);
++#endif
+ }
+ 
+ #ifdef VK_EXT_debug_utils
+diff --git a/Source/WebKit/CMakeLists.txt b/Source/WebKit/CMakeLists.txt
+index 954f638ae8..417091bccd 100644
+--- a/Source/WebKit/CMakeLists.txt
++++ b/Source/WebKit/CMakeLists.txt
+@@ -824,7 +824,7 @@ elseif (USE_ANGLE_EGL)
+         ANGLE::GLES
+         ANGLE::EGL
+     )
+-else ()
++elseif (NOT TESSERA_NO_GL)
+     list(APPEND WebKit_SYSTEM_INCLUDE_DIRECTORIES
+         ${EGL_INCLUDE_DIRS}
+     )
+@@ -1527,6 +1527,14 @@ endif ()
+ 
+ list(APPEND WebKit_SOURCES ${WebKit_DERIVED_SOURCES})
+ 
++# Tessera: no DRM or GBM main device in the no-GL build (AGENTS.md, WebKit exception).
++if (TESSERA_NO_GL)
++    list(APPEND WebKit_UNIFIED_SOURCE_EXCLUDES
++        "^UIProcess/glib/DRMMainDevice[.]cpp"
++        "^WebProcess/GPU/graphics/gbm/"
++    )
++    list(FILTER WebKit_SOURCES EXCLUDE REGEX "UIProcess/glib/DRMMainDevice\\.cpp$|WebProcess/GPU/graphics/gbm/")
++endif ()
+ WEBKIT_COMPUTE_SOURCES(WebKit)
+ if (DEFINED WebKit_SWIFT_INTEROP_SOURCES)
+     list(REMOVE_ITEM WebKit_SOURCES ${WebKit_SWIFT_INTEROP_SOURCES})
+diff --git a/Source/WebKit/PlatformWPE.cmake b/Source/WebKit/PlatformWPE.cmake
+index 18a878a15e..0ab979a41d 100644
+--- a/Source/WebKit/PlatformWPE.cmake
++++ b/Source/WebKit/PlatformWPE.cmake
+@@ -522,6 +522,13 @@ if (ENABLE_WPE_PLATFORM)
+         endif ()
+     endif ()
+ 
++    if (ENABLE_WPE_PLATFORM_TESSERA)
++        list(APPEND WebKit_PRIVATE_LIBRARIES WPEPlatformTessera)
++        if (_old_cmake_swift_needs_explicit_objects)
++            list(APPEND WebKit_PRIVATE_LIBRARIES "$<TARGET_OBJECTS:WPEPlatformTessera>")
++        endif ()
++    endif ()
++
+     if (ENABLE_WPE_PLATFORM_WAYLAND)
+         list(APPEND WebKit_PRIVATE_LIBRARIES WPEPlatformWayland)
+         if (_old_cmake_swift_needs_explicit_objects)
+diff --git a/Source/WebKit/UIProcess/API/glib/WebKitProtocolHandler.cpp b/Source/WebKit/UIProcess/API/glib/WebKitProtocolHandler.cpp
+index 579aee4fa2..3e621d3eb4 100644
+--- a/Source/WebKit/UIProcess/API/glib/WebKitProtocolHandler.cpp
++++ b/Source/WebKit/UIProcess/API/glib/WebKitProtocolHandler.cpp
+@@ -170,6 +170,7 @@ static bool canvasAccelerationEnabled(WebKitURISchemeRequest* request)
+     return webkit_settings_get_enable_2d_canvas_acceleration(webkit_web_view_get_settings(webView));
+ }
+ 
++#if !USE(TESSERA_VULKAN_ONLY)
+ static bool uiProcessContextIsEGL()
+ {
+ #if PLATFORM(GTK)
+@@ -178,13 +179,16 @@ static bool uiProcessContextIsEGL()
+     return true;
+ #endif
+ }
++#endif
+ 
++#if !USE(TESSERA_VULKAN_ONLY)
+ static const char* openGLAPI()
+ {
+     if (epoxy_is_desktop_gl())
+         return "OpenGL (libepoxy)";
+     return "OpenGL ES 2 (libepoxy)";
+ }
++#endif
+ 
+ #if PLATFORM(GTK) || (PLATFORM(WPE) && ENABLE(WPE_PLATFORM))
+ static String dmabufRendererWithSupportedBuffers()
+@@ -601,6 +605,7 @@ void WebKitProtocolHandler::handleGPU(WebKitURISchemeRequest* request, RenderPro
+         tablesBuilder.append("</table>"_s);
+     };
+ 
++#if !USE(TESSERA_VULKAN_ONLY)
+     auto addEGLInfo = [&](auto& jsonObject) {
+         addTableRow(jsonObject, "GL_RENDERER"_s, String::fromUTF8(reinterpret_cast<const char*>(glGetString(GL_RENDERER))));
+         addTableRow(jsonObject, "GL_VENDOR"_s, String::fromUTF8(reinterpret_cast<const char*>(glGetString(GL_VENDOR))));
+@@ -630,6 +635,7 @@ void WebKitProtocolHandler::handleGPU(WebKitURISchemeRequest* request, RenderPro
+         addTableRow(jsonObject, "EGL_VENDOR"_s, String::fromUTF8(eglQueryString(eglDisplay, EGL_VENDOR)));
+         addTableRow(jsonObject, "EGL_EXTENSIONS"_s, makeString(unsafeSpan(eglQueryString(nullptr, EGL_EXTENSIONS)), ' ', unsafeSpan(eglQueryString(eglDisplay, EGL_EXTENSIONS))));
+     };
++#endif
+ 
+     auto jsonObject = JSON::Object::create();
+ 
+@@ -744,9 +750,13 @@ void WebKitProtocolHandler::handleGPU(WebKitURISchemeRequest* request, RenderPro
+     addTableRow(hardwareAccelerationObject, "2D canvas"_s, canvasAccelerationEnabled(request) ? "Accelerated"_s : "Unaccelerated"_s);
+ 
+     if (policy != "never"_s) {
++#if USE(TESSERA_VULKAN_ONLY)
++        addTableRow(hardwareAccelerationObject, "API"_s, "Vulkan"_s);
++#else
+         bool hasEGLContext = uiProcessContextIsEGL() && eglGetCurrentContext() != EGL_NO_CONTEXT;
+ 
+         addTableRow(hardwareAccelerationObject, "API"_s, hasEGLContext ? String::fromUTF8(openGLAPI()) : "Not available"_s);
++#endif
+ #if PLATFORM(GTK)
+         bool showBuffersInfo = true;
+ #elif PLATFORM(WPE) && ENABLE(WPE_PLATFORM)
+@@ -768,10 +778,14 @@ void WebKitProtocolHandler::handleGPU(WebKitURISchemeRequest* request, RenderPro
+ #endif // PLATFORM(GTK) || (PLATFORM(WPE) && ENABLE(WPE_PLATFORM))
+         }
+ 
++#if USE(TESSERA_VULKAN_ONLY)
++        addTableRow(hardwareAccelerationObject, "Native interface"_s, "Vulkan"_s);
++#else
+         addTableRow(hardwareAccelerationObject, "Native interface"_s, uiProcessContextIsEGL() ? "EGL"_s : "None"_s);
+ 
+         if (hasEGLContext)
+             addEGLInfo(hardwareAccelerationObject);
++#endif
+     } else {
+ #if PLATFORM(GTK)
+         addTableRow(hardwareAccelerationObject, "Buffer format"_s, renderBufferDescription(request));
+diff --git a/Source/WebKit/UIProcess/API/wpe/WebKitWebViewWPE.cpp b/Source/WebKit/UIProcess/API/wpe/WebKitWebViewWPE.cpp
+index c0f3b899c0..b256499165 100644
+--- a/Source/WebKit/UIProcess/API/wpe/WebKitWebViewWPE.cpp
++++ b/Source/WebKit/UIProcess/API/wpe/WebKitWebViewWPE.cpp
+@@ -101,6 +101,28 @@ WebKitWebView* webkit_web_view_new(WebKitWebViewBackend* backend)
+ 
+ #endif // USE(LIBWPE)
+ 
++#if ENABLE(WPE_PLATFORM)
++/**
++ * webkit_web_view_new_with_display:
++ * @display: a #WPEDisplay
++ *
++ * Creates a new web view on @display with a default configuration. It is the
++ * way to make a view without the variadic g_object_new(), for a caller that
++ * binds this API through a foreign-function interface.
++ *
++ * Returns: The newly created web view.
++ */
++WEBKIT_API WebKitWebView* webkit_web_view_new_with_display(WPEDisplay* display)
++{
++    g_return_val_if_fail(WPE_IS_DISPLAY(display), nullptr);
++
++    return WEBKIT_WEB_VIEW(g_object_new(WEBKIT_TYPE_WEB_VIEW,
++        "display", display,
++        "web-context", webkit_web_context_get_default(),
++        nullptr));
++}
++#endif // ENABLE(WPE_PLATFORM)
++
+ /**
+  * webkit_web_view_set_background_color:
+  * @web_view: a #WebKitWebView
+diff --git a/Source/WebKit/UIProcess/glib/WebProcessPoolGLib.cpp b/Source/WebKit/UIProcess/glib/WebProcessPoolGLib.cpp
+index 76a8024d12..9b5f641579 100644
+--- a/Source/WebKit/UIProcess/glib/WebProcessPoolGLib.cpp
++++ b/Source/WebKit/UIProcess/glib/WebProcessPoolGLib.cpp
+@@ -204,7 +204,11 @@ void WebProcessPool::platformInitializeWebProcess(const WebProcessProxy& process
+ #if OS(ANDROID)
+         parameters.rendererBufferTransportMode.add(RendererBufferTransportMode::Hardware);
+ #endif
++#if USE(TESSERA_VULKAN_ONLY)
++        parameters.rendererBufferTransportMode.add(RendererBufferTransportMode::Hardware);
++#else
+         parameters.rendererBufferTransportMode.add(RendererBufferTransportMode::SharedMemory);
++#endif
+     }
+ #endif
+ 
+diff --git a/Source/WebKit/UIProcess/wpe/AcceleratedBackingStore.cpp b/Source/WebKit/UIProcess/wpe/AcceleratedBackingStore.cpp
+index fd9ca6e5b7..4b99cc6548 100644
+--- a/Source/WebKit/UIProcess/wpe/AcceleratedBackingStore.cpp
++++ b/Source/WebKit/UIProcess/wpe/AcceleratedBackingStore.cpp
+@@ -41,6 +41,8 @@
+ 
+ #if OS(ANDROID)
+ #include <drm/drm_fourcc.h>
++#elif USE(TESSERA_VULKAN_ONLY)
++#include <drm/drm_fourcc.h>
+ #elif USE(LIBDRM)
+ #include <drm_fourcc.h>
+ #endif
+@@ -154,6 +156,11 @@ void AcceleratedBackingStore::didCreateDMABufBuffer(uint64_t id, WebCore::DMABuf
+ 
+ void AcceleratedBackingStore::didCreateSHMBuffer(uint64_t id, WebCore::ShareableBitmap::Handle&& handle)
+ {
++#if USE(TESSERA_VULKAN_ONLY)
++    UNUSED_PARAM(id);
++    UNUSED_PARAM(handle);
++    RELEASE_ASSERT_NOT_REACHED_WITH_MESSAGE("SHM presentation is forbidden in the Vulkan-only build");
++#else
+     auto bitmap = WebCore::ShareableBitmap::create(WTF::move(handle), WebCore::SharedMemory::Protection::ReadOnly);
+     if (!bitmap)
+         return;
+@@ -170,6 +177,7 @@ void AcceleratedBackingStore::didCreateSHMBuffer(uint64_t id, WebCore::Shareable
+     m_buffers.add(id, WTF::move(buffer));
+ 
+     notifyBufferConfigurationIfNeeded();
++#endif
+ }
+ 
+ #if OS(ANDROID)
+@@ -347,7 +355,7 @@ RendererBufferDescription AcceleratedBackingStore::bufferDescription() const
+         description.type = RendererBufferDescription::Type::SharedMemory;
+         switch (wpe_buffer_shm_get_format(WPE_BUFFER_SHM(buffer))) {
+         case WPE_PIXEL_FORMAT_ARGB8888:
+-#if USE(LIBDRM)
++#if USE(LIBDRM) || USE(TESSERA_VULKAN_ONLY)
+             description.fourcc = DRM_FORMAT_ARGB8888;
+ #endif
+             break;
+diff --git a/Source/WebKit/WPEPlatform/CMakeLists.txt b/Source/WebKit/WPEPlatform/CMakeLists.txt
+index 428bb83d0f..e9da553dca 100644
+--- a/Source/WebKit/WPEPlatform/CMakeLists.txt
++++ b/Source/WebKit/WPEPlatform/CMakeLists.txt
+@@ -106,13 +106,16 @@ set(WPEPlatform_PRIVATE_INCLUDE_DIRECTORIES
+ )
+ 
+ set(WPEPlatform_LIBRARIES
+-    Epoxy::Epoxy
+     GLib::Gio
+     WebKit::WTF
+     XkbCommon::XkbCommon
+     bmalloc
+ )
+ 
++if (NOT TESSERA_NO_GL)
++    list(APPEND WPEPlatform_LIBRARIES Epoxy::Epoxy)
++endif ()
++
+ if (USE_GBM)
+     list(APPEND WPEPlatform_LIBRARIES GBM::GBM)
+ endif ()
+@@ -166,11 +169,20 @@ if (ENABLE_WPE_PLATFORM_HEADLESS)
+     list(APPEND WPEPlatform_LIBRARIES WPEPlatformHeadless)
+ endif ()
+ 
++if (ENABLE_WPE_PLATFORM_TESSERA)
++    add_subdirectory(${WEBKIT_DIR}/WPEPlatform/wpe/tessera)
++    list(APPEND WPEPlatform_LIBRARIES WPEPlatformTessera)
++endif ()
++
+ if (ENABLE_WPE_PLATFORM_WAYLAND)
+     add_subdirectory(${WEBKIT_DIR}/WPEPlatform/wpe/wayland)
+     list(APPEND WPEPlatform_LIBRARIES WPEPlatformWayland)
+ endif ()
+ 
++# Tessera: no DMA-BUF or Android buffers in the no-GL build (AGENTS.md, WebKit exception).
++if (TESSERA_NO_GL)
++    list(FILTER WPEPlatform_SOURCES EXCLUDE REGEX "wpe/WPEBufferAndroid\\.cpp$")
++endif ()
+ add_library(WPEPlatform OBJECT ${WPEPlatform_SOURCES})
+ target_include_directories(WPEPlatform PRIVATE ${WPEPlatform_PRIVATE_INCLUDE_DIRECTORIES})
+ target_include_directories(WPEPlatform SYSTEM PRIVATE ${WPEPlatform_SYSTEM_INCLUDE_DIRECTORIES})
+diff --git a/Source/WebKit/WPEPlatform/wpe/WPEBufferDMABuf.cpp b/Source/WebKit/WPEPlatform/wpe/WPEBufferDMABuf.cpp
+index 2ae94943ee..2d1d1647b0 100644
+--- a/Source/WebKit/WPEPlatform/wpe/WPEBufferDMABuf.cpp
++++ b/Source/WebKit/WPEPlatform/wpe/WPEBufferDMABuf.cpp
+@@ -27,7 +27,9 @@
+ #include "WPEBufferDMABuf.h"
+ 
+ #include "WPEDisplayPrivate.h"
++#if !USE(TESSERA_VULKAN_ONLY)
+ #include <epoxy/egl.h>
++#endif
+ #include <fcntl.h>
+ #include <mutex>
+ #include <unistd.h>
+@@ -58,7 +60,9 @@ struct _WPEBufferDMABufPrivate {
+     Vector<uint32_t> offsets;
+     Vector<uint32_t> strides;
+     uint64_t modifier;
++#if !USE(TESSERA_VULKAN_ONLY)
+     EGLImage eglImage;
++#endif
+ #if USE(GBM)
+     UnixFileDescriptor deviceFD;
+     std::optional<struct gbm_device*> device;
+@@ -68,6 +72,7 @@ struct _WPEBufferDMABufPrivate {
+ };
+ WEBKIT_DEFINE_FINAL_TYPE(WPEBufferDMABuf, wpe_buffer_dma_buf, WPE_TYPE_BUFFER, WPEBuffer)
+ 
++#if !USE(TESSERA_VULKAN_ONLY)
+ static void wpeBufferDMABufDisposeEGLImageIfNeeded(WPEBufferDMABuf* buffer)
+ {
+     auto* priv = buffer->priv;
+@@ -87,10 +92,15 @@ static void wpeBufferDMABufDisposeEGLImageIfNeeded(WPEBufferDMABuf* buffer)
+     }
+ }
+ 
++#endif
+ static void wpeBufferDMABufDispose(GObject* object)
+ {
++#if !USE(TESSERA_VULKAN_ONLY) || USE(GBM)
+     auto* dmabufBuffer = WPE_BUFFER_DMA_BUF(object);
++#endif
++#if !USE(TESSERA_VULKAN_ONLY)
+     wpeBufferDMABufDisposeEGLImageIfNeeded(dmabufBuffer);
++#endif
+ 
+ #if USE(GBM)
+     auto* priv = dmabufBuffer->priv;
+@@ -106,6 +116,7 @@ static void wpeBufferDMABufDispose(GObject* object)
+     G_OBJECT_CLASS(wpe_buffer_dma_buf_parent_class)->dispose(object);
+ }
+ 
++#if !USE(TESSERA_VULKAN_ONLY)
+ static gpointer wpeBufferDMABufImportToEGLImage(WPEBuffer* buffer, GError** error)
+ {
+     auto* priv = WPE_BUFFER_DMA_BUF(buffer)->priv;
+@@ -176,6 +187,7 @@ static gpointer wpeBufferDMABufImportToEGLImage(WPEBuffer* buffer, GError** erro
+         g_set_error(error, WPE_BUFFER_ERROR, WPE_BUFFER_ERROR_IMPORT_FAILED, "Failed to import buffer to EGL image: eglCreateImageKHR failed with error %#04x", eglGetError());
+     return priv->eglImage;
+ }
++#endif
+ 
+ #if USE(GBM)
+ static bool wpeBufferDMABufTryEnsureGBMDevice(WPEBufferDMABuf* buffer)
+@@ -289,8 +301,12 @@ static void wpe_buffer_dma_buf_class_init(WPEBufferDMABufClass* bufferDMABufClas
+     GObjectClass* objectClass = G_OBJECT_CLASS(bufferDMABufClass);
+     objectClass->dispose = wpeBufferDMABufDispose;
+ 
++#if !USE(TESSERA_VULKAN_ONLY) || USE(GBM)
+     WPEBufferClass* bufferClass = WPE_BUFFER_CLASS(bufferDMABufClass);
++#endif
++#if !USE(TESSERA_VULKAN_ONLY)
+     bufferClass->import_to_egl_image = wpeBufferDMABufImportToEGLImage;
++#endif
+ #if USE(GBM)
+     bufferClass->import_to_pixels = wpeBufferDMABufImportToPixels;
+ #endif
+@@ -316,7 +332,8 @@ static void wpe_buffer_dma_buf_class_init(WPEBufferDMABufClass* bufferDMABufClas
+ WPEBufferDMABuf* wpe_buffer_dma_buf_new(WPEDisplay* display, int width, int height, guint32 format, guint32 planeCount, int* fds, guint32* offsets, guint32* strides, guint64 modifier)
+ {
+     g_return_val_if_fail(WPE_IS_DISPLAY(display), nullptr);
+-    g_return_val_if_fail(planeCount > 0, nullptr);
++    g_return_val_if_fail(planeCount > 0 && planeCount <= 4, nullptr);
++    g_return_val_if_fail(width > 0 && height > 0, nullptr);
+     g_return_val_if_fail(fds, nullptr);
+     g_return_val_if_fail(offsets, nullptr);
+     g_return_val_if_fail(strides, nullptr);
+diff --git a/Source/WebKit/WPEPlatform/wpe/WPEDisplay.cpp b/Source/WebKit/WPEPlatform/wpe/WPEDisplay.cpp
+index c99404367f..5f7215f575 100644
+--- a/Source/WebKit/WPEPlatform/wpe/WPEDisplay.cpp
++++ b/Source/WebKit/WPEPlatform/wpe/WPEDisplay.cpp
+@@ -31,7 +31,9 @@
+ #include "WPEEGLError.h"
+ #include "WPEExtensions.h"
+ #include "WPEInputMethodContextNone.h"
++#if !USE(TESSERA_VULKAN_ONLY)
+ #include <epoxy/egl.h>
++#endif
+ #include <gio/gio.h>
+ #include <mutex>
+ #include <wtf/HashMap.h>
+@@ -76,9 +78,11 @@
+  * the web view is rendered using the WPE platform API.
+  */
+ struct _WPEDisplayPrivate {
++#if !USE(TESSERA_VULKAN_ONLY)
+     bool eglInitialized;
+     EGLDisplay eglDisplay;
+     GUniqueOutPtr<GError> eglDisplayError;
++#endif
+     HashMap<String, bool> extensionsMap;
+     GRefPtr<WPEBufferFormats> preferredBufferFormats;
+     GRefPtr<WPEKeymap> keymap;
+@@ -132,12 +136,13 @@ static void wpeDisplayConstructed(GObject* object)
+ 
+ static void wpeDisplayDispose(GObject* object)
+ {
++#if !USE(TESSERA_VULKAN_ONLY)
+     auto* priv = WPE_DISPLAY(object)->priv;
+-
+     if (priv->eglDisplay) {
+         eglTerminate(priv->eglDisplay);
+         priv->eglDisplay = nullptr;
+     }
++#endif
+ 
+     G_OBJECT_CLASS(wpe_display_parent_class)->dispose(object);
+ }
+@@ -256,11 +261,17 @@ WPEView* wpeDisplayCreateView(WPEDisplay* display)
+ 
+ bool wpeDisplayCheckEGLExtension(WPEDisplay* display, ASCIILiteral extensionName)
+ {
++#if USE(TESSERA_VULKAN_ONLY)
++    UNUSED_PARAM(display);
++    UNUSED_PARAM(extensionName);
++    return false;
++#else
+     auto addResult = display->priv->extensionsMap.ensure(extensionName, [&] {
+         auto* eglDisplay = wpe_display_get_egl_display(display, nullptr);
+         return eglDisplay && epoxy_has_egl_extension(eglDisplay, extensionName.characters());
+     });
+     return addResult.iterator->value;
++#endif
+ }
+ 
+ WPEInputMethodContext* wpeDisplayCreateInputMethodContext(WPEDisplay* display, WPEView* view)
+@@ -402,6 +413,10 @@ gpointer wpe_display_get_egl_display(WPEDisplay* display, GError** error)
+ {
+     g_return_val_if_fail(WPE_IS_DISPLAY(display), nullptr);
+ 
++#if USE(TESSERA_VULKAN_ONLY)
++    g_set_error_literal(error, WPE_DISPLAY_ERROR, WPE_DISPLAY_ERROR_NOT_SUPPORTED, "EGL is not available in the Vulkan-only build");
++    return nullptr;
++#else
+     auto* priv = display->priv;
+     if (!priv->eglInitialized) {
+         priv->eglInitialized = true;
+@@ -433,6 +448,7 @@ gpointer wpe_display_get_egl_display(WPEDisplay* display, GError** error)
+     if (error && priv->eglDisplayError)
+         *error = g_error_copy(priv->eglDisplayError.get());
+     return priv->eglDisplay;
++#endif
+ }
+ 
+ /**
+diff --git a/Source/WebKit/WPEPlatform/wpe/WPEExtensions.cpp b/Source/WebKit/WPEPlatform/wpe/WPEExtensions.cpp
+index b93182c8bf..6a46aff478 100644
+--- a/Source/WebKit/WPEPlatform/wpe/WPEExtensions.cpp
++++ b/Source/WebKit/WPEPlatform/wpe/WPEExtensions.cpp
+@@ -40,6 +40,10 @@
+ #include "wpe/headless/WPEDisplayHeadless.h"
+ #endif
+ 
++#if ENABLE(WPE_PLATFORM_TESSERA)
++#include "wpe/tessera/WPEDisplayTessera.h"
++#endif
++
+ #if ENABLE(WPE_PLATFORM_WAYLAND)
+ #include "wpe/wayland/WPEDisplayWayland.h"
+ #endif
+@@ -77,6 +81,9 @@ void wpeEnsureExtensionPointsLoaded()
+ #if ENABLE(WPE_PLATFORM_HEADLESS)
+         g_type_ensure(wpe_display_headless_get_type());
+ #endif
++#if ENABLE(WPE_PLATFORM_TESSERA)
++        g_type_ensure(wpe_display_tessera_get_type());
++#endif
+ #if ENABLE(WPE_PLATFORM_WAYLAND)
+         g_type_ensure(wpe_display_wayland_get_type());
+ #endif
+diff --git a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.cpp b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.cpp
+index 1af594fd56..65d5900e45 100644
+--- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.cpp
++++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.cpp
+@@ -31,7 +31,9 @@
+ #include "WebProcess.h"
+ #include <WebCore/BitmapTexture.h>
+ #include <WebCore/FontRenderOptions.h>
++#if !USE(TESSERA_VULKAN_ONLY)
+ #include <WebCore/GLContext.h>
++#endif
+ #include <WebCore/GLFence.h>
+ #include <WebCore/Page.h>
+ #include <WebCore/PlatformDisplay.h>
+@@ -40,6 +42,7 @@
+ #include <WebCore/ShareableBitmap.h>
+ #include <array>
+ #include <fcntl.h>
++#include <poll.h>
+ #include <unistd.h>
+ #include <wtf/SafeStrerror.h>
+ #include <wtf/SystemTracing.h>
+@@ -50,21 +53,30 @@ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_BEGIN
+ #include <skia/core/SkColorSpace.h>
+ #include <skia/gpu/ganesh/GrBackendSurface.h>
+ #include <skia/gpu/ganesh/SkSurfaceGanesh.h>
++#if !USE(TESSERA_VULKAN_ONLY)
+ #include <skia/gpu/ganesh/gl/GrGLBackendSurface.h>
++#endif
+ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_END
+ 
+ #if PLATFORM(GTK) || ENABLE(WPE_PLATFORM)
+ #include "AcceleratedBackingStoreMessages.h"
+ #include "AcceleratedSurfaceMessages.h"
+-#include <WebCore/DMABufBuffer.h>
++#include <WebCore/DMABufBufferAttributes.h>
++#include "RendererBufferFormat.h"
++#if !USE(TESSERA_VULKAN_ONLY)
+ #include <epoxy/egl.h>
+ #endif
++#endif
+ 
+ #if USE(LIBEPOXY)
++#if !USE(TESSERA_VULKAN_ONLY)
+ #include <epoxy/gl.h>
++#endif
+ #else
++#if !USE(TESSERA_VULKAN_ONLY)
+ #include <GLES2/gl2.h>
+ #endif
++#endif
+ 
+ #if USE(GBM)
+ #include <WebCore/DRMDeviceManager.h>
+@@ -105,6 +117,9 @@ static uint64_t generateID()
+     return ++identifier;
+ }
+ 
++#if USE(TESSERA_VULKAN_ONLY)
++static bool useExplicitSync() { return false; }
++#else
+ static bool useExplicitSync()
+ {
+     auto& display = PlatformDisplay::sharedDisplay();
+@@ -112,6 +127,7 @@ static bool useExplicitSync()
+     return extensions.ANDROID_native_fence_sync && (display.eglCheckVersion(1, 5) || extensions.KHR_fence_sync);
+ }
+ 
++#endif
+ AcceleratedSurface::AcceleratedSurface(WebPage& webPage, Function<void()>&& frameCompleteHandler, RenderingPurpose renderingPurpose)
+     : m_webPage(webPage)
+     , m_frameCompleteHandler(WTF::move(frameCompleteHandler))
+@@ -124,6 +140,7 @@ AcceleratedSurface::AcceleratedSurface(WebPage& webPage, Function<void()>&& fram
+     , m_renderingPurpose(renderingPurpose)
+ #if PLATFORM(GTK) || ENABLE(WPE_PLATFORM)
+     , m_hardwareAccelerationEnabled(webPage.corePage()->settings().hardwareAccelerationEnabled())
++    , m_usesVulkan(m_useSkia && PlatformDisplay::sharedDisplay().skiaUsesVulkan())
+ #endif
+     , m_backgroundColor(webPage.effectiveBackgroundColor())
+     , m_swapChain(*this)
+@@ -154,6 +171,35 @@ AcceleratedSurface::RenderTarget::RenderTarget(AcceleratedSurface& surface, cons
+ 
+ AcceleratedSurface::RenderTarget::~RenderTarget() = default;
+ 
++#if USE(TESSERA_VULKAN_ONLY)
++std::unique_ptr<AcceleratedSurface::RenderTarget> AcceleratedSurface::RenderTargetVulkan::create(AcceleratedSurface& surface, const IntSize& size)
++{
++    auto image = SkiaVulkanExport::create(size);
++    RELEASE_ASSERT_WITH_MESSAGE(image, "Tessera requires exportable Vulkan frame buffers");
++    return makeUnique<RenderTargetVulkan>(surface, size, WTF::move(image));
++}
++AcceleratedSurface::RenderTargetVulkan::RenderTargetVulkan(AcceleratedSurface& surface, const IntSize& size, std::unique_ptr<SkiaVulkanExport>&& image)
++    : RenderTarget(surface, size)
++    , m_export(WTF::move(image))
++{
++    m_skiaSurface = sk_ref_sp(m_export->surface());
++    WebProcess::singleton().parentProcessConnection()->send(Messages::AcceleratedBackingStore::DidCreateDMABufBuffer(m_id, m_export->takeAttributes(), RendererBufferFormat::Usage::Rendering), m_surface->surfaceID());
++}
++AcceleratedSurface::RenderTargetVulkan::~RenderTargetVulkan()
++{
++    m_skiaSurface = nullptr;
++    WebProcess::singleton().parentProcessConnection()->send(Messages::AcceleratedBackingStore::DidDestroyBuffer(m_id), m_surface->surfaceID());
++}
++void AcceleratedSurface::RenderTargetVulkan::willRenderFrame()
++{
++    m_export->acquire(WTF::move(m_releaseFence));
++}
++void AcceleratedSurface::RenderTargetVulkan::didRenderFrame() { m_renderingFence = m_export->release(); }
++void AcceleratedSurface::RenderTargetVulkan::sendFrame(Vector<IntRect, 1>&& damage)
++{
++    WebProcess::singleton().parentProcessConnection()->send(Messages::AcceleratedBackingStore::Frame(m_id, WTF::move(damage), WTF::move(m_renderingFence)), m_surface->surfaceID());
++}
++#else
+ void AcceleratedSurface::RenderTarget::createSkiaSurfaceForFramebuffer(unsigned fbo)
+ {
+     if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+@@ -238,8 +284,15 @@ void AcceleratedSurface::RenderTargetShareableBuffer::sendFrame(Vector<WebCore::
+ void AcceleratedSurface::RenderTargetShareableBuffer::willRenderFrame()
+ {
+     if (m_releaseFenceFD) {
+-        if (auto fence = GLFence::importFD(PlatformDisplay::sharedDisplay().glDisplay(), WTF::move(m_releaseFenceFD)))
+-            fence->serverWait();
++        if (m_surface->usesGL()) {
++            if (auto fence = GLFence::importFD(PlatformDisplay::sharedDisplay().glDisplay(), WTF::move(m_releaseFenceFD)))
++                fence->serverWait();
++        } else {
++            // A sync file becomes readable once it signals.
++            struct pollfd pollFD = { m_releaseFenceFD.value(), POLLIN, 0 };
++            while (poll(&pollFD, 1, -1) == -1 && (errno == EINTR || errno == EAGAIN)) { }
++            m_releaseFenceFD = { };
++        }
+     }
+ 
+     if (!m_surface->useSkia()) {
+@@ -437,7 +490,13 @@ AcceleratedSurface::RenderTargetSHMImage::RenderTargetSHMImage(AcceleratedSurfac
+ {
+     if (m_surface->usesGL())
+         initializeColorBuffer();
+-    else if (m_surface->useSkia())
++    else if (m_surface->usesVulkan() && m_surface->renderingPurpose() == RenderingPurpose::Composited) {
++        auto info = SkImageInfo::Make(size.width(), size.height(), kRGBA_8888_SkColorType, kPremul_SkAlphaType, SkColorSpace::MakeSRGB());
++        auto properties = FontRenderOptions::singleton().createSurfaceProps();
++        m_skiaSurface = SkSurfaces::RenderTarget(PlatformDisplay::sharedDisplay().skiaGrContext(), skgpu::Budgeted::kNo, info, 0, kTopLeft_GrSurfaceOrigin, &properties);
++        if (!m_skiaSurface)
++            m_skiaSurface = m_bitmap->createSurface();
++    } else if (m_surface->useSkia())
+         m_skiaSurface = m_bitmap->createSurface();
+ 
+     WebProcess::singleton().parentProcessConnection()->send(Messages::AcceleratedBackingStore::DidCreateSHMBuffer(m_id, WTF::move(bitmapHandle)), m_surface->surfaceID());
+@@ -522,6 +581,9 @@ AcceleratedSurface::RenderTargetTexture::~RenderTargetTexture() = default;
+ 
+ #endif // PLATFORM(GTK) || ENABLE(WPE_PLATFORM)
+ 
++
++#endif // USE(TESSERA_VULKAN_ONLY)
++
+ #if USE(WPE_RENDERER)
+ std::unique_ptr<AcceleratedSurface::RenderTarget> AcceleratedSurface::RenderTargetWPEBackend::create(AcceleratedSurface& surface, const IntSize& initialSize, UnixFileDescriptor&& hostFD)
+ {
+@@ -598,8 +660,12 @@ void AcceleratedSurface::RenderTargetWPEBackend::didRenderFrame()
+ AcceleratedSurface::SwapChain::SwapChain(AcceleratedSurface& surface)
+     : m_surface(surface)
+ {
++#if USE(TESSERA_VULKAN_ONLY)
++    RELEASE_ASSERT(m_surface->usesVulkan());
++    m_type = Type::Vulkan;
++#else
+ #if PLATFORM(GTK) || ENABLE(WPE_PLATFORM)
+-    if (!m_surface->hardwareAccelerationEnabled()) {
++    if (!m_surface->hardwareAccelerationEnabled() || m_surface->usesVulkan()) {
+         m_type = Type::SharedMemory;
+         return;
+     }
+@@ -652,6 +718,7 @@ AcceleratedSurface::SwapChain::SwapChain(AcceleratedSurface& surface)
+ #endif // PLATFORM(GTK)
+ 
+     }
++#endif
+ }
+ 
+ #if (PLATFORM(GTK) || ENABLE(WPE_PLATFORM)) && (USE(GBM) || OS(ANDROID))
+@@ -768,6 +835,10 @@ bool AcceleratedSurface::SwapChain::handleBufferFormatChangeIfNeeded()
+ 
+ std::unique_ptr<AcceleratedSurface::RenderTarget> AcceleratedSurface::SwapChain::createTarget() const
+ {
++#if USE(TESSERA_VULKAN_ONLY)
++    RELEASE_ASSERT(m_type == Type::Vulkan);
++    return RenderTargetVulkan::create(m_surface.get(), m_size);
++#else
+     switch (m_type) {
+ #if PLATFORM(GTK) || ENABLE(WPE_PLATFORM)
+ #if USE(GBM) || OS(ANDROID)
+@@ -790,6 +861,7 @@ std::unique_ptr<AcceleratedSurface::RenderTarget> AcceleratedSurface::SwapChain:
+         break;
+     }
+     return nullptr;
++#endif
+ }
+ 
+ AcceleratedSurface::RenderTarget* AcceleratedSurface::SwapChain::nextTarget()
+@@ -930,6 +1002,9 @@ void AcceleratedSurface::SwapChainDamageTracker::didPresent(RenderTarget& target
+ 
+ bool AcceleratedSurface::shouldPaintMirrored() const
+ {
++#if USE(TESSERA_VULKAN_ONLY)
++    return false;
++#else
+     switch (m_swapChain.type()) {
+     case SwapChain::Type::Invalid:
+         return false;
+@@ -953,6 +1028,7 @@ bool AcceleratedSurface::shouldPaintMirrored() const
+     }
+ 
+     RELEASE_ASSERT_NOT_REACHED();
++#endif
+ }
+ 
+ #if PLATFORM(WPE) && ENABLE(WPE_PLATFORM) && (USE(GBM) || OS(ANDROID))
+@@ -1102,8 +1178,10 @@ void AcceleratedSurface::willRenderFrame(const IntSize& size)
+     if (m_target)
+         m_target->willRenderFrame();
+ 
++#if !USE(TESSERA_VULKAN_ONLY)
+     if (sizeDidChange && !m_useSkia)
+         glViewport(0, 0, size.width(), size.height());
++#endif
+ }
+ 
+ std::optional<Color> AcceleratedSurface::backgroundColor()
+diff --git a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.h b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.h
+index a76cad2de8..51a30c3001 100644
+--- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.h
++++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.h
+@@ -30,7 +30,10 @@
+ #include "MessageReceiver.h"
+ #include <WebCore/Color.h>
+ #include <WebCore/CoordinatedCompositionReason.h>
+-#include <WebCore/DMABufBuffer.h>
++#include <WebCore/DMABufBufferAttributes.h>
++#if USE(TESSERA_VULKAN_ONLY)
++#include <WebCore/SkiaVulkanExport.h>
++#endif
+ #include <WebCore/Damage.h>
+ #include <WebCore/IntSize.h>
+ #include <atomic>
+@@ -119,8 +122,11 @@ public:
+     bool shouldPaintMirrored() const;
+ 
+ #if PLATFORM(GTK) || ENABLE(WPE_PLATFORM)
+-    bool usesGL() const { return m_renderingPurpose == RenderingPurpose::Composited || m_hardwareAccelerationEnabled; }
++    // Vulkan composited and non-composited frames stay in exported GPU memory.
++    bool usesVulkan() const { return m_usesVulkan; }
++    bool usesGL() const { return !m_usesVulkan && (m_renderingPurpose == RenderingPurpose::Composited || m_hardwareAccelerationEnabled); }
+ #elif PLATFORM(WPE)
++    constexpr bool usesVulkan() const { return false; }
+     constexpr bool usesGL() const { return true; }
+ #endif
+ 
+@@ -231,6 +237,22 @@ private:
+     };
+ 
+ #if PLATFORM(GTK) || ENABLE(WPE_PLATFORM)
++#if USE(TESSERA_VULKAN_ONLY)
++    class RenderTargetVulkan final : public RenderTarget {
++    public:
++        static std::unique_ptr<RenderTarget> create(AcceleratedSurface&, const WebCore::IntSize&);
++        RenderTargetVulkan(AcceleratedSurface&, const WebCore::IntSize&, std::unique_ptr<WebCore::SkiaVulkanExport>&&);
++        ~RenderTargetVulkan();
++    private:
++        void willRenderFrame() override;
++        void didRenderFrame() override;
++        void sendFrame(Vector<WebCore::IntRect, 1>&&) override;
++        void setReleaseFenceFD(UnixFileDescriptor&& fence) override { m_releaseFence = WTF::move(fence); }
++        std::unique_ptr<WebCore::SkiaVulkanExport> m_export;
++        UnixFileDescriptor m_releaseFence;
++        UnixFileDescriptor m_renderingFence;
++    };
++#else
+     class RenderTargetShareableBuffer : public RenderTarget {
+         WTF_MAKE_TZONE_ALLOCATED(RenderTargetShareableBuffer);
+     public:
+@@ -341,6 +363,7 @@ private:
+ 
+         const Ref<WebCore::BitmapTexture> m_texture;
+     };
++#endif // USE(TESSERA_VULKAN_ONLY)
+ #endif // PLATFORM(GTK) || ENABLE(WPE_PLATFORM)
+ 
+ #if USE(WPE_RENDERER)
+@@ -368,6 +391,9 @@ private:
+ 
+         enum class Type {
+             Invalid,
++#if USE(TESSERA_VULKAN_ONLY)
++            Vulkan,
++#endif
+ #if PLATFORM(GTK) || ENABLE(WPE_PLATFORM)
+ #if USE(GBM) || OS(ANDROID)
+             EGLImage,
+@@ -488,6 +514,7 @@ private:
+     RenderingPurpose m_renderingPurpose { RenderingPurpose::Composited };
+ #if PLATFORM(GTK) || ENABLE(WPE_PLATFORM)
+     bool m_hardwareAccelerationEnabled { true };
++    bool m_usesVulkan { false };
+ #endif
+     mutable Lock m_backgroundColorLock;
+     std::optional<WebCore::Color> m_backgroundColor WTF_GUARDED_BY_LOCK(m_backgroundColorLock);
+diff --git a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/NonCompositedFrameRenderer.cpp b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/NonCompositedFrameRenderer.cpp
+index 9d0b9b2808..d3488d360a 100644
+--- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/NonCompositedFrameRenderer.cpp
++++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/NonCompositedFrameRenderer.cpp
+@@ -31,13 +31,19 @@
+ #include "RenderProcessInfo.h"
+ #include "WebPage.h"
+ #include "WebPageInlines.h"
++#if !USE(TESSERA_VULKAN_ONLY)
+ #include <WebCore/GLContext.h>
++#endif
+ #include <WebCore/GraphicsContextSkia.h>
+ #include <WebCore/Page.h>
+ #include <WebCore/PlatformDisplay.h>
+ #include <WebCore/Settings.h>
++#if !USE(TESSERA_VULKAN_ONLY)
+ #include <epoxy/egl.h>
++#endif
++#if !USE(TESSERA_VULKAN_ONLY)
+ #include <epoxy/gl.h>
++#endif
+ #include <wtf/SetForScope.h>
+ #include <wtf/SystemTracing.h>
+ 
+@@ -63,15 +69,29 @@ NonCompositedFrameRenderer::NonCompositedFrameRenderer(WebPage& webPage)
+ #endif
+ }
+ 
++bool NonCompositedFrameRenderer::usesAcceleratedRendering() const
++{
++#if USE(TESSERA_VULKAN_ONLY)
++    return true;
++#else
++    return !!m_context;
++#endif
++}
++
+ bool NonCompositedFrameRenderer::initialize()
+ {
++#if !USE(TESSERA_VULKAN_ONLY)
+     if (m_surface->usesGL()) {
+         static_assert(sizeof(GLNativeWindowType) <= sizeof(uint64_t), "GLNativeWindowType must not be longer than 64 bits.");
+         m_context = GLContext::create(PlatformDisplay::sharedDisplay(), m_surface->window());
+         if (!m_context || !m_context->makeContextCurrent())
+             return false;
+     }
++#endif
+ 
++#if USE(TESSERA_VULKAN_ONLY)
++    RELEASE_ASSERT(PlatformDisplay::sharedDisplay().makeSkiaContextCurrent());
++#endif
+     m_surface->didCreateCompositingRunLoop(RunLoop::mainSingleton());
+     return true;
+ }
+@@ -80,10 +100,16 @@ NonCompositedFrameRenderer::~NonCompositedFrameRenderer()
+ {
+     if (m_forcedRepaintAsyncCallback)
+         m_forcedRepaintAsyncCallback();
++#if USE(TESSERA_VULKAN_ONLY)
++    RELEASE_ASSERT(PlatformDisplay::sharedDisplay().makeSkiaContextCurrent());
++#else
+     if (m_context)
+         m_context->makeContextCurrent();
++#endif
+     m_surface->willDestroyGLContext();
++#if !USE(TESSERA_VULKAN_ONLY)
+     m_context = nullptr;
++#endif
+     m_surface->willDestroyCompositingRunLoop();
+ }
+ 
+@@ -130,7 +156,7 @@ void NonCompositedFrameRenderer::resetFrameDamage()
+     const auto& settings = m_webPage->corePage()->settings();
+     auto rectangleThreshold = Damage::clampRectangleThreshold(settings.damageRectangleThreshold());
+ 
+-    if (!m_context) {
++    if (!usesAcceleratedRendering()) {
+         // For CPU rendering use the damage unconditionally to reduce the amount of pixels to upload to the GPU for the UI process.
+         m_frameDamage = std::make_optional<Damage>(scaledRect, Damage::Mode::Rectangles, rectangleThreshold);
+         return;
+@@ -208,19 +234,22 @@ void NonCompositedFrameRenderer::updateRendering()
+     if (drawingArea)
+         drawingArea->willStartRenderingUpdateDisplay();
+ 
++#if USE(TESSERA_VULKAN_ONLY)
++    RELEASE_ASSERT(PlatformDisplay::sharedDisplay().makeSkiaContextCurrent());
++#else
+     if (m_context)
+         m_context->makeContextCurrent();
++#endif
+     m_surface->willRenderFrame(scaledSize);
+ 
+     if (auto* canvas = m_surface->canvas()) {
+-        if (m_context)
+-            PlatformDisplay::sharedDisplay().skiaGLContext()->makeContextCurrent();
++        RELEASE_ASSERT(PlatformDisplay::sharedDisplay().makeSkiaContextCurrent());
+ 
+         canvas->save();
+         if (auto clearColor = m_surface->skiaClearColor({ }))
+             canvas->clear(*clearColor);
+ 
+-        GraphicsContextSkia graphicsContext(*canvas, m_context ? RenderingMode::Accelerated : RenderingMode::Unaccelerated, RenderingPurpose::DOM);
++        GraphicsContextSkia graphicsContext(*canvas, usesAcceleratedRendering() ? RenderingMode::Accelerated : RenderingMode::Unaccelerated, RenderingPurpose::DOM);
+         graphicsContext.applyDeviceScaleFactor(webPage->deviceScaleFactor());
+ 
+         // recordingContext is the GPU context, so we need to manually flip Y only
+@@ -242,7 +271,7 @@ void NonCompositedFrameRenderer::updateRendering()
+ #endif
+ 
+         auto drawRect = [&](const IntRect& rect) {
+-            WTFBeginSignpost(canvas, DrawRect, "Skia/%s, dirty region %ix%i+%i+%i", m_context ? "GPU" : "CPU", rect.x(), rect.y(), rect.width(), rect.height());
++            WTFBeginSignpost(canvas, DrawRect, "Skia/%s, dirty region %ix%i+%i+%i", usesAcceleratedRendering() ? "GPU" : "CPU", rect.x(), rect.y(), rect.width(), rect.height());
+             webPage->drawRect(graphicsContext, rect);
+             WTFEndSignpost(canvas, DrawRect);
+         };
+@@ -262,11 +291,13 @@ void NonCompositedFrameRenderer::updateRendering()
+ 
+         canvas->restore();
+ 
+-        if (m_context) {
++        if (usesAcceleratedRendering()) {
+             if (auto* surface = canvas->getSurface())
+                 PlatformDisplay::sharedDisplay().skiaGrContext()->flushAndSubmit(surface, GrSyncCpu::kNo);
+ 
++#if !USE(TESSERA_VULKAN_ONLY)
+             m_context->makeContextCurrent();
++#endif
+         }
+     }
+ 
+@@ -368,7 +399,10 @@ void NonCompositedFrameRenderer::commitTransientZoom(double scale, FloatPoint, F
+ 
+ void NonCompositedFrameRenderer::fillGLInformation(RenderProcessInfo&& info, CompletionHandler<void(RenderProcessInfo&&)>&& completionHandler)
+ {
+-    if (!m_context) {
++#if USE(TESSERA_VULKAN_ONLY)
++    info.glRenderer = "Vulkan (Ganesh)"_s;
++#else
++    if (!usesAcceleratedRendering()) {
+         completionHandler(WTF::move(info));
+         return;
+     }
+@@ -387,12 +421,13 @@ void NonCompositedFrameRenderer::fillGLInformation(RenderProcessInfo&& info, Com
+         info.eglExtensions = makeString(unsafeSpan(eglQueryString(nullptr, EGL_EXTENSIONS)), ' ', unsafeSpan(eglQueryString(eglDisplay, EGL_EXTENSIONS)));
+     }
+ 
++#endif
+     completionHandler(WTF::move(info));
+ }
+ 
+ void NonCompositedFrameRenderer::releaseMemory(WTF::Critical critical)
+ {
+-    if (m_context)
++    if (usesAcceleratedRendering())
+         PlatformDisplay::sharedDisplay().skiaReleaseUnusedResources(critical);
+ }
+ 
+diff --git a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/NonCompositedFrameRenderer.h b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/NonCompositedFrameRenderer.h
+index eb5f426f39..63ba3b1d46 100644
+--- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/NonCompositedFrameRenderer.h
++++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/NonCompositedFrameRenderer.h
+@@ -82,7 +82,10 @@ private:
+ 
+     const WeakRef<WebPage> m_webPage;
+     const Ref<AcceleratedSurface> m_surface;
++    bool usesAcceleratedRendering() const;
++#if !USE(TESSERA_VULKAN_ONLY)
+     std::unique_ptr<WebCore::GLContext> m_context;
++#endif
+     bool m_pendingNotifyFrame { false };
+     bool m_isWaitingForFrameComplete { false };
+     bool m_shouldRenderFollowupFrame { false };
+diff --git a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/ThreadedCompositor.cpp b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/ThreadedCompositor.cpp
+index 7b5b4c2a0b..aa32079ef6 100644
+--- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/ThreadedCompositor.cpp
++++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/ThreadedCompositor.cpp
+@@ -61,12 +61,22 @@ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_END
+ #include <WebCore/TextureMapperLayer.h>
+ #endif
+ 
++#if USE(VULKAN) && !USE(TEXTURE_MAPPER)
++#include <WebCore/SkiaVulkanDevice.h>
++#endif
++
+ #if USE(LIBEPOXY)
++#if !USE(TESSERA_VULKAN_ONLY)
+ #include <epoxy/egl.h>
++#endif
++#if !USE(TESSERA_VULKAN_ONLY)
+ #include <epoxy/gl.h>
++#endif
+ #else
++#if !USE(TESSERA_VULKAN_ONLY)
+ #include <GLES2/gl2.h>
+ #endif
++#endif
+ 
+ namespace WebKit {
+ using namespace WebCore;
+@@ -113,6 +123,23 @@ ThreadedCompositor::ThreadedCompositor(WebPage& webPage, LayerTreeHost& layerTre
+     m_surface->didCreateCompositingRunLoop(m_workQueue->runLoop());
+ 
+     m_workQueue->dispatchSync([this] {
++#if USE(VULKAN) && !USE(TEXTURE_MAPPER)
++        // With Vulkan the compositor thread draws through its own Skia context on the
++        // process's device, and frames reach the surface's render targets without a GL
++        // context or a window to swap.
++        if (PlatformDisplay::sharedDisplay().skiaUsesVulkan()) {
++            if (!PlatformDisplay::sharedDisplay().setSkiaVulkanContextForCurrentThread(true)) {
++                Locker locker { m_state.lock };
++                m_state.state = State::Invalidated;
++                return;
++            }
++            m_maxTextureSize = SkiaVulkanDevice::singleton()->limits().maxImageDimension2D;
++            m_threadSafeGrContext = PlatformDisplay::sharedDisplay().skiaGrContext()->threadSafeProxy();
++            return;
++        }
++#endif
++
++#if !USE(TESSERA_VULKAN_ONLY)
+         // GLNativeWindowType depends on the EGL implementation: reinterpret_cast works
+         // for pointers (only if they are 64-bit wide and not for other cases), and static_cast for
+         // numeric types (and when needed they get extended to 64-bit) but not for pointers. Using
+@@ -138,6 +165,7 @@ ThreadedCompositor::ThreadedCompositor(WebPage& webPage, LayerTreeHost& layerTre
+ #else
+         PlatformDisplay::sharedDisplay().setSkiaGLContextForCurrentThread(WTF::move(context));
+         m_threadSafeGrContext = PlatformDisplay::sharedDisplay().skiaGrContext()->threadSafeProxy();
++#endif
+ #endif
+     });
+ }
+@@ -179,7 +207,15 @@ void ThreadedCompositor::invalidate()
+ #if USE(TEXTURE_MAPPER)
+         m_context = nullptr;
+ #else
++#if USE(VULKAN)
++        if (PlatformDisplay::sharedDisplay().skiaUsesVulkan()) {
++            PlatformDisplay::sharedDisplay().setSkiaVulkanContextForCurrentThread(false);
++            return;
++        }
++#endif
++#if !USE(TESSERA_VULKAN_ONLY)
+         PlatformDisplay::sharedDisplay().setSkiaGLContextForCurrentThread(nullptr);
++#endif
+ #endif
+     });
+     m_sceneState = nullptr;
+@@ -632,7 +668,10 @@ void ThreadedCompositor::renderLayerTree()
+     if (m_context)
+         m_context->swapBuffers();
+ #else
+-    PlatformDisplay::sharedDisplay().skiaGLContext()->swapBuffers();
++#if !USE(TESSERA_VULKAN_ONLY)
++    if (auto* glContext = PlatformDisplay::sharedDisplay().skiaGLContext())
++        glContext->swapBuffers();
++#endif
+ #endif
+ 
+     m_surface->didRenderFrame(targetContents);
+@@ -885,6 +924,17 @@ void ThreadedCompositor::drawFPSCounter(SkCanvas& canvas)
+ void ThreadedCompositor::fillGLInformation(RenderProcessInfo&& info, CompletionHandler<void(RenderProcessInfo&&)>&& completionHandler)
+ {
+     m_workQueue->dispatchSync([protectedThis = Ref { *this }, info = WTF::move(info), completionHandler = WTF::move(completionHandler)]() mutable {
++#if USE(VULKAN) && !USE(TEXTURE_MAPPER)
++        // There is no GL context to ask; the renderer is the Vulkan device Skia draws on.
++        if (PlatformDisplay::sharedDisplay().skiaUsesVulkan()) {
++            info.glRenderer = makeString("Vulkan: "_s, unsafeSpan(SkiaVulkanDevice::singleton()->deviceName()));
++            RunLoop::mainSingleton().dispatch([info = WTF::move(info), completionHandler = WTF::move(completionHandler)]() mutable {
++                completionHandler(WTF::move(info));
++            });
++            return;
++        }
++#endif
++#if !USE(TESSERA_VULKAN_ONLY)
+         info.glRenderer = String::fromUTF8(reinterpret_cast<const char*>(glGetString(GL_RENDERER)));
+         info.glVendor = String::fromUTF8(reinterpret_cast<const char*>(glGetString(GL_VENDOR)));
+         info.glVersion = String::fromUTF8(reinterpret_cast<const char*>(glGetString(GL_VERSION)));
+@@ -895,6 +945,7 @@ void ThreadedCompositor::fillGLInformation(RenderProcessInfo&& info, CompletionH
+         info.eglVersion = String::fromUTF8(eglQueryString(eglDisplay, EGL_VERSION));
+         info.eglVendor = String::fromUTF8(eglQueryString(eglDisplay, EGL_VENDOR));
+         info.eglExtensions = makeString(unsafeSpan(eglQueryString(nullptr, EGL_EXTENSIONS)), ' ', unsafeSpan(eglQueryString(eglDisplay, EGL_EXTENSIONS)));
++#endif
+ 
+         RunLoop::mainSingleton().dispatch([info = WTF::move(info), completionHandler = WTF::move(completionHandler)]() mutable {
+             completionHandler(WTF::move(info));
+diff --git a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/ThreadedCompositor.h b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/ThreadedCompositor.h
+index 350699338b..d670c09b22 100644
+--- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/ThreadedCompositor.h
++++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/ThreadedCompositor.h
+@@ -30,7 +30,9 @@
+ #include <WebCore/Damage.h>
+ #include <WebCore/DisplayUpdate.h>
+ #include <WebCore/FloatRect.h>
++#if !USE(TESSERA_VULKAN_ONLY)
+ #include <WebCore/GLContext.h>
++#endif
+ #include <WebCore/IntRect.h>
+ #include <WebCore/IntSize.h>
+ #include <WebCore/RunLoopObserver.h>
+diff --git a/Source/WebKit/WebProcess/glib/WebProcessGLib.cpp b/Source/WebKit/WebProcess/glib/WebProcessGLib.cpp
+index 917397644b..cb3a485df1 100644
+--- a/Source/WebKit/WebProcess/glib/WebProcessGLib.cpp
++++ b/Source/WebKit/WebProcess/glib/WebProcessGLib.cpp
+@@ -36,6 +36,7 @@
+ #include "WebSystemSoundDelegate.h"
+ #include <WebCore/PlatformRenderTheme.h>
+ #include <WebCore/PlatformScreen.h>
++#include <WebCore/PlatformDisplay.h>
+ #include <WebCore/ProcessCapabilities.h>
+ #include <WebCore/ScreenProperties.h>
+ #include <WebCore/SystemSoundManager.h>
+@@ -62,7 +63,7 @@
+ #include <WebCore/GBMDevice.h>
+ #endif
+ 
+-#if PLATFORM(GTK) || PLATFORM(WPE)
++#if (PLATFORM(GTK) || PLATFORM(WPE)) && !USE(TESSERA_VULKAN_ONLY)
+ #include <WebCore/PlatformDisplayGBM.h>
+ #include <WebCore/PlatformDisplaySurfaceless.h>
+ #endif
+@@ -149,6 +150,9 @@ void WebProcess::initializePlatformDisplayIfNeeded() const
+     if (PlatformDisplay::sharedDisplayIfExists())
+         return;
+ 
++#if USE(TESSERA_VULKAN_ONLY)
++    PlatformDisplay::setSharedDisplay(PlatformDisplay::createVulkan());
++#else
+ #if USE(GBM)
+     if (m_rendererBufferTransportMode.contains(RendererBufferTransportMode::Hardware)) {
+         bool disabled = false;
+@@ -188,6 +192,7 @@ void WebProcess::initializePlatformDisplayIfNeeded() const
+ 
+     WTFLogAlways("Could not create EGL display: no supported platform available. Aborting...");
+     CRASH();
++#endif
+ }
+ 
+ void WebProcess::initializeVulkanIfNeeded()
+@@ -212,11 +217,13 @@ void WebProcess::platformInitializeWebProcess(WebProcessCreationParameters& para
+     if (!parameters.applicationName.isEmpty())
+         WebCore::setApplicationName(parameters.applicationName);
+ 
++#if !USE(TESSERA_VULKAN_ONLY)
+     const char* enableCPURendering = getenv("WEBKIT_SKIA_ENABLE_CPU_RENDERING");
+     IGNORE_CLANG_WARNINGS_BEGIN("unsafe-buffer-usage-in-libc-call")
+     if (enableCPURendering && strcmp(enableCPURendering, "0"))
+         ProcessCapabilities::setCanUseAcceleratedBuffers(false);
+     IGNORE_CLANG_WARNINGS_END
++#endif
+ 
+ #if ENABLE(MEDIA_STREAM)
+     addSupplementWithoutRefCountedCheck<UserMediaCaptureManager>();
+diff --git a/Source/cmake/OptionsWPE.cmake b/Source/cmake/OptionsWPE.cmake
+index 4875fe8706..5005522342 100644
+--- a/Source/cmake/OptionsWPE.cmake
++++ b/Source/cmake/OptionsWPE.cmake
+@@ -15,7 +15,9 @@ find_package(GLib 2.70.0 REQUIRED COMPONENTS GioUnix Thread Module)
+ find_package(HarfBuzz 2.7.4 REQUIRED COMPONENTS ICU)
+ find_package(ICU 70.1 REQUIRED COMPONENTS data i18n uc)
+ find_package(JPEG REQUIRED)
+-find_package(Epoxy 1.5.4 REQUIRED)
++if (NOT TESSERA_NO_GL)
++    find_package(Epoxy 1.5.4 REQUIRED)
++endif ()
+ find_package(Soup3 3.0.0 REQUIRED)
+ find_package(XkbCommon 0.4.0 REQUIRED)
+ find_package(LibXml2 2.9.13 REQUIRED)
+@@ -414,7 +416,18 @@ if (NOT EXISTS "${TOOLS_DIR}/glib/apply-build-revision-to-files.py")
+ endif ()
+ 
+ SET_AND_EXPOSE_TO_BUILD(USE_ATSPI TRUE)
+-SET_AND_EXPOSE_TO_BUILD(USE_LIBEPOXY TRUE)
++# Tessera: no OpenGL, EGL, GLES or libepoxy. See the WebKit exception in AGENTS.md.
++if (TESSERA_NO_GL)
++    if (NOT USE_VULKAN OR ENABLE_WEBGL OR USE_GBM OR USE_LIBDRM OR ENABLE_WPE_PLATFORM_DRM OR ENABLE_WPE_PLATFORM_WAYLAND OR ENABLE_WPE_PLATFORM_HEADLESS OR USE_GSTREAMER_GL)
++        message(FATAL_ERROR "TESSERA_NO_GL requires Vulkan and forbids GL, GBM, DRM, Wayland and headless platforms")
++    endif ()
++    SET_AND_EXPOSE_TO_BUILD(USE_TESSERA_VULKAN_ONLY TRUE)
++    # The one platform the build ships: the embedding application owns the window.
++    SET_AND_EXPOSE_TO_BUILD(ENABLE_WPE_PLATFORM_TESSERA ON)
++    SET_AND_EXPOSE_TO_BUILD(USE_LIBEPOXY FALSE)
++else ()
++    SET_AND_EXPOSE_TO_BUILD(USE_LIBEPOXY TRUE)
++endif ()
+ SET_AND_EXPOSE_TO_BUILD(USE_XDGMIME TRUE)
+ 
+ SET_AND_EXPOSE_TO_BUILD(USE_CAIRO FALSE)

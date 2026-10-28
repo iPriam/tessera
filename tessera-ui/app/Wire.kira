@@ -1,0 +1,47 @@
+//! What the session says of the handles it holds, and the one malformed
+//! message the boot tests ask for.
+
+import Foundation
+import KiraUI
+import Heap
+import LibTessera
+
+/// A display-subsystem error with `code`.
+function displayError(code: ErrorCode) -> TesseraError {
+    return TesseraError { code: code, subsystem: .Display, flags: ErrorFlags.none, detail: 0 }
+}
+
+/// Closes `handle`. A close that fails is said; nothing else can be done
+/// about it.
+function closeHandle(handle: Handle) {
+    match handleClose(handle) {
+        Ok -> {}
+        Error(failure) -> log warn("could not close a handle", error: errorName(failure))
+    }
+}
+
+/// A twelve-byte frame request, which the fixed-width protocol makes
+/// unambiguously malformed. TesseraDisplayClient never writes one, so it
+/// cannot be asked for one: this is the one place outside its encoder that
+/// spells a display header, and only to break it.
+namespace Malformed {
+    let bytes: Number = 12
+    let frameRequestOpcode: Number = 22
+    let version: Number = 1
+    let opcodeAt: Number = 0
+    let lengthAt: Number = 4
+    let versionAt: Number = 8
+}
+
+/// Integration-test poison pill: a malformed message must kill only this
+/// client session, never MosaicDisplay or the machine around it. Kept apart
+/// from the client library's sends so a production message cannot opt in to
+/// a wrong wire size.
+function sendMalformedMessage(channel: Handle) -> Result<Void, TesseraError> {
+    let body = zeroedBlock(count: Malformed.bytes, alignment: 16)
+    blockStore<U32>(body, Malformed.opcodeAt, Malformed.frameRequestOpcode)
+    blockStore<U32>(body, Malformed.lengthAt, Malformed.bytes)
+    blockStore<U32>(body, Malformed.versionAt, Malformed.version)
+    let none: [Handle] = []
+    return channelWrite(channel, Buffer { address: body.pointer(), length: Malformed.bytes }, none)
+}

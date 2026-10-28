@@ -1,0 +1,37 @@
+//! The sidebar of folders in the Notes window.
+import KiraUI
+
+/// The sidebar: every note, then each folder, each with how many notes it holds at the trailing end.
+construct FolderSidebar(folders: [NotesFolder]) extends Widget {
+    body {
+        List {
+            Section {
+                NavigationLink(value = FolderRoute(name: Routes.allNotes)) {
+                    folderRow("All Notes", .Tray, noteCount(folders))
+                }
+
+                For(folder in folders) {
+                    NavigationLink(value = FolderRoute(name: copy folder.name)) {
+                        folderRow(folder.name, .Folder, UN32(folder.notes.count))
+                    }
+                }
+            } header: {
+                Text("On My Tessera")
+            } footer: {
+                Text(notesKept() ? "" : "There is no data volume: these notes will not be kept")
+            }
+        }
+        .navigationTitle("Folders")
+    }
+}
+
+/// One row of the sidebar: its title and symbol, with its count at the trailing end.
+function folderRow(title: String, symbol: Symbol, count: UN32) -> Any Widget {
+    return HStack(spacing = .Small) {
+        Label(title = title, systemImage = symbol)
+        Spacer()
+        Text(String(count))
+        .foregroundColor(.Secondary)
+    }
+    .fillWidth()
+}

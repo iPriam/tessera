@@ -1,0 +1,278 @@
+import Foundation
+import KiraUI
+import LibTessera
+import AppKit
+import PlatformKit
+import TesseraUI
+
+// What was posted, kept after its banner went (roadmap/23-product-experience.md
+// §4): every notification that arrives, banner shown or held back, goes into
+// PlatformKit's `NotificationHistory`, kept in a file on the data volume so
+// it outlives a restart and a switch of platform. The lock screen lists it,
+// grouped by application; choosing one opens its application, and each can
+// be cleared, one at a time or an application's at once. Settings lets an
+// application keep its notifications out of banners (`notifications.quiet`)
+// while they still go into the history.
+
+namespace NotificationStore {
+    let path: String = "/" + SystemDirectory.systemData + "/Notifications.txt"
+}
+
+public namespace NotificationSetting {
+    // The applications whose notifications show no banner.
+    let quiet: String = "notifications.quiet"
+    let separator: String = "|"
+}
+
+struct HistoryRead {
+    var history: NotificationHistory? = .None
+    var quietGeneration: Number? = .None
+    var quiet: [String] = []
+}
+
+namespace HistorySlot {
+    let key: PersistentStateKey = PersistentStateKey { name: "platformui.notification.history" }
+}
+
+function historySlot() -> RawPtr {
+    if !ambientStateHas(HistorySlot.key) {
+        ambientStatePut(HistorySlot.key, nativeUserData(nativeState(HistoryRead {})))
+    }
+    return ambientStateGet(HistorySlot.key)
+}
+
+/// The notifications kept, read from their file now: what another program,
+/// as the home screen, reads for its badges.
+public function storedNotificationHistory() -> NotificationHistory {
+    return match readFile(NotificationStore.path) {
+        Ok(contents) -> historyFrom(contents.text)
+        Error(failure) -> {
+            // Nothing kept yet is an empty history.
+            absorb failure
+            NotificationHistory {}
+        }
+    }
+}
+
+namespace CountBadgeLook {
+    let ink: RGBAColor = RGBAColor { r: 1.0, g: 0.23, b: 0.19, a: 1.0 }
+    // Its text, as a share of its side.
+    let text: Number = 0.6
+}
+
+/// The red count on an icon's top trailing corner, `side` points tall, as
+/// an iPad's badge says how many notifications an application kept.
+public function countBadge(count: Number, side: Number) -> Any Widget {
+    return Text(count > 99 ? "99+" : String(count))
+    .font(size: resolvedLength(side * CountBadgeLook.text), weight: .SemiBold)
+    .foregroundColor(.White)
+    .edgePadding(EdgeSet.horizontal, resolvedLength(side / 4))
+    .height(resolvedLength(side))
+    .background(Capsule().fill(CountBadgeLook.ink))
+    .hugWidth()
+}
+
+/// The notifications kept, read from their file the first time.
+public function notificationHistory() -> NotificationHistory {
+    var read = nativeRecover<HistoryRead>(historySlot())
+    match read.history {
+        Some(history) -> return history
+        None -> {}
+    }
+    let loaded = match readFile(NotificationStore.path) {
+        Ok(contents) -> historyFrom(contents.text)
+        Error(failure) -> {
+            log info("no notification history kept yet", failure)
+            NotificationHistory {}
+        }
+    }
+    read.history = .Some(copy loaded)
+    return loaded
+}
+
+// Keeps `history`, in memory and in its file.
+function keepHistory(history: NotificationHistory) {
+    var read = nativeRecover<HistoryRead>(historySlot())
+    match writeFile(NotificationStore.path, historyText(history)) {
+        Ok -> {}
+        Error(failure) -> log warn("the notification history could not be kept", failure)
+    }
+    read.history = .Some(move history)
+}
+
+// Keeps every notification in `arrived` that arrived `at`.
+function recordNotifications(arrived: borrow [BridgeNotification], at: Number) {
+    if arrived.count == 0 { return }
+    var history = notificationHistory()
+    for notification in arrived {
+        history.record(notification.application, notification.title, notification.body, at)
+    }
+    keepHistory(move history)
+}
+
+/// Clears the notification `id` from the history.
+public function clearNotification(id: Number) {
+    var history = notificationHistory()
+    history.clear(id)
+    keepHistory(move history)
+}
+
+/// Clears every notification `application` posted from the history.
+public function clearApplicationNotifications(application: borrow String) {
+    var history = notificationHistory()
+    history.clearApplication(application)
+    keepHistory(move history)
+}
+
+/// The applications whose notifications show no banner, read again only
+/// when Settings changed.
+public function quietApplications() -> [String] {
+    var read = nativeRecover<HistoryRead>(historySlot())
+    let generation = settingsGeneration()
+    if read.quietGeneration != .Some(generation) {
+        var names: [String] = []
+        for name in settingValue(NotificationSetting.quiet, "").split(
+            NotificationSetting.separator
+        ) {
+            if name.count > 0 { names.append(copy name) }
+        }
+        read.quiet = names
+        read.quietGeneration = .Some(generation)
+    }
+    return copy read.quiet
+}
+
+/// What choosing in the notification list does: opening an application,
+/// clearing one notification, or clearing an application's.
+public struct NotificationListActions {
+    let open: (String) -> Void = notificationListIgnores
+    let clear: (Number) -> Void = notificationListIgnoresId
+    let clearApplication: (String) -> Void = notificationListIgnores
+}
+
+public function notificationListIgnores(application: String) {}
+
+public function notificationListIgnoresId(id: Number) {}
+
+namespace NotificationListLook {
+    // The most groups and notifications in a group the list shows.
+    let groups: Number = 3
+    let perGroup: Number = 2
+    let width: Number = 420
+    let corner: Number = 22
+    let padding: Number = 14
+    let title: Number = 15
+    let body: Number = 14
+}
+
+let notificationListPlate: RGBAColor = RGBAColor { r: 1.0, g: 1.0, b: 1.0, a: 0.18 }
+
+/// Whether the lock screen shows what notifications say, or only who sent
+/// them, as it does while a passcode keeps it locked.
+public enum NotificationPrivacy {
+    Shown
+    Hidden
+}
+
+/// The notifications `groups` holds as the lock screen lists them: each
+/// application's on a plate of its own, newest first, with Clear.
+public function notificationList(
+    groups: borrow [HistoryGroup],
+    actions: borrow NotificationListActions,
+    privacy: NotificationPrivacy
+) -> Any Widget {
+    var plates: [Any Widget] = []
+    for (index, group) in groups.enumerated() {
+        if index >= NotificationListLook.groups { break }
+        plates.append(notificationPlate(group, actions, privacy))
+    }
+    return VStack(spacing = .Medium, alignment = .Center, children = plates)
+    .width(resolvedLength(NotificationListLook.width))
+}
+
+// One application's notifications, its icon and name over them, with Clear.
+function notificationPlate(
+    group: borrow HistoryGroup,
+    actions: borrow NotificationListActions,
+    privacy: borrow NotificationPrivacy
+) -> Any Widget {
+    var rows: [Any Widget] = []
+    let application = copy group.application
+    let clearAll = copy actions.clearApplication
+    rows.append(
+        HStack(spacing = .Small, alignment = .Center) {
+            ApplicationIcon(name = copy group.application, side = 20)
+            Text(copy group.application)
+            .font(size: resolvedLength(NotificationListLook.body), weight: .SemiBold)
+            .foregroundColor(.White)
+            Spacer()
+            Button(action = { in clearAll(application) }) {
+                Text("Clear").foregroundColor(.White)
+            }
+            .buttonStyle(.Plain)
+        }
+    )
+    let shown = match privacy {
+        Shown -> true
+        Hidden -> false
+    }
+    if shown {
+        for (index, entry) in group.entries.enumerated() {
+            if index >= NotificationListLook.perGroup { break }
+            rows.append(notificationRow(entry, actions))
+        }
+    } else {
+        rows.append(
+            Text(
+                group.entries.count == 1 ? "1 Notification" : "\(group.entries.count) Notifications"
+            ).font(
+                size: resolvedLength(NotificationListLook.title),
+                weight: .SemiBold
+            ).foregroundColor(.White)
+        )
+    }
+    if shown && group.entries.count > NotificationListLook.perGroup {
+        rows.append(
+            Text("\(group.entries.count - NotificationListLook.perGroup) more").font(
+                size: resolvedLength(NotificationListLook.body)
+            ).foregroundColor(.White).opacity(0.7)
+        )
+    }
+    return VStack(spacing = .Small, alignment = .Leading, children = rows)
+    .padding(resolvedLength(NotificationListLook.padding))
+    .background(
+        RoundedRectangle(cornerRadius = NotificationListLook.corner, style = .Continuous).fill(
+            notificationListPlate
+        )
+    )
+}
+
+// One notification: its title and body, opening its application when
+// chosen, with a button that clears it.
+function notificationRow(
+    entry: borrow HistoryEntry,
+    actions: borrow NotificationListActions
+) -> Any Widget {
+    let open = copy actions.open
+    let clear = copy actions.clear
+    let application = copy entry.application
+    let id = entry.id
+    return HStack(spacing = .Small, alignment = .Top) {
+        Button(action = { in open(application) }) {
+            VStack(spacing = .None, alignment = .Leading) {
+                Text(copy entry.title)
+                .font(size: resolvedLength(NotificationListLook.title), weight: .SemiBold)
+                .foregroundColor(.White)
+                Text(copy entry.body)
+                .font(size: resolvedLength(NotificationListLook.body))
+                .foregroundColor(.White)
+            }
+        }
+        .buttonStyle(.Plain)
+        Spacer()
+        Button(action = { in clear(id) }) {
+            Icon(symbol = .XmarkCircleFill).foregroundColor(.White)
+        }
+        .buttonStyle(.Plain)
+    }
+}

@@ -1,0 +1,433 @@
+//! A session with MosaicDisplay, the display server: the handshake, the
+//! frame exchange, and what can arrive while either waits. This file, and every
+//! other in this folder, takes part only in a build for Tessera (KLF section
+//! 27.8): `RunKiraLayerApp` reaches them there through `kiraLayerPlatformRun!`.
+
+import Foundation
+import KiraUI
+import Ember
+import KiraLayout
+import LibTessera
+import TesseraDisplayClient
+
+/// The serial a frame is requested, granted and shown under, so a serial
+/// cannot be mixed with another protocol value.
+distinct FrameSerial = UNumber
+
+/// One session with one MosaicDisplay: the channel, the client's number, and
+/// the surface MosaicDisplay gives it.
+struct Session {
+    var channel: Handle
+    var client: Number
+    var surface: DisplaySurfaceId
+}
+
+/// Whether the session's surface has the keyboard.
+enum Focus {
+    Focused
+    Unfocused
+}
+
+/// A session just opened, the size its surface was configured at, and the
+/// focus it starts with.
+struct Opened {
+    var session: Session
+    var size: Size
+    // How many pixels a point is on the output, which the surface's buffers
+    // are drawn at.
+    var scale: Number
+    // The output's size in pixels.
+    var output: Size
+    var focus: Focus
+    // Where the platform draws over the surface, if the display said so
+    // before the focus state.
+    var insets: EdgeInsets = EdgeInsets {}
+}
+
+/// What a session waited for when the display sent something else.
+enum Awaited {
+    Configuration
+    FocusState
+    FrameGrant
+    FrameCompletion
+}
+
+/// How a session with MosaicDisplay ended.
+enum SessionEnd {
+    // The display closed its end: it exited, or let this client go.
+    Closed
+    // Reading or writing the channel failed.
+    Broken(TesseraError)
+    // Ember had no frame to draw into.
+    NotDrawn(HeadlessFailure)
+    // There were no textures to draw into at the size configured.
+    NoTextures(RendererFailure)
+    // Ember could not export a frame for the display to import.
+    NotExported(MemoryExportFailure)
+    // The display sent something other than what the session waited for.
+    Unexpected(Awaited)
+}
+
+/// What a message is to a session waiting on a frame exchange.
+enum Arrival {
+    // Handled in place: a mode change or input capability.
+    Absorbed
+    Refocused(Focus)
+    // The surface was configured again, at this size, and acknowledged.
+    Resized(Size)
+    // The display is in this mode now, or was when the session began.
+    Moded(CompositorMode)
+    // The platform draws over the surface this far in from its edges now.
+    Inset(EdgeInsets)
+    // A window flies out of or into one of the surface's icons, or landed:
+    // noted where the interface reads it (`flyingLaunchIcon`).
+    IconFlight
+    // Something the session itself has to act on.
+    Moves
+}
+
+/// Opens a session on `link`: hello, welcome, the output, the first configure
+/// and its acknowledgement, and the focus state the surface starts in.
+function openSession(link: borrow DisplayLink) -> Result<Opened, SessionEnd> {
+    let beginning = match beginDisplaySession(link) {
+        Ok(value) -> value
+        Error(failure) -> return .Error(endOf(failure))
+    }
+    let configured = beginning.configured
+    log info(
+        "is on an output",
+        client: link.clientIndex,
+        width: beginning.output.width,
+        height: beginning.output.height,
+        refresh: beginning.output.refresh,
+        scale: beginning.output.scale
+    )
+    log info(
+        "was configured",
+        client: link.clientIndex,
+        x: configured.x,
+        y: configured.y,
+        width: configured.width,
+        height: configured.height,
+        serial: configured.serial
+    )
+    let session = Session {
+        channel: copy link.channel,
+        client: link.clientIndex,
+        surface: configured.surface
+    }
+    // The insets of a surface that fills the screen under the platform's
+    // bands may come before the focus state.
+    var insets = EdgeInsets {}
+    while true {
+        let next = try session.receiveMessage()
+        match session.insetsOf(next) {
+            Some(told) -> {
+                insets = told
+                continue
+            }
+            None -> {}
+        }
+        return match session.focusOf(next) {
+            Some(focus) -> .Ok(
+                Opened {
+                    session: session,
+                    size: Size { width: configured.width, height: configured.height },
+                    scale: beginning.output.scale,
+                    output: Size { width: beginning.output.width, height: beginning.output.height },
+                    focus: focus,
+                    insets: insets
+                }
+            )
+            None -> .Error(.Unexpected(.FocusState))
+        }
+    }
+}
+
+/// A channel failure as a session end: the peer closing is the display letting
+/// the session go.
+function endOf(failure: borrow TesseraError) -> SessionEnd {
+    if failure.code == .PeerClosed { return .Closed }
+    return .Broken(copy failure)
+}
+
+extend SessionEnd {
+    /// Says how the session ended.
+    function report(borrow self, client: Number) {
+        match self {
+            Closed -> log info("the display closed the session", client: client)
+            Broken(failure) -> log warn(
+                "the display session failed",
+                client: client,
+                error: errorName(failure)
+            )
+            NotDrawn(failure) -> log warn(
+                "there was no frame to draw into",
+                client: client,
+                failure: failure
+            )
+            NoTextures(failure) -> log warn(
+                "there were no textures to draw into",
+                client: client,
+                failure: failure
+            )
+            NotExported(failure) -> log warn(
+                "a frame could not be exported",
+                client: client,
+                failure: failure
+            )
+            Unexpected(awaited) -> log warn(
+                "the display sent something else",
+                client: client,
+                awaited: awaited
+            )
+        }
+    }
+}
+
+extend Session {
+    /// Sends `message` on the session's channel; a failure ends the session with the reason.
+    function sendMessage(borrow self, message: borrow DisplayMessage) -> Result<Void, SessionEnd> {
+        return match sendDisplayMessage(copy channel, message) {
+            Ok -> .Ok
+            Error(failure) -> .Error(endOf(failure))
+        }
+    }
+
+    /// Receives the next message on the session's channel; a failure ends the session with the reason.
+    function receiveMessage(borrow self) -> Result<DisplayMessage, SessionEnd> {
+        return match receiveDisplayMessage(copy channel) {
+            Ok(message) -> .Ok(message)
+            Error(failure) -> .Error(endOf(failure))
+        }
+    }
+
+    /// The message waiting on the session's channel, none when nothing is. A
+    /// wait on the channel can outlive the message it was for, read meanwhile
+    /// where a frame's answer was awaited, so what a wait says arrived is read
+    /// with this, never waited for.
+    function pollMessage(borrow self) -> Result<DisplayMessage?, SessionEnd> {
+        return match pollDisplayMessage(copy channel) {
+            Ok(message) -> .Ok(message)
+            Error(failure) -> .Error(endOf(failure))
+        }
+    }
+
+    /// The focus `message` gives this session's surface, or none when it says
+    /// nothing of it.
+    function focusOf(borrow self, message: borrow DisplayMessage) -> Focus? {
+        return match message {
+            FocusIn(moved) -> focusMoved(moved, .Focused)
+            FocusOut(moved) -> focusMoved(moved, .Unfocused)
+            Hello, Welcome, Attach, Commit, Key, FrameDone, FrameRequest, FrameReady, Configure, AckConfigure, SetMode, ModeChanged, InputCapability, SurfaceCreated, SurfaceDestroyed, GrantFocus, InstallGrab, GrabFired, SetChannel, ChannelChanged, PresentSystem, Verify, VerifyResult, InjectInput, Notify, Notification, ActivateRequested, SetBar, PointerMotion, PointerButton, PointerAxis, PointerEnter, PointerLeave, SetDock, SurfacePressed, RequestWindow, WindowRequested, GrantMove, GrantResize, HoldInput, SetOverlay, SetIdle, IdleChanged, BarBackdrop, SetGlass, SetLaunchOrigin, SetStageBadge, PlaceSurface, SurfacePlaced, SetHidden, SetMargin, Insets, Output -> .None
+        }
+    }
+
+    /// `focus`, when `moved` is this session's surface.
+    function focusMoved(borrow self, moved: DisplaySurfaceId, focus: Focus) -> Focus? {
+        if moved != surface { return .None }
+        log info("the focus moved", client: client, focus: focus)
+        return .Some(focus)
+    }
+
+    /// Handles what can arrive at any wait in place. A mode change, or the
+    /// platform taking a band for its bar, re-lays-out a live surface by
+    /// re-configuring it, which can land at any wait once the session is past
+    /// its opening handshake; a re-`Configure` is acknowledged, and the next
+    /// frame is drawn at the size it gives.
+    function arrival(borrow self, message: borrow DisplayMessage) -> Result<Arrival, SessionEnd> {
+        match focusOf(message) {
+            Some(focus) -> return .Ok(.Refocused(focus))
+            // Not about focus: the cases below.
+            None -> {}
+        }
+        match message {
+            Configure(configured) -> {
+                if configured.surface != surface { return .Ok(.Moves) }
+                try sendMessage(
+                    .AckConfigure(DisplayFrame { surface: surface, serial: configured.serial })
+                )
+                log info(
+                    "reconfigured",
+                    client: client,
+                    width: configured.width,
+                    height: configured.height,
+                    serial: configured.serial
+                )
+                return .Ok(.Resized(Size { width: configured.width, height: configured.height }))
+            }
+            ModeChanged(change) -> {
+                if change.surface != surface { return .Ok(.Absorbed) }
+                log info(
+                    "the display is in a mode",
+                    client: client,
+                    mode: compositorModeName(change.mode.mode)
+                )
+                return .Ok(.Moded(change.mode.mode))
+            }
+            InputCapability(capability) -> reportInputs(capability)
+            // The display tells the home screen of its own icon a window
+            // flies out of or into, and that the window landed.
+            SetLaunchOrigin(origin) -> {
+                if origin.surface != surface { return .Ok(.Absorbed) }
+                noteFlyingIcon(
+                    .Some(
+                        LaunchIcon {
+                            x: origin.icon.x,
+                            y: origin.icon.y,
+                            width: origin.icon.width,
+                            height: origin.icon.height,
+                            corner: origin.corner
+                        }
+                    )
+                )
+                return .Ok(.IconFlight)
+            }
+            WindowRequested(request) -> {
+                if request.surface != surface || request.action != .Landed { return .Ok(.Moves) }
+                noteFlyingIcon(.None)
+                return .Ok(.IconFlight)
+            }
+            Insets(told) -> {
+                if told.surface != surface { return .Ok(.Absorbed) }
+                log info(
+                    "the platform draws over the surface",
+                    client: client,
+                    top: told.top,
+                    bottom: told.bottom
+                )
+                return .Ok(.Inset(edgeInsetsOf(told)))
+            }
+            // MosaicDisplay announces the output as a session begins and
+            // drives one output at one mode, so a later announcement says
+            // nothing new yet.
+            Output(output) -> log info(
+                "the output was announced again",
+                client: client,
+                width: output.width,
+                height: output.height,
+                scale: output.scale
+            )
+            Hello, Welcome, Attach, Commit, Key, FrameDone, FrameRequest, FrameReady, FocusIn, FocusOut, AckConfigure, SetMode, SurfaceCreated, SurfaceDestroyed, GrantFocus, InstallGrab, GrabFired, SetChannel, ChannelChanged, PresentSystem, Verify, VerifyResult, InjectInput, Notify, Notification, ActivateRequested, SetBar, PointerMotion, PointerButton, PointerAxis, PointerEnter, PointerLeave, SetDock, SurfacePressed, RequestWindow, GrantMove, GrantResize, HoldInput, SetOverlay, SetIdle, IdleChanged, BarBackdrop, SetGlass, SetStageBadge, PlaceSurface, SurfacePlaced, SetHidden, SetMargin -> return .Ok(
+                .Moves
+            )
+        }
+        return .Ok(.Absorbed)
+    }
+
+    /// The insets `message` tells this surface, if it is them.
+    function insetsOf(borrow self, message: borrow DisplayMessage) -> EdgeInsets? {
+        return match message {
+            Insets(told) -> told.surface == surface ? .Some(edgeInsetsOf(told)) : .None
+            Hello, Welcome, Attach, Commit, Key, FrameDone, FrameRequest, FrameReady, FocusIn,
+                FocusOut, Configure, AckConfigure, SetMode, ModeChanged, InputCapability,
+                SurfaceCreated, SurfaceDestroyed, GrantFocus, InstallGrab, GrabFired, SetChannel,
+                ChannelChanged, PresentSystem, Verify, VerifyResult, InjectInput, Notify,
+                Notification, ActivateRequested, SetBar, PointerMotion, PointerButton,
+                PointerAxis, PointerEnter, PointerLeave, SetDock, SurfacePressed, RequestWindow,
+                WindowRequested, GrantMove, GrantResize, HoldInput, SetOverlay, SetIdle, IdleChanged, BarBackdrop, SetGlass, SetLaunchOrigin, SetStageBadge, PlaceSurface, SurfacePlaced, SetHidden,
+                SetMargin, Output -> .None
+        }
+    }
+
+    /// Reports what input the compositor says exists.
+    function reportInputs(borrow self, capability: borrow DisplayInputCapability) {
+        if !capability.present { return }
+        for kind in capability.kinds {
+            log info("the compositor reports an input", client: client, input: kind)
+        }
+    }
+
+    /// The next message that moves the session on, with what can arrive at any
+    /// wait handled in place.
+    function awaitMoving(borrow self) -> Result<DisplayMessage, SessionEnd> {
+        while true {
+            let message = try receiveMessage()
+            let arrived = try arrival(message)
+            match arrived {
+                Moves -> return .Ok(message)
+                // Handled where it arrived.
+                Absorbed, Refocused, Resized, Moded, Inset, IconFlight -> {}
+            }
+        }
+    }
+
+    /// Asks the display for frame `serial` on this session's surface.
+    function requestFrame(borrow self, serial: FrameSerial) -> Result<Void, SessionEnd> {
+        return sendMessage(.FrameRequest(DisplayFrame { surface: surface, serial: serial.raw }))
+    }
+
+    /// Attaches the frame drawn into `drawn`, `pixels` of it from the top-left
+    /// corner, and commits it as `serial`.
+    function commitFrame(
+        borrow self,
+        exporter: borrow MemoryExporter,
+        drawn: borrow ExportedMemory,
+        pixels: borrow Size,
+        serial: FrameSerial,
+        slot: UNumber = 0,
+        fresh: Bool = true
+    ) -> Result<Void, SessionEnd> {
+        var token = DisplayToken { high: 0, low: 0 }
+        if fresh {
+            token = match exporter.export(drawn) {
+                Ok(value) -> DisplayToken { high: value.high, low: value.low }
+                Error(failure) -> return .Error(.NotExported(failure))
+            }
+        }
+        try sendMessage(
+            .Attach(
+                DisplayAttach {
+                    surface: surface,
+                    token: token,
+                    width: UNumber(pixels.width),
+                    height: UNumber(pixels.height),
+                    slot: slot
+                }
+            )
+        )
+        return sendMessage(.Commit(DisplayFrame { surface: surface, serial: serial.raw }))
+    }
+}
+
+/// A step of a frame exchange the display answers with.
+enum FrameStep {
+    Granted(UNumber)
+    Done(UNumber)
+}
+
+/// The frame step a display message carries, if it is one: a frame granted, or a frame done.
+function frameStep(message: borrow DisplayMessage) -> FrameStep? {
+    return match message {
+        FrameReady(frame) -> .Some(.Granted(frame.serial))
+        FrameDone(frame) -> .Some(.Done(frame.serial))
+        Hello, Welcome, Attach, Commit, Key, FrameRequest, FocusIn, FocusOut, Configure, AckConfigure, SetMode, ModeChanged, InputCapability, SurfaceCreated, SurfaceDestroyed, GrantFocus, InstallGrab, GrabFired, SetChannel, ChannelChanged, PresentSystem, Verify, VerifyResult, InjectInput, Notify, Notification, ActivateRequested, SetBar, PointerMotion, PointerButton, PointerAxis, PointerEnter, PointerLeave, SetDock, SurfacePressed, RequestWindow, WindowRequested, GrantMove, GrantResize, HoldInput, SetOverlay, SetIdle, IdleChanged, BarBackdrop, SetGlass, SetLaunchOrigin, SetStageBadge, PlaceSurface, SurfacePlaced, SetHidden, SetMargin, Insets, Output -> .None
+    }
+}
+
+/// Whether `message` is the `awaited` answer to frame `serial`.
+function answers(message: borrow DisplayMessage, awaited: Awaited, serial: FrameSerial) -> Bool {
+    return match message {
+        FrameReady(frame) -> frame.serial == serial.raw && awaited == .FrameGrant
+        FrameDone(frame) -> frame.serial == serial.raw && awaited == .FrameCompletion
+        Hello, Welcome, Attach, Commit, Key, FrameRequest, FocusIn, FocusOut, Configure, AckConfigure, SetMode, ModeChanged, InputCapability, SurfaceCreated, SurfaceDestroyed, GrantFocus, InstallGrab, GrabFired, SetChannel, ChannelChanged, PresentSystem, Verify, VerifyResult, InjectInput, Notify, Notification, ActivateRequested, SetBar, PointerMotion, PointerButton, PointerAxis, PointerEnter, PointerLeave, SetDock, SurfacePressed, RequestWindow, WindowRequested, GrantMove, GrantResize, HoldInput, SetOverlay, SetIdle, IdleChanged, BarBackdrop, SetGlass, SetLaunchOrigin, SetStageBadge, PlaceSurface, SurfacePlaced, SetHidden, SetMargin, Insets, Output -> false
+    }
+}
+
+/// The key `message` carries, if it carries one.
+function keyIn(message: borrow DisplayMessage) -> DisplayKey? {
+    return match message {
+        Key(key) -> .Some(copy key)
+        Hello, Welcome, Attach, Commit, FrameDone, FrameRequest, FrameReady, FocusIn, FocusOut, Configure, AckConfigure, SetMode, ModeChanged, InputCapability, SurfaceCreated, SurfaceDestroyed, GrantFocus, InstallGrab, GrabFired, SetChannel, ChannelChanged, PresentSystem, Verify, VerifyResult, InjectInput, Notify, Notification, ActivateRequested, SetBar, PointerMotion, PointerButton, PointerAxis, PointerEnter, PointerLeave, SetDock, SurfacePressed, RequestWindow, WindowRequested, GrantMove, GrantResize, HoldInput, SetOverlay, SetIdle, IdleChanged, BarBackdrop, SetGlass, SetLaunchOrigin, SetStageBadge, PlaceSurface, SurfacePlaced, SetHidden, SetMargin, Insets, Output -> .None
+    }
+}
+
+/// The display's insets as the interface's safe area.
+function edgeInsetsOf(told: borrow DisplayInsets) -> EdgeInsets {
+    return EdgeInsets {
+        top: Number(told.top),
+        leading: Number(told.leading),
+        bottom: Number(told.bottom),
+        trailing: Number(told.trailing)
+    }
+}

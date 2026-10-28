@@ -1,0 +1,84 @@
+import Foundation
+
+// The architectures Tessera builds for, and what each answers. Adding one is a
+// case here and a kernel configuration fragment under kernel/config.
+enum Architecture {
+    X86_64
+    Aarch64
+}
+
+// The architecture `-arch` names.
+function architectureNamed(name: borrow String) -> Architecture {
+    return match name {
+        "aarch64" -> .Aarch64
+        else -> .X86_64
+    }
+}
+
+extend Architecture {
+    // The name Tessera spells it with, as `uname -m` reports it on Linux.
+    function name(borrow self) -> String {
+        return match self {
+            X86_64 -> "x86_64"
+            Aarch64 -> "aarch64"
+        }
+    }
+
+    // The Kira target: Tessera is a target of its own, with the Linux kernel
+    // behind it (KLF-RIDL section 5.8).
+    function kiraTarget(borrow self) -> String {
+        return match self {
+            X86_64 -> "x86_64-unknown-tessera"
+            Aarch64 -> "aarch64-unknown-tessera"
+        }
+    }
+
+    // The directory holding the loader the ELF header names, from the root of
+    // a release.
+    function libraryDirectory(borrow self) -> String {
+        return match self {
+            X86_64 -> "lib64"
+            Aarch64 -> "lib"
+        }
+    }
+
+    // The loader every dynamically linked program names in PT_INTERP.
+    function loader(borrow self) -> String {
+        return match self {
+            X86_64 -> "ld-linux-x86-64.so.2"
+            Aarch64 -> "ld-linux-aarch64.so.1"
+        }
+    }
+
+    // The Linux multiarch name a Debian sysroot keeps libraries under.
+    function multiarch(borrow self) -> String {
+        return match self {
+            X86_64 -> "x86_64-linux-gnu"
+            Aarch64 -> "aarch64-linux-gnu"
+        }
+    }
+
+    // What Valgrind calls the platform in its tools' names.
+    function valgrindPlatform(borrow self) -> String {
+        return match self {
+            X86_64 -> "amd64-linux"
+            Aarch64 -> "arm64-linux"
+        }
+    }
+
+    // The kernel's name for it, as `ARCH=` takes it.
+    function kbuild(borrow self) -> String {
+        return match self {
+            X86_64 -> "x86_64"
+            Aarch64 -> "arm64"
+        }
+    }
+
+    // The kernel image QEMU boots, from the kernel's output directory.
+    function kernelImage(borrow self) -> String {
+        return match self {
+            X86_64 -> "arch/x86/boot/bzImage"
+            Aarch64 -> "arch/arm64/boot/Image"
+        }
+    }
+}

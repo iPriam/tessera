@@ -1,0 +1,96 @@
+import Foundation
+import Heap
+import LibTessera
+import TesseraDisplayClient
+
+// Interaction tokens (roadmap/16 section 14.1). MosaicDisplay mints one for
+// each hardware key press and each pointer button press, and gives it to the
+// surface the event went to. A token is the proof that a real input event
+// reached that surface; the Presence service asks MosaicDisplay to verify it.
+// A release, a repeat, a grabbed key and anything software sends carry none.
+
+// A token as minted, with the surface it was given to and when.
+struct MintedToken {
+    var id: DisplayInteractionToken
+    var surface: DisplaySurfaceId
+    var issued: UNumber
+    // Whether the Presence service has verified it; a token is single use.
+    var spent: Bool = false
+}
+
+namespace InteractionTokens {
+    // How long a token lives after it was issued, in milliseconds.
+    let lifetime: UNumber = 30000
+    // The most tokens held at once; the oldest are dropped first.
+    let capacity: Number = 64
+    // A token's random bytes: its two 64-bit halves.
+    let bytes: Number = 16
+}
+
+// Mints a token for an event on `surface` at `issued`. When the random bytes
+// cannot be drawn there is no token, and the event carries none.
+function mintInteractionToken(
+    server: borrow mut Server,
+    surface: DisplaySurfaceId,
+    issued: UNumber
+) -> DisplayInteractionToken {
+    let block = zeroedBlock(count: InteractionTokens.bytes, alignment: 16)
+    let buffer = Buffer { address: block.pointer(), length: InteractionTokens.bytes }
+    match randomFill(buffer) {
+        Ok -> {}
+        Error(reason) -> return noInteractionToken(reason)
+    }
+    let id = DisplayInteractionToken {
+        idLow: UNumber(blockLoad<U64>(block, 0)),
+        idHigh: UNumber(blockLoad<U64>(block, 8)),
+    }
+    server.tokens = heldTokens(server.tokens, issued)
+    server.tokens.append(
+        MintedToken { id: copy id, surface: surface, issued: issued, spent: false }
+    )
+    return id
+}
+
+function noInteractionToken(reason: borrow TesseraError) -> DisplayInteractionToken {
+    log warn("an interaction token could not be drawn", error: errorName(reason))
+    return DisplayInteractionToken {}
+}
+
+// The tokens still live at `now`, keeping the newest `capacity` of them.
+function heldTokens(tokens: borrow [MintedToken], now: UNumber) -> [MintedToken] {
+    var live: [MintedToken] = []
+    for minted in tokens {
+        if now < minted.issued + InteractionTokens.lifetime { live.append(copy minted) }
+    }
+    let excess = live.count - InteractionTokens.capacity
+    var held: [MintedToken] = []
+    for (index, minted) in live.enumerated() {
+        if index >= excess { held.append(copy minted) }
+    }
+    return held
+}
+
+// The token a key event carries: a press gets one, and a release or a repeat
+// does not, because each press is the one the person made.
+function keyToken(
+    server: borrow mut Server,
+    surface: DisplaySurfaceId,
+    key: borrow PendingKey
+) -> DisplayInteractionToken {
+    return match key.state {
+        Pressed -> mintInteractionToken(server, surface, key.time)
+        Released, Repeated -> DisplayInteractionToken {}
+    }
+}
+
+// The token a pointer button event carries: a press gets one.
+function buttonToken(
+    server: borrow mut Server,
+    surface: DisplaySurfaceId,
+    change: borrow PointerButtonChange
+) -> DisplayInteractionToken {
+    return match change.button.state {
+        Pressed -> mintInteractionToken(server, surface, change.time)
+        Released, Repeated -> DisplayInteractionToken {}
+    }
+}

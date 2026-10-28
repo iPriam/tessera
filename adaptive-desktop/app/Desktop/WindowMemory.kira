@@ -1,0 +1,151 @@
+import Foundation
+import LibTessera
+import AppKit
+import PlatformKit
+import PlatformUI
+import TesseraDisplayClient
+
+// A window opens where its application's window was last left, as a Mac
+// reopens a window at the frame it saved: each time a person moves or
+// resizes a freely placed window, the platform keeps the frame in the
+// Settings service under the application's name, and puts the next window
+// the application opens there, kept inside the room windows have now.
+
+namespace WindowMemory {
+    let prefix: String = "window.frame."
+}
+
+// The setting `application`'s last window frame is kept in: its name with
+// each character a setting's name cannot hold made a `-`.
+function windowFrameKey(application: borrow String) -> String {
+    var characters: [String] = [WindowMemory.prefix]
+    for index in 0..application.count {
+        let character = application.substring(index, index + 1)
+        characters.append(settingKeyValid(character) ? character : "-")
+    }
+    return joined(characters, "")
+}
+
+// The frame `application`'s window was last left at, none when none was
+// kept or what was kept is not a frame.
+function rememberedWindowFrame(application: borrow String) -> SurfaceFrame? {
+    let words = settingValue(windowFrameKey(application), "").split(" ")
+    if words.count != 4 { return .None }
+    var values: [Number] = []
+    for word in words {
+        let value = try parseNumber(word) otherwise return .None
+        values.append(value)
+    }
+    if values[2] <= 0 || values[3] <= 0 { return .None }
+    return .Some(SurfaceFrame { x: values[0], y: values[1], width: values[2], height: values[3] })
+}
+
+// Keeps `frame` as where `application`'s window was last left.
+function rememberWindowFrame(application: borrow String, frame: borrow SurfaceFrame) {
+    let channel = match settingsConnect() {
+        Ok(value) -> value
+        Error(failed) -> {
+            log warn("cannot reach the settings to keep a window's frame", error: errorName(failed))
+            return
+        }
+    }
+    let value = "\(frame.x) \(frame.y) \(frame.width) \(frame.height)"
+    match settingsWrite(channel, windowFrameKey(application), value) {
+        Ok -> {}
+        Error(failed) -> log warn(
+            "a window's frame was not kept",
+            application: application,
+            error: errorName(failed)
+        )
+    }
+    match handleClose(channel) {
+        Ok -> {}
+        Error(failed) -> log warn(
+            "could not close the settings connection",
+            error: errorName(failed)
+        )
+    }
+}
+
+// Whether the platform keeps where `surface` was left: an application's
+// window placed freely, never the desktop's picture, which fills the screen
+// under the bar and the Dock.
+function remembersFrame(desktop: borrow Desktop, surface: DisplaySurfaceId) -> Bool {
+    if desktop.mode != .Freeform { return false }
+    return match desktop.desktop {
+        Some(picture) -> picture.raw != surface.raw
+        None -> true
+    }
+}
+
+// `frame` moved and cut to fit inside `room`.
+function frameInside(frame: borrow SurfaceFrame, room: borrow SurfaceFrame) -> SurfaceFrame {
+    let width = min(frame.width, room.width)
+    let height = min(frame.height, room.height)
+    return SurfaceFrame {
+        x: clamp(frame.x, room.x, room.x + room.width - width),
+        y: clamp(frame.y, room.y, room.y + room.height - height),
+        width: width,
+        height: height,
+    }
+}
+
+// A person left the freely placed window `placement` names where it is:
+// its application's next window opens there.
+function keepWindowFrame(desktop: borrow Desktop, placement: borrow DisplayPlacement) {
+    if !remembersFrame(desktop, placement.surface) { return }
+        let application = match applicationOf(copy desktop.bridge, placement.surface.raw) {
+            Some(value) -> value
+            None -> return
+        }
+    let frame = SurfaceFrame {
+        x: placement.x,
+        y: placement.y,
+        width: Number(placement.width),
+        height: Number(placement.height),
+    }
+    rememberWindowFrame(application, frame)
+}
+
+// Puts the new window `surface` where its application's window was last
+// left, when one was and windows are placed freely.
+function restoreWindowFrame(desktop: borrow Desktop, surface: DisplaySurfaceId) {
+    if !remembersFrame(desktop, surface) { return }
+    let channel = match desktop.channel {
+        Some(value) -> value
+        None -> return
+    }
+    let application = match applicationOf(copy desktop.bridge, surface.raw) {
+        Some(value) -> value
+        None -> return
+    }
+    let kept = match rememberedWindowFrame(application) {
+        Some(value) -> value
+        None -> return
+    }
+    let frame = frameInside(kept, windowRoom(desktop))
+    let placement = DisplayPlacement {
+        surface: surface,
+        x: frame.x,
+        y: frame.y,
+        width: UNumber(frame.width),
+        height: UNumber(frame.height),
+    }
+    match sent(sendPlaceSurface(channel, move placement)) {
+        Ok(sent) -> if sent {
+            log info("a window opened where its application's was left", surface: surface.raw)
+        }
+        Error(failed) -> requestFailed("put a window where it was left", failed)
+    }
+}
+
+// Names the windows whose application PID 1 has named since they opened,
+// and puts each where its application's window was last left.
+function nameWaitingWindows(desktop: borrow mut Desktop) {
+    if desktop.unnamed.count == 0 { return }
+    let waiting = nameWindows(desktop.bridge, desktop.state, desktop.unnamed)
+    for surface in desktop.unnamed {
+        if !waiting.contains(surface) { restoreWindowFrame(desktop, surface) }
+    }
+    desktop.unnamed = move waiting
+}

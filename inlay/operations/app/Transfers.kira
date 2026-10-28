@@ -1,0 +1,167 @@
+//! Copying and moving entries into a folder, one at a time, so the person can
+//! watch it, answer a collision, and cancel between entries.
+//!
+//! A move within one volume is a rename. A move to another volume copies the
+//! entry whole and only then removes the source, so a move that fails or is
+//! cancelled never loses what it had not finished copying.
+
+import Foundation
+
+/// Whether a transfer copies or moves.
+public enum TransferKind {
+    Copy
+    Move
+}
+
+/// What to do when the destination has an entry of the same name.
+public enum Collision {
+    /// Remove what is there, folder and all, and put the entry in its place.
+    Replace
+    /// Keep both: the entry arrives under the next numbered name.
+    KeepBoth
+    /// Leave this entry where it is.
+    Skip
+}
+
+/// What one step of a transfer did.
+public enum TransferStep {
+    /// The entry arrived; this is its path.
+    Arrived(String)
+    /// The entry was left where it is, as asked.
+    Skipped(String)
+    /// The destination has an entry with this name: the next step needs a
+    /// [`Collision`] choice.
+    Collides(String)
+    /// The entry could not be transferred; the transfer goes on with the next.
+    Failed(ChangeFailure)
+    /// Nothing is left.
+    Finished
+}
+
+/// A copy or move of entries into one folder, done a step at a time.
+public struct Transfer {
+    let kind: TransferKind
+    let destination: String
+    /// The sources not transferred yet, in order.
+    var pending: [String] = []
+    /// The paths entries arrived at.
+    var arrived: [String] = []
+    /// The sources left where they were, skipped or failed.
+    var kept: [String] = []
+}
+
+/// A transfer of `sources` into `destination`.
+public function transferOf(
+    kind: TransferKind,
+    sources: borrow [String],
+    destination: borrow String
+) -> Transfer {
+    return Transfer { kind: kind, destination: copy destination, pending: copy sources }
+}
+
+extend Transfer {
+    /// How many entries the transfer has done, skipped or failed, of all.
+    function progress(borrow self) -> (Number, Number) {
+        let done = arrived.count + kept.count
+        return (done, done + pending.count)
+    }
+
+    /// Transfers the next entry. `choice` answers the collision the last step
+    /// reported, and is not asked for otherwise.
+    function step(borrow mut self, choice: Collision?) -> TransferStep {
+        if pending.count == 0 { return .Finished }
+        let source = copy pending[0]
+        let name = lastPathPart(source)
+        var target = childPath(destination, name)
+        if target == source {
+            // A copy into the folder it is in is a duplicate, never a
+            // collision with itself.
+            target = childPath(destination, freeName(destination, name))
+        }
+        if isDirectory(source) && (destination == source || destination.startsWith(source + "/")) {
+            return self.keep(source, .Failed(.IntoItself(copy source)))
+        }
+        if pathExists(target) {
+            match choice {
+                Some(chosen) -> match chosen {
+                    Replace -> match removeTree(target) {
+                        Ok -> {}
+                        Error(failure) -> return self.keep(source, .Failed(failure))
+                    }
+                    KeepBoth -> target = childPath(destination, freeName(destination, name))
+                    Skip -> return self.keep(source, .Skipped(copy source))
+                }
+                None -> return .Collides(name)
+            }
+        }
+        match self.transferOne(source, target) {
+            Ok -> {
+                self.pending = rest(self.pending)
+                self.arrived.append(copy target)
+                return .Arrived(target)
+            }
+            Error(failure) -> return self.keep(source, .Failed(failure))
+        }
+    }
+
+    /// Stops the transfer: what was not transferred stays where it is.
+    function cancel(borrow mut self) {
+        for source in pending { kept.append(copy source) }
+        pending = []
+    }
+
+    function keep(borrow mut self, source: borrow String, step: TransferStep) -> TransferStep {
+        pending = rest(pending)
+        kept.append(copy source)
+        return step
+    }
+
+    function transferOne(
+        borrow self,
+        source: borrow String,
+        target: borrow String
+    ) -> Result<Void, ChangeFailure> {
+        match kind {
+            Copy -> return copyWhole(source, target)
+            Move -> {
+                if renamed(source, target) { return .Ok }
+                try copyWhole(source, target)
+                return removeTree(source)
+            }
+        }
+    }
+}
+
+// Whether `source` moved to `target` by a rename, which works within one
+// volume; across volumes it is refused and the move copies instead.
+function renamed(source: borrow String, target: borrow String) -> Bool {
+    return match renamePath(source, target) {
+        Ok -> true
+        Error(failure) -> {
+            // Another volume: the move copies, then removes.
+            absorb failure
+            false
+        }
+    }
+}
+
+// Copies `source` to `target`, removing a partial copy when it fails.
+function copyWhole(source: borrow String, target: borrow String) -> Result<Void, ChangeFailure> {
+    match copyTree(source, target) {
+        Ok -> return .Ok
+        Error(failure) -> {
+            match removeTree(target) {
+                Ok -> {}
+                // The partial copy stays; the failure that matters is the copy's.
+                Error(left) -> absorb left
+            }
+            return .Error(failure)
+        }
+    }
+}
+
+function rest(items: borrow [String]) -> [String] {
+    var kept: [String] = []
+    for index in 1..items.count { kept.append(copy items[index]) }
+    return kept
+}

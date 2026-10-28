@@ -1,0 +1,321 @@
+import Foundation
+
+// The Linux backend's calls into the kernel (§21.1).
+//
+// Every one is resolved by name through the framework's syscall table, which
+// carries both architectures. Calls that exist on only one of them (`open`,
+// `poll`, `arch_prctl`, `epoll_wait`) are not used, so the same source is the
+// same program on aarch64 and x86-64.
+
+@FFI.Syscall { name: read }
+function read(fd: Int, buffer: RawPtr, count: U64) -> Int
+
+@FFI.Syscall { name: write }
+function write(fd: Int, buffer: RawPtr, count: U64) -> Int
+
+@FFI.Syscall { name: pread64 }
+function pread(fd: Int, buffer: RawPtr, count: U64, offset: U64) -> Int
+
+@FFI.Syscall { name: pwrite64 }
+function pwrite(fd: Int, buffer: RawPtr, count: U64, offset: U64) -> Int
+
+@FFI.Syscall { name: preadv }
+function preadv(fd: Int, vectors: RawPtr, count: Int, offsetLow: U64, offsetHigh: U64) -> Int
+
+@FFI.Syscall { name: pwritev }
+function pwritev(fd: Int, vectors: RawPtr, count: Int, offsetLow: U64, offsetHigh: U64) -> Int
+
+@FFI.Syscall { name: writev }
+function writev(fd: Int, vectors: RawPtr, count: Int) -> Int
+
+@FFI.Syscall { name: close }
+function close(fd: Int) -> Int
+
+@FFI.Syscall { name: close_range }
+function closeRange(first: U32, last: U32, flags: U32) -> Int
+
+@FFI.Syscall { name: dup3 }
+function dup3(fd: Int, target: Int, flags: Int) -> Int
+
+@FFI.Syscall { name: fcntl }
+function fcntl(fd: Int, command: Int, argument: RawPtr) -> Int
+
+@FFI.Syscall { name: ioctl }
+function ioctl(fd: Int, request: U64, argument: RawPtr) -> Int
+
+@FFI.Syscall { name: perf_event_open }
+function perfEventOpen(attributes: RawPtr, pid: U32, cpu: U32, group: U32, flags: U64) -> Int
+
+// `ioctl` for a request whose argument is a number rather than a pointer.
+@FFI.Syscall { name: ioctl }
+function ioctlValue(fd: Int, request: U64, argument: Int) -> Int
+
+@FFI.Syscall { name: openat }
+function openat(directory: Int, path: CString, flags: Int, mode: Int) -> Int
+
+@FFI.Syscall { name: openat2 }
+function openat2(directory: Int, path: CString, how: RawPtr, size: U64) -> Int
+
+@FFI.Syscall { name: statx }
+function statx(directory: Int, path: CString, flags: Int, mask: U32, out: RawPtr) -> Int
+
+@FFI.Syscall { name: statfs }
+function statfs(path: CString, out: RawPtr) -> Int
+
+@FFI.Syscall { name: getdents64 }
+function getdents64(fd: Int, entries: RawPtr, count: U64) -> Int
+
+@FFI.Syscall { name: mkdirat }
+function mkdirat(directory: Int, path: CString, mode: Int) -> Int
+
+@FFI.Syscall { name: unlinkat }
+function unlinkat(directory: Int, path: CString, flags: Int) -> Int
+
+@FFI.Syscall { name: renameat2 }
+function renameat2(
+    fromDirectory: Int,
+    fromPath: CString,
+    toDirectory: Int,
+    toPath: CString,
+    flags: U32
+) -> Int
+
+@FFI.Syscall { name: fchmodat }
+function fchmodat(directory: Int, path: CString, mode: Int, flags: Int) -> Int
+
+@FFI.Syscall { name: utimensat }
+function utimensat(directory: Int, path: CString, times: RawPtr, flags: Int) -> Int
+
+@FFI.Syscall { name: readlinkat }
+function readlinkat(directory: Int, path: CString, buffer: RawPtr, size: U64) -> Int
+
+@FFI.Syscall { name: ftruncate }
+function ftruncate(fd: Int, length: U64) -> Int
+
+@FFI.Syscall { name: fallocate }
+function fallocate(fd: Int, mode: Int, offset: U64, length: U64) -> Int
+
+@FFI.Syscall { name: fsync }
+function fsync(fd: Int) -> Int
+
+@FFI.Syscall { name: lseek }
+function lseek(fd: Int, offset: U64, whence: Int) -> Int
+
+@FFI.Syscall { name: fdatasync }
+function fdatasync(fd: Int) -> Int
+
+@FFI.Syscall { name: mmap }
+function mmap(
+    address: RawPtr,
+    length: U64,
+    protection: Int,
+    flags: Int,
+    fd: Int,
+    offset: U64
+) -> Int
+
+@FFI.Syscall { name: munmap }
+function munmap(address: RawPtr, length: U64) -> Int
+
+@FFI.Syscall { name: mprotect }
+function mprotect(address: RawPtr, length: U64, protection: Int) -> Int
+
+@FFI.Syscall { name: madvise }
+function madvise(address: RawPtr, length: U64, advice: Int) -> Int
+
+@FFI.Syscall { name: mincore }
+function mincore(address: RawPtr, length: U64, vector: RawPtr) -> Int
+
+@FFI.Syscall { name: mlock }
+function mlock(address: RawPtr, length: U64) -> Int
+
+@FFI.Syscall { name: munlock }
+function munlock(address: RawPtr, length: U64) -> Int
+
+@FFI.Syscall { name: memfd_create }
+function memfdCreate(name: CString, flags: U32) -> Int
+
+@FFI.Syscall { name: eventfd2 }
+function eventfd2(initial: U32, flags: Int) -> Int
+
+@FFI.Syscall { name: timerfd_create }
+function timerfdCreate(clock: Int, flags: Int) -> Int
+
+@FFI.Syscall { name: timerfd_settime }
+function timerfdSettime(fd: Int, flags: Int, value: RawPtr, old: RawPtr) -> Int
+
+@FFI.Syscall { name: clock_gettime }
+function clockGettime(clock: Int, out: RawPtr) -> Int
+
+@FFI.Syscall { name: clock_settime }
+function clockSettime(clock: Int, value: RawPtr) -> Int
+
+@FFI.Syscall { name: clock_getres }
+function clockGetres(clock: Int, out: RawPtr) -> Int
+
+@FFI.Syscall { name: clock_adjtime }
+function clockAdjtime(clock: Int, timex: RawPtr) -> Int
+
+@FFI.Syscall { name: clock_nanosleep }
+function clockNanosleep(clock: Int, flags: Int, request: RawPtr, remaining: RawPtr) -> Int
+
+@FFI.Syscall { name: ppoll }
+function ppoll(fds: RawPtr, count: U64, timeout: RawPtr, mask: RawPtr) -> Int
+
+@FFI.Syscall { name: futex }
+function futex(
+    address: RawPtr,
+    operation: Int,
+    value: U32,
+    timeout: RawPtr,
+    target: RawPtr,
+    value3: U32
+) -> Int
+
+@FFI.Syscall { name: sched_yield }
+function schedYield() -> Int
+
+@FFI.Syscall { name: sched_setattr }
+function schedSetattr(tid: Int, attributes: RawPtr, flags: U32) -> Int
+
+@FFI.Syscall { name: gettid }
+function gettid() -> Int
+
+@FFI.Syscall { name: getpid }
+function getpid() -> Int
+
+@FFI.Syscall { name: exit }
+function exitThread(code: Int)
+
+@FFI.Syscall { name: exit_group }
+function exitGroup(code: Int)
+
+@FFI.Syscall { name: tgkill }
+function tgkill(process: Int, thread: Int, signal: Int) -> Int
+
+@FFI.Syscall { name: ptrace }
+function ptrace(request: U64, pid: U64, address: RawPtr, data: RawPtr) -> U64
+
+@FFI.Syscall { name: wait4 }
+function wait4(pid: U64, status: RawPtr, options: U64, usage: RawPtr) -> U64
+
+@FFI.Syscall { name: rt_tgsigqueueinfo }
+function tgsigqueueinfo(process: U64, thread: U64, signal: U64, info: RawPtr) -> U64
+
+@FFI.Syscall { name: clone3 }
+function clone3(arguments: RawPtr, size: U64) -> Int
+
+@FFI.Syscall { name: execveat }
+function execveat(directory: Int, path: CString, argv: RawPtr, envp: RawPtr, flags: Int) -> Int
+
+@FFI.Syscall { name: pidfd_open }
+function pidfdOpen(pid: Int, flags: U32) -> Int
+
+@FFI.Syscall { name: pidfd_send_signal }
+function pidfdSendSignal(pidfd: Int, signal: Int, info: RawPtr, flags: U32) -> Int
+
+@FFI.Syscall { name: waitid }
+function waitid(idtype: Int, id: Int, info: RawPtr, options: Int, usage: RawPtr) -> Int
+
+@FFI.Syscall { name: rt_sigprocmask }
+function sigprocmask(how: Int, set: RawPtr, old: RawPtr, size: U64) -> Int
+
+@FFI.Syscall { name: signalfd4 }
+function signalfd4(fd: Int, mask: RawPtr, size: U64, flags: Int) -> Int
+
+@FFI.Syscall { name: socket }
+function socket(family: Int, kind: Int, protocol: Int) -> Int
+
+@FFI.Syscall { name: socketpair }
+function socketpair(family: Int, kind: Int, protocol: Int, pair: RawPtr) -> Int
+
+@FFI.Syscall { name: bind }
+function bind(fd: Int, address: RawPtr, length: U32) -> Int
+
+@FFI.Syscall { name: listen }
+function listen(fd: Int, backlog: Int) -> Int
+
+@FFI.Syscall { name: accept4 }
+function accept4(fd: Int, address: RawPtr, length: RawPtr, flags: Int) -> Int
+
+@FFI.Syscall { name: connect }
+function connect(fd: Int, address: RawPtr, length: U32) -> Int
+
+@FFI.Syscall { name: sendmsg }
+function sendmsg(fd: Int, message: RawPtr, flags: Int) -> Int
+
+@FFI.Syscall { name: recvmsg }
+function recvmsg(fd: Int, message: RawPtr, flags: Int) -> Int
+
+@FFI.Syscall { name: sendmmsg }
+function sendmmsg(fd: Int, messages: RawPtr, count: U32, flags: Int) -> Int
+
+@FFI.Syscall { name: recvmmsg }
+function recvmmsg(fd: Int, messages: RawPtr, count: U32, flags: Int, timeout: RawPtr) -> Int
+
+@FFI.Syscall { name: shutdown }
+function shutdown(fd: Int, how: Int) -> Int
+
+@FFI.Syscall { name: setsockopt }
+function setsockopt(fd: Int, level: Int, name: Int, value: RawPtr, length: U32) -> Int
+
+@FFI.Syscall { name: getsockopt }
+function getsockopt(fd: Int, level: Int, name: Int, value: RawPtr, length: RawPtr) -> Int
+
+@FFI.Syscall { name: getsockname }
+function getsockname(fd: Int, address: RawPtr, length: RawPtr) -> Int
+
+@FFI.Syscall { name: getpeername }
+function getpeername(fd: Int, address: RawPtr, length: RawPtr) -> Int
+
+@FFI.Syscall { name: getrandom }
+function getrandom(buffer: RawPtr, count: U64, flags: U32) -> Int
+
+@FFI.Syscall { name: uname }
+function uname(out: RawPtr) -> Int
+
+@FFI.Syscall { name: sysinfo }
+function sysinfo(out: RawPtr) -> Int
+
+@FFI.Syscall { name: inotify_init1 }
+function inotifyInit1(flags: Int) -> Int
+
+@FFI.Syscall { name: inotify_add_watch }
+function inotifyAddWatch(fd: Int, path: CString, mask: U32) -> Int
+
+@FFI.Syscall { name: kill }
+function kill(pid: Int, signal: Int) -> Int
+
+// The machine and its volumes, for system processes only.
+
+@FFI.Syscall { name: mount }
+function mount(source: CString, target: CString, kind: CString, flags: U64, data: RawPtr) -> Int
+
+@FFI.Syscall { name: umount2 }
+function umount2(target: CString, flags: Int) -> Int
+
+@FFI.Syscall { name: chdir }
+function chdir(path: CString) -> Int
+
+@FFI.Syscall { name: chroot }
+function chroot(path: CString) -> Int
+
+// A confined child's view (Confine.kira): the root it turns into, the links
+// it lays in it, and the flag that keeps it from gaining privileges at exec.
+@FFI.Syscall { name: pivot_root }
+function pivotRoot(newRoot: CString, putOld: CString) -> Int
+
+@FFI.Syscall { name: symlinkat }
+function symlinkat(target: CString, directory: Int, path: CString) -> Int
+
+@FFI.Syscall { name: prctl }
+function prctl(option: Int, second: U64, third: U64, fourth: U64, fifth: U64) -> Int
+
+@FFI.Syscall { name: sync }
+function sync() -> Int
+
+@FFI.Syscall { name: reboot }
+function reboot(magic: Int, magic2: Int, command: Int, argument: RawPtr) -> Int
+
+@FFI.Syscall { name: execve }
+function execve(path: CString, argv: RawPtr, envp: RawPtr) -> Int

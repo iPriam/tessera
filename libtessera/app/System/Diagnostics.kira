@@ -1,0 +1,172 @@
+import Foundation
+import Heap
+
+// Random bytes (§19), logging, tracing and debugging (§20.1, §20.2).
+//
+// Until the system logger exists, log lines go to the kernel's log. Trace
+// events go to the kernel tracer, in the systrace line format, with `args`
+// as hex.
+
+// Whether the tracer was opened: -1 not yet tried, 0 no, 1 yes.
+
+public function randomFill(out: borrow Buffer) -> Result<Void, TesseraError> {
+    return kernelRandomFill(out.address, out.length)
+}
+
+@Derive(Copy)
+public enum LogLevel: U32 {
+    Trace = 0
+    Debug = 1
+    Info = 2
+    Notice = 3
+    Warning = 4
+    Error = 5
+    Fault = 6
+}
+
+@Derive(Copy)
+public enum TraceFlowPhase: U32 {
+    Begin = 0
+    Step = 1
+    End = 2
+}
+
+function processName() -> String {
+    if library.tracedProcessName.count == 0 {
+        library.tracedProcessName = match kernelProgramName() {
+            Ok(name) -> name
+            Error(failed) -> {
+                // The line goes out unnamed; the name is asked for again
+                // with the next.
+                absorb failed
+                ""
+            }
+        }
+    }
+    return library.tracedProcessName
+}
+
+public function logWrite(
+    level: LogLevel,
+    subsystem: borrow String,
+    category: borrow String,
+    message: borrow String
+) -> Result<Void, TesseraError> {
+    if subsystem.count > 64 || category.count > 64 { return .Error(failure(.NameTooLong)) }
+    if message.count > 4096 { return .Error(failure(.OutOfRange)) }
+    let line = processName() + "[" + stringFromUnsigned(
+        kernelProcessId()
+    ) + "] " + subsystem + "/" + category + ": " + message + "\n"
+    return kernelLogWrite(level, line)
+}
+
+// Whether the tracer is on: asked again at most once a second.
+public function traceEnabled(category: borrow String) -> Bool {
+    if category.count == 0 || category.count > 64 { return false }
+    let open = match library.traceOpen {
+        Some(known) -> known
+        None -> {
+            let opened = entitlementHeld("tessera.trace") && kernelTraceOpen()
+            library.traceOpen = .Some(opened)
+            opened
+        }
+    }
+    if !open { return false }
+    let now = monotonicNow()
+    let stale = match library.traceChecked {
+        Some(checked) -> now - checked > U64(1000000000)
+        None -> true
+    }
+    if stale {
+        library.traceOn = match kernelTraceRecording() {
+            Ok(recording) -> recording
+            Error(failed) -> {
+                // A recorder that cannot be asked records nothing.
+                absorb failed
+                false
+            }
+        }
+        library.traceChecked = .Some(now)
+    }
+    return library.traceOn
+}
+
+function traceHex(args: borrow Buffer) -> String {
+    let digits = "0123456789abcdef"
+    var text = ""
+    for index in 0..min(Number(args.length), 512) {
+        let byte = heapLoad<U8>(args.address, index)
+        text += digits.substring(byte / 16, byte / 16 + 1) + digits.substring(
+            byte % 16,
+            byte % 16 + 1
+        )
+    }
+    return text
+}
+
+function traceEmit(category: borrow String, line: borrow String) {
+    if !traceEnabled(category) { return }
+    kernelTraceWrite(line)
+}
+
+function tracePid() -> String { return stringFromUnsigned(kernelProcessId()) }
+
+public function traceBegin(category: borrow String, name: borrow String, args: borrow Buffer) {
+    traceEmit(category, "B|" + tracePid() + "|" + category + ":" + name + "|" + traceHex(args))
+}
+
+public function traceEnd(category: borrow String) {
+    traceEmit(category, "E|" + tracePid())
+}
+
+public function traceInstant(category: borrow String, name: borrow String, args: borrow Buffer) {
+    traceEmit(category, "I|" + tracePid() + "|" + category + ":" + name + "|" + traceHex(args))
+}
+
+public function traceCounter(category: borrow String, name: borrow String, value: Number) {
+    let text = value < 0 ? "-" + stringFromUnsigned(U64(-value)) : stringFromUnsigned(U64(value))
+    traceEmit(category, "C|" + tracePid() + "|" + category + ":" + name + "|" + text)
+}
+
+public function traceFlow(
+    category: borrow String,
+    name: borrow String,
+    flowId: UNumber,
+    phase: TraceFlowPhase
+) {
+    let mark = match phase {
+        Begin -> "s"
+        Step -> "t"
+        End -> "f"
+    }
+    traceEmit(category, "F|\(tracePid())|\(category):\(name)|\(flowId)|\(mark)")
+}
+
+// Crash reports are produced by the system from outside the crashing
+// process. No crash reporter exists yet, and a process cannot catch its own
+// fault without a signal handler, which Kira code cannot install.
+public function crashSetReporter(channel: Handle) -> Result<Void, TesseraError> {
+    try resolve(channel, .Channel, Rights.write)
+    if !entitlementHeld("tessera.debug.crash") { return .Error(failure(.NotEntitled)) }
+    return .Error(failureIn(.Unsupported, .Audit))
+}
+
+public function debugIsAttached() -> Bool {
+    return match kernelDebuggerAttached() {
+        Ok(attached) -> attached
+        Error(failed) -> {
+            // A tracer the kernel will not name is not one to stop for.
+            absorb failed
+            false
+        }
+    }
+}
+
+// A breakpoint trap in the calling thread when a debugger is attached; nothing
+// otherwise, and nothing on a production image.
+public function debugBreak() {
+    runtimeEnsure()
+    if !library.startup.flags.has(StartupFlags.debugImage) && !library.systemProcess { return }
+    if !debugIsAttached() { return }
+    kernelBreakpoint()
+}

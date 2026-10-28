@@ -1,0 +1,375 @@
+//! The install service: serves the installer's requests, one at a time, from init.
+import Foundation
+import Heap
+import LibTessera
+
+// The Install service (`tessera.install`), which the recovery media runs as
+// /bin/installer --serve: Recovery's Disk Utility and Install ask it to lay a
+// disk out, put a volume on a partition and install the system the media
+// carries, at `RecoveryPayload.image`. The wire is LibTessera's
+// `System/Install.kira`. One request is served at a time, start to end: an
+// install is the only thing the media is for while it runs.
+
+/// Where the install payload on the recovery media is found.
+namespace RecoveryPayload {
+    // The build's `RecoveryLayout.payload`.
+    let image: String = "/System/Installation/system.img"
+    // The build's `RecoveryLayout.digest`: the image's fs-verity digest.
+    let digest: String = "/System/Installation/system.digest"
+    // Where an install mounts the volume's top and the image, in the tmpfs.
+    let volume: String = "/run/installer/volume"
+    let imageAt: String = "/run/installer/image"
+}
+
+/// The wire the install service speaks: its operations and how requests and answers are sent.
+namespace ServeWire {
+    let headerBytes: Number = 32
+    let messageBytes: Number = 4096
+    let alignment: Number = 16
+    let partition: UN32 = UN32(1)
+    let erase: UN32 = UN32(2)
+    let install: UN32 = UN32(3)
+}
+
+/// The keys the port's completions carry: the listener's, the termination's, and a connection's past them.
+@Open
+enum PortKey: UN32 {
+    Listener = 1
+    Termination = 2
+}
+
+/// The keys the service's waits are made under.
+namespace ServeKey {
+    // A connection's key is its id plus this.
+    let clients: Number = 16
+    let batch: Number = 16
+}
+
+/// A connection the install service is serving: its id and its channel.
+struct Served {
+    let id: Number
+    let channel: Handle
+}
+
+/// A request taken from a connection, ready to be performed.
+struct ServeRequest {
+    let op: UN32
+    let a: Number
+    let text: String
+}
+
+/// Listens and serves until init asks it to stop.
+function serve() -> UN8 {
+    let port = match portCreate(.None) {
+        Ok(value) -> value
+        Error(failed) -> return serveStopped("no port", failed)
+    }
+    match processWatchTermination(port, code(PortKey.Termination)) {
+        Ok -> {}
+        Error(failed) -> log warn("cannot hear a request to stop", error: errorName(failed))
+    }
+    let listener = match serviceListen("tessera.install") {
+        Ok(value) -> value
+        Error(failed) -> return serveStopped("cannot listen", failed)
+    }
+    match objectWaitAsync(listener, Signals.readable, .Repeat, port, code(PortKey.Listener)) {
+        Ok -> {}
+        Error(failed) -> return serveStopped("cannot wait for connections", failed)
+    }
+    log info("serving installs")
+    var clients: [Served] = []
+    var next = 1
+    while true {
+        let completions = match portWait(port, ServeKey.batch, Deadline.infinite) {
+            Ok(value) -> value
+            Error(failed) -> return serveStopped("port wait", failed)
+        }
+        for completion in completions {
+            let key = Number(completion.key)
+            match fromCode<PortKey>(UN32(min(key, ServeKey.clients))) {
+                Termination -> {
+                    log info("asked to stop")
+                    return 0
+                }
+                Listener -> acceptAll(listener, port, clients, next)
+                else -> serveClient(port, clients, key - ServeKey.clients)
+            }
+        }
+    }
+    return 0
+}
+
+/// Logs why serving stopped and returns the exit status for it.
+function serveStopped(what: borrow String, failed: borrow TesseraError) -> UN8 {
+    log fault("the Install service stopped", what, error: errorName(failed))
+    return 1
+}
+
+/// Takes every connection waiting on the listener.
+function acceptAll(
+    listener: Handle,
+    port: Handle,
+    clients: borrow mut [Served],
+    next: borrow mut Number
+) {
+    while true {
+        let channel = match serviceAccept(listener) {
+            Ok(value) -> value
+            Error(failed) -> {
+                if failed.code != .ShouldWait {
+                    log warn("a connection could not be taken", error: errorName(failed))
+                }
+                return
+            }
+        }
+        let id = next
+        next += 1
+        match objectWaitAsync(
+            channel,
+            Signals.readable | Signals.peerClosed,
+            .Repeat,
+            port,
+            UNumber(ServeKey.clients + id)
+        ) {
+            Ok -> clients.append(Served { id: id, channel: channel })
+            Error(failed) -> {
+                log warn("a connection could not be waited on", error: errorName(failed))
+                closeServed(channel)
+            }
+        }
+    }
+}
+
+/// Serves every request waiting on the connection `id`; one whose peer has gone is closed.
+function serveClient(port: Handle, clients: borrow mut [Served], id: Number) {
+    var at: Number? = .None
+    for index in 0..clients.count {
+        if clients[index].id == id { at = .Some(index) }
+    }
+    let index = match at {
+        Some(value) -> value
+        None -> return
+    }
+    let channel = clients[index].channel
+    while true {
+        match takeRequest(channel) {
+            Ok(request) -> perform(channel, request)
+            Error(failed) -> {
+                if failed.code == .ShouldWait { return }
+                match portCancel(port, UNumber(ServeKey.clients + id)) {
+                    Ok(cancelled) -> {}
+                    Error(cancelling) -> absorb cancelling
+                }
+                closeServed(channel)
+                var kept: [Served] = []
+                for other in clients {
+                    if other.id != id { kept.append(other) }
+                }
+                clients = kept
+                return
+            }
+        }
+    }
+}
+
+/// The next request on `channel`, or the error that stopped it being taken.
+function takeRequest(channel: Handle) -> Result<ServeRequest, TesseraError> {
+    let block = zeroedBlock(count: ServeWire.messageBytes, alignment: ServeWire.alignment)
+    let received = try channelRead(
+        channel,
+        Buffer { address: block.pointer(), length: ServeWire.messageBytes },
+        UNumber(0)
+    )
+    if received.bytes < ServeWire.headerBytes {
+        return .Ok(ServeRequest { op: UN32(0), a: 0, text: "" })
+    }
+    return .Ok(
+        ServeRequest {
+            op: heapLoad<U32>(block.pointer(), 0),
+            a: Number(heapLoad<U64>(block.pointer(), 8)),
+            text: stringFromCBytes(
+                heapOffset(block.pointer(), ServeWire.headerBytes),
+                received.bytes - ServeWire.headerBytes
+            )
+        }
+    )
+}
+
+/// Performs `request` and answers its channel with the outcome.
+function perform(channel: Handle, request: borrow ServeRequest) {
+    if request.op == ServeWire.partition {
+        match partitionDisk(request.text) {
+            Ok(partition) -> reply(channel, request.op, .Ok, 0, 0, partition)
+            Error(problem) -> refuse(channel, request.op, .BadState, problem)
+        }
+    } else if request.op == ServeWire.erase {
+        let partition = request.text.substring(0, min(request.a, request.text.count))
+        let name = request.text.substring(min(request.a, request.text.count), request.text.count)
+        match erasePartition(partition, name) {
+            Ok -> reply(channel, request.op, .Ok, 0, 0, "")
+            Error(problem) -> refuse(channel, request.op, .BadState, problem)
+        }
+    } else if request.op == ServeWire.install {
+        var progress = CopyProgress { channel: .Some(channel), done: 0, total: 0 }
+        match installPayload(request.text, progress) {
+            Ok -> reply(channel, request.op, .Ok, progress.done, progress.total, "")
+            Error(problem) -> refuse(channel, request.op, .BadState, problem)
+        }
+    } else {
+        refuse(channel, request.op, .Unsupported, "no such request")
+    }
+}
+
+/// One GUID partition table over the disk, holding one Tessera partition, as Disk Utility's Erase of a whole disk makes one.
+function partitionDisk(disk: borrow String) -> Result<String, String> {
+    match releaseDisk(disk) {
+        Ok -> {}
+        Error(problem) -> return .Error(problem)
+    }
+    let partitions = [VolumePartition { name: "Tessera", bytes: 0, kind: .Tessera }]
+    match volumeWritePartitions(disk, partitions) {
+        Ok -> {}
+        Error(failed) -> return .Error("the disk could not be partitioned: \(errorName(failed))")
+    }
+    let last = disk.charAt(disk.count - 1)
+    let partition = last >= 48 && last <= 57 ? disk + "p1" : disk + "1"
+    log info("partitioned the disk", disk, partition)
+    return .Ok(partition)
+}
+
+/// Erases `partition` and formats it as a Tessera volume named `name`.
+function erasePartition(partition: borrow String, name: borrow String) -> Result<Void, String> {
+    if partition.count == 0 || partition.contains("/") { return .Error("no such partition") }
+    match releaseDisk(partition) {
+        Ok -> {}
+        Error(problem) -> return .Error(problem)
+    }
+    return format(partition, name.count > 0 ? copy name : VolumeLayout.label, true)
+}
+
+/// Unmounts every volume on `disk` and its partitions, last mounted first, as Disk Utility unmounts a disk before it erases it.
+function releaseDisk(disk: borrow String) -> Result<Void, String> {
+    let table = match volumeMounts() {
+        Ok(value) -> value
+        Error(failed) -> return .Error("the mounts could not be read: \(errorName(failed))")
+    }
+    var targets: [String] = []
+    for line in table.split("\n") {
+        let fields = line.split(" ")
+        if fields.count >= 2 && fields[0].startsWith("/dev/" + disk) {
+            targets.append(mountPath(fields[1]))
+        }
+    }
+    var index = targets.count
+    while index > 0 {
+        index -= 1
+        match volumeUnmount(targets[index], VolumeUnmountOptions.none) {
+            Ok -> log info("unmounted a volume on the disk", disk, target: targets[index])
+            Error(failed) -> return .Error(
+                "\(targets[index]) could not be unmounted: \(errorName(failed))"
+            )
+        }
+    }
+    return .Ok
+}
+
+/// A mount table's path, whose spaces it writes `\040`, as the path itself.
+function mountPath(field: borrow String) -> String {
+    let parts = field.split("\\040")
+    var path = ""
+    for index in 0..parts.count {
+        if index > 0 { path += " " }
+        path += parts[index]
+    }
+    return path
+}
+
+/// Installs the media's system onto the volume on `partition`, its version the first 16 hexadecimal digits of the image's fs-verity digest.
+function installPayload(
+    partition: borrow String,
+    progress: borrow mut CopyProgress
+) -> Result<Void, String> {
+    if partition.count == 0 || partition.contains("/") { return .Error("no such partition") }
+    let digest = match readFileRange(RecoveryPayload.digest, 0, 8) {
+        Ok(bytes) -> hexText(bytes)
+        Error(failure) -> return .Error("the media's system has no digest: \(traceText(failure))")
+    }
+    if digest.count != 16 { return .Error("the media's system has no digest") }
+    let installation = Installation {
+        disk: copy partition,
+        volume: RecoveryPayload.volume,
+        image: .File(RecoveryPayload.image),
+        imageAt: RecoveryPayload.imageAt
+    }
+    match makeMissing("/run/installer") {
+        Ok -> {}
+        Error(problem) -> return .Error(problem)
+    }
+    let installed = install(installation, digest, progress, false)
+    match volumeUnmount(installation.volume, VolumeUnmountOptions.none) {
+        Ok -> {}
+        Error(failed) -> log warn("the volume stays mounted", error: errorName(failed))
+    }
+    return installed
+}
+
+/// The hexadecimal text of `bytes`, two digits a byte.
+function hexText(bytes: borrow [UN8]) -> String {
+    let digits = "0123456789abcdef"
+    var text = ""
+    for byte in bytes {
+        let value = Number(byte)
+        let high = floor(value / 16)
+        text += digits.substring(high, high + 1) + digits.substring(
+            value - high * 16,
+            value - high * 16 + 1
+        )
+    }
+    return text
+}
+
+/// Sends where an install is: `done` of `total` files.
+function sendProgress(channel: Handle, done: Number, total: Number) {
+    reply(channel, ServeWire.install, .ShouldWait, done, total, "")
+}
+
+/// Refuses a request on `channel` with `code` and the reason `problem`.
+function refuse(channel: Handle, op: UN32, code: ErrorCode, problem: borrow String) {
+    log warn("a request failed", problem)
+    reply(channel, op, code, 0, 0, problem)
+}
+
+/// One answer. A caller that cannot be sent to has gone, and its channel's wait closes it.
+function reply(
+    channel: Handle,
+    op: UN32,
+    code: ErrorCode,
+    a: Number,
+    b: Number,
+    text: borrow String
+) {
+    let length = min(text.count, ServeWire.messageBytes - ServeWire.headerBytes)
+    let block = zeroedBlock(count: ServeWire.headerBytes + length, alignment: ServeWire.alignment)
+    heapStore<U32>(block.pointer(), 0, op)
+    heapStore<U32>(block.pointer(), 4, code.rawValue())
+    heapStore<U64>(block.pointer(), 8, U64(a))
+    heapStore<U64>(block.pointer(), 16, U64(b))
+    copyBytes(heapOffset(block.pointer(), ServeWire.headerBytes), text.data, length)
+    let none: [Handle] = []
+    match channelWrite(
+        channel,
+        Buffer { address: block.pointer(), length: ServeWire.headerBytes + length },
+        none
+    ) {
+        Ok -> {}
+        Error(failed) -> log warn("a caller could not be answered", error: errorName(failed))
+    }
+}
+
+/// Closes the channel of a served connection.
+function closeServed(channel: Handle) {
+    match handleClose(channel) {
+        Ok -> {}
+        Error(failed) -> absorb failed
+    }
+}

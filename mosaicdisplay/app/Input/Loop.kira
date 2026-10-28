@@ -1,0 +1,599 @@
+import Foundation
+import LibTessera
+import DeviceKit
+import TesseraDisplayClient
+
+// The keys of the loop's port. A client's is its index plus one; the
+// keyboard's is past every client's, the request to stop past the
+// keyboard's, and a new link on the service channel past the stop request's.
+namespace PortKey {
+    let keyboard: Number = 0x10000
+    let stop: Number = 0x20000
+    let link: Number = 0x30000
+    let pointer: Number = 0x40000
+    let repeat: Number = 0x50000
+    let inputWatch: Number = 0x60000
+    let idle: Number = 0x70000
+    let output: Number = 0x80000
+    let stage: Number = 0x90000
+    let backdrop: Number = 0xA0000
+    let home: Number = 0xB0000
+    let flip: Number = 0xC0000
+    let presence: Number = 0xD0000
+    let settings: Number = 0xE0000
+    // How many keys past its kind's a keyboard's or a pointer's may be.
+    let span: Number = 0x10000
+}
+
+namespace Relayout {
+    let bootSerial: UNumber = 1
+    let serial: UNumber = 2
+}
+
+// What a completion key names.
+enum Waker {
+    Client(Number)
+    Keyboard(Number)
+    Pointer(Number)
+    Repeat
+    Idle
+    InputWatch
+    Output
+    Stage
+    Home
+    Backdrop
+    Flip
+    Presence
+    Settings
+    Stop
+    Link
+    Unknown
+}
+
+function wakerOf(key: UNumber, count: Number) -> Waker {
+    let value = Number(key)
+    if value >= PortKey.keyboard && value < PortKey.keyboard + PortKey.span {
+        return .Keyboard(value - PortKey.keyboard)
+    }
+    if value >= PortKey.pointer && value < PortKey.pointer + PortKey.span {
+        return .Pointer(value - PortKey.pointer)
+    }
+    if value == PortKey.repeat { return .Repeat }
+    if value == PortKey.idle { return .Idle }
+    if value == PortKey.inputWatch { return .InputWatch }
+    if value == PortKey.output { return .Output }
+    if value == PortKey.stage { return .Stage }
+    if value == PortKey.home { return .Home }
+    if value == PortKey.backdrop { return .Backdrop }
+    if value == PortKey.flip { return .Flip }
+    if value == PortKey.presence { return .Presence }
+    if value == PortKey.settings { return .Settings }
+    if value == PortKey.stop { return .Stop }
+    if value == PortKey.link { return .Link }
+    let index = Number(value) - 1
+    if index >= 0 && index < count { return .Client(index) }
+    return .Unknown
+}
+
+// The live client on top, an application before the platform.
+function topmostLiveClient(server: borrow Server) -> Number? {
+    var chosen: Number? = .None
+    var highest = 0
+    for index in 0..server.clients.count {
+        let client = server.clients[index]
+        if client.alive && !client.hidden && client.role != .Platform && (
+            chosen.isNone() || client.zOrder >= highest
+        ) {
+            highest = client.zOrder
+            chosen = .Some(index)
+        }
+    }
+    if chosen.isSome() { return chosen }
+    for index in 0..server.clients.count {
+        let client = server.clients[index]
+        if client.alive && !client.hidden && (chosen.isNone() || client.zOrder >= highest) {
+            highest = client.zOrder
+            chosen = .Some(index)
+        }
+    }
+    return chosen
+}
+
+// Sends a surface its frame. False when it could not be sent.
+function sendConfigure(
+    server: borrow Server,
+    index: Number,
+    serial: UNumber
+) -> Result<Void, SessionFailure> {
+    return sendConfigureFrame(server, index, server.clients[index].frame, serial)
+}
+
+// Sends a surface `frame`, which a window on its way to its own frame is
+// at for now.
+function sendConfigureFrame(
+    server: borrow Server,
+    index: Number,
+    frame: borrow Geometry,
+    serial: UNumber
+) -> Result<Void, SessionFailure> {
+    let client = server.clients[index]
+    if frame.width <= 0 || frame.height <= 0 { return .Error(.InvalidGeometry) }
+    let configure: DisplayMessage = .Configure(
+        DisplayConfiguration {
+            surface: client.surface,
+            x: frame.x,
+            y: frame.y,
+            width: UNumber(frame.width),
+            height: UNumber(frame.height),
+            serial: serial,
+        }
+    )
+    match sendDisplayMessage(client.channel, configure) {
+        Ok -> {}
+        Error(reason) -> return .Error(.Send(reason))
+    }
+    log info(
+        "configured a surface",
+        surface: client.surface.raw,
+        x: frame.x,
+        y: frame.y,
+        width: frame.width,
+        height: frame.height,
+        serial: serial
+    )
+    return .Ok
+}
+
+// Sends a surface its frame and waits for it to acknowledge.
+function configureClient(
+    server: borrow Server,
+    index: Number,
+    serial: UNumber
+) -> Result<Void, SessionFailure> {
+    try sendConfigure(server, index, serial)
+    let client = server.clients[index]
+    let answer = try nextMessage(client.channel)
+    let acknowledged = match answer {
+        AckConfigure(frame) -> frame.surface == client.surface && frame.serial == serial
+        Hello, Welcome, Attach, Commit, Key, FrameDone, FrameRequest, FrameReady, FocusIn, FocusOut,
+            Configure, SetMode, ModeChanged, InputCapability, SurfaceCreated, SurfaceDestroyed,
+            GrantFocus, InstallGrab, GrabFired, SetChannel, ChannelChanged, PresentSystem, Verify,
+            VerifyResult, InjectInput, Notify, Notification, ActivateRequested, SetBar, PointerMotion, PointerButton, PointerAxis, PointerEnter, PointerLeave, SetDock, SurfacePressed, RequestWindow, WindowRequested, GrantMove, GrantResize, HoldInput, SetOverlay, SetIdle, IdleChanged, BarBackdrop, SetGlass, SetLaunchOrigin, SetStageBadge, PlaceSurface, SurfacePlaced, SetHidden, SetMargin, Insets, Output -> false
+    }
+    if !acknowledged {
+        return .Error(.ExpectedConfigureAck)
+    }
+    log info("a surface acknowledged a configure", surface: client.surface.raw, serial: serial)
+    return .Ok
+}
+
+// Focuses the client at `index`, or nobody when it cannot be told. The
+// focused surface is stacked above every other.
+function focusClient(server: borrow mut Server, index: Number) {
+    let client = server.clients[index]
+    match sendDisplayMessage(client.channel, .FocusIn(client.surface)) {
+        Ok -> {
+            log info("focused a surface", surface: client.surface.raw)
+            server.focus = .Some(index)
+            raise(server, index)
+            retarget(server)
+        }
+        Error(reason) -> focusFailed(server, client.surface.raw, reason)
+    }
+}
+
+function focusFailed(server: borrow mut Server, surface: UNumber, reason: borrow TesseraError) {
+    log info("a surface could not be focused", surface: surface, error: errorName(reason))
+    server.focus = .None
+}
+
+// Stacks the client at `index` above every other.
+function raise(server: borrow mut Server, index: Number) {
+    var highest = 0
+    for client in server.clients {
+        if client.zOrder > highest { highest = client.zOrder }
+    }
+    if server.clients[index].zOrder < highest || server.clients.count == 1 {
+        server.clients[index].zOrder = highest + 1
+    }
+}
+
+function tellFocusOut(client: borrow Client) {
+    tell(client.channel, .FocusOut(client.surface))
+}
+
+function clearFocus(server: borrow mut Server) {
+    match server.focus {
+        Some(index) -> tellFocusOut(server.clients[index])
+        None -> {}
+    }
+    server.focus = .None
+    retarget(server)
+}
+
+function moveFocus(server: borrow mut Server, index: Number) {
+    let before = stageSnapshot(server)
+    clearFocus(server)
+    focusClient(server, index)
+    animateStage(server, before)
+}
+
+// Asks the port for one completion when the client at `index` has something
+// to read, or has gone.
+function armClient(server: borrow Server, index: Number) -> Result<Void, TesseraError> {
+    let channel = server.clients[index].channel
+    return objectWaitAsync(
+        channel,
+        Signals.readable | Signals.peerClosed,
+        .Once,
+        server.port,
+        Number(index + 1)
+    )
+}
+
+// Asks the port for one completion when a keyboard has records.
+function armKeyboard(
+    server: borrow Server,
+    keyboard: borrow HeldInput
+) -> Result<Void, TesseraError> {
+    return refWaitAsync(
+        keyboard.device,
+        DeviceEvents.readable,
+        .Once,
+        server.port,
+        UNumber(PortKey.keyboard + keyboard.serial)
+    )
+}
+
+// The clients handed at boot, each welcomed and configured.
+function bootClients(
+    reader: Handle,
+    links: borrow [ClientLink],
+    display: borrow Display
+) -> [Client] {
+    var clients: [Client] = []
+    for index in 0..links.count {
+        let link = links[index]
+        let alive = match beginClient(link.channel, UNumber(index + 1), display.scanout) {
+            Ok -> true
+            Error(reason) -> {
+                log warn("a boot client did not begin", reason)
+                false
+            }
+        }
+        clients.append(
+            Client {
+                channel: link.channel,
+                role: link.role,
+                surface: DisplaySurfaceId(UNumber(index + 1)),
+                frame: Geometry {
+                    x: 0,
+                    y: 0,
+                    width: display.scanout.pointWidth(),
+                    height: display.scanout.pointHeight()
+                },
+                zOrder: index,
+                alive: alive,
+                content: .None,
+            }
+        )
+    }
+    return clients
+}
+
+// A client's session ended: its frame leaves the screen, the platform hears of
+// it, and focus moves on.
+function clientEnded(server: borrow mut Server, index: Number) {
+    let before = stageSnapshot(server)
+    log info(
+        "a display client disconnected or sent an invalid frame",
+        surface: server.clients[index].surface.raw
+    )
+    server.clients[index].alive = false
+    forgetPointer(server, index)
+    dropContent(server, index)
+    tellPlatformSurfaceDestroyed(server, server.clients[index].surface)
+    relayoutStack(server)
+    if server.focus == .Some(index) {
+        clearFocus(server)
+        match topmostLiveClient(server) {
+            Some(next) -> focusClient(server, next)
+            None -> {}
+        }
+    }
+    animateStage(server, before)
+    redraw(server, "a closed window")
+}
+
+// The platform's session ended: its bar leaves the screen. The band is kept for
+// the platform PID 1 starts again, which takes it again.
+function platformEnded(server: borrow mut Server, index: Number) {
+    server.clients[index].alive = false
+    forgetPointer(server, index)
+    dropContent(server, index)
+    if server.platform == .Some(server.clients[index].channel) {
+        server.platform = .None
+        server.inputHeld = false
+    }
+}
+
+function serveClient(server: borrow mut Server, index: Number) {
+    let served = server.clients[index].role == .Platform
+    ? servePlatform(server, index) : serveApplication(server, index)
+    match served {
+        Ok -> {}
+        Error(reason) -> endedSession(server, index, reason)
+    }
+    // A client that was served and is still alive is listened to again.
+    if server.clients[index].alive {
+        match armClient(server, index) {
+            Ok -> {}
+            Error(reason) -> clientListenFailed(server, index, reason)
+        }
+    }
+}
+
+function clientListenFailed(server: borrow mut Server, index: Number, reason: borrow TesseraError) {
+    log warn("a client cannot be listened to", error: errorName(reason))
+    server.clients[index].alive = false
+}
+
+function endedSession(server: borrow mut Server, index: Number, reason: borrow SessionFailure) {
+    log info("a client session ended", surface: server.clients[index].surface.raw, reason)
+    if server.clients[index].role == .Platform { platformEnded(server, index) } else {
+        clientEnded(server, index)
+    }
+}
+
+// A keyboard has records. One that stops answering is closed, and the
+// machine goes on without it. Input off a keyboard is real hardware, and the
+// trusted path turns on that being the last thing that happened.
+function serveKeyboard(server: borrow mut Server, serial: Number) {
+    let index = match servingIndex(server.keyboards, serial) {
+        Some(value) -> value
+        // A keyboard already let go.
+        None -> return
+    }
+    let keyboard = server.keyboards[index]
+    match readKeyboard(server, keyboard.device) {
+        Ok -> armKeyboardAfterRead(server, index, keyboard)
+        Error(reason) -> keyboardStopped(server, index, reason)
+    }
+}
+
+function keyboardStopped(server: borrow mut Server, index: Number, reason: borrow TesseraError) {
+    log info("the keyboard stopped answering", error: errorName(reason))
+    loseKeyboard(server, index)
+}
+
+function armKeyboardAfterRead(
+    server: borrow mut Server,
+    index: Number,
+    keyboard: borrow HeldInput
+) {
+    match armKeyboard(server, keyboard) {
+        Ok -> {
+            server.lastInputHardware = true
+            return
+        }
+        Error(reason) -> keyboardListenFailed(reason)
+    }
+    loseKeyboard(server, index)
+}
+
+function keyboardListenFailed(reason: borrow TesseraError) {
+    log warn("the keyboard cannot be listened to", error: errorName(reason))
+}
+
+// The server for the clients handed at boot: each configured, the topmost
+// focused, the platform told of the rest, and the keyboard opened. With no
+// client to focus, as when the clients started again beside it have not said
+// hello, it serves unfocused until PID 1 links one.
+function startServer(
+    port: Handle,
+    reader: Handle,
+    links: borrow [ClientLink],
+    display: Display
+) -> Server {
+    let composer = makeComposer(display)
+    var server = Server {
+        port: port,
+        reader: reader,
+        clients: bootClients(reader, clientLinks(links), display),
+        presence: presenceLink(links),
+        display: move display,
+        focus: .None,
+        platform: .None,
+        mode: .Exclusive,
+        split: false,
+        grabbed: [],
+        systemPresent: false,
+        lastInputHardware: false,
+        pending: [],
+        composer: move composer,
+        composed: 0,
+    }
+    log info("compositing", mode: compositorModeName(server.mode))
+    for index in 0..server.clients.count {
+        if server.clients[index].alive {
+            match configureClient(server, index, Relayout.bootSerial) {
+                Ok -> {}
+                Error(reason) -> configurationFailed(server, index, reason)
+            }
+        }
+    }
+    match topmostLiveClient(server) {
+        Some(focused) -> {
+            for index in 0..server.clients.count {
+                if server.clients[index].alive && index != focused {
+                    tellFocusOut(server.clients[index])
+                }
+            }
+            focusClient(server, focused)
+        }
+        None -> log warn("no client to focus; serving until one is linked")
+    }
+    tellPlatformSurfaces(server)
+    for client in server.clients {
+        if server.platform.isNone() && isPlatform(client) {
+            server.platform = .Some(client.channel)
+            server.splashHeld = client.alive
+        }
+    }
+    startInput(server)
+    server.repeatTimer = makeRepeatTimer()
+    // The platform may have set its idle times while the output was still
+    // starting, before there was a timer to arm for them.
+    server.idleTimer = makeIdleTimer()
+    armIdle(server)
+    server.keymap = keymapNamed(settingValue(KeyboardSetting.layout, KeyboardSetting.fallback))
+    log info("keys are typed through a keymap", layout: server.keymap.name)
+    armSettingsWatch(server.settings, server.port, UNumber(PortKey.settings))
+    for index in 0..server.clients.count {
+        if server.clients[index].alive {
+            match armClient(server, index) {
+                Ok -> {}
+                Error(reason) -> clientListenFailed(server, index, reason)
+            }
+        }
+    }
+    listenPresence(server)
+    armLinks(server)
+    armOutputChange(server)
+    return server
+}
+
+function configurationFailed(
+    server: borrow mut Server,
+    index: Number,
+    reason: borrow SessionFailure
+) {
+    log warn(
+        "a surface could not be configured",
+        surface: server.clients[index].surface.raw,
+        reason
+    )
+    server.clients[index].alive = false
+}
+
+// Serves the clients, and those linked later, until the process is asked to
+// stop or its port fails; true when it was asked to.
+function runDisplayLoop(
+    port: Handle,
+    reader: Handle,
+    links: borrow [ClientLink],
+    display: Display
+) -> Result<Void, TesseraError> {
+    var server = startServer(port, reader, links, move display)
+    let asked = serve(server)
+    closeInput(server)
+    match server.repeatTimer {
+        Some(timer) -> closeHandle(timer)
+        None -> {}
+    }
+    match server.idleTimer {
+        Some(timer) -> closeHandle(timer)
+        None -> {}
+    }
+    match server.stageTimer {
+        Some(timer) -> closeHandle(timer)
+        None -> {}
+    }
+    match server.backdropTimer {
+        Some(timer) -> closeHandle(timer)
+        None -> {}
+    }
+
+    // `display.shown` is intentionally retained: it is the current scanout, and
+    // the display reads it until a later commit replaces it, whether or not
+    // the client that drew it is still there.
+    return asked
+}
+
+// How long a redraw waits behind completions still arriving, in
+// milliseconds, so a stream of input never holds the screen still.
+namespace RedrawPacing {
+    let longest: Number = 16
+}
+
+function serve(server: borrow mut Server) -> Result<Void, TesseraError> {
+    while true {
+        // A redraw waits for the flip in flight to land, which wakes the loop.
+        let drawable = server.redrawOwed && server.display.flipping.isNone()
+        let waited = drawable ? readyCompletion(server.port) : nextReady(server.port)
+        let ready = try waited
+        let completion = match ready {
+            Some(value) -> value
+            None -> {
+                flushRedraw(server)
+                continue
+            }
+        }
+        if drawable {
+            let now = try nowMillis()
+            let due = match server.redrawOwedSince {
+                Some(started) -> Number(now) - started >= RedrawPacing.longest
+                None -> true
+            }
+            if due { flushRedraw(server) }
+        }
+        match wakerOf(completion.key, server.clients.count) {
+            Stop -> {
+                log info("asked to stop")
+                return .Ok
+            }
+            Link -> arrived(server)
+            Client(index) -> serveClient(server, index)
+            Keyboard(serial) -> serveKeyboard(server, serial)
+            Pointer(serial) -> servePointer(server, serial)
+            Repeat -> repeatFired(server, completion)
+            Idle -> try idleFired(server, completion)
+            InputWatch -> inputWatchWoke(server)
+            Output -> outputChanged(server)
+            Stage -> stageTick(server, completion)
+            Home -> try homeTick(server, completion)
+            Backdrop -> try backdropFired(server)
+            Flip -> flipLanded(server, completion)
+            Presence -> servePresence(server)
+            Settings -> settingsChanged(server)
+            Unknown -> log warn("a completion no wait was made for", key: completion.key)
+        }
+    // A session that ends leaves the server serving: PID 1 starts a
+    // client kept running again, or a dev root restarts it, and its new
+    // link arrives here.
+    }
+    return .Ok
+}
+
+// Returns only once the process is asked to stop, because a display server
+// that exits gives the screen back. Anything else `port` still completes is
+// left over from the clients' session.
+function holdTheDisplay(port: Handle) -> Result<Void, TesseraError> {
+    while true {
+        match nextCompletion(port) {
+            Ok(completion) -> {
+                if Number(completion.key) == PortKey.stop {
+                    log info("asked to stop")
+                    return .Ok
+                }
+            }
+            Error(reason) -> return holdDisplayWithoutPort(reason)
+        }
+    }
+
+}
+
+function holdDisplayWithoutPort(reason: borrow TesseraError) -> Result<Void, TesseraError> {
+    log warn("the loop's port failed; holding the display without it", error: errorName(reason))
+    return sleepForever()
+}
+// Holds the process, and with it the display, for good.
+function sleepForever() -> Result<Void, TesseraError> {
+    while true {
+        match threadSleep(Number(Deadline.infinite)) {
+            Ok -> {}
+            Error(reason) -> return .Error(reason)
+        }
+    }
+    return .Ok
+}

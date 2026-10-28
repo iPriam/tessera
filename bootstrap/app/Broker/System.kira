@@ -1,0 +1,297 @@
+import Foundation
+import Heap
+import LibTessera
+
+// System channels (roadmap/16-libtessera.md §12).
+//
+// A process's System channel is one connection to the broker that it keeps
+// for as long as it runs. Its messages are ordinary Channel messages: the
+// §10.3 header and body, and the handles the library carries beside them.
+// Requests are `System/connectService` and `System/listServices`; every
+// answer carries its request's transaction id, so an event the broker
+// sends between them is never taken for one.
+//
+// The first message on a connection says which kind it is, and
+// `brokerReceive` tells the broker: a Channel message is a System
+// channel, anything else the check-in wire.
+
+namespace SystemMethod {
+    let connectService: String = "System/connectService"
+    let listServices: String = "System/listServices"
+    let attach: String = "System/attach"
+}
+
+namespace SystemWire {
+    // The §10.3 version every message carries.
+    let version: Number = 1
+    // An `Error` answer's body: the code, the subsystem and the detail.
+    let errorBytes: Number = 16
+    // `connectService`'s answer: the client's end rides as handle 0.
+    let connectedBytes: Number = 8
+}
+
+// What a program asks on its System channel.
+enum SystemRequest {
+    ListServices
+    // `attach` only says what the connection is, which joining the broker's
+    // System channels already did.
+    Attach
+    ConnectService(String)
+    // A `connectService` whose name is missing or too long.
+    Malformed
+    Unsupported
+}
+
+// The request in a System channel message, given its header and its body.
+function systemRequest(header: borrow MessageHeader, body: borrow Buffer) -> SystemRequest {
+    if header.ordinal == wireOrdinal(SystemMethod.listServices) { return .ListServices }
+    if header.ordinal == wireOrdinal(SystemMethod.attach) { return .Attach }
+    if header.ordinal != wireOrdinal(SystemMethod.connectService) { return .Unsupported }
+    if body.length < 8 { return .Malformed }
+    let length = Number(heapLoad<U64>(body.address, 0))
+    if length == 0 || length > CheckInWire.nameBytes || 8 + length > body.length {
+        return .Malformed
+    }
+    return .ConnectService(stringFromCBytes(heapOffset(body.address, 8), length))
+}
+
+// One Channel message on `system`: `header`, `body`, and `passed` as its one
+// handle if there is one.
+function sendSystemMessage(
+    system: Handle,
+    header: borrow MessageHeader,
+    body: borrow Buffer,
+    passed: borrow Handle?
+) -> Result<Void, TesseraError> {
+    let headerBytes = Wire.headerBytes
+    let size = headerBytes + body.length
+    let blockBytes = zeroedBlock(count: size, alignment: 16)
+    let block = Buffer { address: blockBytes.pointer(), length: size }
+    try wireHeaderWrite(block, header)
+    if body.length > 0 {
+        copyBytes(heapOffset(block.address, headerBytes), body.address, body.length)
+    }
+    var handles: [Handle] = []
+    match passed {
+        Some(handle) -> handles.append(handle)
+        // A message with no handle carries none.
+        None -> {}
+    }
+    return channelWrite(system, block, handles)
+}
+
+function answerHeader(txid: Number, ordinal: Number, flags: MessageFlags) -> MessageHeader {
+    return MessageHeader { txid: txid, ordinal: ordinal, flags: flags, version: SystemWire.version }
+}
+
+// Sends an answer; one that cannot be sent is said, and the program that
+// asked finds out when its channel closes or its request times out.
+function answer(
+    system: Handle,
+    header: borrow MessageHeader,
+    body: borrow Buffer,
+    passed: borrow Handle?
+) {
+    match sendSystemMessage(system, header, body, passed) {
+        // Sent; the program reads its answer from its own channel.
+        Ok -> {}
+        Error(failed) -> log warn("cannot answer a System channel", error: errorName(failed))
+    }
+}
+
+// An answer that is an `Error`: its code, subsystem LibTessera, no detail.
+function refuse(system: Handle, txid: Number, ordinal: Number, code: borrow ErrorCode) {
+    let bodyBytes = zeroedBlock(count: SystemWire.errorBytes, alignment: 16)
+    let body = Buffer { address: bodyBytes.pointer(), length: SystemWire.errorBytes }
+    heapStore<U32>(body.address, 0, code.rawValue())
+    answer(
+        system,
+        answerHeader(txid, ordinal, MessageFlags.response | MessageFlags.error),
+        body,
+        .None
+    )
+}
+
+function refuseConnect(request: borrow ConnectRequest, code: borrow ErrorCode) {
+    refuse(request.client.channel, request.txid, wireOrdinal(SystemMethod.connectService), code)
+}
+
+// `connectService`'s answer: the client's end of the channel, as handle 0.
+function answerConnected(request: borrow ConnectRequest, passed: Handle) {
+    let bodyBytes = zeroedBlock(count: SystemWire.connectedBytes, alignment: 16)
+    let body = Buffer { address: bodyBytes.pointer(), length: SystemWire.connectedBytes }
+    answer(
+        request.client.channel,
+        answerHeader(request.txid, wireOrdinal(SystemMethod.connectService), MessageFlags.response),
+        body,
+        .Some(passed)
+    )
+}
+
+function padded(length: Number) -> Number { return trunc((length + 7) / 8) * 8 }
+
+// A §10.3 `String` at `offset`: its length, then its bytes padded to 8; the
+// offset after it.
+function encodeString(block: RawPtr, offset: Number, text: borrow String) -> Number {
+    let length = text.count
+    heapStore<U64>(block, offset, UNumber(length))
+    copyBytes(heapOffset(block, offset + 8), text.data, length)
+    return offset + 8 + padded(length)
+}
+
+// `listServices`'s answer: `Vector<ServiceInfo { name: String,
+// requiredEntitlement: Optional<String> }>`.
+function answerServiceList(system: Handle, txid: Number, services: borrow [OfferedService]) {
+    var size = 8
+    for service in services {
+        size += 8 + padded(service.name.count) + 8
+        match service.entitlement {
+            Some(entitlement) -> size += 8 + padded(entitlement.count)
+            // An absent entitlement is its tag alone.
+            None -> {}
+        }
+    }
+    let bodyBytes = zeroedBlock(count: size, alignment: 16)
+    let block = bodyBytes.pointer()
+    heapStore<U64>(block, 0, UNumber(services.count))
+    var offset = 8
+    for service in services {
+        offset = encodeString(block, offset, service.name)
+        match service.entitlement {
+            Some(entitlement) -> {
+                heapStore<U64>(block, offset, UNumber(1))
+                offset = encodeString(block, offset + 8, entitlement)
+            }
+            None -> offset += 8
+        }
+    }
+    answer(
+        system,
+        answerHeader(txid, wireOrdinal(SystemMethod.listServices), MessageFlags.response),
+        Buffer { address: block, length: offset },
+        .None
+    )
+}
+
+extend Broker {
+    // A newcomer whose first message was a Channel message: it joins the
+    // System channels, and that message and whatever followed it are
+    // answered.
+    function becomeSystem(borrow mut self, newcomer: Peer, block: RawPtr, bytes: Number) {
+        log info(
+            "a program holds a System channel",
+            program: programName(newcomer.program),
+            process: newcomer.process
+        )
+        systems.append(move newcomer)
+        let index = systems.count - 1
+        answerSystem(index, block, bytes)
+        // Whatever else it sent behind the first.
+        readSystem(index)
+    }
+
+    // One request on a System channel, `bytes` long in `block`.
+    function answerSystem(borrow mut self, index: Number, block: RawPtr, bytes: Number) {
+        let message = Buffer { address: block, length: bytes }
+        let header = match wireHeaderRead(message) {
+            Ok(value) -> value
+            Error(failed) -> {
+                // Too short to say what it asks or whom to answer.
+                absorb failed
+                return
+            }
+        }
+        let headerBytes = Wire.headerBytes
+        let body = Buffer { address: heapOffset(block, headerBytes), length: bytes - headerBytes }
+        let system = systems[index]
+        match systemRequest(header, body) {
+            ListServices -> answerServiceList(system.channel, header.txid, services)
+            Attach -> answer(
+                system.channel,
+                answerHeader(header.txid, header.ordinal, MessageFlags.response),
+                Buffer { address: block, length: 0 },
+                .None
+            )
+            ConnectService(name) -> connect(
+                ConnectRequest { client: system, txid: header.txid },
+                name
+            )
+            Malformed -> refuse(system.channel, header.txid, header.ordinal, .InvalidArgument)
+            Unsupported -> refuse(system.channel, header.txid, header.ordinal, .Unsupported)
+        }
+    }
+
+    // Reads everything the System channel at `index` sent, then waits for
+    // more, or closes it once it has closed.
+    function readSystem(borrow mut self, index: Number) {
+        let blockBytes = zeroedBlock(count: CheckInWire.messageBytes, alignment: 16)
+        let block = blockBytes.pointer()
+        let channel = systems[index].channel
+        while true {
+            let received = match receiveBrokerMessage(channel, block) {
+                Ok(value) -> value
+                Error(failed) -> {
+                    if isStillOpen(failed) {
+                        arm(channel, systems[index].key)
+                    } else {
+                        dropSystem(index)
+                    }
+                    return
+                }
+            }
+            match received.kind {
+                ChannelMessage -> answerSystem(index, block, received.bytes)
+                // A check-in message on a System channel means nothing.
+                CheckInWire -> {}
+            }
+        }
+    }
+
+    // Closes the System channel at `index` and forgets it.
+    function dropSystem(borrow mut self, index: Number) {
+        var holding: [Peer] = []
+        for (position, system) in systems.enumerated() {
+            if position == index {
+                forgetWaiting(system.channel)
+                release(system.channel)
+            } else {
+                holding.append(system)
+            }
+        }
+        systems = holding
+    }
+
+    // A service's `Post`: its event, as a Channel message with no
+    // transaction, on every System channel whose program holds the
+    // entitlement.
+    function post(borrow self, service: Number, event: borrow PostedEvent) {
+        if !services[service].mayPost(event.ordinal) {
+            log warn(
+                "a service may not post that event; it was dropped",
+                service: services[service].name,
+                ordinal: event.ordinal
+            )
+            return
+        }
+        let header = MessageHeader {
+            txid: 0,
+            ordinal: event.ordinal,
+            flags: MessageFlags.event,
+            version: SystemWire.version
+        }
+        var told = 0
+        for system in systems {
+            if holds(system.program, event.entitlement) {
+                match sendSystemMessage(system.channel, header, event.body, .None) {
+                    Ok -> told++
+                    Error(failed) -> log warn(
+                        "cannot tell a program of an event",
+                        program: programName(system.program),
+                        error: errorName(failed)
+                    )
+                }
+            }
+        }
+        log info("a service posted an event", service: services[service].name, channels: told)
+    }
+}

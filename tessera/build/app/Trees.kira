@@ -1,0 +1,18 @@
+import Foundation
+
+// The modes and paths the build's trees are made with.
+
+namespace FileMode {
+    // `chmod 755`: what runs, and every directory.
+    let program: UNumber = 493
+    // `chmod 644`: what is read.
+    let data: UNumber = 420
+}
+
+// The directory holding `path`.
+function parentOf(path: borrow String) -> String {
+    match path.lastIndexOf("/") {
+        Some(slash) -> return slash == 0 ? "/" : path.substring(0, slash)
+        None -> return ""
+    }
+}

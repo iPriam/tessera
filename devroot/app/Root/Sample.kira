@@ -1,0 +1,133 @@
+import Foundation
+import Heap
+import LibTessera
+
+// `sample <seconds> <hz>`: every CPU sampled, written to `samples` on the
+// request's volume for the host to read back and name:
+//
+//     lost <count>
+//     process <pid> <name>
+//     counter <pid> <count> <total> <least> <most> <name>   what `traceCounter` summed
+//
+// to `maps` each process's /proc maps as the kernel wrote them, each after a
+// `pid <pid>` line, and to `kernel` the kernel's `<address> <name>` lines;
+// both whole, since building megabytes of text a line at a time copies it
+// at every line.
+//
+// and the stacks, innermost frame first as the kernel gives them, to
+// `stacks` as words (`stackWords`); beside them, where threads blocked
+// (`blocks`) and when they came back (`resumes`), the same way.
+
+namespace SampleRequest {
+    let file: String = "samples"
+    let mapsFile: String = "maps"
+    let kernelFile: String = "kernel"
+    let stackFile: String = "stacks"
+    let blockFile: String = "blocks"
+    // Threads switched back in; the last two are the sampled span's start
+    // and end.
+    let resumeFile: String = "resumes"
+    let seconds: Number = 3
+    let hz: Number = 997
+}
+
+function writeSamples(files: borrow Files, line: borrow String) -> Result<Void, RootFailure> {
+    let words = line.trim().split(" ")
+    var seconds = SampleRequest.seconds
+    var hz = SampleRequest.hz
+    if words.count >= 2 {
+        match words[1].toNumber() {
+            Some(value) -> seconds = value
+            None -> {}
+        }
+    }
+    if words.count >= 3 {
+        match words[2].toNumber() {
+            Some(value) -> hz = value
+            None -> {}
+        }
+    }
+    log info("sampling the machine", seconds, hz)
+    let samples = match sampleMachine(seconds, hz) {
+        Ok(value) -> value
+        Error(failed) -> return .Error(.Storage(failed))
+    }
+    var text = "lost \(samples.lost)\n"
+    var maps = ""
+    for process in samples.processes {
+        text.append("process \(process.pid) \(process.name)\n")
+        maps.append("pid \(process.pid)\n" + process.maps + "\n")
+    }
+    for counter in samples.counters {
+        text.append(
+            "counter \(counter.pid) \(counter.count) \(counter.total) \(counter.least) \(counter.most) \(counter.name)\n"
+        )
+    }
+    log info(
+        "sampled the machine",
+        stacks: samples.stacks.count,
+        blocks: samples.blocks.count,
+        resumes: samples.resumes.count,
+        processes: samples.processes.count
+    )
+    try storeText(files, SampleRequest.file, text)
+    try storeText(files, SampleRequest.mapsFile, maps)
+    try storeText(files, SampleRequest.kernelFile, samples.kernelSymbols)
+    try storeStacks(files, SampleRequest.stackFile, samples.stacks)
+    try storeStacks(files, SampleRequest.blockFile, samples.blocks)
+    var resumes: [SampledStack] = []
+    for resume in samples.resumes {
+        resumes.append(
+            SampledStack { pid: resume.pid, tid: resume.tid, time: resume.time, frames: [] }
+        )
+    }
+    resumes.append(SampledStack { pid: 0, tid: 0, time: samples.began, frames: [] })
+    resumes.append(SampledStack { pid: 0, tid: 0, time: samples.ended, frames: [] })
+    return storeStacks(files, SampleRequest.resumeFile, resumes)
+}
+
+function storeText(
+    files: borrow Files,
+    name: borrow String,
+    text: borrow String
+) -> Result<Void, RootFailure> {
+    match files.writeText("\(RequestVolume.path)/\(name)", text) {
+        Ok -> return .Ok
+        Error(failed) -> return .Error(.Storage(failed))
+    }
+}
+
+function storeStacks(
+    files: borrow Files,
+    name: String,
+    stacks: borrow [SampledStack]
+) -> Result<Void, RootFailure> {
+    var words: Number = 0
+    for stack in stacks { words += 4 + stack.frames.count }
+    let block = stackWords(stacks, words)
+    let written = Buffer { address: block.pointer(), length: words * 8 }
+    match files.store("\(RequestVolume.path)/\(name)", written, false) {
+        Ok -> return .Ok
+        Error(failed) -> return .Error(.Storage(failed))
+    }
+}
+
+// The stacks as `words` words, which take far less time to write than the
+// tens of frames of each as text: per stack its pid, its tid, its time, its
+// frame count and then its frames.
+function stackWords(stacks: borrow [SampledStack], words: Number) -> ByteBlock {
+    let block = zeroedBlock(count: max(words * 8, 8), alignment: 16)
+    var at: Number = 0
+    for stack in stacks {
+        heapStore<U64>(block.pointer(), at, U64(stack.pid))
+        heapStore<U64>(block.pointer(), at + 8, U64(stack.tid))
+        heapStore<U64>(block.pointer(), at + 16, stack.time)
+        heapStore<U64>(block.pointer(), at + 24, U64(stack.frames.count))
+        at += 32
+        for frame in stack.frames {
+            heapStore<U64>(block.pointer(), at, frame)
+            at += 8
+        }
+    }
+    return move block
+}

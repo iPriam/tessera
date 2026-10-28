@@ -1,0 +1,13 @@
+//! Disk Utility: the volumes mounted in /Volumes, and whether each can be
+//! written.
+//!
+//! Kira UI draws it and puts it on Tessera's display.
+/// The Disk Utility app package: the volumes mounted in /Volumes, and whether each can be written.
+construct DiskUtilityApp extends Package {
+    let version: String = "0.1.0"
+    let kind: PackageKind = .App
+    // Its icon, light and dark, which the platform shows wherever the
+    // application is.
+    let assets: [String] = ["Resources/AppIcon.tessicon"]
+    let moduleRoot: String = "DiskUtility"
+}

@@ -1,0 +1,114 @@
+//! Reads expression text into the [`Token`] list the parser evaluates.
+//!
+//! A number is a run of digits with at most one decimal point. Spaces separate
+//! tokens and add none. Any other character that is not an operator or a
+//! bracket is malformed.
+
+import Foundation
+
+/// The characters a number is written with.
+///
+/// Foundation has no digit test, so the digits are listed here.
+namespace Numerals {
+    /// The ten decimal digits, `0` to `9`.
+    let digits: String = "0123456789"
+}
+
+/// Reads the tokens of an expression, left to right.
+///
+/// A space produces no token. Stops at the first character that cannot start
+/// a token and returns its failure.
+///
+/// # Errors
+///
+/// Returns `.Malformed` for an unknown character or a number with more than
+/// one point, `.TooManyDecimals` or `.Overflow` for a literal outside the
+/// limits in `CalcLimit`, and `.Malformed` when a literal does not convert.
+function tokenize(text: borrow String) -> Result<[Token], CalculationFailure> {
+    var tokens: [Token] = []
+    var index: Number = 0
+    while true {
+        if index >= text.count { break }
+        match lexemeAt(text, index) {
+            Ok(lexeme) -> {
+                let (token, next) = lexeme
+                index = next
+                match token {
+                    Some(found) -> { tokens.append(found) }
+                    // A space adds no token.
+                    None -> {}
+                }
+            }
+            Error(failure) -> { return .Error(failure) }
+        }
+    }
+    return .Ok(tokens)
+}
+
+/// Reads the token that starts at `index`, and the index just after it.
+///
+/// The token is `.None` for a space, which is skipped.
+///
+/// # Errors
+///
+/// Returns `.Malformed` when the character at `index` starts no token, or the
+/// errors of [`scanNumber`] for a number.
+function lexemeAt(text: borrow String, index: Number) -> Result<(
+    Token?, Number
+), CalculationFailure> {
+    let character = slice(text, index, index + 1)
+    if Numerals.digits.contains(character) || character == "." {
+        return scanNumber(text, index)
+    }
+    if character == " " {
+        return .Ok((.None, index + 1))
+    }
+    match punctuation(character) {
+        Some(token) -> { return .Ok((.Some(token), index + 1)) }
+        None -> { return .Error(.Malformed) }
+    }
+}
+
+/// The token a one-character operator or bracket stands for, or `.None`.
+function punctuation(character: borrow String) -> Token? {
+    match character {
+        "(" -> { return .Some(.Open) }
+        ")" -> { return .Some(.Close) }
+        "+" -> { return .Some(.Operation(.Add)) }
+        "-" -> { return .Some(.Operation(.Subtract)) }
+        "*" -> { return .Some(.Operation(.Multiply)) }
+        "/" -> { return .Some(.Operation(.Divide)) }
+        "%" -> { return .Some(.Percent) }
+        else -> { return .None }
+    }
+}
+
+/// Reads the number that starts at `start`, and the index just after it.
+///
+/// # Errors
+///
+/// Returns `.Malformed` for more than one point, or for text that does not
+/// convert to a `Number`. Returns `.TooManyDecimals` when the fraction has more
+/// than 18 digits, and `.Overflow` when the integer part has more than 19.
+function scanNumber(text: borrow String, start: Number) -> Result<(
+    Token?, Number
+), CalculationFailure> {
+    var end = start
+    while true {
+        if end >= text.count { break }
+        let character = slice(text, end, end + 1)
+        if !Numerals.digits.contains(character) && character != "." { break }
+        end = end + 1
+    }
+    let literal = slice(text, start, end)
+    let parts = literal.split(".")
+    if parts.count > 2 { return .Error(.Malformed) }
+    if parts[0].count > CalcLimit.integerDigits { return .Error(.Overflow) }
+    if parts.count == 2 && parts[1].count > CalcLimit.decimalPlaces {
+        return .Error(.TooManyDecimals)
+    }
+    match literal.toNumber() {
+        Some(value) -> { return .Ok((.Some(.Literal(value)), end)) }
+        None -> { return .Error(.Malformed) }
+    }
+}

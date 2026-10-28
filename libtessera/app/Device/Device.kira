@@ -1,0 +1,194 @@
+import Foundation
+import Heap
+
+// Devices (§16.2, `Device.list`), as the Devices service finds them (17
+// §25): it reads the DeviceKit registry and answers with the devices of a
+// class the caller may use, the first being the default.
+//
+// A device id is `(class + 1) << 48` over a class-local number: the IIO
+// device and sensor kind (`n << 8 | kind`), the ALSA card and device
+// (`card << 8 | device`), or the `videoN` / `eventN` number.
+//
+// The service's answer to `List` is one 184-byte record per device: `id`
+// @0, `class` @8, `subKind` @12, `flags` @16, the capability length @20, the
+// name @24 and vendor @88 (64 bytes each, NUL-padded), and the capabilities
+// @152 (32 bytes).
+
+// What kind of device a record is about.
+@Derive(Copy)
+public enum DeviceClass: U32 {
+    Sensor = 0
+    AudioInput = 1
+    AudioOutput = 2
+    Camera = 3
+    Haptic = 4
+}
+
+// `DeviceInfo.flags`.
+@Derive(Copy)
+public distinct DeviceFlags = UNumber
+
+public namespace DeviceFlags {
+    let none: DeviceFlags = DeviceFlags(0)
+    let systemDefault: DeviceFlags = DeviceFlags(1)
+    let removable: DeviceFlags = DeviceFlags(2)
+    let wakeupCapable: DeviceFlags = DeviceFlags(4)
+}
+
+// A sensor's `DeviceInfo.subKind`.
+@Derive(Copy)
+public enum SensorKind: U32 {
+    Accelerometer = 0
+    Gyroscope = 1
+    Magnetometer = 2
+    Barometer = 3
+    AmbientLight = 4
+    Proximity = 5
+    Gravity = 6
+    LinearAcceleration = 7
+    RotationVector = 8
+    StepCounter = 9
+    StepDetector = 10
+    Temperature = 11
+    Humidity = 12
+    HeartRate = 13
+    // The fold angle.
+    Hinge = 14
+    Orientation = 15
+    // A motion trigger.
+    Significant = 16
+}
+
+// `Stream.control` requests for cameras.
+@Derive(Copy)
+public enum CameraControl: U32 {
+    Focus = 0
+    Exposure = 1
+    Zoom = 2
+    Torch = 3
+}
+
+// `Stream.control` requests for haptics.
+@Derive(Copy)
+public enum HapticControl: U32 {
+    Intensity = 0
+}
+
+// The kinds `tessera.sensors.motion` covers; `tessera.sensors.environment`
+// covers the rest.
+let motionSensors: [SensorKind] = [.Accelerometer, .Gyroscope, .Gravity, .LinearAcceleration, .RotationVector, .StepCounter, .StepDetector, .Significant]
+
+// What a class (and, for sensors, the kind) needs held.
+function deviceEntitlement(deviceClass: borrow DeviceClass, subKind: U32) -> String {
+    match deviceClass {
+        AudioInput -> return "tessera.audio.capture"
+        AudioOutput -> return "tessera.audio.playback"
+        Camera -> return "tessera.camera"
+        Haptic -> return "tessera.haptics"
+        Sensor -> {
+            if caseWithCode(motionSensors, subKind).isSome() { return "tessera.sensors.motion" }
+            return "tessera.sensors.environment"
+        }
+    }
+}
+
+function deviceClassEntitled(deviceClass: borrow DeviceClass) -> Bool {
+    match deviceClass {
+        Sensor -> return entitlementHeld("tessera.sensors.motion") || entitlementHeld(
+            "tessera.sensors.environment"
+        )
+        AudioInput, AudioOutput, Camera, Haptic -> return entitlementHeld(
+            deviceEntitlement(deviceClass, U32(0))
+        )
+    }
+}
+
+// `Vector<DeviceInfo>`.
+public function deviceList(
+    deviceClass: DeviceClass,
+    out: borrow Buffer,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    let target = try portTarget(port)
+    if !deviceClassEntitled(deviceClass) {
+        portComplete(
+            target,
+            key,
+            .Error(failureIn(.NotEntitled, .Devices)),
+            .Stream,
+            U64(0),
+            U64(0),
+            U64(0)
+        )
+        return .Ok
+    }
+    let connection = match serviceConnectFd("tessera.devices") {
+        Ok(value) -> value
+        Error(failed) -> {
+            portComplete(
+                target,
+                key,
+                .Error(failureIn(.DeviceLost, .Devices)),
+                .Stream,
+                U64(0),
+                U64(0),
+                U64(0)
+            )
+            return .Ok
+        }
+    }
+    let answer = deviceCall(connection, .None, .List, U64(code(deviceClass)), nullPointer(), U64(0))
+    kernelRelease(connection)
+    let reply = match answer {
+        Ok(value) -> value
+        Error(failed) -> {
+            portComplete(target, key, .Error(failed), .Stream, U64(0), U64(0), U64(0))
+            return .Ok
+        }
+    }
+    match deviceMessageError(reply) {
+        Ok -> {}
+        Error(failed) -> {
+            deviceMessageRelease(reply)
+            portComplete(target, key, .Error(failed), .Stream, U64(0), U64(0), U64(0))
+            return .Ok
+        }
+    }
+    let count = reply.length / deviceRecordBytes
+    encodeReset()
+    encodeU64(count)
+    for index in 0..count {
+        let record = heapOffset(reply.payload, Number(U64(index) * deviceRecordBytes))
+        encodeU64(heapLoad<U64>(record, 0))
+        encodeU32(heapLoad<U32>(record, 8))
+        encodeU32(heapLoad<U32>(record, 12))
+        encodeString(deviceRecordText(record, U64(24)))
+        encodeString(deviceRecordText(record, U64(88)))
+        if heapLoad<U32>(record, 20) == 32 {
+            encodeBytes(heapOffset(record, 152), U64(32))
+        } else {
+            encodeU64(U64(0))
+        }
+        encodeU32(heapLoad<U32>(record, 16))
+        encodeAlign(8)
+    }
+    deviceMessageRelease(reply)
+    match encodeDeliver(out) {
+        Ok(size) -> portComplete(target, key, .Ok, .Stream, size, U64(0), U64(0))
+        Error(failed) -> portComplete(target, key, .Error(failed), .Stream, U64(0), U64(0), U64(0))
+    }
+    encodeReset()
+    return .Ok
+}
+
+let deviceRecordBytes: U64 = U64(184)
+
+// A NUL-padded 64-byte field of a record.
+function deviceRecordText(record: RawPtr, at: U64) -> String {
+    var length = U64(0)
+    while length < U64(64) && heapLoad<U8>(record, at + length) != U8(0) {
+        length = length + U64(1)
+    }
+    return stringFromCBytes(heapOffset(record, at), length)
+}

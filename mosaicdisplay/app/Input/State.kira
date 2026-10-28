@@ -1,0 +1,213 @@
+import Foundation
+import LibTessera
+import DeviceKit
+import TesseraDisplayClient
+
+// The display server sleeps on every source of work at once. There is no timer
+// driving frames: a client that does not ask for one causes no GPU work and no
+// page flip. Input remains live while the client is idle.
+
+// Where a surface sits on the output.
+struct Geometry {
+    var x: Number
+    var y: Number
+    var width: Number
+    var height: Number
+}
+
+struct Client {
+    var channel: Handle
+    var role: DisplayRole
+    var surface: DisplaySurfaceId
+    var frame: Geometry
+    var zOrder: Number
+    var alive: Bool
+    // The last frame the client committed, kept until a later one replaces it
+    // and the screen no longer shows it.
+    var content: Content?
+    // The frame `content` replaced, kept until the flip after the one that
+    // replaced it (`keepReplaced`).
+    var replaced: Content? = .None
+    // The home screen's icon the application was last opened from, which it
+    // flies back into going home; none once it was opened from the Dock.
+    var homeIcon: DisplayStageBadge? = .None
+    // The textures it draws into in turn, imported once (Slots.kira).
+    var slots: [Content?] = []
+    // The platform took the surface off the screen.
+    var hidden: Bool = false
+    // How far round its window the client's buffers reach, for the shadow it
+    // draws there; the window is `frame`.
+    var margin: Number = 0
+    // The radius of the window's corners, which it is clipped to and its
+    // shadow is cast round; nothing for a surface that is not a window.
+    var corner: Number = 0
+    // Where the platform draws over the surface, as the client was last told.
+    var insets: SurfaceInsets = SurfaceInsets {}
+    // The pieces of glass the client asked for under its surface, drawn
+    // over what is composed below it.
+    var glass: [DisplayGlass] = []
+    var badges: [DisplayStageBadge] = []
+    // The margin and the glass the client set since its last commit, which
+    // that commit makes take effect with the picture drawn for them.
+    var staged: StagedSurface = StagedSurface {}
+    // Where the client is in its frame exchange.
+    var exchange: FrameExchange = .Idle
+    // Where the person left the window while windows were freeform, kept
+    // while another mode lays it out and given back when freeform returns,
+    // as a Mac gives every window back its place on leaving Stage Manager.
+    var windowFrame: Geometry? = .None
+    var stageFrame: Geometry? = .None
+}
+
+// The server's state while it composites: its ports, the display, its
+// clients and who has focus, the mode the platform set, the keys the platform
+// grabbed, the trusted path's two facts and the keyboard.
+struct Server {
+    var port: Handle
+    var reader: Handle
+    var display: Display
+    var clients: [Client]
+    var focus: Number?
+    // The platform session at boot, which channel values and grabbed keys go to.
+    var platform: Handle?
+    var mode: CompositorMode
+    var split: Bool
+    var grabbed: [UNumber]
+    var systemPresent: Bool
+    var lastInputHardware: Bool
+    var pending: [PendingKey]
+    // The interaction tokens minted for hardware presses still live (Tokens.kira).
+    var tokens: [MintedToken] = []
+    // The Presence service's link, which asks whether a token may be acted on
+    // (Presence.kira). None until the service has one.
+    var presence: Handle? = .None
+    // What draws a picture no one surface covers. None on a machine with no
+    // device for it.
+    var composer: Composer?
+    // Composed pictures shown, which picks the image the next is drawn into.
+    var composed: Number
+    var stageMotion: [StageMotion] = []
+    // A window swiped home, or flying into its icon or out of it, and the
+    // timer its flight is drawn by (HomeFlight.kira).
+    var homeFlight: HomeFlight? = .None
+    var homeTimer: Handle? = .None
+    // The icon the home screen last opened an application from, which the
+    // application grows out of.
+    var launchOrigin: LaunchOrigin? = .None
+    var stageStarted: UNumber = 0
+    var stageTimer: Handle? = .None
+    // When the stage's motion last moved on, and how long it has been held
+    // for the windows resized on the way to draw themselves.
+    var stageTicked: UNumber = 0
+    var stageHeld: UNumber = 0
+    // The height of the band along the top of the output the platform's bar
+    // takes, which no other surface is configured into; 0 when the platform
+    // draws no bar.
+    var bar: Number = 0
+    // Where the pointer is on the output, and what it did since the last
+    // input frame.
+    var pointerX: Number = 0
+    var pointerY: Number = 0
+    var pointing: PendingPointer = PendingPointer {}
+    // Whether the composed cursor moved since the picture was last composed:
+    // every record the pointer has ready is taken before it is drawn once.
+    var cursorOwed: Bool = false
+    // Whether the screen owes a redraw, and since when: it is made once the
+    // loop has taken every completion ready, so a burst of messages is
+    // composed once, or `RedrawPacing.longest` after it was owed (Loop.kira).
+    var redrawOwed: Bool = false
+    var redrawOwedSince: Number? = .None
+    var redrawReason: String = ""
+    var pacing: Pacing = Pacing {}
+    // The frames clients committed that the owed redraw shows, told done
+    // once it is on the screen (Exchange.kira).
+    var framesOwed: [OwedFrame] = []
+    // How many frames the platform and the home screen have committed, and
+    // the home screen's icon it was last told a window flies out of or into
+    // (HomeFlight.kira).
+    var platformFrames: Number = 0
+    var homeScreenFrames: Number = 0
+    var homeScreenIcon: Geometry? = .None
+    // The frames, and the contents let go of, the flip in flight is waited
+    // for: told done, or released, once it lands (Windows.kira).
+    var framesFlipping: [OwedFrame] = []
+    var releasing: [Content] = []
+    var releasingFlip: [Content] = []
+    // Whether the flip in flight sets a new mode, after which the targets
+    // made for the old one are let go of.
+    var modesetFlipping: Bool = false
+    // The height of the band along the bottom of the output the platform's
+    // dock takes; 0 when it draws none.
+    var dock: Number = 0
+    // The band along the bottom Stage Manager lays its windows and its strip
+    // out above: the dock's, as it was when the stage began. A dock that
+    // comes up over the stage and goes again, as an iPad's does, leaves the
+    // windows and the strip where they are.
+    var stageFloor: Number = 0
+    // The part of the output the platform draws over the applications, its
+    // banners, which the pointer over goes to it; empty while it draws none.
+    var overlay: DisplayOverlay = DisplayOverlay { x: 0, y: 0, width: 0, height: 0 }
+    // How many pointer buttons are down, the client the first went down on,
+    // which hears the pointer until the last comes up, and the client the
+    // pointer goes to now (Windows.kira).
+    var buttonsDown: Number = 0
+    // The buttons down, by code, and whether a dropped report means the
+    // device is asked which it holds once its records are read (Pointer.kira).
+    var buttonsHeld: [UNumber] = []
+    var pointerResync: Bool = false
+    var pressedOn: Number? = .None
+    var pointerOver: Number? = .None
+    // A window the person is dragging by its title bar.
+    var moving: Moving? = .None
+    // A window the person is dragging by an edge or a corner (Resize.kira).
+    var resizing: Resizing? = .None
+    // The shape the cursor has (CursorShapes.kira).
+    var cursorShape: CursorShape = .Arrow
+    // Whether the platform holds the keyboard and the pointer, with focus
+    // left on the window in front (`HoldInput`).
+    var inputHeld: Bool = false
+    // Whether the splash stays until the platform has drawn: true at boot
+    // when one of the clients PID 1 handed over is the platform.
+    var splashHeld: Bool = false
+    // The keymap keys are typed through, the modifier keys held down and the
+    // modifiers they make (Keymap.kira).
+    var keymap: Keymap = Keymaps.us
+    // The System channel, on which a change to the keyboard layout arrives.
+    var settings: SettingsWatch = settingsWatch()
+    var modifiersDown: [UNumber] = []
+    var modifiers: DisplayModifiers = DisplayModifiers {}
+    // The key repeating, and the timer it repeats from (Repeat.kira).
+    var repeating: RepeatingKey? = .None
+    var repeatTimer: Handle? = .None
+    // The idle times the platform set, whether the output is awake, dimmed
+    // or blanked, the timer that changes it, when input last came, in
+    // milliseconds of the monotonic clock, and whether the blanked picture is
+    // on the screen (Idle.kira).
+    var idle: DisplayIdle = DisplayIdle {}
+    var idleState: DisplayIdleState = .Awake
+    var idleTimer: Handle? = .None
+    var lastInput: Number = 0
+    var blankShown: Bool = false
+    // Every keyboard and every pointer held open, the number the next one's
+    // port key carries, the watch that says when input devices come and go
+    // (Hotplug.kira), and whether the cursor was ever put on the output.
+    var keyboards: [HeldInput] = []
+    var pointers: [HeldInput] = []
+    var inputSerial: Number = 0
+    var inputWatch: Ref? = .None
+    var cursorShown: Bool = false
+    // The surfaces of the last composed picture, bottom first.
+    var shownStack: String = ""
+    // Whether the output changed size and the next flip sets its new mode
+    // (Resolution.kira).
+    var modesetOwed: Bool = false
+    // How bright the picture under the bar was last told to the platform,
+    // in thousandths, or none before it is told; when a picture was last composed,
+    // whether a picture composed since is still to be, and the timer that
+    // waits for it (Backdrop.kira).
+    var barBackdrop: Number? = .None
+    var bottomBackdrop: Number? = .None
+    var backdropComposed: Number = 0
+    var backdropOwed: Bool = false
+    var backdropTimer: Handle? = .None
+}

@@ -1,0 +1,255 @@
+import Foundation
+import Heap
+
+// Clocks and timers (§8).
+//
+// A timer is a kernel timer on the absolute clock it was made for. Arming
+// one adds a pending operation that `Port.wait` advances when the timer is
+// readable; a periodic timer delivers the expirations counted since its last
+// packet was taken.
+
+@Derive(Copy)
+public enum Clock {
+    Monotonic
+    Boottime
+    Realtime
+    ProcessCpu
+    ThreadCpu
+}
+
+// `Time.realtimeDetails` (§8.1).
+@Derive(Copy)
+public struct RealtimeDetails {
+    var monotonicOffset: Number
+    var synchronised: Bool
+    var lastSet: UNumber
+    var errorBound: UNumber
+}
+
+@Derive(Copy)
+public distinct TimerOptions = UNumber
+
+public namespace TimerOptions {
+    let none: TimerOptions = TimerOptions(0)
+    // The timer may wake the device from suspend.
+    let wake: TimerOptions = TimerOptions(1)
+}
+
+// The clocks the library reads and puts timers on; a timer keeps its own and
+// sends its code with it. The alarm clock is the boot-time clock able to wake
+// the device from suspend.
+@Derive(Copy)
+enum ClockSource: U32 {
+    Monotonic = 0
+    Boottime = 1
+    Realtime = 2
+    ProcessCpu = 3
+    ThreadCpu = 4
+    BoottimeAlarm = 5
+}
+
+let clockSources: [ClockSource] = [ClockSource.Monotonic, ClockSource.Boottime, ClockSource.Realtime, ClockSource.ProcessCpu, ClockSource.ThreadCpu, ClockSource.BoottimeAlarm]
+
+function clockSource(clock: borrow Clock) -> ClockSource {
+    return match clock {
+        Monotonic -> .Monotonic
+        Boottime -> .Boottime
+        Realtime -> .Realtime
+        ProcessCpu -> .ProcessCpu
+        ThreadCpu -> .ThreadCpu
+    }
+}
+
+// The monotonic clock, which every deadline is on.
+function monotonicNow() -> U64 { return clockValue(.Monotonic) }
+
+// The monotonic deadline `nanoseconds` from now, for a wait that must end.
+public function monotonicDeadline(nanoseconds: UNumber) -> UNumber {
+    return UNumber(monotonicNow()) + nanoseconds
+}
+
+// The clock's reading. Every clock the library reads exists on the kernels
+// it runs on, so a reading cannot fail but for a broken kernel, and then it
+// is 0.
+function clockValue(clock: borrow ClockSource) -> U64 {
+    return match kernelClockRead(clock) {
+        Ok(value) -> value
+        Error(failed) -> {
+            absorb failed
+            return U64(0)
+        }
+    }
+}
+
+public function timeRead(clock: borrow Clock) -> Result<UNumber, TesseraError> {
+    return .Ok(try kernelClockRead(clockSource(clock)))
+}
+
+public function timeResolution(clock: borrow Clock) -> Result<UNumber, TesseraError> {
+    return .Ok(try kernelClockResolution(clockSource(clock)))
+}
+
+// The kernel's synchronisation state. The kernel does not record when the
+// clock was last set.
+public function timeRealtimeDetails() -> Result<RealtimeDetails, TesseraError> {
+    let realtime = try kernelClockRead(.Realtime)
+    let monotonic = monotonicNow()
+    let sync = try kernelRealtimeSync()
+    return .Ok(
+        RealtimeDetails {
+            monotonicOffset: realtime - monotonic,
+            synchronised: sync.synchronised,
+            lastSet: U64(0),
+            errorBound: sync.errorBound,
+        }
+    )
+}
+
+// A timer on the monotonic or boot-time clock.
+public function timerCreate(clock: borrow Clock) -> Result<Handle, TesseraError> {
+    if clock != .Monotonic && clock != .Boottime { return .Error(failure(.InvalidArgument)) }
+    let source = clockSource(clock)
+    let backing = try kernelTimerCreate(source)
+    let object = objectCreate(.Timer(timerQuiet(source)), backing)
+    return handleForNew(object, Rights.processDefault)
+}
+
+// A timer on `clock` that has not fired.
+function timerQuiet(clock: borrow ClockSource) -> TimerObject {
+    return TimerObject { fired: false, undelivered: U64(0), clock: clock }
+}
+
+// Adds the expirations the kernel has counted since the last read.
+function timerCollect(object: Number, timer: TimerObject) -> TimerObject {
+    var collected = move timer
+    let backing = try library.objects[object].backing otherwise return collected
+    let count = match kernelTimerExpirations(backing) {
+        Ok(value) -> value
+        Error(failed) -> {
+            // Expirations not read stay counted for the next read.
+            absorb failed
+            U64(0)
+        }
+    }
+    if count != U64(0) {
+        collected.undelivered += count
+        collected.fired = true
+    }
+    return collected
+}
+
+function timerSignals(object: Number, timer: TimerObject) -> U32 {
+    let collected = timerCollect(object, move timer)
+    let fired = collected.fired
+    setTimer(object, move collected)
+    if fired { return Signals.signaled.raw }
+    return U32(0)
+}
+
+function timerDisarm(object: Number) -> Result<Void, TesseraError> {
+    let backing = try backingOf(object)
+    return kernelTimerDisarm(backing)
+}
+
+// Re-makes the timer on the alarm clock for a wake timer.
+function timerUseAlarm(object: Number) -> Result<Void, TesseraError> {
+    var timer = try timerOf(object)
+    if timer.clock == .BoottimeAlarm { return .Ok }
+    if timer.clock != .Boottime { return .Error(failure(.InvalidArgument)) }
+    if !entitlementHeld("tessera.power.wake") { return .Error(failure(.NotEntitled)) }
+    let backing = try kernelTimerCreate(.BoottimeAlarm)
+    objectRebind(object, backing)
+    timer.clock = .BoottimeAlarm
+    setTimer(object, move timer)
+    return .Ok
+}
+
+function timerArm(
+    timer: Handle,
+    first: U64,
+    period: U64,
+    options: TimerOptions,
+    port: Handle,
+    key: U64
+) -> Result<Void, TesseraError> {
+    if options.raw > TimerOptions.wake.raw { return .Error(failure(.InvalidArgument)) }
+    let slot = try resolve(timer, .Timer, Rights.write)
+    let portObject = try resolveObject(port, .Port, Rights.none)
+    let object = objectOfSlot(slot)
+    pendingCancelAll(object, PendingOp.Timer)
+    if options.has(TimerOptions.wake) {
+        try timerUseAlarm(object)
+    }
+    let timer = try timerOf(object)
+    setTimer(object, timerQuiet(timer.clock))
+    var start = first
+    if start == U64(0) { start = U64(1) }
+    let backing = try backingOf(object)
+    try kernelTimerProgram(backing, start, period)
+    pendingAdd(.Timer(TimerWork { period: period }), .Handle(slot), portObject, key)
+    return .Ok
+}
+
+// One-shot: one `Timer` packet, `result0` 1 and `result1` the instant it
+// fired. Re-arming replaces the arming before, which ends `Cancelled`.
+public function timerSet(
+    timer: Handle,
+    deadline: UNumber,
+    slack: UNumber,
+    options: TimerOptions,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    return timerArm(timer, deadline, U64(0), options, port, key)
+}
+
+// One packet per period, `result0` the expirations since the last packet
+// was taken, flagged `MORE`.
+public function timerSetPeriodic(
+    timer: Handle,
+    first: UNumber,
+    period: UNumber,
+    slack: UNumber,
+    options: TimerOptions,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    if period == U64(0) { return .Error(failure(.InvalidArgument)) }
+    return timerArm(timer, first, period, options, port, key)
+}
+
+// Disarms the timer; answers whether it was armed.
+public function timerCancel(timer: Handle) -> Result<Bool, TesseraError> {
+    let object = try resolveObject(timer, .Timer, Rights.write)
+    let armed = pendingCancelOn(object, PendingOp.Timer)
+    try timerDisarm(object)
+    return .Ok(armed)
+}
+
+function timerStep(index: Number, arming: borrow TimerWork) {
+    let object = library.pending[index].object
+    var timer = match library.objects[object].state {
+        Timer(state) -> timerCollect(object, move state)
+        None, Port, Event, EventPair, Channel, Memory, Thread, Process, Job, Node, File, Watch, Endpoint, Stream, WakeLock, Presence -> return
+    }
+    let count = timer.undelivered
+    if count == U64(0) || (arming.period != U64(0) && library.pending[index].inFlight) {
+        setTimer(object, move timer)
+        return
+    }
+    timer.undelivered = U64(0)
+    let clock = timer.clock
+    setTimer(object, move timer)
+    if arming.period == U64(0) {
+        pendingFinish(index, .Ok, U64(1), clockValue(clock), U64(0))
+        return
+    }
+    pendingDeliverMore(index, count, monotonicNow(), U64(0))
+}
+
+// Sets the realtime clock to `nanoseconds` since 1970 UTC. Requires
+// `tessera.time.set`.
+public function timeSetRealtime(nanoseconds: UNumber) -> Result<Void, TesseraError> {
+    if !entitlementHeld("tessera.time.set") { return .Error(failure(.NotEntitled)) }
+    return kernelSetRealtime(nanoseconds)
+}

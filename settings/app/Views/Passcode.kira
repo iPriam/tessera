@@ -1,0 +1,99 @@
+import Foundation
+import KiraUI
+import LibTessera
+import PlatformKit
+import PlatformUI
+
+// Passcode (roadmap/27-lock-screen.md): turn the device passcode on with a
+// passcode given twice, change it, or turn it off, each change after the
+// current passcode is given. What is typed is never logged or kept; only
+// its salted PBKDF2 is (`PasscodeStore`).
+
+construct PasscodePane() extends Widget {
+    @State var current: String = ""
+    @State var first: String = ""
+    @State var second: String = ""
+    @State var said: String = ""
+
+    body {
+        let required = passcodeRequired()
+        var rows: [Any Widget] = []
+        if required {
+            rows.append(SecureField(title = "Current Passcode", text = $current))
+        }
+        rows.append(SecureField(title = required ? "New Passcode" : "Passcode", text = $first))
+        rows.append(SecureField(title = "Verify", text = $second))
+        rows.append(
+            Button(action = { in self.setPasscode(required) }) {
+                Text(required ? "Change Passcode" : "Turn Passcode On")
+            }
+        )
+        if required {
+            rows.append(
+                Button(role = .Destructive, action = { in self.turnOff() }) {
+                    Text("Turn Passcode Off")
+                }
+            )
+        }
+        if said.count > 0 { rows.append(Text(copy said).foregroundColor(.Secondary)) }
+        Form(
+            children: [
+                Section(
+                    children: rows,
+                    header: Text(required ? "Passcode Is On" : "Passcode Is Off"),
+                    footer: Text(
+                        "The lock screen asks for the passcode. If you forget it, Recovery can erase the data volume, which removes it with everything kept there."
+                    )
+                )
+            ]
+        )
+        .navigationTitle("Passcode")
+    }
+
+    function setPasscode(required: Bool) {
+        if required && !self.currentMatches() { return }
+        if first != second {
+            said = "The passcodes do not match."
+            return
+        }
+        match keepPasscode(first) {
+            Ok -> said = required ? "The passcode was changed." : "The passcode is on."
+            Error(failure) -> said = passcodeProblem(failure)
+        }
+        self.clearFields()
+    }
+
+    function turnOff() {
+        if !self.currentMatches() { return }
+        match forgetPasscode() {
+            Ok -> said = "The passcode is off."
+            Error(failure) -> said = passcodeProblem(failure)
+        }
+        self.clearFields()
+    }
+
+    // Whether the current passcode was given rightly; saying so when not.
+    function currentMatches() -> Bool {
+        let kept = try passcodeKept() otherwise return true
+        if kept.matches(current) { return true }
+        said = "The current passcode is wrong."
+        self.clearFields()
+        return false
+    }
+
+    function clearFields() {
+        current = ""
+        first = ""
+        second = ""
+    }
+}
+
+function passcodeProblem(failure: borrow PasscodeStoreFailure) -> String {
+    return match failure {
+        Refused(reason) -> match reason {
+            TooShort -> "A passcode has at least \(PasscodeRule.shortest) characters."
+            Crypto -> "The passcode could not be kept: the system's cryptography refused."
+        }
+        Unwritable(why) -> "The passcode could not be kept (\(why))."
+    }
+}

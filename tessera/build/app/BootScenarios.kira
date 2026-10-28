@@ -1,0 +1,295 @@
+import Foundation
+
+// The services boots that drive the machine past the plain one: services
+// killed and restarted, two clients sharing the display, the media and
+// mobile platforms.
+
+namespace StageLayouts {
+    // Stage Manager on the 1280x800 output, under the 40-point bar and above
+    // the 90-point Dock, and the freeform layout it gives back.
+    let on: String = "the mode changed|mode: \"stage\"|split: false|layout: \"2 at 295,152 853x446, 3 at 295,152 853x446\""
+    let off: String = "the mode changed|mode: \"freeform\"|split: false|layout: \"2 at 143,114 853x446, 3 at 171,142 853x446\""
+    let mobileOn: String = "the mode changed|mode: \"stage\"|split: false|layout: \"2 at 433,40 576x720, 3 at 433,40 576x720\""
+    let mobileOff: String = "the mode changed|mode: \"stack\"|split: false|layout: \"2 at 0,0 1280x800, 3 at 0,0 1280x800\""
+    let shiftedKey: String = "a key arrived with a modifier held|client: 2|key: 6|state: \"pressed\"|text: \"C\"|shift: true|control: false"
+    // What MosaicDisplay logs as the output dims, blanks and wakes for want
+    // of input (roadmap/08-display-server.md, "Input").
+    let dimmed: String = "MosaicDisplay.Input.Idle]: the output changed for want of input|state: \"dimmed\""
+    let blanked: String = "MosaicDisplay.Input.Idle]: the output changed for want of input|state: \"blanked\""
+    let awake: String = "MosaicDisplay.Input.Idle]: the output changed for want of input|state: \"awake\""
+}
+
+// The restart boot: PID 1 kills MosaicDisplay with SIGKILL, and the UI
+// survives losing its link, takes the replacement from PID 1 and puts a
+// frame on the new scanout. Once init has seen eight quiet seconds it kills
+// the service broker, and the Power service checks in again with the broker
+// it restarts, and the platform connects its System channel to it again.
+// diskutil ejects the scratch disk and the CD meanwhile, and a service that
+// ends as soon as it starts is given up on after ten deaths in ten seconds.
+function restartScenario(machine: borrow mut TestMachine) -> Bool {
+    machine.await(400, { written in return restarted(written) })
+    // The drive opened its tray when the Volume service ejected the disc.
+    let tray = machine.monitor.ask("info block discmedium", 1)
+    if !tray.contains("tray open") {
+        return machine.fail("services restart failed: the disc's tray did not open\n\(tray)", 0)
+    }
+    if !restarted(machine.read()) {
+        return machine.fail("services display-server or broker restart failed", 120)
+    }
+    return true
+}
+
+// Whether every restart the restart boot makes was recovered from. The
+// second start of MosaicDisplay is counted at the end: the UI is handed the
+// new link as the new server starts, so which says so first is a race.
+function restarted(written: borrow BootLog) -> Bool {
+    var message = ""
+    var starts = 0
+    var killed = false
+    var reconnected = false
+    var brokerKilled = false
+    var recovered = false
+    var checkedIn = false
+    var reattached = false
+    var ejected = false
+    var disc = false
+    var gaveUp = false
+    for line in written.lines {
+        if line.contains("MosaicDisplay.main]: starting") { starts = starts + 1 }
+        let killing = message.contains("killing a service")
+        if killing && line.contains("= service: \"mosaicdisplay\"") { killed = true }
+        if killed && line.contains("TesseraUI.Run]: took a replacement display link") {
+            reconnected = true
+        }
+        if killing && line.contains("= service: \"bootstrap\"") { brokerKilled = true }
+        if messageLine(line) { message = copy line }
+        if reconnected && message.contains("TesseraUI.DisplayCheck]: a frame is on the display")
+            && line.contains("= frame: 1") {
+            recovered = true
+        }
+        if brokerKilled && message.contains("a service checked in") && line.contains(
+            "= service: \"tessera.power\""
+        ) {
+            checkedIn = true
+        }
+        if brokerKilled && line.contains("]: watching for devices again") { reattached = true }
+        if line.contains("Disk vda ejected") { ejected = true }
+        if discEjected(line) { disc = true }
+        if message.contains("died ten times in ten seconds") && line.contains(
+            "= service: \"crash-loop\""
+        ) {
+            gaveUp = true
+        }
+    }
+    return recovered && checkedIn && reattached && ejected && disc && gaveUp && starts >= 2
+}
+
+// Whether `line` says a SCSI CD, `sr<number>`, was ejected.
+function discEjected(line: borrow String) -> Bool {
+    var from = 0
+    while true {
+        let at = try line.indexOf("Disk sr", from) otherwise return false
+        var end = at + 7
+        while end < line.count && line.charAt(end) >= 48 && line.charAt(end) <= 57 { end = end + 1 }
+        if end > at + 7 && line.substring(end, min(end + 8, line.count)) == " ejected" {
+            return true
+        }
+        from = at + 1
+    }
+    return false
+}
+
+// How many Display Check clients said their second frame is on the display,
+// each counted once by the first word of its lines.
+function clientsShown(written: borrow BootLog) -> Number {
+    var on: Map<String, Bool> = Map {}
+    var seen: Map<String, Bool> = Map {}
+    var shown = 0
+    for line in written.lines {
+        let words = line.trim().split(" ")
+        let process = words.count > 0 ? copy words[0] : ""
+        if messageLine(line) {
+            on.set(
+                copy process,
+                line.contains("TesseraUI.DisplayCheck]: a frame is on the display")
+            )
+        }
+        let showing = match on.value(process) {
+            Some(value) -> value
+            None -> false
+        }
+        if showing && endsWithField(line, "= frame: 2") && seen.value(process) == .None {
+            seen.set(copy process, true)
+            shown = shown + 1
+        }
+    }
+    return shown
+}
+
+// The multi boot: two clients, the top one focused while the other runs
+// underneath, Stage Manager on and off, clicks, keys held and shifted, and a
+// speaker, a keyboard and a stick plugged in and pulled out.
+function multiScenario(machine: borrow mut TestMachine) -> Bool {
+    let monitor = copy machine.monitor
+    openLockScreen(machine)
+    machine.await(
+        300,
+        { written in
+            return written.count("TesseraUI.DisplayCheck]: a frame is on the display|frame: 2") >= 2
+                && written.shows("Volume scratch on vda unmounted")
+                && written.has("the platform granted focus|surface: 3")
+                && written.has("refused focus to an application that asked for it|surface: 2")
+        }
+    )
+    if clientsShown(machine.read()) != 2 {
+        return machine.fail("services multi-client rendering failed", 140)
+    }
+    // F6 turns Stage Manager on: client 3, focused, goes on the stage and
+    // client 2 into the strip.
+    monitor.send("sendkey f6")
+    machine.await(50, { written in return written.has(StageLayouts.on) })
+    machine.await(50, { written in return written.has("the stage transition settled|surface: 3") })
+    // The one waiting window is centered vertically. Click its badge, then
+    // the next window's preview: both activate the original surface. The
+    // activating click must not reach the application's controls.
+    monitor.takeVirtioMouse()
+    monitor.send("mouse_move -2000 -2000")
+    monitor.send("mouse_move 20 405")
+    // Each click waits for the display to focus the window it brought
+    // forward, or a second click would bring it forward again.
+    for surface in [2, 3] {
+        let focused = "focused a surface|surface: \(surface)"
+        let forward = "a click brought a window forward|surface: \(surface)"
+        let before = machine.read().count(focused)
+        let settled = "the stage transition settled|surface: \(surface)"
+        let settledBefore = machine.read().count(settled)
+        monitor.click()
+        machine.await(
+            50,
+            { written in return written.has(forward) && written.count(focused) > before }
+        )
+        machine.await(50, { written in return written.count(settled) > settledBefore })
+        if surface == 2 { monitor.send("mouse_move 69 -31") }
+    }
+    monitor.send("sendkey f6")
+    machine.await(50, { written in return written.has(StageLayouts.off) })
+    monitor.send("sendkey a")
+    machine.await(
+        50,
+        { written in
+            return written.has(
+                "TesseraUI.DisplayCheck]: a key arrived|client: 3|key: 4|state: \"pressed\""
+            )
+        }
+    )
+    // B held for a second and a quarter, at client 2 now that A ended client
+    // 3's session: the kernel's repeats are dropped, and MosaicDisplay's
+    // timer repeats it after half a second.
+    machine.await(
+        50,
+        { written in
+            return written.has(
+                "AdaptiveDesktop.Desktop.Windows]: the window behind came forward|surface: 2"
+            )
+        }
+    )
+    monitor.send("sendkey b 1250")
+    machine.await(
+        50,
+        {
+            written in return written.has(
+                "TesseraUI.DisplayCheck]: a key repeated|client: 2|key: 5"
+            )
+        }
+    )
+    // MosaicDisplay tracks Shift held down, and the keymap gives the capital.
+    monitor.send("sendkey shift-c")
+    machine.await(50, { written in return written.has(StageLayouts.shiftedKey) })
+    // A USB speaker: the Devices service's registry watch sees the audio
+    // output come and go, and the platform hears of it.
+    monitor.send("device_add usb-audio,bus=xhci.0,audiodev=silence,id=speaker")
+    machine.await(
+        200,
+        { written in return written.has("Devices]: a device was added|kind: \"audio output\"") }
+    )
+    monitor.send("device_del speaker")
+    machine.await(
+        200,
+        { written in return written.has("Devices]: a device was removed|kind: \"audio output\"") }
+    )
+    // A USB keyboard, which MosaicDisplay holds beside the one the machine
+    // booted with, as a Mac types from every keyboard.
+    monitor.send("device_add usb-kbd,bus=xhci.0,id=keys")
+    machine.await(200, { written in return written.has("found a keyboard|keyboards: 2") })
+    monitor.send("device_del keys")
+    machine.await(200, { written in return written.has("a keyboard went away|keyboards: 1") })
+    // The stick, once the platform watches: the Volume service mounts it and
+    // the platform hears of the volume both times.
+    plugStick(machine)
+    machine.await(
+        200,
+        { written in
+            return written.has(
+                "AdaptiveDesktop.Desktop.Devices]: a volume was mounted|path: \"/Volumes/stick\""
+            )
+        }
+    )
+    monitor.send("device_del stick")
+    machine.await(
+        200,
+        { written in
+            return written.has(
+                "AdaptiveDesktop.Desktop.Devices]: a volume was unmounted|path: \"/Volumes/stick\""
+            )
+        }
+    )
+    // Each program logs on its own, so a line can land after its step was
+    // waited for: the whole set is asked for until it holds, and judged once.
+    machine.await(50, { written in return focusRouted(written) })
+    if !focusRouted(machine.read()) {
+        return machine.fail("services multi-client focus routing failed", 140)
+    }
+    awaitBanners(machine)
+    return true
+}
+
+// Plugs the boot's stick in, on the USB host.
+function plugStick(machine: borrow TestMachine) {
+    machine.monitor.send("drive_add 0 if=none,id=stick,file=\(machine.stick),format=raw")
+    machine.monitor.send("device_add usb-storage,bus=xhci.0,drive=stick,id=stick")
+}
+
+// Whether focus went where the multi boot sends it.
+function focusRouted(written: borrow BootLog) -> Bool {
+    if written.count("a UI channel connected|role: DisplayRole.Application") != 2 { return false }
+    if written.count("a UI channel connected|role: DisplayRole.Platform") != 1 { return false }
+    for spec in [
+        "compositing|mode: \"exclusive\"",
+        "configured a surface|surface: 1|x: 0|y: 0|width: 1280|height: 800|serial: 1",
+        "a surface acknowledged a configure|surface: 1|serial: 1",
+        "configured a surface|surface: 2|x: 0|y: 0|width: 1280|height: 800|serial: 1",
+        "a surface acknowledged a configure|surface: 2|serial: 1",
+        "configured a surface|surface: 3|x: 0|y: 0|width: 1280|height: 800|serial: 1",
+        "a surface acknowledged a configure|surface: 3|serial: 1",
+        "AdaptiveDesktop.main]: configured|x: 0|y: 0|width: 1280|height: 800",
+        "TesseraUI.Session]: was configured|client: 2|x: 0|y: 0|width: 1280|height: 800|serial: 1",
+        "TesseraUI.Session]: was configured|client: 3|x: 0|y: 0|width: 1280|height: 800|serial: 1",
+        "focused a surface|surface: 3",
+        "TesseraUI.Session]: the focus moved|client: 2|focus: Focus.Unfocused",
+        "TesseraUI.Session]: the focus moved|client: 3|focus: Focus.Focused",
+        "TesseraUI.DisplayCheck]: a key arrived|client: 3|key: 4|state: \"pressed\"",
+        "refused focus to an application that asked for it|surface: 2",
+        StageLayouts.on,
+        StageLayouts.off,
+        "Stage Manager changed|on: true",
+        StageLayouts.shiftedKey,
+        "a press landed on a surface without focus|surface: 2",
+        "a click brought a window forward|surface: 2",
+        "a click brought a window forward|surface: 3"
+    ] {
+        if !written.has(spec) { return false }
+    }
+    return !written.has(
+        "TesseraUI.DisplayCheck]: a key arrived|client: 2|key: 4|state: \"pressed\""
+    )
+}

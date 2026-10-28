@@ -1,0 +1,143 @@
+import Foundation
+
+// The update test (`boot -update`, roadmap/13-security-and-updates.md,
+// "Updates"). On a volume made from nothing it installs the system just
+// built, then a second good system as an update, and boots: PID 1 boots the
+// trial and the system's init keeps it once its services are up. Then it
+// installs, as an update, a system whose seal does not cover it, and boots
+// twice: the first boot is refused, and the second rolls the update back on
+// its own and boots the kept one, with the data the first boot wrote.
+
+// The three boots, after the installs before each; zero when every one held.
+function updateBoots(
+    host: borrow Host,
+    architecture: Architecture,
+    options: borrow BootOptions,
+    images: borrow BootImages,
+    mode: borrow BootMode
+) -> Number {
+    if images.updated.count == 0 || images.tampered.count == 0 {
+        log fault("the update test needs the updated and the tampered systems")
+        return 1
+    }
+    let machine = host.machineDirectory(architecture)
+    let volume = "\(machine)/\(VolumeLayout.updateVolume)"
+    let record = "\(machine)/\(VolumeLayout.updateInstalled)"
+    for path in [copy volume, copy record] {
+        if fileExists(path) {
+            match removePath(path) {
+                Ok -> {}
+                Error(failure) -> {
+                    log fault("the update test's volume cannot be made again", traceText(failure))
+                    return 1
+                }
+            }
+        }
+    }
+    let installs = [
+        UpdateInstall {
+            image: copy images.system,
+            digest: copy images.systemDigest,
+            update: false
+        },
+        UpdateInstall {
+            image: copy images.updated,
+            digest: copy images.updatedDigest,
+            update: true
+        }
+    ]
+    for install in installs {
+        match installSystemAs(
+            host,
+            architecture,
+            images,
+            install.image,
+            install.digest,
+            volume,
+            record,
+            options,
+            install.update
+        ) {
+            Ok -> {}
+            Error(problem) -> {
+                log fault("the update test's install failed", problem)
+                return 1
+            }
+        }
+    }
+    var stage = copy mode
+    stage.updateStage = 1
+    if bootWith(host, architecture, options, images, stage) != 0 { return 1 }
+    match installSystemAs(
+        host,
+        architecture,
+        images,
+        images.tampered,
+        images.tamperedDigest,
+        volume,
+        record,
+        options,
+        true
+    ) {
+        Ok -> {}
+        Error(problem) -> {
+            log fault("the failing update could not be installed", problem)
+            return 1
+        }
+    }
+    for next in [2, 3] {
+        stage.updateStage = next
+        if bootWith(host, architecture, options, images, stage) != 0 { return 1 }
+    }
+    log info("an update was kept, and one that failed was rolled back")
+    // Made again at the next run; kept only when a boot failed, to look at.
+    dropScratch([copy volume, copy record])
+    return 0
+}
+
+struct UpdateInstall {
+    let image: String
+    let digest: String
+    let update: Bool
+}
+
+// Whether the update test's boot `mode.updateStage` did what it must: zero
+// when it did.
+function updateVerdict(
+    written: borrow BootLog,
+    mode: borrow BootMode,
+    logPath: borrow String
+) -> Number {
+    let system = written.shows(BootBanners.system)
+    let trial = written.shows("Volume.Trial]: booting the trial system")
+    var problem = ""
+    if mode.updateStage == 1 {
+        if !trial { problem = "PID 1 did not boot the update" }
+        else if !system { problem = "the update did not reach the system's init" }
+        else if !written.shows("Volume.Trial]: marked the system good") {
+            problem = "the update was not kept"
+        }
+    } else if mode.updateStage == 2 {
+        if !trial { problem = "PID 1 did not boot the failing update" }
+        else if system || !written.shows("Boot]: refusing to boot") {
+            problem = "the failing update was not refused"
+        }
+    } else {
+        if trial { problem = "PID 1 tried the failing update again" }
+        else if !written.shows(
+            "Volume.Trial]: rolled back an update that did not reach its services"
+        ) {
+            problem = "the failing update was not rolled back"
+        } else if !system { problem = "the kept system did not boot after the rollback" }
+        else if !written.shows("SystemLog]: read the last boot's log") {
+            problem = "the data volume lost the last boot's log"
+        }
+    }
+    if problem.count > 0 {
+        print(written.tail(80))
+        log fault("the update test failed", stage: mode.updateStage, problem: problem, log: logPath)
+        return 1
+    }
+    log info("the update boot held", stage: mode.updateStage, log: logPath)
+    return 0
+}

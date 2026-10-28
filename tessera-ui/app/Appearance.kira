@@ -1,0 +1,74 @@
+//! The appearance the person chose in Settings, which every window on Tessera
+//! is drawn in: read from the Settings service as the session starts, and
+//! again each time `System/settingsChanged` says it changed, as a Mac's
+//! windows follow System Settings' Appearance at once. The Dynamic Platform is
+//! followed the same way: open applications keep running when it switches,
+//! and draw at the new platform's size from their next build.
+
+import Foundation
+import Heap
+import KiraUI
+import LibTessera
+
+/// The System Settings key that holds the appearance the windows follow.
+public namespace AppearanceSetting {
+    // `light`, `dark`, or none for the style's own.
+    let key: String = "appearance.scheme"
+    let light: String = "light"
+    let dark: String = "dark"
+}
+
+/// Reads the chosen appearance and tells Kira UI.
+public function applyAppearanceSetting() {
+    let chosen = settingValue(AppearanceSetting.key, "")
+    let scheme: PlatformScheme = chosen == AppearanceSetting.dark ? .Dark : (
+        chosen == AppearanceSetting.light ? .Light : .Unstated
+    )
+    publishPlatformScheme(scheme)
+    log info("the appearance is the person's", scheme: chosen.count > 0 ? chosen : "unstated")
+}
+
+/// Every message the System channel holds now, for an application: a changed
+/// appearance or platform is applied. Whether one was, so the window is drawn
+/// again.
+function takeSystemMessages(system: Handle) -> Bool {
+    let bytes = 256
+    let block = zeroedBlock(count: bytes, alignment: 16)
+    var changed = false
+    while true {
+        let received = match channelRead(
+            system,
+            Buffer { address: block.pointer(), length: bytes },
+            4
+        ) {
+            Ok(value) -> value
+            Error(failed) -> {
+                // An empty channel is where the messages end, not a failure.
+                if failed.code != .ShouldWait {
+                    log warn("the System channel could not be read", error: errorName(failed))
+                }
+                return changed
+            }
+        }
+        for handle in received.handles { closeHandle(handle) }
+        let key = match settingsChangedIn(block.pointer(), received.bytes) {
+            Some(value) -> value
+            None -> continue
+        }
+        noteSettingsChanged()
+        // Any change is drawn: a component that keeps a value it read from
+        // Settings reads it again when the generation moved, as Settings does
+        // for a pane another program asked it to show.
+        changed = true
+        // The two keys are different, so at most one of these applies.
+        if key == AppearanceSetting.key {
+            applyAppearanceSetting()
+        }
+        if key == PlatformSetting.key {
+            let mode = runningInterfaceMode()
+            if mode != interfaceMode() { setInterfaceMode(mode) }
+            log info("the platform switched", desktop: mode == .AdaptiveDesktop)
+        }
+    }
+    return changed
+}

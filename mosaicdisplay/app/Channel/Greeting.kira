@@ -1,0 +1,102 @@
+import Foundation
+import Heap
+import LibTessera
+
+// The first message PID 1 sends, and the File that arrives with it.
+//
+// PID 1 greets this process the moment it exists, and the greeting carries an
+// open File for the machine's own description.
+
+namespace Greeting {
+    // As much of a handed-over file as this program will say out loud.
+    let room: Number = 256
+    let key: Number = 1
+}
+
+// Reads the first message on the service channel and answers with the File
+// that came with it.
+//
+// Blocking, and deliberately so: init sends this the moment the process exists,
+// and a display that drew its splash before looking would have to come back for
+// the answer later. There is exactly one message today.
+function takeGreeting(reader: Handle) -> Handle? {
+    let body = zeroedBlock(count: ServiceMessage.headerBytes, alignment: 16)
+    let channel = match serviceChannel() {
+        Ok(value) -> value
+        Error(reason) -> return noGreeting(reason)
+    }
+    let received = match readMessage(reader, channel, body, 1) {
+        Ok(value) -> value
+        Error(reason) -> return noGreeting(reason)
+    }
+    let opcode = heapLoad<ServiceHeader>(body.pointer()).opcode
+    var file: Handle? = .None
+    if received.bytes < Number(ServiceMessage.headerBytes) {
+        log warn("a message is the wrong size", bytes: received.bytes)
+    } else if opcode != ServiceOpcode.Hello.rawValue() {
+        log warn("an opcode is not one this knows", opcode: opcode)
+    } else if received.handles.count == 0 {
+        log warn("init said hello and sent nothing with it")
+    } else {
+        file = .Some(received.handles[0])
+    }
+    for index in 0..received.handles.count {
+        let kept = match file {
+            Some(handle) -> handle == received.handles[index]
+            None -> false
+        }
+        if !kept { closeHandle(received.handles[index]) }
+    }
+    return file
+}
+
+function noGreeting(reason: borrow TesseraError) -> Handle? {
+    log warn("nothing on the channel", error: errorName(reason))
+    return .None
+}
+
+// Says what came through a File this program never opened.
+//
+// The assertion the whole seam exists for: there is no path here, no lookup,
+// and no way this process could have reached the file on its own.
+function sayWhatArrived(reader: Handle, file: Handle) {
+    let room = zeroedBlock(count: Greeting.room, alignment: 16)
+    match reportGreeting(reader, file, room) {
+        Ok(read) -> greetingRead(read, room)
+        Error(reason) -> log warn("the handed-over file would not read", error: errorName(reason))
+    }
+}
+
+function reportGreeting(reader: Handle, file: Handle, room: borrow ByteBlock) -> Result<Number, TesseraError> {
+    return readGreeting(reader, file, room)
+}
+
+function greetingRead(read: Number, room: borrow ByteBlock) {
+    if read == 0 {
+        log warn("the handed-over file was empty")
+        return
+    }
+    log info("read through a file init opened", bytes: read)
+    var bytes: [UN8] = []
+    for index in 0..read { bytes.append(UN8(heapLoad<U8>(room.pointer(), index))) }
+    match textFromBytes(bytes) {
+        Some(text) -> print(text.trim())
+        None -> log warn("the handed-over file is not text", bytes: read)
+    }
+}
+
+function readGreeting(
+    reader: Handle,
+    file: Handle,
+    room: borrow ByteBlock
+) -> Result<Number, TesseraError> {
+    try fileReadAt(
+        file,
+        0,
+        [Buffer { address: room.pointer(), length: Greeting.room }],
+        reader,
+        Greeting.key
+    )
+    let done = try awaitAnswer(reader)
+    return .Ok(Number(done.result0))
+}

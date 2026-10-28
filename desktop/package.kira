@@ -1,0 +1,14 @@
+// Desktop: the surface under every application, as Finder's desktop and
+// Launchpad are on a Mac. It lists the installed applications, and typing
+// narrows them; Return opens the first that is left.
+//
+// Kira UI draws it and puts it on Tessera's display.
+construct DesktopApp extends Package {
+    let version: String = "0.1.0"
+    let kind: PackageKind = .App
+    let moduleRoot: String = "Desktop"
+    let dependencies: [Dependency] = [
+        Dependency { name: "HomeLayout", path: "layout" },
+        Dependency { name: "FileOperations", path: "../inlay/operations" }
+    ]
+}

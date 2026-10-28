@@ -1,0 +1,7 @@
+//! The Presence package: the service that verifies interaction tokens for the platforms.
+/// The Tessera Presence package: the service that verifies interaction tokens.
+construct TesseraPresence extends Package {
+    let version: String = "0.1.0"
+    let kind: PackageKind = .App
+    let moduleRoot: String = "TesseraPresence"
+}

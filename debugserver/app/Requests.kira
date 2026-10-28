@@ -1,0 +1,260 @@
+import Foundation
+
+// What a packet asks, decoded once from its text.
+
+struct MemoryRange {
+    let address: U64
+    let count: Number
+}
+
+struct MemoryWrite {
+    let address: U64
+    let bytes: [UN8]
+}
+
+struct RegisterWrite {
+    let number: Number
+    let value: U64
+}
+
+struct BreakpointAt {
+    let address: U64
+    // The trap's length, which lldb names as the breakpoint's kind.
+    let length: Number
+}
+
+struct StepRequest {
+    // The thread to step; none for the one selected.
+    let thread: Number?
+    let signal: Number
+}
+
+struct TransferRange {
+    let offset: Number
+    let count: Number
+}
+
+enum Request {
+    Supported
+    StartNoAck
+    HostInfo
+    ProcessInfo
+    RegisterInfo(Number)
+    FirstThreads
+    MoreThreads
+    CurrentThread
+    StopReason
+    SelectThread(Number)
+    ThreadAlive(Number)
+    ReadRegisters
+    WriteRegisters(String)
+    ReadRegister(Number)
+    WriteRegister(RegisterWrite)
+    ReadMemory(MemoryRange)
+    WriteMemory(MemoryWrite)
+    InsertBreakpoint(BreakpointAt)
+    RemoveBreakpoint(BreakpointAt)
+    MemoryRegion(U64)
+    AuxiliaryVector(TransferRange)
+    Continue(Number)
+    Step(StepRequest)
+    ContinueActions
+    Attach(Number)
+    AttachName(String)
+    Kill
+    Detach
+    // A request lldb sends that is answered `OK` and needs nothing done.
+    Accepted
+    // Anything else, which the protocol answers with an empty reply.
+    Unsupported
+}
+
+function requestOf(text: borrow String) -> Request {
+    if text.isEmpty() { return .Unsupported }
+    return match text.substring(0, 1) {
+        "q" -> queryOf(text)
+        "Q" -> settingOf(text)
+        "v" -> verboseOf(text)
+        "?" -> .StopReason
+        "g" -> .ReadRegisters
+        "G" -> .WriteRegisters(text.substring(1, text.count))
+        "p" -> numberRequest(
+            text.substring(1, text.count),
+            { number in return .ReadRegister(number) }
+        )
+        "P" -> registerWriteOf(text.substring(1, text.count))
+        "m" -> memoryReadOf(text.substring(1, text.count))
+        "M" -> memoryWriteOf(text.substring(1, text.count))
+        "Z" -> breakpointOf(text, { at in return .InsertBreakpoint(at) })
+        "z" -> breakpointOf(text, { at in return .RemoveBreakpoint(at) })
+        "H" -> threadSelectOf(text)
+        "T" -> numberRequest(
+            text.substring(1, text.count),
+            { thread in return .ThreadAlive(thread) }
+        )
+        "c" -> .Continue(0)
+        "C" -> numberRequest(
+            text.substring(1, text.count).before(";"),
+            { signal in return .Continue(signal) }
+        )
+        "s" -> .Step(StepRequest { thread: .None, signal: 0 })
+        "S" -> numberRequest(
+            text.substring(1, text.count).before(";"),
+            { signal in
+                return .Step(StepRequest { thread: .None, signal: signal })
+            }
+        )
+        "k" -> .Kill
+        "D" -> .Detach
+        else -> .Unsupported
+    }
+}
+
+function numberRequest(text: borrow String, request: (Number) -> Request) -> Request {
+    return match parseHexNumber(text) {
+        Ok(value) -> request(value)
+        Error(reason) -> .Unsupported
+    }
+}
+
+function queryOf(text: borrow String) -> Request {
+    return match text {
+        "qHostInfo" -> .HostInfo
+        "qProcessInfo" -> .ProcessInfo
+        "qfThreadInfo" -> .FirstThreads
+        "qsThreadInfo" -> .MoreThreads
+        "qC" -> .CurrentThread
+        else -> queryWithArgumentsOf(text)
+    }
+}
+
+function queryWithArgumentsOf(text: borrow String) -> Request {
+    if text.startsWith("qSupported") { return .Supported }
+    // lldb offers to look symbols up for the server, which needs none.
+    if text.startsWith("qSymbol") { return .Accepted }
+    if text.startsWith("qRegisterInfo") {
+        return numberRequest(
+            text.substring(13, text.count),
+            { number in return .RegisterInfo(number) }
+        )
+    }
+    if text.startsWith("qMemoryRegionInfo:") {
+        return match parseHex(text.substring(18, text.count)) {
+            Ok(address) -> .MemoryRegion(address)
+            Error(reason) -> .Unsupported
+        }
+    }
+    if text.startsWith("qXfer:auxv:read::") { return auxiliaryOf(text.substring(17, text.count)) }
+    return .Unsupported
+}
+
+function settingOf(text: borrow String) -> Request {
+    return match text.before(":") {
+        "QStartNoAckMode" -> .StartNoAck
+        // Settings that change nothing this server sends.
+        "QEnableErrorStrings" -> .Accepted
+        "QListThreadsInStopReply" -> .Accepted
+        else -> .Unsupported
+    }
+}
+
+function verboseOf(text: borrow String) -> Request {
+    if text == "vCont?" { return .ContinueActions }
+    if text.startsWith("vKill") { return .Kill }
+    if text.startsWith("vCont;") { return continueActionOf(text.substring(6, text.count)) }
+    if text.startsWith("vAttach;") {
+        return numberRequest(text.substring(8, text.count), { pid in return .Attach(pid) })
+    }
+    if text.startsWith("vAttachName;") {
+        return match textOfHex(text.substring(12, text.count)) {
+            Ok(name) -> .AttachName(name)
+            Error(reason) -> .Unsupported
+        }
+    }
+    return .Unsupported
+}
+
+// The first of `vCont`'s actions, which in all-stop mode decides: `c`, `C05`,
+// `s:1f2` or `S05:1f2`; a thread's action for the rest is to keep running.
+function continueActionOf(text: borrow String) -> Request {
+    let action = text.before(";")
+    let parts = action.split(":")
+    var thread: Number? = .None
+    if parts.count > 1 {
+        thread = match parseHexNumber(parts[1]) {
+            Ok(value) -> .Some(value)
+            // A thread this is not names none, which is every thread.
+            Error(reason) -> .None
+        }
+    }
+    let kind = parts[0]
+    if kind.isEmpty() { return .Unsupported }
+    var signal = 0
+    // No signal, when the action names none or names one that is not hex.
+    if kind.count > 1 { signal = try parseHexNumber(kind.substring(1, kind.count)) otherwise 0 }
+    return match kind.substring(0, 1) {
+        "c" -> .Continue(0)
+        "C" -> .Continue(signal)
+        "s" -> .Step(StepRequest { thread: thread, signal: 0 })
+        "S" -> .Step(StepRequest { thread: thread, signal: signal })
+        else -> .Unsupported
+    }
+}
+
+// `p`-style `n=value`, the value in memory order.
+function registerWriteOf(text: borrow String) -> Request {
+    let parts = text.split("=")
+    if parts.count != 2 { return .Unsupported }
+    let number = try parseHexNumber(parts[0]) otherwise return .Unsupported
+    let value = try parseLittleEndian(parts[1]) otherwise return .Unsupported
+    return .WriteRegister(RegisterWrite { number: number, value: value })
+}
+
+// `address,count`.
+function memoryReadOf(text: borrow String) -> Request {
+    let parts = text.split(",")
+    if parts.count != 2 { return .Unsupported }
+    let address = try parseHex(parts[0]) otherwise return .Unsupported
+    let count = try parseHexNumber(parts[1]) otherwise return .Unsupported
+    return .ReadMemory(MemoryRange { address: address, count: count })
+}
+
+// `address,count:bytes`.
+function memoryWriteOf(text: borrow String) -> Request {
+    let parts = text.split(":")
+    if parts.count != 2 { return .Unsupported }
+    let range = parts[0].split(",")
+    if range.count != 2 { return .Unsupported }
+    let address = try parseHex(range[0]) otherwise return .Unsupported
+    let bytes = try parseHexBytes(parts[1]) otherwise return .Unsupported
+    return .WriteMemory(MemoryWrite { address: address, bytes: bytes })
+}
+
+// `Z0,address,kind` or `z0,address,kind`: a software breakpoint. The other
+// kinds, hardware breakpoints and watchpoints, are not offered.
+function breakpointOf(text: borrow String, request: (BreakpointAt) -> Request) -> Request {
+    let parts = text.split(",")
+    if parts.count < 3 || parts[0].substring(1, parts[0].count) != "0" { return .Unsupported }
+    let address = try parseHex(parts[1]) otherwise return .Unsupported
+    let length = try parseHexNumber(parts[2].before(";")) otherwise return .Unsupported
+    return request(BreakpointAt { address: address, length: length })
+}
+
+// `Hg<thread>` selects the thread registers are read from; `Hc` names the
+// one to run, which in all-stop mode is all of them.
+function threadSelectOf(text: borrow String) -> Request {
+    if text.count < 2 || text.substring(1, 2) != "g" { return .Accepted }
+    let named = text.substring(2, text.count)
+    // `-1` and `0` name any thread.
+    if named == "-1" || named == "0" { return .Accepted }
+    return numberRequest(named, { thread in return .SelectThread(thread) })
+}
+
+// `offset,count` of `qXfer:auxv:read::`.
+function auxiliaryOf(text: borrow String) -> Request {
+    let parts = text.split(",")
+    if parts.count != 2 { return .Unsupported }
+    let offset = try parseHexNumber(parts[0]) otherwise return .Unsupported
+    let count = try parseHexNumber(parts[1]) otherwise return .Unsupported
+    return .AuxiliaryVector(TransferRange { offset: offset, count: count })
+}

@@ -1,0 +1,69 @@
+import Foundation
+import LibTessera
+
+// Becoming the system, and running the init inside it.
+//
+// From the replacement onwards the machine is the system's and this program
+// is gone, which is why the handover is the last thing PID 1 does.
+
+// Mounts the current system, becomes it, and runs the init inside it.
+//
+// Never returns: either this process is replaced, or the machine is stopped.
+// There is no third outcome by design — a boot that asked for a system and
+// did not get one must not continue as though it had.
+function handOverToSystem(calls: Handle, bootArguments: borrow [String]) {
+    match mountSystem(calls, bootArguments) {
+        Ok -> {}
+        Error(problem) -> {
+            refuseToBoot("the system could not be mounted: \(problem)")
+            return
+        }
+    }
+    // The system's init is this program again, run from the volume. It gets
+    // the boot flags this one was given, without `tessera.system` so it does
+    // not hand over a second time, and with `tessera.handed-over` so it knows
+    // it is the system's own. It also gets the Kira runtime's settings, so a
+    // heap report asked for at boot covers the system as well. They are read
+    // before the system is the root: its /proc is not mounted yet.
+    let flags = match launchInfoCreate(.Cold, handedOverArguments()) {
+        Ok(made) -> made
+        Error(failed) -> {
+            refuseToBoot(
+                "the system init's arguments could not be written (" + errorName(failed) + ")"
+            )
+            return
+        }
+    }
+    match machineEnterRoot(System.mountPoint) {
+        Ok -> {}
+        Error(failed) -> {
+            refuseToBoot("the system could not be made the root (" + errorName(failed) + ")")
+            return
+        }
+    }
+
+    log info("mounted the system; handing over", init: System.init)
+    match processReplace(System.init, .Some(flags)) {
+        Ok -> refuseToBoot(System.init + " answered instead of running")
+        Error(failed) -> refuseToBoot(System.init + " could not be run (" + errorName(failed) + ")")
+    }
+}
+
+// The arguments the system's init is started with: its path, then every boot
+// flag this init was given but `tessera.system`, then `tessera.handed-over`.
+function handedOverArguments() -> [String] {
+    var passed = [System.init]
+    match processArguments() {
+        Ok(given) -> {
+            for index in 1..given.count {
+                if given[index] != BootFlag.system { passed.append(copy given[index]) }
+            }
+        }
+        Error(failed) -> log warn(
+            "the kernel's arguments could not be read; the system init gets none",
+            error: errorName(failed)
+        )
+    }
+    passed.append(BootFlag.handedOver)
+    return passed
+}

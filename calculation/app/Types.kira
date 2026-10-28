@@ -1,0 +1,94 @@
+//! The value types of expression evaluation: the tokens an expression is read
+//! into, the failures evaluation can return, and the limits of a `Number`.
+//!
+//! Evaluation runs in three steps: [`tokenize`](calculate) reads the text into
+//! `Token`s, the parser evaluates them, and any failure is a
+//! [`CalculationFailure`] with a message from [`failureText`].
+
+import Foundation
+
+/// A binary arithmetic operator.
+enum Operator {
+    /// Addition, `+`.
+    Add
+    /// Subtraction, `-`. A `-` before an operand is a negation instead; see `Parser.kira`.
+    Subtract
+    /// Multiplication, `*`.
+    Multiply
+    /// Division, `/`.
+    Divide
+}
+
+/// One piece of an expression once its text is read.
+///
+/// A percent is a token of its own: the parser decides whether it divides a
+/// value by one hundred or takes a share of a running total.
+enum Token {
+    /// A decimal literal, already converted to a `Number`.
+    Literal(Number)
+    /// A binary operator or the minus sign of a negation.
+    Operation(Operator)
+    /// An opening bracket, `(`.
+    Open
+    /// A closing bracket, `)`.
+    Close
+    /// A percent sign, `%`.
+    Percent
+}
+
+/// Why an expression has no value.
+///
+/// Each case has one message, given by [`failureText`].
+public enum CalculationFailure {
+    /// The expression has no text, or no tokens.
+    Empty
+    /// The tokens do not form an expression, such as a dangling operator.
+    Malformed
+    /// A typed number has more decimal places than a `Number` keeps (18).
+    TooManyDecimals
+    /// The result's integer part reaches `CalcLimit.bound`, beyond what a `Number` holds.
+    Overflow
+    /// A division's divisor is zero.
+    DivideByZero
+    /// A closing bracket has no opening bracket, or a bracket is left open.
+    Unbalanced
+}
+
+/// The limits of a `Number` and of what the calculator reads and shows.
+namespace CalcLimit {
+    /// The digits a typed number may have before its point.
+    ///
+    /// Nineteen digits is below `CalcLimit.bound`, so a typed number never
+    /// reaches the bound by itself.
+    let integerDigits: Number = 19
+    /// The decimal places a `Number` keeps (the decimal type's maximum scale in the runtime).
+    let decimalPlaces: Number = 18
+    /// The significant digits the display shows.
+    let significantDigits: Number = 15
+    /// The integer part a result may reach: 2^64 less 616.
+    ///
+    /// A `Number`'s 65-bit mantissa cannot hold 2^64 (the runtime's decimal
+    /// mantissa width), and the 616 covers the rounding of a quotient at 18
+    /// places (see `Arithmetic.kira`).
+    let bound: Number = 18446744073709551000
+}
+
+/// The message shown for a failure, in the form the display prints.
+///
+/// Every case of [`CalculationFailure`] has exactly one message here.
+///
+/// # Examples
+///
+/// ```kira
+/// let text = failureText(.DivideByZero)
+/// ```
+public function failureText(failure: CalculationFailure) -> String {
+    match failure {
+        Empty -> { return "Enter an expression" }
+        Malformed -> { return "Not a valid expression" }
+        TooManyDecimals -> { return "At most 18 decimal places" }
+        Overflow -> { return "The result is too large" }
+        DivideByZero -> { return "Cannot divide by zero" }
+        Unbalanced -> { return "Unbalanced parentheses" }
+    }
+}

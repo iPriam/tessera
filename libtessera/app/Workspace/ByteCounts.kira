@@ -1,0 +1,23 @@
+import Foundation
+
+// A count of bytes as macOS writes one, in diskutil, Finder and Settings
+// alike: in powers of 1000, to a tenth, as `512 B`, `4.2 MB` or `1.0 GB`.
+
+namespace ByteCountUnit {
+    let names: [String] = ["B", "KB", "MB", "GB", "TB"]
+    let step: Number = 1000
+}
+
+// `bytes` in the largest unit it fills, to a tenth.
+public function byteCountText(bytes: Number) -> String {
+    var unit: Number = 1
+    var which: Number = 0
+    for _ in 1..ByteCountUnit.names.count {
+        if bytes < unit * ByteCountUnit.step { break }
+        unit *= ByteCountUnit.step
+        which += 1
+    }
+    if which == 0 { return "\(bytes) B" }
+    let tenths = trunc((bytes * 10 + unit / 2) / unit)
+    return "\(trunc(tenths / 10)).\(tenths % 10) \(ByteCountUnit.names[which])"
+}

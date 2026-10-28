@@ -1,0 +1,552 @@
+import Foundation
+import RenderBox
+
+// `IconRenderer`: a document rendered as the system shows an application's
+// icon, pass by pass on the GPU as IconRendering renders it. Each group's
+// contents, distance field and shadow render into images kept on one
+// device; the composite then draws the icon from them.
+
+// The pictures an icon is rendered as.
+public enum IconStyle {
+    // The icon in its own colours, light and dark.
+    Default
+    Dark
+    // Clear glass, light and dark.
+    ClearLight
+    ClearDark
+    // Tinted the colour a person picks, light and dark.
+    TintedLight(IconColor)
+    TintedDark(IconColor)
+}
+
+// How a style draws the document: the appearance it reads; for a clear
+// mode mask, the glass the mask is laid over; for a dark tinted icon, the
+// glass and tint it is screened with.
+struct StyleSetup {
+    let appearance: IconAppearance
+    let glass: Background?
+    let screen: ScreenedTint? = .None
+    // Whether the style is one of the dark ones, which adapt the document
+    // to the dark.
+    let dark: Bool = false
+}
+
+extend StyleSetup {
+    // Whether the groups render as a clear mode mask's: in monochrome,
+    // casting neutral shadows.
+    function masked(borrow self) -> Bool {
+        if glass != .None { return true }
+        return match screen {
+            Some -> true
+            None -> false
+        }
+    }
+}
+
+function setupOf(style: borrow IconStyle) -> Result<StyleSetup, IconRenderFailure> {
+    return match style {
+        Default -> .Ok(StyleSetup { appearance: .Light, glass: .None })
+        Dark -> .Ok(StyleSetup { appearance: .Dark, glass: .None, dark: true })
+        ClearLight -> .Ok(maskedOver(gray(MitigatedChiclet.lightClear), false))
+        ClearDark -> .Ok(maskedOver(gray(MitigatedChiclet.darkClear), true))
+        TintedLight(tint) -> .Ok(
+            maskedOver(
+                tintedGlass(tint, MitigatedChiclet.lightTint, MitigatedChiclet.lightTintFactor),
+                false
+            )
+        )
+        TintedDark(tint) -> .Ok(
+            StyleSetup {
+                appearance: .MonoDark,
+                glass: .None,
+                screen: .Some(
+                    ScreenedTint {
+                        glass: tintedGlass(
+                            tint,
+                            MitigatedChiclet.darkTint,
+                            MitigatedChiclet.darkTintFactor
+                        ),
+                        tint: copy tint
+                    }
+                ),
+                dark: true
+            }
+        )
+    }
+}
+
+// The mono appearance as a mask over glass of one colour, in a dark tone
+// when `dark`.
+function maskedOver(glass: RGBAColor, dark: Bool) -> StyleSetup {
+    return StyleSetup {
+        appearance: dark ? .MonoDark : .Mono,
+        glass: .Some(backgroundBetween(copy glass, copy glass, .DisplayP3)),
+        dark: dark
+    }
+}
+
+// `tint` mixed with gray `level` in linear light, keeping `factor` of the
+// tint, its components taken as Display P3's.
+function tintedGlass(tint: borrow IconColor, level: Number, factor: Number) -> RGBAColor {
+    let gray = linearFromEncoded(level)
+    let components = [tint.red, tint.green, tint.blue]
+    var mixed: [Number] = []
+    for component in components {
+        let linear = factor * linearFromEncoded(component) + (1 - factor) * gray
+        mixed.append(encodedFromLinear(linear))
+    }
+    return RGBAColor { r: mixed[0], g: mixed[1], b: mixed[2], a: 1 }
+}
+
+namespace AutomaticBackground {
+    // The light appearance's background, white down to this at the bottom,
+    // in Display P3, as IconRendering draws `system-light`.
+    let lightBottom: Number = 0.960938
+    // The dark appearance's background, top and bottom, in Display P3.
+    let darkTop: Number = 0.121582
+    let darkBottom: Number = 0.0588379
+}
+
+function gray(level: Number) -> RGBAColor {
+    return RGBAColor { r: level, g: level, b: level, a: 1 }
+}
+
+function backgroundBetween(top: RGBAColor, bottom: RGBAColor, space: ColorSpace) -> Background {
+    let side = IconGeometry.canvas
+    return Background {
+        top: top,
+        bottom: bottom,
+        space: space,
+        start: Point { x: 0, y: IconGeometry.backgroundStart * side },
+        end: Point { x: 0, y: IconGeometry.backgroundEnd * side }
+    }
+}
+
+function systemLightBackground() -> Background {
+    return backgroundBetween(white(), gray(AutomaticBackground.lightBottom), .DisplayP3)
+}
+
+function systemDarkBackground() -> Background {
+    return backgroundBetween(
+        gray(AutomaticBackground.darkTop),
+        gray(AutomaticBackground.darkBottom),
+        .DisplayP3
+    )
+}
+
+// The background the document's fill paints in `appearance`.
+function backgroundOf(
+    document: borrow IconDocument,
+    appearance: IconAppearance
+) -> Result<Background, IconRenderFailure> {
+    return match backgroundFill(document.fill, appearance) {
+        Automatic -> .Ok(appearance == .Dark ? systemDarkBackground() : systemLightBackground())
+        SystemLight -> .Ok(systemLightBackground())
+        SystemDark -> .Ok(systemDarkBackground())
+        None -> .Ok(backgroundBetween(clear(), clear(), .DisplayP3))
+        Solid(color) -> .Ok(backgroundBetween(rgbaOf(color), rgbaOf(color), colorSpaceOf(color)))
+        LinearGradient(gradient) -> .Ok(gradientBackground(gradient))
+        AutomaticGradient(color) -> .Ok(gradientBackground(automaticGradient(color)))
+    }
+}
+
+// The background `setup` draws: a dark tinted icon's
+// `contourGradients.darkTint`, else the document's.
+function styleBackground(
+    document: borrow IconDocument,
+    setup: borrow StyleSetup
+) -> Result<Background, IconRenderFailure> {
+    if setup.screen != .None {
+        return .Ok(
+            backgroundBetween(
+                gray(ContourGradients.darkTintStart),
+                gray(ContourGradients.darkTintEnd),
+                .DisplayP3
+            )
+        )
+    }
+    return backgroundOf(document, setup.appearance)
+}
+
+// The document's fill in `appearance`. Unset, the dark appearance's is the
+// system's dark gradient, as the document is adapted to the dark, unless
+// the light chiclet is wholly transparent.
+function backgroundFill(fill: borrow FillChoice, appearance: IconAppearance) -> IconFill {
+    if appearance == .Dark {
+        return match fill.dark {
+            Some(chosen) -> copy chosen
+            None -> transparent(fill.light) ? copy fill.light : .Automatic
+        }
+    }
+    return fill.value(appearance)
+}
+
+// The chiclet's gradient runs down the canvas wherever the document places
+// it, in Display P3.
+function gradientBackground(gradient: borrow IconGradient) -> Background {
+    return backgroundBetween(
+        rgbaOf(inDisplayP3(gradient.from)),
+        rgbaOf(inDisplayP3(gradient.to)),
+        .DisplayP3
+    )
+}
+
+// The group's images, rendered on `device`; none when it covers no pixel.
+function renderedGroup(
+    device: borrow mut RenderDevice,
+    group: borrow PreparedGroup,
+    context: borrow GlassContext
+) -> Result<GroupImages?, IconRenderFailure> {
+    let side = context.side
+    let box = pixelBox(group.bounds, side)
+    if box.width <= 0 || box.height <= 0 { return .Ok(.None) }
+    let contents = try groupContents(device, group, box, context)
+    let sizing = FieldSizing { side: side, outset: context.outset() }
+    let fieldSide = UN32(side + 2)
+    let fieldContents = try fieldList(group, sizing)
+    let field = try rendered(
+        device.render(fieldContents, fieldSide, fieldSide, clear(), .Rgba16Float, .StandardRgb)
+    )
+    let cast = ShadowCast {
+        neutral: context.masked || group.shadow.kind == .Neutral,
+        masked: context.masked
+    }
+    let shadow = try groupShadow(device, group, field, sizing, context, cast)
+    return .Ok(
+        .Some(
+            GroupImages {
+                contents: contents,
+                box: box,
+                field: field,
+                shadow: shadow,
+                shadowOpacity: group.shadow.opacity,
+                neutralShadow: cast.neutral,
+                bounds: copy group.bounds,
+                translucency: group.translucency,
+                opacity: group.opacity,
+                blend: group.blend,
+                blur: group.blur,
+                specular: group.specular
+            }
+        )
+    )
+}
+
+// The group's contents over `box`, drawn in colour mode 14 too, in its
+// working space (see readIcon).
+function groupContents(
+    device: borrow mut RenderDevice,
+    group: borrow PreparedGroup,
+    box: borrow Rect,
+    context: borrow GlassContext
+) -> Result<TextureImage, IconRenderFailure> {
+    let list = try contentsList(group, box, context.side, context.masked)
+    let width = UN32(box.width)
+    let height = UN32(box.height)
+    return rendered(device.render(list, width, height, clear(), .Rgba16Float, .StandardRgb))
+}
+
+// The group's shadow image, none when it casts none.
+function groupShadow(
+    device: borrow mut RenderDevice,
+    group: borrow PreparedGroup,
+    field: borrow TextureImage,
+    sizing: borrow FieldSizing,
+    context: borrow GlassContext,
+    cast: borrow ShadowCast
+) -> Result<TextureImage?, IconRenderFailure> {
+    if group.shadow.kind == .None || group.shadow.opacity <= 0 { return .Ok(.None) }
+    let side = UN32(context.side)
+    let list = try shadowList(group, field, sizing, context.deepest(), context.size, cast)
+    return .Ok(.Some(try rendered(device.render(list, side, side, clear(), .Rgba8, .DisplayP3))))
+}
+
+// How the icon is laid out in its image.
+public enum IconLayout {
+    // As macOS shows it: the chiclet 824 of every 1024 pixels across,
+    // casting its shadow.
+    Framed
+    // As iOS and iPadOS show it: the chiclet filling the image, with no
+    // shadow, which the home screen gives it if it wants one.
+    Edge
+}
+
+// An icon is drawn at `factor` times the side it is shown at, then halved on
+// the device until it is that side: each halving reads four pixels as one, so
+// the glass's thin edges and the chiclet's outline are a smooth pixel wide at
+// any size rather than stepped, as a large rendering scaled down shows them.
+namespace IconSupersample {
+    let factor: Number = 4
+    // Past this side an icon is drawn at least as large as it is shown at.
+    let enough: Number = 1024
+}
+
+// How many times larger than `side` an icon is drawn: the factor, halved
+// until it no longer passes the side that needs none.
+function supersampleOf(side: Number) -> Number {
+    var factor = IconSupersample.factor
+    while factor > 1 && side * factor > IconSupersample.enough * 2 { factor = factor / 2 }
+    return factor
+}
+
+function iconFrame(layout: IconLayout, side: Number) -> IconFrame {
+    let drawn = side * supersampleOf(side)
+    return match layout {
+        Framed -> IconFrame {
+            side: drawn,
+            body: drawn * IconGeometry.bodyShare,
+            chicletShadow: true,
+            shown: side
+        }
+        Edge -> IconFrame { side: drawn, body: drawn, chicletShadow: false, shown: side }
+    }
+}
+
+// The icon `bundle` holds, rendered in `style` as a square image `side`
+// pixels across, laid out as `layout` places it.
+public function renderedIcon(
+    bundle: borrow IconBundle,
+    style: IconStyle,
+    side: Number,
+    layout: IconLayout
+) -> Result<IconImage, IconRenderFailure> {
+    let setup = try setupOf(style)
+    let masked = setup.masked()
+    let look = GroupLook {
+        appearance: setup.appearance,
+        chiclet: setup.dark ? darkChicletOf(bundle.document.fill) : .None
+    }
+    let groups = try preparedGroups(bundle, look)
+    let background = try styleBackground(bundle.document, setup)
+    let frame = iconFrame(layout, side)
+    let context = GlassContext {
+        side: frame.body,
+        size: sizeClassFor(side),
+        dim: background.luminance() <= ChicletLuminance.maxDim,
+        masked: masked,
+        screened: setup.screen != .None
+    }
+    var device = match openRenderDevice() {
+        Ok(device) -> device
+        Error(failure) -> return .Error(.Rendering(failure))
+    }
+    let image = drawnIcon(device, groups, setup, background, context, frame)
+    device.close()
+    return image
+}
+
+// The groups rendered, then composited as `setup` draws them.
+function drawnIcon(
+    device: borrow mut RenderDevice,
+    groups: borrow [PreparedGroup],
+    setup: borrow StyleSetup,
+    background: borrow Background,
+    context: borrow GlassContext,
+    frame: borrow IconFrame
+) -> Result<IconImage, IconRenderFailure> {
+    let images = try groupImages(device, groups, context)
+    match setup.glass {
+        Some(glass) -> return maskedIcon(device, images, glass, context, frame)
+        None -> {}
+    }
+    let list = try compositeList(images, background, context, frame, setup.screen)
+    let drawn = try drawnImage(device, list, frame.side)
+    releaseGroups(device, images)
+    return readImage(device, move drawn, frame, .DisplayP3)
+}
+
+// The groups' images given back to the device once the icon is drawn from
+// them, so the renders after take their textures instead of new ones.
+function releaseGroups(device: borrow mut RenderDevice, groups: borrow [GroupImages]) {
+    for group in groups {
+        device.release(copy group.contents)
+        device.release(copy group.field)
+        match group.shadow {
+            Some(shadow) -> device.release(copy shadow)
+            // A group that casts no shadow has no image for it.
+            None -> {}
+        }
+    }
+}
+
+function groupImages(
+    device: borrow mut RenderDevice,
+    groups: borrow [PreparedGroup],
+    context: borrow GlassContext
+) -> Result<[GroupImages], IconRenderFailure> {
+    var images: [GroupImages] = []
+    for group in groups {
+        let prepared = try renderedGroup(device, group, context)
+        match prepared {
+            Some(made) -> images.append(move made)
+            None -> {}
+        }
+    }
+    return .Ok(images)
+}
+
+// A clear mode icon: its mask rendered, then laid over `glass`.
+function maskedIcon(
+    device: borrow mut RenderDevice,
+    groups: borrow [GroupImages],
+    glass: borrow Background,
+    context: borrow GlassContext,
+    frame: borrow IconFrame
+) -> Result<IconImage, IconRenderFailure> {
+    let pixelSide = UN32(frame.side)
+    let maskContents = try maskList(groups, context, frame)
+    let mask = try rendered(
+        device.render(maskContents, pixelSide, pixelSide, clear(), .Rgba16Float, .StandardRgb)
+    )
+    releaseGroups(device, groups)
+    let list = try maskedCompositeList(copy mask, glass, context, frame)
+    let drawn = try drawnImage(device, list, frame.side)
+    device.release(move mask)
+    return readImage(device, move drawn, frame, .DisplayP3)
+}
+
+// `image`, `from` pixels across, halved on the device until it is `to`
+// across: drawn at half its side with linear filtering, each pixel's centre
+// falls between four texels and reads their mean.
+function halvedImage(
+    device: borrow mut RenderDevice,
+    image: TextureImage,
+    from: Number,
+    to: Number
+) -> Result<TextureImage, IconRenderFailure> {
+    var current = move image
+    var side = from
+    while side > to {
+        side = side / 2
+        let pixelSide = UN32(side)
+        let half = try rendered(
+            device.render(
+                imageCopyFiltered(copy current, side, .Linear),
+                pixelSide,
+                pixelSide,
+                clear(),
+                .Rgba16Float,
+                .StandardRgb
+            )
+        )
+        device.release(move current)
+        current = move half
+    }
+    return .Ok(current)
+}
+
+// A list drawing `image`, `side` pixels across, texel for texel.
+function imageCopy(image: TextureImage, side: Number) -> LayerContents {
+    return imageCopyFiltered(move image, side, .None)
+}
+
+// A list drawing `image` stretched over `side` pixels, read with `filter`.
+function imageCopyFiltered(
+    image: TextureImage,
+    side: Number,
+    filter: InterpolationMode
+) -> LayerContents {
+    let list = DisplayList()
+    var shape = Shape()
+    shape.setRect(Rect { width: side, height: side })
+    var fill = Fill()
+    fill.setImage(
+        ImageFill {
+            image: .Texture(move image),
+            transform: AffineTransform { a: side, d: side },
+            interpolation: filter,
+            tint: .None,
+            colorSpace: .StandardRgb
+        }
+    )
+    list.drawShape(shape, fill, 1, .Normal)
+    return list.moveContents()
+}
+
+// RenderBox's premultiplied pixels with their colour divided out again.
+function unpremultiplied(pixels: borrow [UN8]) -> [UN8] {
+    var bytes: [UN8] = []
+    var at = 0
+    while at + 3 < pixels.count {
+        let alpha = Number(pixels[at + 3])
+        for channel in 0..3 {
+            let value = Number(pixels[at + channel])
+            bytes.append(alpha == 0 ? 0 : UN8(min(round(value * 255 / alpha), 255)))
+        }
+        bytes.append(pixels[at + 3])
+        at += 4
+    }
+    return bytes
+}
+
+// An SVG document drawn by itself into a square image `side` pixels across,
+// its viewBox fitted and centred.
+public function svgImage(
+    text: borrow String,
+    side: Number
+) -> Result<IconImage, IconRenderFailure> {
+    let document = try svgParsed(parsedSvg(text))
+    let list = DisplayList()
+    try svgDrawn(drawSvg(document, list, Rect { width: side, height: side }))
+    var device = match openRenderDevice() {
+        Ok(device) -> device
+        Error(failure) -> return .Error(.Rendering(failure))
+    }
+    let image = readIcon(device, list.moveContents(), side, .StandardRgb)
+    device.close()
+    return image
+}
+
+// `contents` rendered into a square image `side` across in `space` and read
+// back.
+// `FUN_1ccaef818` renders through RBImageRenderer in colour mode 14, whose
+// layers (RB::ColorMode::layer_format) keep extended range: light added to
+// white stays above one until the darklights and the clamp take it down.
+// Its working space (RBColorModeWorkingColorSpace) is sRGB, extended. The
+// icon is drawn so in half floats, then copied into bytes in `space`.
+function readIcon(
+    device: borrow mut RenderDevice,
+    contents: borrow LayerContents,
+    side: Number,
+    space: ColorSpace
+) -> Result<IconImage, IconRenderFailure> {
+    let drawn = try drawnImage(device, contents, side)
+    let frame = IconFrame { side: side, body: side, chicletShadow: false, shown: side }
+    return readImage(device, move drawn, frame, space)
+}
+
+// `contents` rendered into a square half-float image `side` across in the
+// working space.
+function drawnImage(
+    device: borrow mut RenderDevice,
+    contents: borrow LayerContents,
+    side: Number
+) -> Result<TextureImage, IconRenderFailure> {
+    let pixelSide = UN32(side)
+    return rendered(
+        device.render(contents, pixelSide, pixelSide, clear(), .Rgba16Float, .StandardRgb)
+    )
+}
+
+// `drawn`, `frame.side` across, halved to `frame.shown`, copied into bytes in
+// `space` and read back.
+function readImage(
+    device: borrow mut RenderDevice,
+    drawn: TextureImage,
+    frame: borrow IconFrame,
+    space: ColorSpace
+) -> Result<IconImage, IconRenderFailure> {
+    let side = frame.shown
+    let pixelSide = UN32(side)
+    let halved = try halvedImage(device, move drawn, frame.side, side)
+    let copied = imageCopy(copy halved, side)
+    let icon = try rendered(device.render(copied, pixelSide, pixelSide, clear(), .Rgba8, space))
+    device.release(move halved)
+    let pixels = match device.read(icon) {
+        Ok(bytes) -> bytes
+        Error(failure) -> return .Error(.Rendering(failure))
+    }
+    return .Ok(
+        IconImage { width: side, height: side, bytes: unpremultiplied(pixels), colorSpace: space }
+    )
+}

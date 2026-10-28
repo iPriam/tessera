@@ -1,0 +1,8 @@
+//! The `pmset` package: the command that reads what the Power service says of the machine's power.
+/// The Tessera pmset package: the power command.
+construct TesseraPmset extends Package {
+    let version: String = "0.1.0"
+    let kind: PackageKind = .App
+    let moduleRoot: String = "TesseraPmset"
+    let dependencies: [Dependency] = [Dependency { name: "ArgumentParser", path: "../argument-parser" }]
+}

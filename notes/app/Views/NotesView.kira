@@ -1,0 +1,100 @@
+//! The Notes window: its sidebar, its list and its detail.
+import KiraUI
+
+/// The Notes window: the sidebar, the list and the detail, redrawn each time the window is built, so a change shows as soon as it is saved.
+construct NotesView(search: NotesSearch) extends Widget {
+    // What is being typed under the chosen note.
+    @State var line: String = ""
+    @FocusState var writing: Bool = true
+
+    body {
+        let folders = loadFolders()
+        let query = copy search.query
+        NavigationSplitView(path = NavigationPath {}) {
+            FolderSidebar(folders = folders)
+            .toolbar {
+                ToolbarItem(placement = .PrimaryAction) {
+                    Button(
+                        action = { in
+                            newFolder(loadFolders())
+                            return
+                        }
+                    ) {
+                        Icon(symbol = .FolderBadgePlus)
+                    }
+                }
+            }
+        } content: {
+            NoteList(notes = listedNotes(folders, query))
+            .navigationTitle(folderTitle(chosenFolder()))
+            .toolbar {
+                ToolbarItem(placement = .PrimaryAction) {
+                    Button(
+                        action = { in
+                            newNote(loadFolders())
+                            line = ""
+                            return
+                        }
+                    ) {
+                        Icon(symbol = .SquarePencil)
+                    }
+                }
+            }
+            .searchable(
+                text = Binding<String> {
+                    get: { in
+                        return copy search.query
+                    },
+                    set: { text in
+                        var held = search
+                        held.query = move text
+                        return
+                    }
+                },
+                prompt = "Search"
+            )
+        } detail: {
+            // The field is under whichever note is chosen: Return gives a new
+            // note its title, then adds each line under it.
+            noteDetail(
+                chosenNote(folders),
+                listedNotes(folders, query).count,
+                // It has the keyboard from the start, as `writing` begins.
+                TextField(title = notePrompt(chosenNote(folders)), text = $line).onSubmit(
+                    { in
+                        addTyped(loadFolders(), copy line)
+                        line = ""
+                        return
+                    }
+                ).focused($writing)
+            )
+            .toolbar {
+                ToolbarItem(placement = .PrimaryAction) {
+                    Menu(title = "More", systemImage = .Ellipsis) {
+                        Button(
+                            action = { in
+                                deleteChosen(loadFolders())
+                                return
+                            }
+                        ) {
+                            Label(title = "Delete Note", systemImage = .Trash)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The title a folder shows: its name, or the name of the folder the notes are kept in.
+function folderTitle(folder: borrow String) -> String {
+    return folder == Routes.allNotes ? "All Notes" : copy folder
+}
+
+/// What the field asks for: a title while the note has none.
+function notePrompt(note: Note?) -> String {
+    match note {
+        Some(chosen) -> return chosen.title.count == 0 ? "Title" : "Add a line"
+        None -> return "Choose or start a note"
+    }
+}

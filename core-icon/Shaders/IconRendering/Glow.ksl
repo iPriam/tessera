@@ -1,0 +1,70 @@
+// glow: a Gaussian glow `radius` points wide outside the edge, in `color`.
+// The distance is taken the other way round here, positive outside.
+import Stitch
+
+type GlowArguments {
+    let toUser: Float4
+    let toUserTranslation: Float2
+    let radius: Float
+    let biasAmount: Float
+    let color: Float4
+    let sdfScale: Float
+    let sdfZero: Float
+    let fieldInverseSize: Float2
+}
+
+type FullscreenIn {
+    @builtin(vertex_index)
+    let vid: UInt
+}
+
+type FullscreenOut {
+    @builtin(position)
+    let clip_position: Float4
+}
+
+type StitchOut {
+    let color: Float4
+}
+
+// The Gaussian's exponent: exp(x * x * -0.5).
+const gaussianExponent: Float = -0.5
+
+shader Glow {
+    group Draw {
+        uniform arguments: GlowArguments
+        texture field: Texture2d
+        sampler fieldSampler: Sampler
+    }
+
+    vertex {
+        input FullscreenIn
+        output FullscreenOut
+
+        function entry(input: FullscreenIn) -> FullscreenOut {
+            let out: FullscreenOut
+            out.clip_position = Stitch.fullscreen(input.vid)
+            return out
+        }
+    }
+
+    fragment {
+        input FullscreenOut
+        output StitchOut
+
+        function entry(input: FullscreenOut) -> StitchOut {
+            let a = arguments
+            let position = Stitch.userPoint(input.clip_position.xy, a.toUser, a.toUserTranslation)
+            let texel = sample(field, fieldSampler, position * a.fieldInverseSize)
+            let d = -Stitch.insideDistance(texel, a.sdfScale, a.sdfZero)
+            let x = d / a.radius
+            let g = exp(x * x * gaussianExponent)
+            let falloff = max((1.0 - g) * a.biasAmount + 1.0, Stitch.smallestWidth)
+            let w = Stitch.changeWidth(x) * Stitch.antialiasSpan
+            let edge = Stitch.saturate(x / w + 0.5)
+            let result: StitchOut
+            result.color = a.color * (edge * g / falloff)
+            return result
+        }
+    }
+}

@@ -1,0 +1,72 @@
+import Foundation
+
+// Rights (§3.3) and signals (§3.4), one constant per bit.
+
+public namespace Rights {
+    let duplicate: Rights = Rights(1)
+    let transfer: Rights = Rights(2)
+    let read: Rights = Rights(4)
+    let write: Rights = Rights(8)
+    let map: Rights = Rights(16)
+    let execute: Rights = Rights(32)
+    let signal: Rights = Rights(64)
+    let wait: Rights = Rights(128)
+    let inspect: Rights = Rights(256)
+    let manage: Rights = Rights(512)
+    let setProperty: Rights = Rights(1024)
+    let enumerate: Rights = Rights(2048)
+    let create: Rights = Rights(4096)
+    let delete: Rights = Rights(8192)
+    let traverse: Rights = Rights(16384)
+    let grant: Rights = Rights(32768)
+    // `Handle.duplicate`'s "the same rights as the source".
+    let same: Rights = Rights(0xFFFFFFFFFFFFFFFF)
+}
+
+namespace Rights {
+    // No rights at all; as a requirement, any handle meets it.
+    let none: Rights = Rights(0)
+    // What a process gets on an object it created itself (§3.3).
+    let processDefault: Rights = Rights(0x7CF)
+    // Every bit a node can carry: the five permission-model operations and Traverse.
+    let nodeAll: Rights = Rights(0x780C)
+}
+
+public namespace Signals {
+    let none: Signals = Signals(0)
+    let readable: Signals = Signals(1)
+    let writable: Signals = Signals(2)
+    let peerClosed: Signals = Signals(4)
+    let signaled: Signals = Signals(8)
+    let terminated: Signals = Signals(16)
+    let error: Signals = Signals(32)
+    let overrun: Signals = Signals(64)
+}
+
+// `USER_0` … `USER_7`, settable on events and event pairs only.
+public function signalUser(index: UNumber) -> Signals {
+    if index > U32(7) { return Signals(0) }
+    return Signals(U32(1) << (U32(24) + index))
+}
+
+let signalsUserMask: U32 = U32(0xFF000000)
+
+// How often `Object.waitAsync` and a readiness source post: once, each
+// time the last packet was taken and the signal is still asserted, or each
+// time it becomes asserted.
+@Derive(Copy)
+public enum WaitOptions: U32 {
+    Once = 0
+    Repeat = 1
+    Edge = 2
+}
+
+// `Completion.flags`.
+@Derive(Copy)
+public distinct CompletionFlags = UNumber
+
+public namespace CompletionFlags {
+    let none: CompletionFlags = CompletionFlags(0)
+    // Further packets follow.
+    let more: CompletionFlags = CompletionFlags(1)
+}

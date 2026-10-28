@@ -1,0 +1,130 @@
+//! The status bar on Adaptive Mobile: which items it shows, when it is shown or kept, and the home screen's
+//! edit that hides it.
+import Foundation
+import LibTessera
+import PlatformUI
+import TesseraDisplayClient
+import KiraUI
+
+/// What the status area shows besides the time (roadmap/11-adaptive-desktop.md):
+/// Focus as Control Center has it, the network the kernel's interfaces are on,
+/// and the battery as the power service reads it, on the bar and on the lock
+/// screen alike. A machine without a battery shows the mains; one whose power
+/// service has not answered yet shows neither.
+function statusItems(focus: Bool) -> StatusItems {
+    var items = StatusItems { focus: focus }
+    match networkLink() {
+        Some(link) -> items.connection = .Some(
+            match link.medium {
+                Wireless -> .Wireless(link.connected)
+                Wired -> .Wired(link.connected)
+            }
+        )
+        None -> {}
+    }
+    match powerRead() {
+        Ok(info) -> {
+            items.mains = info.batteryPercent == PowerInfo.noBattery
+            if !items.mains {
+                items.battery = .Some(
+                    BatteryLevel {
+                        percent: info.batteryPercent,
+                        charging: info.batteryState == .Charging
+                    }
+                )
+            }
+        }
+        // The power service has not answered yet, or there is none: no
+        // battery is shown, and the next frame asks again.
+        Error(failed) -> log debug("no power state for the status area", error: errorName(failed))
+    }
+    return items
+}
+
+/// The status bar stands over everything, the lock screen and Control Center
+/// too, unless what is in front asked for it to be hidden
+/// (`.statusBarHidden`), as a game does, or as the home screen does while it
+/// is edited and its own bar takes the top.
+function statusBarShown(mobile: borrow Mobile) -> Bool {
+    if mobile.lock.locked || mobile.controls.open { return true }
+    if homeEditHidesBar(mobile) { return false }
+    if atHome(mobile) {
+        return match mobile.home {
+            Some(surface) -> !mobile.barHidden.contains(surface)
+            None -> true
+        }
+    }
+    return match mobile.front {
+        Some(surface) -> !mobile.barHidden.contains(surface)
+        None -> true
+    }
+}
+
+/// Whether the status bar's band is kept out of the application in front:
+/// the home screen keeps it while it hides the bar, so nothing on it moves.
+function statusBarBandKept(mobile: borrow Mobile) -> Bool {
+    if homeEditHidesBar(mobile) { return false }
+    return atHome(mobile) || statusBarShown(mobile)
+}
+
+/// Whether an edited Home hides the status bar: its own bar takes the top, and
+/// the band goes with the bar. Nothing else covers the top then, so presses on
+/// Home's Edit and Done pills reach Home, not the platform's band.
+function homeEditHidesBar(mobile: borrow Mobile) -> Bool {
+    return atHome(mobile) && mobile.homeEditing && !mobile.lock.locked && !mobile.controls.open
+}
+
+/// An application asked for the status bar to be hidden while it is in front,
+/// or shown again.
+function statusBarAsked(mobile: borrow mut Mobile, surface: DisplaySurfaceId, hidden: Bool) {
+    mobile.barHidden = surfacesBut(mobile.barHidden, surface)
+    if hidden { mobile.barHidden.append(surface) }
+    log info("an application asked about the status bar", surface: surface.raw, hidden: hidden)
+    keepBar(mobile)
+    redrawAfter(0)
+}
+
+/// The home screen began or ended an edit; only its own surface says so.
+function homeEdited(mobile: borrow mut Mobile, surface: DisplaySurfaceId, editing: Bool) {
+    if mobile.home != .Some(surface) { return }
+    mobile.homeEditing = editing
+    log info("the home screen is edited", editing: editing)
+    keepBar(mobile)
+    redrawAfter(0)
+}
+
+/// The band the status bar takes on this output, which is taller on a phone.
+function barHeight(mobile: borrow Mobile) -> Number {
+    return statusBarHeight(statusBarTall(mobile.output.width, mobile.output.height))
+}
+
+/// `surfaces` without `surface`.
+function surfacesBut(
+    surfaces: borrow [DisplaySurfaceId],
+    surface: DisplaySurfaceId
+) -> [DisplaySurfaceId] {
+    var kept: [DisplaySurfaceId] = []
+    for each in surfaces {
+        if each != surface { kept.append(each) }
+    }
+    return kept
+}
+
+/// The status bar takes the top of the screen while it is shown, which every
+/// application is told as its top inset; hidden, the application in front has
+/// the whole screen, and every press on it.
+function keepBar(mobile: borrow mut Mobile) {
+    let band = statusBarBandKept(mobile) ? barHeight(mobile) : 0.0
+    if band == mobile.bar { return }
+    let channel = match mobile.channel {
+        Some(value) -> value
+        None -> return
+    }
+    match sendSetBar(channel, UNumber(band)) {
+        Ok -> {
+            mobile.bar = band
+            log info("the status bar takes the top of the output", height: band)
+        }
+        Error(failed) -> log warn("could not keep the status bar's band", error: errorName(failed))
+    }
+}

@@ -1,0 +1,119 @@
+import Foundation
+import FileOperations
+
+@Test
+function snapshotNamesAreUtcDates() {
+    expect!(snapshotName(0) == "19700101-000000")
+    // 2026-10-26 14:25:30 UTC.
+    expect!(snapshotName(1793024730000) == "20261026-142530")
+    expect!(snapshotName(951782400000) == "20000229-000000")
+}
+
+@Test
+function aSecondBackupLinksWhatDidNotChange() {
+    let folder = freshFolder("backup")
+    let source = childPath(folder, "Documents")
+    let root = childPath(folder, "Backups")
+    expect!(made(makeDirectory(source)))
+    writeText(childPath(source, "a.txt"), "first")
+    writeText(childPath(source, "b.txt"), "second")
+    let first = match backUp(source, root, 1000) {
+        Ok(summary) -> summary
+        Error(failure) -> {
+            absorb failure
+            BackupSummary { snapshot: Snapshot { name: "", path: "" }, copied: -1, linked: -1 }
+        }
+    }
+    expect!(first.copied == 2)
+    expect!(first.linked == 0)
+    writeText(childPath(source, "b.txt"), "changed")
+    let second = match backUp(source, root, 2000) {
+        Ok(summary) -> summary
+        Error(failure) -> {
+            absorb failure
+            BackupSummary { snapshot: Snapshot { name: "", path: "" }, copied: -1, linked: -1 }
+        }
+    }
+    expect!(second.linked == 1)
+    expect!(second.copied == 1)
+    let snapshots = snapshotsIn(root)
+    expect!(snapshots.count == 2)
+    expect!(snapshots[0].name == second.snapshot.name)
+    expect!(textAt(childPath(snapshots[1].path, "b.txt")) == "second")
+    expect!(removed(removeTree(folder)))
+}
+
+@Test
+function aBackupCutShortIsIgnoredAndRemoved() {
+    let folder = freshFolder("partial")
+    let source = childPath(folder, "Documents")
+    let root = childPath(folder, "Backups")
+    expect!(made(makeDirectory(source)))
+    expect!(made(makeDirectory(root)))
+    expect!(made(makeDirectory(childPath(root, "19990101-000000"))))
+    expect!(snapshotsIn(root).count == 0)
+    writeText(childPath(source, "a.txt"), "kept")
+    let done = match backUp(source, root, 1000) {
+        Ok -> true
+        Error(failure) -> {
+            absorb failure
+            false
+        }
+    }
+    expect!(done)
+    expect!(!pathExists(childPath(root, "19990101-000000")))
+    expect!(snapshotsIn(root).count == 1)
+    expect!(removed(removeTree(folder)))
+}
+
+@Test
+function anItemIsRestoredBesideWhatIsThere() {
+    let folder = freshFolder("restore")
+    let source = childPath(folder, "Documents")
+    let root = childPath(folder, "Backups")
+    expect!(made(makeDirectory(source)))
+    writeText(childPath(source, "a.txt"), "original")
+    let snapshot = match backUp(source, root, 1000) {
+        Ok(summary) -> summary.snapshot.path
+        Error(failure) -> {
+            absorb failure
+            ""
+        }
+    }
+    writeText(childPath(source, "a.txt"), "edited")
+    let restored = match restoreItem(childPath(snapshot, "a.txt"), source) {
+        Ok(path) -> path
+        Error(failure) -> {
+            absorb failure
+            ""
+        }
+    }
+    expect!(lastPathPart(restored) == "a 2.txt")
+    expect!(textAt(restored) == "original")
+    expect!(textAt(childPath(source, "a.txt")) == "edited")
+    expect!(removed(removeTree(folder)))
+}
+
+@Test
+function pruningKeepsTheNewest() {
+    let folder = freshFolder("prune")
+    let source = childPath(folder, "Documents")
+    let root = childPath(folder, "Backups")
+    expect!(made(makeDirectory(source)))
+    writeText(childPath(source, "a.txt"), "x")
+    for at in [1000, 2000000, 4000000] {
+        let ok = match backUp(source, root, at) {
+            Ok -> true
+            Error(failure) -> {
+                absorb failure
+                false
+            }
+        }
+        expect!(ok)
+    }
+    expect!(removed(pruneSnapshots(root, 2)))
+    let left = snapshotsIn(root)
+    expect!(left.count == 2)
+    expect!(left[1].name == snapshotName(2000000))
+    expect!(removed(removeTree(folder)))
+}

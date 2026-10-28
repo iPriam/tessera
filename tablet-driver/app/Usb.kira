@@ -1,0 +1,229 @@
+//! The USB side of the tablet driver: the descriptors, the setup requests and the tablet search.
+import Foundation
+import Heap
+import LibTessera
+import DeviceKit
+
+// The tablet, through DeviceKit's Usb family: its descriptors, the HID
+// interface, and its report descriptor.
+
+/// The layout of the USB descriptors the driver reads: the configuration's, one descriptor after another, each led by its length and its type.
+namespace UsbDescriptor {
+    let bufferBytes: Number = 4096
+    let deviceBytes: Number = 18
+    // idVendor and idProduct in the device descriptor, little-endian.
+    let vendorAt: Number = 8
+    let productAt: Number = 10
+    let kindAt: Number = 1
+    let interfaceNumberAt: Number = 2
+    let interfaceClassAt: Number = 5
+    let endpointAddressAt: Number = 2
+    let endpointAttributesAt: Number = 3
+    let hidClass: UN8 = UN8(0x03)
+    let transferTypeMask: UN8 = UN8(3)
+    let interruptTransfer: UN8 = UN8(3)
+    let directionIn: UN32 = UN32(0x80)
+    // The HID descriptor gives the report descriptor's length @7.
+    let hidBytes: Number = 9
+    let reportLengthAt: Number = 7
+}
+
+/// The setup packet that asks a tablet for its HID report descriptor, as the bytes it is sent in.
+namespace ReportRequest {
+    let requestType: Number = 0x81
+    let request: Number = 6
+    let value: Number = 0x2200
+}
+
+/// The nanoseconds in the units the driver waits in.
+namespace Nanoseconds {
+    let completion: Number = 10000000000
+    let transfer: Number = 2000000000
+}
+
+/// The keys this driver's completions carry.
+namespace PortKey {
+    let claim: UNumber = UNumber(1)
+    let open: UNumber = UNumber(2)
+    let report: UNumber = UNumber(10)
+}
+
+/// A tablet the driver found: its interface, its interrupt endpoint and the length of its report descriptor.
+struct Tablet {
+    var interface: Number
+    var interruptIn: UN32
+    var reportLength: Number
+    var vendorId: Number
+    var productId: Number
+}
+
+/// What the descriptors seen so far say of the HID interface.
+struct TabletScan {
+    var interface: Number?
+    var inside: Bool
+    var interruptIn: UN32?
+    var reportLength: Number?
+}
+
+/// The kinds of USB descriptor the driver tells apart.
+enum DescriptorKind {
+    Interface
+    Endpoint
+    Hid
+    Other
+}
+
+/// The driver's error with `code`.
+function failure(code: ErrorCode) -> TesseraError {
+    return TesseraError {
+        code: code,
+        subsystem: .DeviceKit,
+        flags: ErrorFlags.none,
+        detail: UNumber(0)
+    }
+}
+
+/// The hexadecimal text of `value`, padded to `digits` digits.
+function hexText(value: Number, digits: Number) -> String {
+    let alphabet = "0123456789abcdef"
+    var text = ""
+    var rest = UNumber(value)
+    for _ in 0..digits {
+        let digit = Number(rest & UNumber(15))
+        text = alphabet.substring(digit, digit + 1) + text
+        rest = rest >> UNumber(4)
+    }
+    return text
+}
+
+/// The completion for `key`, waiting at most ten seconds; only one operation is in flight at a time, so no other completion is lost.
+function completionFor(port: Handle, key: UNumber) -> Result<Completion, TesseraError> {
+    let deadline = try timeRead(.Monotonic) + Nanoseconds.completion
+    while true {
+        let waited = try portWait(port, 1, deadline)
+        if waited.count == 0 { return .Error(failure(.Timeout)) }
+        for completion in waited {
+            if completion.key == key {
+                if completion.error.code != .Ok { return .Error(completion.error) }
+                return .Ok(completion)
+            }
+        }
+    }
+    return .Error(failure(.Timeout))
+}
+
+/// The kind of descriptor `raw` names.
+function descriptorKind(raw: UN8) -> DescriptorKind {
+    return match raw {
+        4 -> .Interface
+        5 -> .Endpoint
+        0x21 -> .Hid
+        else -> .Other
+    }
+}
+
+/// The byte at `at` in the buffer at `base`.
+function byteAt(base: RawPtr, at: Number) -> UN8 { return heapLoad<U8>(base, at) }
+
+/// The little-endian 16-bit word at `at` in the buffer at `base`.
+function wordAt(base: RawPtr, at: Number) -> Number {
+    return Number(byteAt(base, at)) + Number(byteAt(base, at + 1)) * 256
+}
+
+/// Notes what one descriptor of `length` bytes at `at` says of the HID interface.
+function scanDescriptor(scan: borrow mut TabletScan, base: RawPtr, at: Number, length: Number) {
+    match descriptorKind(byteAt(base, at + UsbDescriptor.kindAt)) {
+        Interface -> {
+            scan.inside = scan.interface.isNone() && byteAt(
+                base,
+                at + UsbDescriptor.interfaceClassAt
+            ) == UsbDescriptor.hidClass
+            if scan.inside {
+                scan.interface = .Some(Number(byteAt(base, at + UsbDescriptor.interfaceNumberAt)))
+            }
+        }
+        Hid -> if scan.inside && length >= UsbDescriptor.hidBytes {
+            scan.reportLength = .Some(wordAt(base, at + UsbDescriptor.reportLengthAt))
+        }
+        Endpoint -> {
+            let attributes = byteAt(base, at + UsbDescriptor.endpointAttributesAt)
+            let address = UN32(byteAt(base, at + UsbDescriptor.endpointAddressAt))
+            let interrupt = (
+                attributes & UsbDescriptor.transferTypeMask
+            ) == UsbDescriptor.interruptTransfer
+            if scan.inside && interrupt && (address & UsbDescriptor.directionIn) != UN32(0) {
+                scan.interruptIn = .Some(address)
+            }
+        }
+        // Other descriptors say nothing of the tablet.
+        Other -> {}
+    }
+}
+
+/// The first HID interface (class 0x03), its interrupt IN endpoint and the length of its report descriptor.
+function findTablet(usb: Ref) -> Result<Tablet, TesseraError> {
+    let outBytes = zeroedBlock(count: UsbDescriptor.bufferBytes, alignment: 16)
+    let out = Buffer { address: outBytes.pointer(), length: Number(UsbDescriptor.bufferBytes) }
+    let size = Number(try usbDescriptors(usb, out))
+    if size < UsbDescriptor.deviceBytes || size > UsbDescriptor.bufferBytes {
+        return .Error(failure(.Internal))
+    }
+    var scan = TabletScan {
+        interface: .None,
+        inside: false,
+        interruptIn: .None,
+        reportLength: .None
+    }
+    var at = UsbDescriptor.deviceBytes
+    while at + 2 <= size {
+        let length = Number(byteAt(out.address, at))
+        if length < 2 || at + length > size { return .Error(failure(.Internal)) }
+        scanDescriptor(scan, out.address, at, length)
+        at += length
+    }
+    let interface = try scan.interface otherwise return .Error(failure(.NotFound))
+    let interruptIn = try scan.interruptIn otherwise return .Error(failure(.NotFound))
+    let reportLength = try scan.reportLength otherwise return .Error(failure(.NotFound))
+    if reportLength == 0 { return .Error(failure(.NotFound)) }
+    return .Ok(
+        Tablet {
+            interface: interface,
+            interruptIn: interruptIn,
+            reportLength: reportLength,
+            vendorId: wordAt(out.address, UsbDescriptor.vendorAt),
+            productId: wordAt(out.address, UsbDescriptor.productAt),
+        }
+    )
+}
+
+/// The setup packet's words for `tablet`'s report descriptor request.
+function reportSetup(tablet: borrow Tablet) -> UNumber {
+    let low = ReportRequest.requestType + ReportRequest.request * 256 + ReportRequest.value * 65536
+    return UNumber(low) | (UNumber(tablet.interface) << UNumber(32)) | (
+        UNumber(tablet.reportLength) << UNumber(48)
+    )
+}
+
+/// The interface's report descriptor, read with a control transfer; answers its bytes.
+function reportDescriptor(
+    usb: Ref,
+    tablet: borrow Tablet,
+    port: Handle
+) -> Result<Number, TesseraError> {
+    let dataBytes = zeroedBlock(count: tablet.reportLength, alignment: 16)
+    let transfer = UsbTransfer {
+        endpoint: UN32(0),
+        transferType: .Control,
+        buffer: Buffer { address: dataBytes.pointer(), length: tablet.reportLength },
+        timeout: UNumber(Nanoseconds.transfer),
+        setup: reportSetup(tablet),
+        flags: UN32(0),
+    }
+    try usbSubmit(usb, transfer, port, PortKey.report)
+    let done = try completionFor(port, PortKey.report)
+    let got = Number(done.result0)
+    // A report descriptor opens with an item, a Usage Page (0x05) most
+    // often; none opens with 0.
+    if got == 0 || byteAt(dataBytes.pointer(), 0) == UN8(0) { return .Error(failure(.Internal)) }
+    return .Ok(got)
+}

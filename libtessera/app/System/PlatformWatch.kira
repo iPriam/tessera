@@ -1,0 +1,44 @@
+import Foundation
+import Heap
+
+// What a running platform does to follow `platform.dynamic`: it watches its
+// System channel for `System/settingsChanged` and, when the setting names
+// another platform, asks PID 1 to switch (roadmap/15-form-factors.md). Any
+// other setting that changed is kept for the platform to take. The
+// platform arms the channel on the port it waits on (`armPlatformSettingWatch`)
+// and reads it when that wait completes (`platformSettingWoke`).
+
+public struct PlatformSettingWatch {
+    var watch: SettingsWatch = settingsWatch()
+    // The other settings that changed since the platform last took them.
+    var changed: [String] = []
+}
+
+// A watch on the System channel this process was started with, not armed.
+public function platformSettingWatch() -> PlatformSettingWatch {
+    return PlatformSettingWatch {}
+}
+
+// Arms the System channel's wait on `port` under `key`, unless it is armed.
+public function armPlatformSettingWatch(
+    watch: borrow mut PlatformSettingWatch,
+    port: Handle,
+    key: UNumber
+) {
+    armSettingsWatch(watch.watch, port, key)
+}
+
+// The System channel's wait completed: every event it holds is read, and a
+// change to `platform.dynamic` is followed by the platform `running`.
+public function platformSettingWoke(
+    watch: borrow mut PlatformSettingWatch,
+    running: borrow String
+) {
+    for setting in settingsWatchWoke(watch.watch) {
+        if setting == PlatformSetting.key {
+            followPlatformSetting(running)
+        } else if !watch.changed.contains(setting) {
+            watch.changed.append(setting)
+        }
+    }
+}

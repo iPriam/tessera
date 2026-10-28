@@ -1,0 +1,130 @@
+import Foundation
+import Heap
+
+// Everything this library holds for its process.
+//
+// LibTessera's calls are free functions over handles (§2), with no context a
+// caller passes in; the objects a handle names have to outlive any one call.
+// So the process's LibTessera state is this one value, and nothing else in
+// the library is mutable at the top level.
+struct Library {
+    // The object table (§2.2) and the handles naming its objects.
+    var objects: [ObjectEntry]
+    var handles: [HandleEntry]
+    var nextObjectId: U64
+    var openHandles: Number
+
+    // Operations waiting for the kernel, and completions waiting on ports.
+    var pending: [PendingOperation]
+    var completions: [QueuedCompletion]
+    var liveCompletions: Number
+
+    // Channel messages read ahead of `Channel.read`, the next transaction
+    // number, and the record being encoded.
+    var bufferedMessages: [BufferedMessage]
+    var nextTransaction: U64
+    var encoding: [U8]
+
+    // The connection to the system process.
+    var system: SystemConnection?
+
+    var streams: [StreamState]
+    var streamSlots: [StreamSlot]
+    var mappings: [MappingEntry]
+    var watchDirectories: [WatchDirectory]
+
+    var powerPage: RawPtr
+    var nextJobName: U64
+    // Jobs this process made and let go while their processes were still
+    // leaving; removed once they have.
+    var emptiedJobs: [String]
+    // What `Process.current` answered; it is answered again while it is open.
+    var processHandle: Handle?
+    // What `Thread.current` answered on each thread that asked.
+    var threadHandles: [CurrentThread]
+    // The channel the parent started this process on, held for the
+    // process's life; none for a system process.
+    var bootstrapHandle: Handle?
+
+    // What the process was started with.
+    var startupDone: Bool
+    var systemProcess: Bool
+    var startupTags: [StartupTag]
+    var startupHandles: [Handle]
+    var startup: StartupInfo
+    var entitlements: [String]
+
+    // Whether the tracer was opened, once it has been tried, and when it was
+    // last asked whether it records.
+    var traceOpen: Bool?
+    var traceOn: Bool
+    var traceChecked: U64?
+    var tracedProcessName: String
+
+    // The Linux backend: the watch on the first process, the page size, the
+    // machine read once from `uname` (two numbers in the open flags differ
+    // between the architectures Tessera runs on), and the log and trace
+    // descriptors.
+    var systemWatch: Number?
+    var pageSize: U64
+    var machineKnown: Bool
+    var machineIsArm: Bool
+    var logDescriptor: LazyDescriptor
+    var traceDescriptor: LazyDescriptor
+    // What each backing a port's operations reach reported, polled at once
+    // at the start of a pass over them (see `kernelReadySnapshot`).
+    var readyPolled: [Number]
+    var readyEvents: [Number]
+    // The network link as last read, and when (see `networkLink`).
+    var networkChecked: U64?
+    var networkKnown: NetworkLink?
+    // The interaction token of the input event being handled, while the
+    // platform hands the event to the application (Interaction/Interaction.kira).
+    var interaction: InteractionToken?
+}
+
+// The process's LibTessera state (see `Library`).
+var library: Library = Library {
+    objects: [],
+    handles: [],
+    nextObjectId: U64(1),
+    openHandles: 0,
+    pending: [],
+    completions: [],
+    liveCompletions: 0,
+    bufferedMessages: [],
+    nextTransaction: U64(1),
+    encoding: [],
+    system: .None,
+    streams: [],
+    streamSlots: [],
+    mappings: [],
+    watchDirectories: [],
+    powerPage: RawPtr(0),
+    nextJobName: U64(1),
+    emptiedJobs: [],
+    processHandle: .None,
+    threadHandles: [],
+    bootstrapHandle: .None,
+    startupDone: false,
+    systemProcess: true,
+    startupTags: [],
+    startupHandles: [],
+    startup: StartupInfo { flags: StartupFlags.none, appId: 0, processId: 0, jobId: 0 },
+    entitlements: [],
+    traceOpen: .None,
+    traceOn: false,
+    traceChecked: .None,
+    tracedProcessName: "",
+    systemWatch: .None,
+    pageSize: U64(0),
+    machineKnown: false,
+    machineIsArm: false,
+    logDescriptor: .Unopened,
+    traceDescriptor: .Unopened,
+    readyPolled: [],
+    readyEvents: [],
+    networkChecked: .None,
+    networkKnown: .None,
+    interaction: .None,
+}

@@ -1,0 +1,174 @@
+import Foundation
+
+// Deflate (RFC 1951) in one block with the fixed Huffman code: literals, and
+// matches found through a table of where each three bytes were last seen.
+// Every value here fits 32 bits, so it is held in `UN32`.
+
+namespace DeflateLimits {
+    let window: UN32 = 32768
+    let shortestMatch: UN32 = 3
+    let longestMatch: UN32 = 258
+    let hashSize: Number = 65536
+    let hashMask: UN32 = 0xffff
+    // Knuth's multiplicative hash constant.
+    let hashFactor: UN32 = 2654435761
+    let endOfBlock: UN32 = 256
+}
+
+// The bits written so far, least significant first, as deflate packs them.
+struct BitWriter {
+    var bytes: [UN8] = []
+    var pending: UN32 = 0
+    var count: UN32 = 0
+}
+
+extend BitWriter {
+    function bits(borrow mut self, value: UN32, width: UN32) {
+        pending = pending | (value << count)
+        count += width
+        while count >= 8 {
+            bytes.append(UN8(pending & 255))
+            pending = pending >> 8
+            count -= 8
+        }
+    }
+
+    // A Huffman code, which deflate writes most significant bit first.
+    function huffman(borrow mut self, value: UN32, width: UN32) {
+        var reversed: UN32 = 0
+        for bit in 0..width { reversed = reversed | (((value >> bit) & 1) << (width - 1 - bit)) }
+        bits(reversed, width)
+    }
+
+    function flushed(borrow mut self) -> [UN8] {
+        if count > 0 { bytes.append(UN8(pending & 255)) }
+        return copy bytes
+    }
+
+    // A literal byte or a length code, `symbol` from 0 to 287, in the fixed
+    // code.
+    function symbol(borrow mut self, symbol: UN32) {
+        if symbol < 144 { huffman(0x30 + symbol, 8) }
+        else if symbol < 256 { huffman(0x190 + symbol - 144, 9) }
+        else if symbol < 280 { huffman(symbol - 256, 7) }
+        else { huffman(0xc0 + symbol - 280, 8) }
+    }
+}
+
+// Each length code's first length and its extra bits (RFC 1951 3.2.5).
+let lengthCodes: [(UN32, UN32)] = [
+    (3, 0), (4, 0), (5, 0), (6, 0), (7, 0), (8, 0), (9, 0), (10, 0), (11, 1), (13, 1), (15, 1), (
+        17,
+        1
+    ),
+    (19, 2), (23, 2), (27, 2), (31, 2), (35, 3), (43, 3), (51, 3), (59, 3), (67, 4), (83, 4), (
+        99,
+        4
+    ),
+    (115, 4), (131, 5), (163, 5), (195, 5), (227, 5), (258, 0)
+]
+
+// Each distance code's first distance and its extra bits.
+let distanceCodes: [(UN32, UN32)] = [
+    (1, 0), (2, 0), (3, 0), (4, 0), (5, 1), (7, 1), (9, 2), (13, 2), (17, 3), (25, 3), (33, 4), (
+        49,
+        4
+    ),
+    (65, 5), (97, 5), (129, 6), (193, 6), (257, 7), (385, 7), (513, 8), (769, 8), (1025, 9), (
+        1537,
+        9
+    ),
+    (2049, 10), (3073, 10), (4097, 11), (6145, 11), (8193, 12), (12289, 12), (16385, 13), (
+        24577,
+        13
+    )
+]
+
+// The code in `table` whose range holds `value`.
+function rangeCode(table: borrow [(UN32, UN32)], value: UN32) -> UN32 {
+    let last = UN32(table.count - 1)
+    for index in 1..last + 1 {
+        if value < table[index].0 { return UN32(index - 1) }
+    }
+    return last
+}
+
+extend BitWriter {
+    function backReference(borrow mut self, length: UN32, distance: UN32) {
+        let lengthIndex = rangeCode(lengthCodes, length)
+        let (lengthStart, lengthExtra) = lengthCodes[lengthIndex]
+        symbol(257 + lengthIndex)
+        if lengthExtra > 0 { bits(length - lengthStart, lengthExtra) }
+        let distanceIndex = rangeCode(distanceCodes, distance)
+        let (distanceStart, distanceExtra) = distanceCodes[distanceIndex]
+        huffman(distanceIndex, 5)
+        if distanceExtra > 0 { bits(distance - distanceStart, distanceExtra) }
+    }
+}
+
+// The three bytes at `at` hashed to 16 bits: bits 16 to 31 of their product
+// with the factor, which wrapping at 32 bits keeps.
+function tripleHash(data: borrow [UN8], at: UN32) -> UN32 {
+    let packed = (UN32(data[at]) << 16) | (UN32(data[at + 1]) << 8) | UN32(data[at + 2])
+    return (wrappingMul(packed, DeflateLimits.hashFactor) >> 16) & DeflateLimits.hashMask
+}
+
+// How many bytes at `at` repeat those at `earlier`, of `size` in all.
+function matchLength(data: borrow [UN8], size: UN32, earlier: UN32, at: UN32) -> UN32 {
+    let left = size - at
+    let longest = left < DeflateLimits.longestMatch ? left : DeflateLimits.longestMatch
+    for length in 0..longest {
+        if data[earlier + length] != data[at + length] { return UN32(length) }
+    }
+    return longest
+}
+
+// The match at `at` against where its three bytes were last seen, nothing
+// when that is out of the window.
+function matchAt(data: borrow [UN8], size: UN32, candidate: borrow UN32?, at: UN32) -> UN32 {
+    return match candidate {
+        Some(earlier) -> at - earlier <= DeflateLimits.window ? matchLength(
+            data,
+            size,
+            earlier,
+            at
+        ) : 0
+        None -> 0
+    }
+}
+
+// `data`, deflated into one final block.
+function deflated(data: borrow [UN8]) -> [UN8] {
+    var writer = BitWriter {}
+    // The final block, with the fixed code.
+    writer.bits(1, 1)
+    writer.bits(1, 2)
+    let none: UN32? = .None
+    var seen: [UN32?] = filled(DeflateLimits.hashSize, none)
+    let size = UN32(data.count)
+    var at: UN32 = 0
+    while at < size {
+        if at + DeflateLimits.shortestMatch > size {
+            writer.symbol(UN32(data[at]))
+            at += 1
+            continue
+        }
+        let hashed = tripleHash(data, at)
+        let candidate = seen[hashed]
+        seen[hashed] = .Some(at)
+        let length = matchAt(data, size, candidate, at)
+        if length >= DeflateLimits.shortestMatch {
+            writer.backReference(length, at - (try candidate otherwise at))
+            let last = size - DeflateLimits.shortestMatch
+            for skipped in (at + 1)..(at + length < last ? at + length : last) {
+                seen[tripleHash(data, UN32(skipped))] = .Some(UN32(skipped))
+            }
+            at += length
+        } else {
+            writer.symbol(UN32(data[at]))
+            at += 1
+        }
+    }
+    writer.symbol(DeflateLimits.endOfBlock)
+    return writer.flushed()
+}

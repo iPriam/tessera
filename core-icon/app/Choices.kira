@@ -1,0 +1,276 @@
+import Foundation
+
+// A property's value in each appearance: the light value, and the dark and
+// mono values that replace it when the document sets them. Dark falls back to
+// light; mono falls back to the value of its tone, as IconServices resolves
+// a tinted lookup with no tinted value to the light or dark one.
+
+public struct BoolChoice {
+    var light: Bool
+    var dark: Bool? = .None
+    var mono: Bool? = .None
+}
+
+public struct NumberChoice {
+    var light: Number
+    var dark: Number? = .None
+    var mono: Number? = .None
+}
+
+public struct BlendChoice {
+    var light: IconBlendMode
+    var dark: IconBlendMode? = .None
+    var mono: IconBlendMode? = .None
+}
+
+public struct FillChoice {
+    var light: IconFill
+    var dark: IconFill? = .None
+    var mono: IconFill? = .None
+}
+
+public struct SpecularChoice {
+    var light: IconSpecular
+    var dark: IconSpecular? = .None
+    var mono: IconSpecular? = .None
+}
+
+public struct BlurChoice {
+    var light: IconBlur
+    var dark: IconBlur? = .None
+    var mono: IconBlur? = .None
+}
+
+public struct RefractionChoice {
+    var light: IconRefraction
+    var dark: IconRefraction? = .None
+    var mono: IconRefraction? = .None
+}
+
+public struct TranslucencyChoice {
+    var light: IconTranslucency
+    var dark: IconTranslucency? = .None
+    var mono: IconTranslucency? = .None
+}
+
+public struct ShadowChoice {
+    var light: IconShadow
+    var dark: IconShadow? = .None
+    var mono: IconShadow? = .None
+}
+
+extend BoolChoice {
+    function value(appearance: IconAppearance) -> Bool {
+        return match appearance {
+            Light -> light
+            Dark -> darkValue()
+            Mono -> match mono {
+                Some(value) -> value
+                None -> light
+            }
+            MonoDark -> match mono {
+                Some(value) -> value
+                None -> darkValue()
+            }
+        }
+    }
+
+    function darkValue() -> Bool {
+        return match dark {
+            Some(value) -> value
+            None -> light
+        }
+    }
+}
+
+extend NumberChoice {
+    function value(appearance: IconAppearance) -> Number {
+        return match appearance {
+            Light -> light
+            Dark -> darkValue()
+            Mono -> match mono {
+                Some(value) -> value
+                None -> light
+            }
+            MonoDark -> match mono {
+                Some(value) -> value
+                None -> darkValue()
+            }
+        }
+    }
+
+    function darkValue() -> Number {
+        return match dark {
+            Some(value) -> value
+            None -> light
+        }
+    }
+}
+
+extend BlendChoice {
+    function value(appearance: IconAppearance) -> IconBlendMode {
+        return match appearance {
+            Light -> light
+            Dark -> darkValue()
+            Mono -> match mono {
+                Some(value) -> value
+                None -> light
+            }
+            MonoDark -> match mono {
+                Some(value) -> value
+                None -> darkValue()
+            }
+        }
+    }
+
+    function darkValue() -> IconBlendMode {
+        return match dark {
+            Some(value) -> value
+            None -> light
+        }
+    }
+}
+
+extend FillChoice {
+    function value(appearance: IconAppearance) -> IconFill {
+        return match appearance {
+            Light -> copy light
+            Dark -> darkValue()
+            Mono -> match mono {
+                Some(value) -> copy value
+                None -> copy light
+            }
+            MonoDark -> match mono {
+                Some(value) -> copy value
+                None -> darkValue()
+            }
+        }
+    }
+
+    function darkValue() -> IconFill {
+        return match dark {
+            Some(value) -> copy value
+            None -> copy light
+        }
+    }
+}
+
+extend SpecularChoice {
+    function value(appearance: IconAppearance) -> IconSpecular {
+        return match appearance {
+            Light -> light
+            Dark -> darkValue()
+            Mono -> match mono {
+                Some(value) -> value
+                None -> light
+            }
+            MonoDark -> match mono {
+                Some(value) -> value
+                None -> darkValue()
+            }
+        }
+    }
+
+    function darkValue() -> IconSpecular {
+        return match dark {
+            Some(value) -> value
+            None -> light
+        }
+    }
+}
+
+extend BlurChoice {
+    function value(appearance: IconAppearance) -> IconBlur {
+        return match appearance {
+            Light -> copy light
+            Dark -> darkValue()
+            Mono -> match mono {
+                Some(value) -> copy value
+                None -> copy light
+            }
+            MonoDark -> match mono {
+                Some(value) -> copy value
+                None -> darkValue()
+            }
+        }
+    }
+
+    function darkValue() -> IconBlur {
+        return match dark {
+            Some(value) -> copy value
+            None -> copy light
+        }
+    }
+}
+
+extend RefractionChoice {
+    function value(appearance: IconAppearance) -> IconRefraction {
+        return match appearance {
+            Light -> copy light
+            Dark -> darkValue()
+            Mono -> match mono {
+                Some(value) -> copy value
+                None -> copy light
+            }
+            MonoDark -> match mono {
+                Some(value) -> copy value
+                None -> darkValue()
+            }
+        }
+    }
+
+    function darkValue() -> IconRefraction {
+        return match dark {
+            Some(value) -> copy value
+            None -> copy light
+        }
+    }
+}
+
+extend TranslucencyChoice {
+    function value(appearance: IconAppearance) -> IconTranslucency {
+        return match appearance {
+            Light -> copy light
+            Dark -> darkValue()
+            Mono -> match mono {
+                Some(value) -> copy value
+                None -> copy light
+            }
+            MonoDark -> match mono {
+                Some(value) -> copy value
+                None -> darkValue()
+            }
+        }
+    }
+
+    function darkValue() -> IconTranslucency {
+        return match dark {
+            Some(value) -> copy value
+            None -> copy light
+        }
+    }
+}
+
+extend ShadowChoice {
+    function value(appearance: IconAppearance) -> IconShadow {
+        return match appearance {
+            Light -> copy light
+            Dark -> darkValue()
+            Mono -> match mono {
+                Some(value) -> copy value
+                None -> copy light
+            }
+            MonoDark -> match mono {
+                Some(value) -> copy value
+                None -> darkValue()
+            }
+        }
+    }
+
+    function darkValue() -> IconShadow {
+        return match dark {
+            Some(value) -> copy value
+            None -> copy light
+        }
+    }
+}

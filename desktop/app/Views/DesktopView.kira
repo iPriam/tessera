@@ -1,0 +1,229 @@
+import Foundation
+import LibTessera
+import KiraUI
+import TesseraUI
+import PlatformUI
+
+// The applications whose name begins with what was typed, ignoring case, as
+// App Library's search narrows its list. Nothing typed keeps them all.
+function matching(applications: borrow [Application], typed: borrow String) -> [Application] {
+    var kept: [Application] = []
+    for application in applications {
+        if typed.count == 0 || nameBeginsWith(application.name, typed) {
+            kept.append(copy application)
+        }
+    }
+    return kept
+}
+
+// How the home screen is laid out, as an iPad's. Icons are drawn at fixed
+// points, as Apple's are, rather than scaled with the text.
+struct LauncherMetrics {
+    // The side of an icon.
+    let icon: Number
+    // The gap between an icon and its name.
+    let labelGap: Number
+    // The width of a column of the grid, which holds an icon and the space
+    // around it.
+    let column: Number
+    // The gap between rows of icons.
+    let rowGap: Number
+    // The size of an icon's name.
+    let label: Number
+    // The space above the grid, which the bar and the search field take.
+    let top: Number
+    // The columns of icons a row of the grid holds, the space from the
+    // screen's edge to the first icon, and the distance between two icons'
+    // leading edges.
+    let columns: Number
+    let inset: Number
+    let pitch: Number
+}
+
+// The iPad's home screen in Apple's iOS and iPadOS 27 kit ("Home Screen -
+// iPad"): six columns of 68-point icons, the first and last 162 points in from
+// the screen's edges and the rest spread evenly between, the first row 52
+// points under the 32-point status bar, and a row every 121 points. An icon's
+// name is 12-point Medium on a 14-point line, 8.5 points under the icon.
+// A tile is wider than its icon, so that a name longer than the icon is
+// not cut; the icon stays centered in it.
+//
+// A screen too narrow for that grid holds four columns, as an iPad in Split
+// View and an iPhone hold, with the space the screen leaves the icons shared
+// evenly between them and the edges; a screen too narrow for four holds the
+// icons smaller.
+namespace HomeScreenGrid {
+    let columns: Number = 6
+    let narrowColumns: Number = 4
+    let inset: Number = 162
+    let icon: Number = 68
+    let rowPitch: Number = 121
+    let statusBar: Number = 32
+    let firstRow: Number = 52
+    let labelLine: Number = 14
+    let tile: Number = 96
+    // The least a narrow screen's grid may have: the space between two icons,
+    // and the smallest an icon may be.
+    let narrowGap: Number = 12
+    let narrowIcon: Number = 44
+}
+
+function launcherMetrics() -> LauncherMetrics {
+    let grid = homeGrid(viewportWidth())
+    return LauncherMetrics {
+        icon: grid.icon,
+        labelGap: 8.5,
+        column: min(HomeScreenGrid.tile, grid.pitch),
+        rowGap: HomeScreenGrid.rowPitch - grid.icon - 8.5 - HomeScreenGrid.labelLine,
+        label: 12,
+        top: HomeScreenGrid.statusBar + HomeScreenGrid.firstRow,
+        columns: grid.columns,
+        inset: grid.inset,
+        pitch: grid.pitch,
+    }
+}
+
+// The grid on a screen `width` points wide: the columns of icons a row holds,
+// the side of an icon, the space from the screen's edge to the first icon and
+// the distance between two icons' leading edges.
+struct HomeGrid {
+    let columns: Number
+    let icon: Number
+    let inset: Number
+    let pitch: Number
+}
+
+function homeGrid(width: Number) -> HomeGrid {
+    let columns = HomeScreenGrid.columns
+    let icon = HomeScreenGrid.icon
+    let inset = HomeScreenGrid.inset
+    // The kit's grid, with the least space between two icons.
+    let kit = 2 * inset + columns * icon + (columns - 1) * HomeScreenGrid.narrowGap
+    if width >= kit {
+        // The kit's spacing: the insets fixed, the rest spread evenly between
+        // the icons.
+        let pitch = (width - 2 * inset - icon) / (columns - 1)
+        return HomeGrid { columns: columns, icon: icon, inset: inset, pitch: pitch }
+    }
+    // Too narrow for the kit's grid: four columns, as an iPad in Split View
+    // and an iPhone hold, and the space the screen leaves the icons shared
+    // evenly between them and the edges.
+    let few = HomeScreenGrid.narrowColumns
+    let room = width - HomeScreenGrid.narrowGap * (few + 1)
+    let side = max(min(HomeScreenGrid.icon, room / few), HomeScreenGrid.narrowIcon)
+    let share = (width - few * side) / (few + 1)
+    return HomeGrid { columns: few, icon: side, inset: share, pitch: side + share, }
+}
+
+let tileInk: RGBAColor = RGBAColor { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }
+let tileShadow: RGBAColor = RGBAColor { r: 0.0, g: 0.0, b: 0.0, a: 0.45 }
+
+// An application's icon at `frame` on the home screen, left out while a
+// window grows out of it or flies back into it, as an iPad's is: the
+// wallpaper shows in its place, and the icon is back the frame the window
+// lands, with no fade.
+function flightIcon(name: borrow String, side: Number, frame: borrow LaunchIcon) -> Any Widget {
+    return ApplicationIcon(name = copy name, side = side)
+    .opacity(iconFlies(frame) ? 0.0 : 1.0)
+    .animation(.Immediate)
+}
+
+// Whether a window flies out of or into the icon at `frame`.
+function iconFlies(frame: borrow LaunchIcon) -> Bool {
+    let flying = try flyingLaunchIcon() otherwise return false
+    let flies = abs(flying.x - frame.x) < 0.5 && abs(flying.y - frame.y) < 0.5
+    if flies { log info("left out the icon a window flies by", x: frame.x, y: frame.y) }
+    return flies
+}
+
+// Where the icon of the home screen's `at`th tile stands on the screen, as
+// `homeScreenRows` lays it out: the first and last columns `inset` in from
+// the edges and the rest spread evenly between, a row every `rowPitch` from
+// `top`. `metrics` is the grid the screen's width has room for.
+function homeIconFrame(at: Number, metrics: borrow LauncherMetrics) -> LaunchIcon {
+    let row = trunc(at / metrics.columns)
+    let column = at - row * metrics.columns
+    return LaunchIcon {
+        x: metrics.inset + column * metrics.pitch,
+        y: metrics.top + row * HomeScreenGrid.rowPitch,
+        width: metrics.icon,
+        height: metrics.icon,
+        corner: metrics.icon * IconShape.corner,
+    }
+}
+
+// The home screen's rows of `metrics.columns` tiles. Equal gaps between the
+// tiles of a row put the first icon and the last at the grid's insets
+// whatever the screen's width; a short last row keeps its tiles in the
+// columns above them, as the kit's empty places do.
+function homeScreenRows(tiles: [Any Widget], metrics: borrow LauncherMetrics) -> Any Widget {
+    let side = metrics.inset - (metrics.column - metrics.icon) / 2
+    var rows: [Any Widget] = []
+    var start: Number = 0
+    while start < tiles.count {
+        var row: [Any Widget] = []
+        for column in 0..metrics.columns {
+            if column > 0 { row.append(Spacer()) }
+            let at = start + column
+            if at < tiles.count {
+                row.append(tiles[at].width(resolvedLength(metrics.column)))
+            } else {
+                row.append(FixedGap(width = metrics.column, height = 0))
+            }
+        }
+        rows.append(
+            HStack(spacing = .None, alignment = .Top, children = row).fillWidth().edgePadding(
+                EdgeSet.horizontal,
+                resolvedLength(side)
+            )
+        )
+        start += metrics.columns
+    }
+    return VStack(spacing = .Length(metrics.rowGap), alignment = .Center, children = rows)
+    .fillWidth()
+}
+
+// What PID 1 said about the last request, under the grid; nothing when it
+// said nothing, as neither Launchpad nor the home screen explains itself.
+function hint(notice: borrow String?) -> Any Widget {
+    return match notice {
+        Some(said) -> Text(copy said)
+        .font(size: resolvedLength(12))
+        .textColor(tileInk)
+        .opacity(0.8)
+        None -> EmptyView()
+    }
+}
+
+// The surface under every application: the background picture the lock
+// screen stands on, so the two meet without a seam. On a touch screen Home
+// stands over it, as an iPad's home screen does; a desktop shows the bare
+// picture, as a Mac's does, its applications reached from the Dock.
+//
+// On a touch screen with windows floating free, or on a stage, Home is there
+// only while it is in front: an application's window stands over the bare
+// picture, as an iPad's windows do, and going home brings the icons back.
+construct DesktopView(applications: [Application], notice: String?) extends Widget {
+    @Environment(\.isStageManagerActive) let staged: Bool
+    @Environment(\.isWindowedAppsActive) let windowed: Bool
+
+    body {
+        let mobile = interfaceMode() == .AdaptiveMobile
+        // Under applications that fill the screen Home stays, for a window
+        // swiped home shrinks over it.
+        let shown = windowActive() || !staged && !windowed
+        ZStack(alignment = .Top) {
+            Wallpaper()
+            if mobile {
+                // Home: its pages, App Library, and editing (Home/).
+                HomeScreen(applications = copy applications, notice = copy notice)
+                .opacity(shown ? 1 : 0)
+            } else {
+                // A Mac's desktop: the items kept on it (Desk/).
+                DeskItems()
+            }
+        }
+        .fillWidth()
+        .fillHeight()
+    }
+}

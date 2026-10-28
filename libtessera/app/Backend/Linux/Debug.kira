@@ -1,0 +1,278 @@
+import Foundation
+import Heap
+
+// A debugger's hold on another process, through ptrace: every thread is
+// seized and stopped, its registers and the process's memory read and
+// written, and it is resumed, stepped and waited for one thread at a time.
+// Memory goes through /proc/<pid>/mem, which a tracer may write where the
+// process may not, as a breakpoint in its code needs.
+
+@Derive(Copy)
+enum PtraceRequest: U64 {
+    // `PTRACE_CONT`
+    Resume = 7
+    // `PTRACE_KILL`
+    Kill = 8
+    // `PTRACE_SINGLESTEP`
+    Step = 9
+    // `PTRACE_DETACH`
+    Detach = 17
+    // `PTRACE_GETSIGINFO`
+    SignalInfo = 16898
+    // `PTRACE_GETREGSET`
+    GetRegisters = 16900
+    // `PTRACE_SETREGSET`
+    SetRegisters = 16901
+    // `PTRACE_SEIZE`
+    Seize = 16902
+    // `PTRACE_INTERRUPT`
+    Interrupt = 16903
+}
+
+namespace PtraceLayout {
+    // `PTRACE_O_TRACECLONE`: a thread the process starts is seized too.
+    let traceClone: U64 = U64(8)
+    // `NT_PRSTATUS`, the register set of the general registers.
+    let generalRegisters: U64 = U64(1)
+    let signalInfoSize: Number = 128
+    let faultAddressAt: Number = 16
+    // `wait4`'s pid for any child or traced thread.
+    let anyThread: U64 = U64(0xFFFFFFFFFFFFFFFF)
+}
+
+function ptraceRequest(
+    request: PtraceRequest,
+    thread: Number,
+    address: U64,
+    data: U64
+) -> Result<Void, TesseraError> {
+    return answerStatus(
+        wideAnswer(ptrace(code(request), U64(thread), RawPtr(address), RawPtr(data)))
+    )
+}
+
+function ptraceBlock(
+    request: PtraceRequest,
+    thread: Number,
+    address: U64,
+    block: RawPtr
+) -> Result<Void, TesseraError> {
+    return answerStatus(wideAnswer(ptrace(code(request), U64(thread), RawPtr(address), block)))
+}
+
+function kernelDebugThreads(pid: Number) -> [Number] {
+    var threads: [Number] = []
+    let listing = match listDirectory("/proc/" + stringFromUnsigned(U64(pid)) + "/task") {
+        Ok(value) -> value
+        Error(failed) -> {
+            // A process that has ended has no threads to list.
+            absorb failed
+            return threads
+        }
+    }
+    for index in 0..listing.count() {
+        match listing.entry(index) {
+            Some(entry) -> {
+                match entry.toNumber() {
+                    Some(id) -> threads.append(id)
+                    // The directory lists thread ids and nothing else.
+                    None -> {}
+                }
+            }
+            // The index is in range.
+            None -> {}
+        }
+    }
+    return threads.sorted({ left, right in return left < right })
+}
+
+// Seizes every thread of `pid` and stops each; the threads, the first the
+// process's own.
+function kernelDebugAttach(pid: Number) -> Result<[Number], TesseraError> {
+    let threads = kernelDebugThreads(pid)
+    if threads.count == 0 { return .Error(failure(.NotFound)) }
+    for thread in threads {
+        try ptraceRequest(.Seize, thread, U64(0), PtraceLayout.traceClone)
+    }
+    for thread in threads {
+        try ptraceRequest(.Interrupt, thread, U64(0), U64(0))
+        // The stop is the interrupt just asked for, of the thread asked.
+        let stopped = try kernelDebugWaitThread(thread)
+        if stopped.thread != thread { return .Error(failure(.BadState)) }
+    }
+    return .Ok(threads)
+}
+
+function kernelDebugDetach(thread: Number, signal: Number) -> Result<Void, TesseraError> {
+    return ptraceRequest(.Detach, thread, U64(0), U64(signal))
+}
+
+function kernelDebugContinue(thread: Number, signal: Number) -> Result<Void, TesseraError> {
+    return ptraceRequest(.Resume, thread, U64(0), U64(signal))
+}
+
+function kernelDebugStep(thread: Number, signal: Number) -> Result<Void, TesseraError> {
+    return ptraceRequest(.Step, thread, U64(0), U64(signal))
+}
+
+function kernelDebugInterrupt(thread: Number) -> Result<Void, TesseraError> {
+    return ptraceRequest(.Interrupt, thread, U64(0), U64(0))
+}
+
+function kernelDebugKill(thread: Number) -> Result<Void, TesseraError> {
+    return ptraceRequest(.Kill, thread, U64(0), U64(0))
+}
+
+// The next change of any traced thread.
+function kernelDebugWait() -> Result<DebugEvent, TesseraError> {
+    return kernelDebugWaitBlocking(PtraceLayout.anyThread)
+}
+
+// A change of a traced thread that has happened already, if any has.
+function kernelDebugPoll() -> Result<DebugEvent?, TesseraError> {
+    return kernelDebugWaitOn(PtraceLayout.anyThread, WaitHow.allThreads | WaitHow.noHang)
+}
+
+function kernelDebugWaitThread(thread: Number) -> Result<DebugEvent, TesseraError> {
+    return kernelDebugWaitBlocking(U64(thread))
+}
+
+function kernelDebugWaitBlocking(pid: U64) -> Result<DebugEvent, TesseraError> {
+    let event = try kernelDebugWaitOn(pid, WaitHow.allThreads)
+    return match event {
+        Some(value) -> .Ok(move value)
+        // Without `WNOHANG`, `wait4` answers only with a change.
+        None -> .Error(failure(.NotFound))
+    }
+}
+
+function kernelDebugWaitOn(pid: U64, options: WaitHow) -> Result<DebugEvent?, TesseraError> {
+    let statusBytes = zeroedBlock(count: 8, alignment: 8)
+    while true {
+        let answer = wideAnswer(wait4(pid, statusBytes.pointer(), U64(options.raw), nullPointer()))
+        if !answerFailed(answer) {
+            if answer == 0 { return .Ok(.None) }
+            return .Ok(.Some(debugEventOf(answer, Number(heapLoad<U32>(statusBytes.pointer(), 0)))))
+        }
+        if answerErrno(answer) != code(Errno.Interrupted) {
+            return .Error(errnoFailure(answerErrno(answer)))
+        }
+    }
+}
+
+// A `wait4` status, decoded as `WIFEXITED`, `WIFSTOPPED` and `WIFSIGNALED`
+// read it.
+function debugEventOf(thread: Number, status: Number) -> DebugEvent {
+    let low = status % 128
+    if low == 0 { return DebugEvent { thread: thread, change: .Exited(trunc(status / 256) % 256) } }
+    if status % 256 == 127 {
+        let stop = DebugStop {
+            signal: trunc(status / 256) % 256,
+            cause: fromCode<DebugStopCause>(U8(trunc(status / 65536) % 256)),
+        }
+        return DebugEvent { thread: thread, change: .Stopped(stop) }
+    }
+    return DebugEvent { thread: thread, change: .Killed(low) }
+}
+
+// An `iovec` naming `values`, which `PTRACE_GETREGSET` fills and
+// `PTRACE_SETREGSET` reads.
+function registerVector(values: borrow ByteBlock, words: Number) -> ByteBlock {
+    let vector = zeroedBlock(count: 16, alignment: 16)
+    heapStore<RawPtr>(vector.pointer(), 0, values.pointer())
+    heapStore<U64>(vector.pointer(), 8, U64(words * 8))
+    return move vector
+}
+
+// The general registers: x0 to x30, sp, pc and pstate on arm64; Linux's
+// `user_regs_struct` on x86-64.
+function kernelDebugRegisters(thread: Number) -> Result<[U64], TesseraError> {
+    let words = generalRegisterWords(kernelArchitecture())
+    let values = zeroedBlock(count: words * 8, alignment: 16)
+    let vector = registerVector(values, words)
+    try ptraceBlock(.GetRegisters, thread, PtraceLayout.generalRegisters, vector.pointer())
+    var registers: [U64] = []
+    for index in 0..words { registers.append(heapLoad<U64>(values.pointer(), index * 8)) }
+    return .Ok(registers)
+}
+
+function kernelDebugSetRegisters(
+    thread: Number,
+    registers: borrow [U64]
+) -> Result<Void, TesseraError> {
+    let words = generalRegisterWords(kernelArchitecture())
+    if registers.count != words { return .Error(failure(.InvalidArgument)) }
+    let values = zeroedBlock(count: words * 8, alignment: 16)
+    for (index, value) in registers.enumerated() {
+        heapStore<U64>(values.pointer(), index * 8, value)
+    }
+    let vector = registerVector(values, words)
+    return ptraceBlock(.SetRegisters, thread, PtraceLayout.generalRegisters, vector.pointer())
+}
+
+// The signal a stopped thread took, its code and the address of a fault.
+function kernelDebugSignal(thread: Number) -> Result<DebugSignal, TesseraError> {
+    let info = zeroedBlock(count: PtraceLayout.signalInfoSize, alignment: 16)
+    try ptraceBlock(.SignalInfo, thread, U64(0), info.pointer())
+    let signal = Number(heapLoad<I32>(info.pointer(), 0))
+    let signalCode = Number(heapLoad<I32>(info.pointer(), 8))
+    // A positive code is the kernel's own; a signal another process sent
+    // carries no address.
+    let faulted = signalCode > 0 && signalIsFault(signal)
+    let address = faulted ? heapLoad<U64>(info.pointer(), PtraceLayout.faultAddressAt) : U64(0)
+    return .Ok(DebugSignal { signal: signal, code: signalCode, address: address })
+}
+
+function openDebugMemory(pid: Number, flags: Number) -> Result<Number, TesseraError> {
+    let path = "/proc/" + stringFromUnsigned(U64(pid)) + "/mem"
+    let fd = openat(AtDirectory.current, cStringFrom(path), flags | LinuxOpen.closeOnExec, 0)
+    if answerFailed(fd) { return .Error(errnoFailure(answerErrno(fd))) }
+    return .Ok(fd)
+}
+
+// Up to `count` bytes at `address`; fewer where the mapping ends.
+function kernelDebugRead(pid: Number, address: U64, count: Number) -> Result<[UN8], TesseraError> {
+    let fd = try openDebugMemory(pid, LinuxOpen.readOnly)
+    let block = zeroedBlock(count: count + 1, alignment: 16)
+    let got = pread(fd, block.pointer(), U64(count), address)
+    closeBacking(fd)
+    if answerFailed(got) { return .Error(errnoFailure(answerErrno(got))) }
+    var bytes: [UN8] = []
+    for index in 0..got { bytes.append(UN8(heapLoad<U8>(block.pointer(), index))) }
+    return .Ok(bytes)
+}
+
+function kernelDebugWrite(
+    pid: Number,
+    address: U64,
+    bytes: borrow [UN8]
+) -> Result<Void, TesseraError> {
+    let fd = try openDebugMemory(pid, LinuxOpen.readWrite)
+    let block = zeroedBlock(count: bytes.count + 1, alignment: 16)
+    for (index, byte) in bytes.enumerated() { heapStore<U8>(block.pointer(), index, U8(byte)) }
+    let put = pwrite(fd, block.pointer(), U64(bytes.count), address)
+    closeBacking(fd)
+    if answerFailed(put) { return .Error(errnoFailure(answerErrno(put))) }
+    // A short write is a mapping that ended inside the range.
+    if put != bytes.count { return .Error(failure(.InvalidArgument)) }
+    return .Ok
+}
+
+function kernelDebugRegions(pid: Number) -> Result<[CrashedRegion], TesseraError> {
+    let maps = try kernelReadText("/proc/" + stringFromUnsigned(U64(pid)) + "/maps")
+    return processRegions(maps)
+}
+
+// The auxiliary vector the kernel gave the process, as it lies in memory:
+// pairs of words, `AT_NULL` last.
+function kernelDebugAuxiliaryVector(pid: Number) -> Result<[UN8], TesseraError> {
+    let file = try readSmallBytes(
+        AtDirectory.current,
+        "/proc/" + stringFromUnsigned(U64(pid)) + "/auxv"
+    )
+    var bytes: [UN8] = []
+    for index in 0..Number(file.count) {
+        bytes.append(UN8(heapLoad<U8>(file.bytes.pointer(), index)))
+    }
+    return .Ok(bytes)
+}

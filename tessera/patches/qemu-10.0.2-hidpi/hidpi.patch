@@ -1,0 +1,78 @@
+Draw the guest at a Retina screen's own density.
+
+QEMU's Cocoa window shows a guest pixel per point of the Mac's screen. On a
+Retina screen that is two device pixels a side per guest pixel: a 4480 by 2520
+panel showed a 2240 by 1105 guest, scaled up and soft.
+
+The view now takes a guest pixel to be one of the screen's pixels. The window's
+content is the guest's mode divided by the screen's backing scale, the view's
+bounds stay the guest's mode so its frames draw a pixel to a pixel, and the
+size the window asks the guest for is its frame in pixels, so resizing the
+window resizes the guest's mode at full density. Do not constrain the window to
+the guest mode's aspect ratio: the window and guest can be resized freely. A
+window moved to a screen of another density asks again. The pointer already
+maps through the bounds.
+
+--- a/ui/cocoa.m
++++ b/ui/cocoa.m
+@@ -413,7 +413,15 @@
+ 
+ - (void) viewDidMoveToWindow
+ {
++    [self resizeWindow];
++}
++
++/* Moved to a screen of another density: the guest's mode follows it. */
++- (void) viewDidChangeBackingProperties
++{
++    [super viewDidChangeBackingProperties];
+     [self resizeWindow];
++    [self updateUIInfo];
+ }
+ 
+ - (void) selectConsoleLocked:(unsigned int)index
+@@ -620,14 +628,26 @@
+     size.width -= insets.left + insets.right;
+     size.height -= insets.top + insets.bottom;
+     return size;
++}
++
++/*
++ * The pixels of the screen the window is on per point: a guest pixel is one of
++ * them, so on a Retina screen the guest draws at the screen's own density
++ * rather than a pixel a point, scaled up.
++ */
++- (CGFloat) backingScale
++{
++    NSScreen *shown = [[self window] screen] ?: [NSScreen mainScreen];
++    return shown ? [shown backingScaleFactor] : 1.0;
+ }
+ 
+ - (void) resizeWindow
+ {
++    CGFloat scale = [self backingScale];
++
+-    [[self window] setContentAspectRatio:NSMakeSize(screen.width, screen.height)];
+ 
+     if (!([[self window] styleMask] & NSWindowStyleMaskResizable)) {
+-        [[self window] setContentSize:NSMakeSize(screen.width, screen.height)];
++        [[self window] setContentSize:NSMakeSize(screen.width / scale, screen.height / scale)];
+         [[self window] center];
+     } else if ([[self window] styleMask] & NSWindowStyleMaskFullScreen) {
+         [[self window] setContentSize:[self fixAspectRatio:[self screenSafeAreaSize]]];
+@@ -635,3 +655,1 @@
+-    } else {
+-        [[self window] setContentSize:[self fixAspectRatio:[self frame].size]];
+     }
+@@ -685,8 +703,9 @@
+ 
+     info.xoff = 0;
+     info.yoff = 0;
+-    info.width = frameSize.width;
+-    info.height = frameSize.height;
++    /* The guest's mode is in the screen's pixels, the frame in its points. */
++    info.width = frameSize.width * [self backingScale];
++    info.height = frameSize.height * [self backingScale];
+ 
+     dpy_set_ui_info(dcl.con, &info, TRUE);
+ }

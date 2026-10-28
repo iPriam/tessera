@@ -1,0 +1,197 @@
+import Foundation
+
+// The backend seam (17 §6.3): how DeviceKit's completions reach a port.
+//
+// DeviceKit runs no code inside `Port.wait`, so each of its asynchronous
+// results is one the port's engine can finish by itself: a kernel object
+// becoming ready, or a read or write at an offset into a caller's buffer. The
+// caller names the backend object by the backend's own number for it and
+// hands over the packet to post; the engine waits on it beside every other
+// pending operation and posts the packet with `kind` forced to `Device`.
+//
+// The specification puts these calls in a module of their own,
+// `LibTesseraBackend`. A Kira package exports one RIDL module, so they are in
+// `LibTessera` here, named for the backend, and no application binding uses
+// them: the SDK's bindings list leaves them out (16 §25).
+
+// What a source waits for or does.
+@Derive(Copy)
+public enum SourceKind: U32 {
+    Readiness = 1
+    ReadAt = 2
+    WriteAt = 3
+}
+
+// Readiness, in DeviceKit's event positions (17 §4.4): the object is
+// readable, writable, hung up (LOST) or in error (ERROR).
+@Derive(Copy)
+public distinct SourceEvents = UNumber
+
+public namespace SourceEvents {
+    let none: SourceEvents = SourceEvents(0)
+    let readable: SourceEvents = SourceEvents(1)
+    let writable: SourceEvents = SourceEvents(2)
+    let hangUp: SourceEvents = SourceEvents(4)
+    let error: SourceEvents = SourceEvents(32)
+}
+
+// How a source posts: `Once` or `Repeat`, and with `fillEvents` the
+// readiness seen in `result0` instead of the submitted value.
+@Derive(Copy)
+public struct SourceOptions {
+    var mode: WaitOptions
+    var fillEvents: Bool
+}
+
+// A kernel object the port's engine finishes an operation on.
+@Derive(Copy)
+public struct SourceSpec {
+    var kind: SourceKind
+    var events: SourceEvents
+    var source: UNumber
+    var offset: UNumber
+    var buffer: Buffer
+}
+
+// The library's readiness for a source's events.
+function sourceInterest(events: SourceEvents) -> Number {
+    var wanted = 0
+    if events.has(SourceEvents.readable) { wanted = wanted | Ready.readable }
+    if events.has(SourceEvents.writable) { wanted = wanted | Ready.writable }
+    return wanted
+}
+
+// The readiness the kernel reported, limited to what was asked for. Hang-up
+// and error are always reported, as the kernel always reports them.
+function sourceSeen(ready: Number, events: SourceEvents) -> SourceEvents {
+    let bits = U64(ready)
+    var seen = SourceEvents.none
+    if (bits & U64(Ready.readable)) != U64(0) { seen = seen | SourceEvents.readable }
+    if (bits & U64(Ready.writable)) != U64(0) { seen = seen | SourceEvents.writable }
+    if (bits & U64(Ready.hangUp)) != U64(0) { seen = seen | SourceEvents.hangUp }
+    if (bits & U64(Ready.error | Ready.invalid)) != U64(0) { seen = seen | SourceEvents.error }
+    return seen & (events | SourceEvents.hangUp | SourceEvents.error)
+}
+
+public function portAttachSource(
+    port: Handle,
+    source: borrow SourceSpec,
+    completion: borrow Completion,
+    options: SourceOptions
+) -> Result<Void, TesseraError> {
+    if options.mode == .Edge { return .Error(failure(.InvalidArgument)) }
+    if source.source > U64(0x7FFFFFFF) { return .Error(failure(.InvalidArgument)) }
+    let portObject = try resolveObject(port, .Port, Rights.none)
+    match source.kind {
+        Readiness -> {
+            if source.events == SourceEvents.none { return .Error(failure(.InvalidArgument)) }
+            let wait = SourceWait {
+                backing: source.source,
+                events: source.events,
+                mode: options.mode,
+                fillEvents: options.fillEvents,
+                result0: completion.result0,
+                result1: completion.result1,
+                aux: completion.aux,
+            }
+            pendingAdd(.Source(wait), .Object(portObject), portObject, completion.key)
+            return .Ok
+        }
+        ReadAt, WriteAt -> {
+            if options.mode != .Once { return .Error(failure(.InvalidArgument)) }
+            let transfer = SourceTransfer {
+                backing: source.source,
+                write: source.kind == .WriteAt,
+                offset: source.offset,
+                aux: completion.aux,
+                buffer: source.buffer,
+            }
+            pendingAdd(.Transfer(move transfer), .Object(portObject), portObject, completion.key)
+            return .Ok
+        }
+    }
+}
+
+// A completion DeviceKit already has the answer to, posted at once with
+// `kind` forced to `Device`: a call the device manager answered during
+// submission (`Device.open`, a token export or import), or a wait already
+// satisfied. The error is the packet's own.
+public function portPostDevice(
+    port: Handle,
+    completion: borrow Completion
+) -> Result<Void, TesseraError> {
+    let portObject = try resolveObject(port, .Port, Rights.none)
+    portComplete(
+        portObject,
+        completion.key,
+        completionOutcome(completion.error),
+        .Device,
+        completion.result0,
+        completion.result1,
+        completion.aux
+    )
+    return .Ok
+}
+
+// One packet, with no results, once `backing` is readable.
+function sourceReadable(backing: Number) -> SourceWait {
+    return SourceWait {
+        backing: backing,
+        events: SourceEvents.readable,
+        mode: .Once,
+        fillEvents: false,
+        result0: U64(0),
+        result1: U64(0),
+        aux: U64(0),
+    }
+}
+
+// What a source sleeps on.
+function sourceWant(source: borrow SourceWait) -> Interest {
+    return Interest { backing: source.backing, ready: sourceInterest(source.events) }
+}
+
+// What a transfer sleeps on.
+function transferWant(transfer: borrow SourceTransfer) -> Interest {
+    return Interest {
+        backing: transfer.backing,
+        ready: transfer.write ? Ready.writable : Ready.readable
+    }
+}
+
+// A readiness source: one packet when the object is ready (`Once`), or
+// one each time the last was taken and it still is (`Repeat`).
+function sourceStep(index: Number, source: borrow SourceWait) {
+    if library.pending[index].inFlight { return }
+    let seen = sourceSeen(kernelReady(source.backing, sourceInterest(source.events)), source.events)
+    if seen == SourceEvents.none { return }
+    var result0 = source.result0
+    if source.fillEvents { result0 = U64(seen.raw) }
+    if source.mode == .Once {
+        pendingFinish(index, .Ok, result0, source.result1, source.aux)
+        return
+    }
+    pendingDeliverMore(index, result0, source.result1, source.aux)
+}
+
+// A transfer: the read or write at the offset, done once the object says
+// it would not block. `result0` is the byte count, `result1` the offset.
+function sourceTransferStep(index: Number, transfer: borrow SourceTransfer) {
+    let want = transferWant(transfer)
+    if kernelReady(transfer.backing, want.ready) == 0 { return }
+    let moved = kernelTransferAt(
+        transfer.backing,
+        transfer.write,
+        transfer.buffer.address,
+        transfer.buffer.length,
+        transfer.offset
+    )
+    match moved {
+        Ok(count) -> pendingFinish(index, .Ok, count, transfer.offset, transfer.aux)
+        Error(failed) -> {
+            if failed.code != .ShouldWait {
+                pendingFinish(index, .Error(failed), U64(0), transfer.offset, transfer.aux)
+            }
+        }
+    }
+}

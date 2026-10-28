@@ -1,0 +1,243 @@
+import Foundation
+import RenderBox
+
+// A document drawn in a dark appearance, adapted as IconRendering's
+// `Icon.adaptedForDarkMode()` adapts one that does not choose its own dark
+// background: the chiclet turns the system's dark gradient, and each layer
+// that chooses nothing for the dark takes the light chiclet's colour where
+// it was drawn light on it.
+
+namespace DarkAdaptation {
+    // A chiclet darker than this keeps its layers as they are.
+    let darkChiclet: Number = 0.2
+    // A fill or artwork colour at least this light takes the chiclet's.
+    let lightFill: Number = 0.85
+}
+
+// The light chiclet a document's layers adapt to in the dark.
+struct DarkChiclet {
+    let fill: IconFill
+}
+
+// The chiclet `fill` adapts layers to, or none when the document chooses
+// its own dark background or its chiclet is wholly transparent.
+function darkChicletOf(fill: borrow FillChoice) -> DarkChiclet? {
+    if fill.dark != .None { return .None }
+    if transparent(fill.light) { return .None }
+    return .Some(DarkChiclet { fill: copy fill.light })
+}
+
+function transparent(fill: borrow IconFill) -> Bool {
+    return match fill {
+        Automatic, SystemLight, SystemDark -> false
+        None -> true
+        Solid(color) -> color.alpha == 0
+        AutomaticGradient(color) -> color.alpha == 0
+        LinearGradient(gradient) -> gradient.from.alpha == 0 && gradient.to.alpha == 0
+    }
+}
+
+// The HSL lightness of `color`'s Display P3 components.
+function lightness(color: borrow IconColor) -> Number {
+    let p3 = inDisplayP3(color)
+    let high = max(max(p3.red, p3.green), p3.blue)
+    let low = min(min(p3.red, p3.green), p3.blue)
+    return (high + low) / 2
+}
+
+// The chiclet's lightness: its colour's, or the mean of its stops'; the
+// system's dark gradient's top's; none for the system's light gradient.
+function chicletLightness(fill: borrow IconFill) -> Number? {
+    return match fill {
+        Solid(color) -> .Some(lightness(color))
+        AutomaticGradient(color) -> .Some(lightness(color))
+        LinearGradient(gradient) -> .Some((lightness(gradient.from) + lightness(gradient.to)) / 2)
+        SystemDark -> .Some(AutomaticBackground.darkTop)
+        Automatic, SystemLight, None -> .None
+    }
+}
+
+// Whether `layer` chooses any of its properties for the dark appearance.
+function choosesDark(layer: borrow IconLayer) -> Bool {
+    if layer.visible.dark != .None || layer.opacity.dark != .None { return true }
+    if layer.blend.dark != .None || layer.glass.dark != .None { return true }
+    return layer.fill.dark != .None
+}
+
+// The chiclet's fill as a layer draws it, at `alpha` when one is given. The
+// system's light gradient runs white to white.
+function chicletFill(chiclet: borrow DarkChiclet, alpha: borrow Number?) -> IconFill {
+    return match chiclet.fill {
+        Solid(color) -> .Solid(withAlpha(color, alpha))
+        AutomaticGradient(color) -> .AutomaticGradient(withAlpha(color, alpha))
+        LinearGradient(gradient) -> .LinearGradient(
+            IconGradient {
+                from: withAlpha(gradient.from, alpha),
+                to: withAlpha(gradient.to, alpha),
+                start: copy gradient.start,
+                stop: copy gradient.stop
+            }
+        )
+        Automatic, SystemLight -> .Solid(
+            IconColor { space: .DisplayP3, red: 1, green: 1, blue: 1, alpha: try alpha otherwise 1 }
+        )
+        SystemDark -> .Solid(
+            IconColor {
+                space: .DisplayP3,
+                red: AutomaticBackground.darkTop,
+                green: AutomaticBackground.darkTop,
+                blue: AutomaticBackground.darkTop,
+                alpha: try alpha otherwise 1
+            }
+        )
+        None -> .None
+    }
+}
+
+function withAlpha(color: borrow IconColor, alpha: borrow Number?) -> IconColor {
+    var changed = copy color
+    changed.alpha = try alpha otherwise color.alpha
+    return changed
+}
+
+// The fill a layer filled with `fill` in the light draws with in the dark,
+// adapted to `chiclet`; `art` is what it draws.
+function adaptedFill(
+    chiclet: borrow DarkChiclet,
+    fill: borrow IconFill,
+    art: borrow LayerArt
+) -> IconFill {
+    match chicletLightness(chiclet.fill) {
+        Some(level) -> if level < DarkAdaptation.darkChiclet { return copy fill }
+        // The system's light gradient adapts whatever lies on it.
+        None -> {}
+    }
+    let light = DarkAdaptation.lightFill
+    return match fill {
+        Automatic -> match art {
+            Vector(document) -> svgIsLight(document) ? chicletFill(chiclet, .None) : copy fill
+            Raster -> copy fill
+        }
+        SystemLight, SystemDark -> copy fill
+        None -> .None
+        Solid(color) -> lightness(color) < light ? copy fill : chicletFill(
+            chiclet,
+            .Some(color.alpha)
+        )
+        AutomaticGradient(color) -> lightness(color) < light ? copy fill : chicletFill(
+            chiclet,
+            .Some(color.alpha)
+        )
+        LinearGradient(gradient) -> lightness(gradient.from) < light || lightness(
+            gradient.to
+        ) < light ? copy fill : chicletFill(chiclet, .Some(gradient.from.alpha))
+    }
+}
+
+// Whether every colour the document's shapes set as their own fill or
+// stroke is light, as IconRendering enumerates the document's shape nodes.
+// A document whose shapes set none counts as light.
+function svgIsLight(document: borrow SvgElement) -> Bool {
+    var gradients: [(String, SvgElement)] = []
+    collectGradients(document, gradients)
+    return shapesAreLight(document, gradients)
+}
+
+function collectGradients(
+    element: borrow SvgElement,
+    gradients: borrow mut [(String, SvgElement)]
+) {
+    if element.name == "linearGradient" || element.name == "radialGradient" {
+        match element.attribute("id") {
+            Some(id) -> gradients.append((id, copy element))
+            // Only named gradients are painted with.
+            None -> {}
+        }
+    }
+    for child in element.children { collectGradients(child, gradients) }
+}
+
+function shapesAreLight(
+    element: borrow SvgElement,
+    gradients: borrow [(String, SvgElement)]
+) -> Bool {
+    if shapeName(element.name) {
+        for property in ["fill", "stroke"] {
+            match element.attribute(property) {
+                Some(paint) -> if !paintIsLight(paint, gradients) { return false }
+                // A shape that leaves the paint unset is not looked at.
+                None -> {}
+            }
+        }
+    }
+    for child in element.children {
+        if !shapesAreLight(child, gradients) { return false }
+    }
+    return true
+}
+
+function shapeName(name: borrow String) -> Bool {
+    return match name {
+        "path", "rect", "circle", "ellipse", "line", "polyline", "polygon" -> true
+        else -> false
+    }
+}
+
+// Whether every colour `paint` names, a colour or a gradient's stops, is
+// light, each taken into Display P3 as `Icon.Color` keeps it.
+function paintIsLight(paint: borrow String, gradients: borrow [(String, SvgElement)]) -> Bool {
+    for color in paintColors(paint, gradients) {
+        let drawn = IconColor {
+            space: .Srgb,
+            red: color.r,
+            green: color.g,
+            blue: color.b,
+            alpha: color.a
+        }
+        if lightness(drawn) < DarkAdaptation.lightFill { return false }
+    }
+    return true
+}
+
+function paintColors(
+    paint: borrow String,
+    gradients: borrow [(String, SvgElement)]
+) -> [RGBAColor] {
+    let trimmed = paint.trim()
+    if trimmed == "none" || trimmed.count == 0 { return [] }
+    if !trimmed.startsWith("url(") {
+        return match parsedSvgColor(trimmed) {
+            Some(color) -> [color]
+            None -> []
+        }
+    }
+    let source = try gradientNamed(trimmed, gradients) otherwise return []
+    var stops = stopsOf(source)
+    if stops.count == 0 {
+        match gradientReference(source) {
+            Some(reference) -> match gradientNamed(reference, gradients) {
+                Some(linked) -> stops = stopsOf(linked)
+                None -> {}
+            }
+            // A gradient that names nothing has no stops.
+            None -> {}
+        }
+    }
+    var colors: [RGBAColor] = []
+    for stop in stops { colors.append(copy stop.color) }
+    return colors
+}
+
+// The gradient a `url(#id)` or `#id` reference names.
+function gradientNamed(
+    text: borrow String,
+    gradients: borrow [(String, SvgElement)]
+) -> SvgElement? {
+    let start = try text.indexOf("#") otherwise return .None
+    let end = try text.indexOf(")") otherwise text.count
+    let id = text.substring(start + 1, max(end, start + 1)).trim()
+    for (name, found) in gradients {
+        if name == id { return .Some(copy found) }
+    }
+    return .None
+}

@@ -1,0 +1,120 @@
+import Foundation
+import LibTessera
+import DeviceKit
+import TesseraDisplayClient
+
+// The textures a client draws into in turn, each imported once (Protocol.kira
+// `DisplayAttach.slot`): a frame that names a slot with no token shows what
+// the slot holds, at the size the frame drew. What a slot held is let go of
+// once a new texture takes the slot, or the client goes.
+
+namespace SlotLimit {
+    let most: Number = 8
+}
+
+// What an attached frame shows.
+enum AttachedOutcome {
+    Shown(Content)
+    // Its texture would not import: the frame is skipped.
+    Skipped(TesseraError)
+    // The client broke the exchange.
+    Broken(SessionFailure)
+}
+
+// The content of the frame `attached` names: a new texture imported, kept in
+// its slot when it names one, or the slot's own. What went wrong has been
+// said.
+function attachedContent(
+    server: borrow mut Server,
+    index: Number,
+    attached: borrow AttachedFrame
+) -> AttachedOutcome {
+    let slot = Number(attached.slot)
+    if !attached.fresh {
+        if slot < 1 || slot > server.clients[index].slots.count {
+            return .Broken(.UnknownTextureSlot(slot))
+        }
+        return match server.clients[index].slots[slot - 1] {
+            Some(held) -> .Shown(redrawnContent(server.display, held, attached))
+            None -> .Broken(.UnknownTextureSlot(slot))
+        }
+    }
+    let surface = match importSurface(server.display, attached.token) {
+        Ok(value) -> value
+        Error(reason) -> return .Skipped(reason)
+    }
+    var content = match contentOf(
+        server.composer,
+        server.display,
+        surface,
+        Number(attached.width),
+        Number(attached.height)
+    ) {
+        Ok(value) -> value
+        Error(reason) -> return undescribedSurface(surface, reason)
+    }
+    if slot > SlotLimit.most {
+        releaseContent(server.composer, content)
+        return .Broken(.TextureSlotLimit(slot))
+    }
+    if slot > 0 {
+        content.slot = slot
+        while server.clients[index].slots.count < slot { server.clients[index].slots.append(.None) }
+        match server.clients[index].slots[slot - 1] {
+            Some(old) -> retireSlot(server, old)
+            None -> {}
+        }
+        server.clients[index].slots[slot - 1] = .Some(copy content)
+    }
+    return .Shown(content)
+}
+
+function undescribedSurface(surface: Ref, reason: borrow TesseraError) -> AttachedOutcome {
+    closeRef(surface)
+    return .Broken(.SurfaceDescription(reason))
+}
+
+// What a slot holds, as drawn `attached`'s size this time.
+function redrawnContent(
+    display: borrow Display,
+    held: borrow Content,
+    attached: borrow AttachedFrame
+) -> Content {
+    var content = copy held
+    let drawnWidth = Number(attached.width)
+    let drawnHeight = Number(attached.height)
+    let drawn = drawnWidth > 0 && drawnHeight > 0
+        && drawnWidth <= held.textureWidth && drawnHeight <= held.textureHeight
+    content.width = drawn ? drawnWidth : held.textureWidth
+    content.height = drawn ? drawnHeight : held.textureHeight
+    content.scanable = content.width == display.scanout.width
+        && content.height == display.scanout.height
+        && content.width == held.textureWidth && content.height == held.textureHeight
+        && held.rowsFit
+    return content
+}
+
+// A slot's old texture goes once the screen has moved past it.
+function retireSlot(server: borrow mut Server, old: borrow Content) {
+    var gone = copy old
+    gone.slot = 0
+    server.releasing.append(gone)
+}
+
+// Lets `content` go, unless a slot keeps it.
+function letGo(composer: borrow Composer?, content: borrow Content) {
+    if content.slot > 0 { return }
+    releaseContent(composer, content)
+}
+
+// The client's slots go with it.
+function dropSlots(server: borrow mut Server, index: Number) {
+    let slots = server.clients[index].slots
+    server.clients[index].slots = []
+    for held in slots {
+        match held {
+            Some(content) -> retireSlot(server, content)
+            None -> {}
+        }
+    }
+}

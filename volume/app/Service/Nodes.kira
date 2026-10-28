@@ -1,0 +1,166 @@
+import Foundation
+import Heap
+import LibTessera
+
+// The mount points under `/Volumes`, as Nodes beneath the system root.
+// Namespace calls complete on a port; these complete at once, so each is
+// waited for on the service's node port, which the main loop never sees.
+
+namespace NodeKey {
+    let volumes: Number = 1
+    let mountPoint: Number = 2
+    let remove: Number = 3
+    let lookup: Number = 4
+    let list: Number = 5
+}
+
+// The mount points, which are `/Volumes/<name>`.
+namespace VolumesPath {
+    let prefix: String = "/" + SystemDirectory.volumes + "/"
+}
+
+// A directory listing: `DirEntry`s, each its size @0, the name's length @4
+// and the name @32.
+namespace DirectoryEntry {
+    let listBytes: Number = 4096
+    let nameLengthAt: Number = 4
+    let nameAt: Number = 32
+}
+
+// What a directory here may be asked.
+function directoryRights() -> Rights {
+    return Rights.read | Rights.inspect | Rights.enumerate | Rights.create | Rights.delete | Rights.traverse
+}
+
+// `/Volumes`, made or found.
+function volumesDirectory(service: borrow mut Service) -> Result<Handle, TesseraError> {
+    match service.volumesDirectory {
+        Some(directory) -> return .Ok(directory)
+        // Not made or found yet: the lookup below does that.
+        None -> {}
+    }
+    let root = try startupHandle(StartupTag.systemRoot) otherwise return .Error(failure(.NotFound))
+    try nodeCreate(
+        root,
+        "Volumes",
+        .Directory,
+        CreateOptions.openExisting,
+        directoryRights(),
+        service.nodePort,
+        NodeKey.volumes
+    )
+    let done = try awaitCompletion(service.nodePort)
+    let directory = Handle(done.result0)
+    service.volumesDirectory = .Some(directory)
+    return .Ok(directory)
+}
+
+// The name of a mount point beneath `/Volumes`.
+function mountPointName(path: borrow String) -> String {
+    let prefix = VolumesPath.prefix
+    if !path.startsWith(prefix) { return path }
+    return path.substring(prefix.count, path.count)
+}
+
+// Makes the mount point `path`, or finds an empty one left from before.
+function makeMountPoint(
+    service: borrow mut Service,
+    path: borrow String
+) -> Result<Void, TesseraError> {
+    let directory = try volumesDirectory(service)
+    try nodeCreate(
+        directory,
+        mountPointName(path),
+        .Directory,
+        CreateOptions.openExisting,
+        directoryRights(),
+        service.nodePort,
+        NodeKey.mountPoint
+    )
+    let done = try awaitCompletion(service.nodePort)
+    closeHandle(Handle(done.result0))
+    return .Ok
+}
+
+function deleteMountPoint(
+    service: borrow mut Service,
+    path: borrow String
+) -> Result<Void, TesseraError> {
+    let directory = try volumesDirectory(service)
+    try nodeDelete(
+        directory,
+        mountPointName(path),
+        DeleteOptions.none,
+        service.nodePort,
+        NodeKey.remove
+    )
+    try awaitCompletion(service.nodePort)
+    return .Ok
+}
+
+// Removes the mount point `path` once nothing is mounted there.
+function removeMountPoint(service: borrow mut Service, path: borrow String) {
+    match deleteMountPoint(service, path) {
+        Ok -> {}
+        Error(failed) -> log warn(
+            "cannot remove a mount point",
+            mountPoint: path,
+            error: errorName(failed)
+        )
+    }
+}
+
+// The names in one listing, from `at` up to `end`.
+function listedNames(block: RawPtr, end: Number) -> [String] {
+    var names: [String] = []
+    var offset = 0
+    while Number(offset) < end {
+        let size = heapLoad<U16>(block, offset)
+        let length = heapLoad<U16>(block, offset + DirectoryEntry.nameLengthAt)
+        names.append(stringFromCBytes(heapOffset(block, offset + DirectoryEntry.nameAt), length))
+        if size == 0 { return names }
+        offset += size
+    }
+    return names
+}
+
+function listNames(service: borrow Service, node: Handle) -> Result<[String], TesseraError> {
+    let block = zeroedBlock(count: DirectoryEntry.listBytes, alignment: 16)
+    var names: [String] = []
+    var cursor: Number = 0
+    while true {
+        let output = Buffer { address: block.pointer(), length: DirectoryEntry.listBytes }
+        try nodeList(node, cursor, output, service.nodePort, NodeKey.list)
+        let done = try awaitCompletion(service.nodePort)
+        for name in listedNames(block.pointer(), Number(done.result0)) { names.append(name) }
+        cursor = Number(done.result1)
+        if cursor == 0 { return .Ok(names) }
+    }
+    return .Ok(names)
+}
+
+function rootListing(
+    service: borrow mut Service,
+    path: borrow String
+) -> Result<[String], TesseraError> {
+    let directory = try volumesDirectory(service)
+    try nodeLookup(
+        directory,
+        mountPointName(path),
+        Rights.enumerate | Rights.inspect,
+        service.nodePort,
+        NodeKey.lookup
+    )
+    let found = try awaitCompletion(service.nodePort)
+    let node = Handle(found.result0)
+    let names = listNames(service, node)
+    closeHandle(node)
+    return names
+}
+
+// What the root of the volume mounted at `path` holds, by name, for the log.
+function rootNames(service: borrow mut Service, path: borrow String) -> Result<String, TesseraError> {
+    let names = try rootListing(service, path)
+    if names.count == 0 { return .Ok("nothing") }
+    return .Ok(joined(names, ", "))
+}

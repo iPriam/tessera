@@ -1,0 +1,38 @@
+import Foundation
+import LibTessera
+import PlatformKit
+import TesseraDisplayClient
+
+// The part of the output a platform draws over the applications without
+// holding the input, its notification banners (roadmap/08-display-server.md,
+// "Input"). The pointer over it goes to the platform, as over its bar and
+// Dock, so a click on a banner reaches the banner rather than the window
+// under it, while that window keeps the keyboard.
+
+// Claims `area` with `SetOverlay` when it is not what `claimed` says was
+// claimed last, and remembers it once the compositor was told. An empty area
+// gives the part back.
+public function claimOverlay(
+    claimed: borrow mut SurfaceFrame,
+    channel: Handle,
+    area: SurfaceFrame
+) {
+    if sameFrame(area, claimed) { return }
+    // The part at or after the output's top left, as an unsigned rectangle.
+    let shown = clippedToSurface(area)
+    let overlay = DisplayOverlay {
+        x: shown.x,
+        y: shown.y,
+        width: shown.width,
+        height: shown.height,
+    }
+    match sendSetOverlay(channel, move overlay) {
+        Ok -> claimed = move area
+        Error(failed) -> log warn("the overlay could not be claimed", error: errorName(failed))
+    }
+}
+
+// Whether `a` and `b` are the one rectangle.
+function sameFrame(a: borrow SurfaceFrame, b: borrow SurfaceFrame) -> Bool {
+    return a.x == b.x && a.y == b.y && a.width == b.width && a.height == b.height
+}

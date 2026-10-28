@@ -1,0 +1,271 @@
+import Foundation
+
+// The machine itself: preparing it, its volumes, and stopping it (§25.5).
+//
+// Only a system process holds `tessera.machine`: PID 1 calls these, the
+// volume service mounts what it finds, and nothing an app runs reaches them.
+// What a kernel needs for any of it is the backend's.
+
+// How the machine stops.
+@Derive(Copy)
+public enum MachineStop: U32 {
+    PowerOff = 0
+    Restart = 1
+}
+
+// What is on a disk. `None` is for a bind or a move, which take a directory
+// rather than a disk.
+@Derive(Copy)
+public enum VolumeFormat: U32 {
+    None = 0
+    Ext4 = 1
+    Btrfs = 2
+    Fat = 3
+    Erofs = 4
+    Squashfs = 5
+}
+
+@Derive(Copy)
+public distinct VolumeOptions = UNumber
+
+public namespace VolumeOptions {
+    let none: VolumeOptions = VolumeOptions(0)
+    let readOnly: VolumeOptions = VolumeOptions(1)
+    let noExecute: VolumeOptions = VolumeOptions(2)
+    let noDevices: VolumeOptions = VolumeOptions(4)
+    let noSetIdentity: VolumeOptions = VolumeOptions(8)
+    let bind: VolumeOptions = VolumeOptions(16)
+    let move: VolumeOptions = VolumeOptions(32)
+}
+
+@Derive(Copy)
+public distinct VolumeUnmountOptions = UNumber
+
+public namespace VolumeUnmountOptions {
+    let none: VolumeUnmountOptions = VolumeUnmountOptions(0)
+    // Leave now, finish when the last user goes.
+    let detach: VolumeUnmountOptions = VolumeUnmountOptions(1)
+}
+
+function machineEntitled() -> Bool { return entitlementHeld("tessera.machine") }
+
+// Makes the machine ready for a userland: whatever the kernel must have in
+// place before processes, jobs and devices can be named. PID 1 calls it
+// first. A part that could not be prepared is the first failure; the rest
+// are still tried.
+public function machinePrepare() -> Result<Void, TesseraError> {
+    if !machineEntitled() { return .Error(failure(.NotEntitled)) }
+    return kernelMachinePrepare()
+}
+
+// Keeps all but critical kernel messages off the console, so they do not
+// land in the middle of a service's log lines.
+public function machineQuietConsole() -> Result<Void, TesseraError> {
+    if !machineEntitled() { return .Error(failure(.NotEntitled)) }
+    return kernelQuietConsole()
+}
+
+// Has the kernel start `program` with the core of each process that dies of
+// a signal, the process's pid its argument, and keep the process until the
+// program exits: the crash reporter (§20.2).
+public function machineReportCrashes(program: borrow String) -> Result<Void, TesseraError> {
+    if !machineEntitled() { return .Error(failure(.NotEntitled)) }
+    return kernelCrashReporter(program)
+}
+
+// Writes everything waiting to every volume.
+public function machineFlush() -> Result<Void, TesseraError> {
+    if !machineEntitled() { return .Error(failure(.NotEntitled)) }
+    return kernelMachineFlush()
+}
+
+// Flushes the volumes and stops the machine `how`. Returns only when the
+// machine refused.
+public function machineStop(how: MachineStop) -> Result<Void, TesseraError> {
+    if !machineEntitled() { return .Error(failure(.NotEntitled)) }
+    return kernelMachineStop(how)
+}
+
+// Makes the volume mounted at `path` the root of this process, and of
+// everything it starts after.
+public function machineEnterRoot(path: borrow String) -> Result<Void, TesseraError> {
+    if path.count == 0 { return .Error(failure(.InvalidArgument)) }
+    if !machineEntitled() { return .Error(failure(.NotEntitled)) }
+    return kernelEnterRoot(path)
+}
+
+// Mounts `source`, a disk from `volumeDisks` or DeviceKit's name for one,
+// holding `format`, at the directory `target`. With `volumeBind` or
+// `volumeMove`, `source` is a directory and `format` is `None`.
+public function volumeMount(
+    source: borrow String,
+    target: borrow String,
+    format: VolumeFormat,
+    options: VolumeOptions
+) -> Result<Void, TesseraError> {
+    if source.count == 0 || target.count == 0 || options.raw > U32(63) {
+        return .Error(failure(.InvalidArgument))
+    }
+    let relocates = (options & (VolumeOptions.bind | VolumeOptions.move)) != VolumeOptions.none
+    if !relocates && format == .None { return .Error(failure(.InvalidArgument)) }
+    if !machineEntitled() { return .Error(failure(.NotEntitled)) }
+    return kernelVolumeMount(source, target, format, options)
+}
+
+// Mounts the subvolume at the path `subvolume` inside the btrfs volume on
+// `source`, a disk from `volumeDisks`, at the directory `target`.
+public function volumeMountSubvolume(
+    source: borrow String,
+    target: borrow String,
+    subvolume: borrow String,
+    options: VolumeOptions
+) -> Result<Void, TesseraError> {
+    if source.count == 0 || target.count == 0 || subvolume.count == 0 {
+        return .Error(failure(.InvalidArgument))
+    }
+    let relocates = (options & (VolumeOptions.bind | VolumeOptions.move)) != VolumeOptions.none
+    if relocates || options.raw > U32(63) { return .Error(failure(.InvalidArgument)) }
+    if !machineEntitled() { return .Error(failure(.NotEntitled)) }
+    return kernelVolumeMountSubvolume(source, target, subvolume, options)
+}
+
+// Makes an empty subvolume at `path`, inside a mounted btrfs volume.
+public function volumeCreateSubvolume(path: borrow String) -> Result<Void, TesseraError> {
+    if path.count == 0 { return .Error(failure(.InvalidArgument)) }
+    if !machineEntitled() { return .Error(failure(.NotEntitled)) }
+    return kernelVolumeCreateSubvolume(path)
+}
+
+// Makes the subvolume `target` a snapshot of the subvolume `source`, both in
+// one mounted btrfs volume, read-only when `readOnly` is set. The snapshot
+// shares every block with `source` until one of them is written.
+public function volumeSnapshot(
+    source: borrow String,
+    target: borrow String,
+    readOnly: Bool
+) -> Result<Void, TesseraError> {
+    if source.count == 0 || target.count == 0 { return .Error(failure(.InvalidArgument)) }
+    if !machineEntitled() { return .Error(failure(.NotEntitled)) }
+    return kernelVolumeSnapshot(source, target, readOnly)
+}
+
+// Deletes the subvolume at `path` and everything in it.
+public function volumeDeleteSubvolume(path: borrow String) -> Result<Void, TesseraError> {
+    if path.count == 0 { return .Error(failure(.InvalidArgument)) }
+    if !machineEntitled() { return .Error(failure(.NotEntitled)) }
+    return kernelVolumeDeleteSubvolume(path)
+}
+
+// Mounts the disk image in the file `image`, holding `format`, read-only at
+// the directory `target`, as a Mac attaches a .dmg: an installed
+// application is such a file in /Applications. It is let go of when the
+// volume is unmounted.
+public function volumeMountImage(
+    image: borrow String,
+    target: borrow String,
+    format: VolumeFormat,
+    options: VolumeOptions
+) -> Result<Void, TesseraError> {
+    if image.count == 0 || target.count == 0 || format == .None || options.raw > U32(15) {
+        return .Error(failure(.InvalidArgument))
+    }
+    if !machineEntitled() { return .Error(failure(.NotEntitled)) }
+    return kernelVolumeMountImage(image, target, format, options)
+}
+
+// Mounts at the directory `target`, read-only, the sealed system: the tree
+// the composefs image mounted at `metadata` describes, every name, mode and
+// directory of it, with each file's data from the same path in the tree at
+// `data`. A file reads only while its fs-verity digest is the one the image
+// records for it, so a file changed since the image was made cannot be read.
+// Neither path may hold `,` or `:`, which separate the mount's options.
+public function volumeMountSealed(
+    metadata: borrow String,
+    data: borrow String,
+    target: borrow String,
+    options: VolumeOptions
+) -> Result<Void, TesseraError> {
+    if metadata.count == 0 || data.count == 0 || target.count == 0 || options.raw > U32(15) {
+        return .Error(failure(.InvalidArgument))
+    }
+    for path in [metadata, data] {
+        if path.contains(",") || path.contains(":") { return .Error(failure(.InvalidArgument)) }
+    }
+    if !machineEntitled() { return .Error(failure(.NotEntitled)) }
+    return kernelVolumeMountSealed(metadata, data, target, options)
+}
+
+// Turns fs-verity on for the file at `path`, as a sealed system's every file
+// has it: from then on the file cannot be written, and a read of a block
+// that does not match its digest fails. A file that has it on already is
+// left as it is.
+public function volumeSealFile(path: borrow String) -> Result<Void, TesseraError> {
+    if path.count == 0 { return .Error(failure(.InvalidArgument)) }
+    if !machineEntitled() { return .Error(failure(.NotEntitled)) }
+    return kernelEnableVerity(path)
+}
+
+// The fs-verity digest of the file at `path`, which has fs-verity on, in
+// lowercase hexadecimal: SHA-256 over the file's Merkle tree, as the kernel
+// measures it. Anyone may ask.
+public function volumeSealedDigest(path: borrow String) -> Result<String, TesseraError> {
+    if path.count == 0 { return .Error(failure(.InvalidArgument)) }
+    return kernelVerityDigest(path)
+}
+
+public function volumeUnmount(
+    target: borrow String,
+    options: VolumeUnmountOptions
+) -> Result<Void, TesseraError> {
+    if target.count == 0 || options.raw > VolumeUnmountOptions.detach.raw {
+        return .Error(failure(.InvalidArgument))
+    }
+    if !machineEntitled() { return .Error(failure(.NotEntitled)) }
+    return kernelVolumeUnmount(target, options)
+}
+
+// The machine's disks, one name per line, in the order the machine was
+// given them.
+public function volumeDisks() -> Result<String, TesseraError> {
+    if !machineEntitled() { return .Error(failure(.NotEntitled)) }
+    let names = try kernelDiskNames()
+    var text = ""
+    for index in 0..names.count { text = text + names[index] + "\n" }
+    return .Ok(text)
+}
+
+// Whether a volume is mounted at the directory `target` and cannot be
+// written, as a disk image or a CD is. What runs from a volume has to come
+// from one that is, so it is what was signed and shipped. Anyone may ask.
+public function volumeReadOnlyAt(target: borrow String) -> Result<Bool, TesseraError> {
+    if target.count == 0 { return .Error(failure(.InvalidArgument)) }
+    return kernelVolumeReadOnlyAt(target)
+}
+
+// Whether the volume holding `path`, anything on any volume, cannot be
+// written, so a file manager offers no changes there. Anyone may ask.
+public function pathReadOnly(path: borrow String) -> Result<Bool, TesseraError> {
+    if path.count == 0 { return .Error(failure(.InvalidArgument)) }
+    return kernelPathReadOnly(path)
+}
+
+// How large the volume holding `target` is, and how much of it is free.
+public struct VolumeSpace {
+    // Every byte the volume holds.
+    let total: Number
+    // The bytes a program may still write.
+    let available: Number
+}
+
+// The space of the volume holding the path `target`. Anyone may ask.
+public function volumeSpaceAt(target: borrow String) -> Result<VolumeSpace, TesseraError> {
+    if target.count == 0 { return .Error(failure(.InvalidArgument)) }
+    let (total, available) = try kernelVolumeSpace(target)
+    return .Ok(VolumeSpace { total: total, available: available })
+}
+
+// What is mounted, one `source target` pair per line.
+public function volumeMounts() -> Result<String, TesseraError> {
+    if !machineEntitled() { return .Error(failure(.NotEntitled)) }
+    return kernelMountTable()
+}

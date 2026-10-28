@@ -1,0 +1,355 @@
+import Foundation
+import Heap
+import LibTessera
+
+// Fences (17 §10): 64-bit timelines, as `drm_syncobj` timelines.
+//
+// A syncobj lives in one DRM file, so every fence in the process is a handle
+// on one shared descriptor, `library.syncDevice`: a duplicate of the first
+// display or GPU connection's, or a render node the manager opens when the
+// process has neither. A fence object keeps the syncobj's own descriptor,
+// which is what an export passes on, and its handle in `library.fences`.
+
+struct FenceRecord {
+    var object: Number
+    var handle: U32
+}
+
+// An eventfd armed for `Fence.waitAsync`, closed once it has fired.
+struct FenceWait {
+    var object: Number
+    var event: Descriptor
+}
+
+function fenceOf(object: Number) -> Result<U32, TesseraError> {
+    for fence in deviceLibrary.fences {
+        if fence.object == object { return .Ok(fence.handle) }
+    }
+    return .Error(failure(.InvalidHandle))
+}
+
+// The DRM file fences live in.
+function syncDevice() -> Result<Descriptor, TesseraError> {
+    match deviceLibrary.syncDevice {
+        Some(device) -> return .Ok(device)
+        None -> {}
+    }
+    var found: Descriptor? = .None
+    for object in deviceLibrary.objects {
+        if !object.live || object.kind != .Connection { continue }
+        if object.family != .Display && object.family != .Gpu { continue }
+        match object.device {
+            Some(device) -> { found = .Some(try device.duplicate()) break }
+            None -> {}
+        }
+    }
+    let device = match found {
+        Some(value) -> value
+        None -> try openFirstGpu()
+    }
+    deviceLibrary.syncDevice = .Some(device)
+    return .Ok(device)
+}
+
+// A render node through the manager, for a process that has no connection.
+function openFirstGpu() -> Result<Descriptor, TesseraError> {
+    let entries = try scan()
+    for entry in entries {
+        if entry.entryClass != .GpuAdapter || entry.node.isNone() { continue }
+        var request = managerRequest(.Open)
+        request.kind = code(Family.Gpu)
+        request.entry = entry.id.raw
+        let answer = try managerCall(request, .None)
+        return match answer.passed {
+            Some(device) -> .Ok(device)
+            None -> .Error(failure(.Internal))
+        }
+    }
+    return .Error(failure(.NotFound))
+}
+
+// `struct drm_syncobj_handle`: handle, flags, fd, pad, point.
+function syncobjToDescriptor(
+    sync: borrow Descriptor,
+    handle: U32,
+    flags: U32,
+    point: U64
+) -> Result<Descriptor, TesseraError> {
+    let blockBytes = zeroedBlock(count: 24, alignment: 16)
+    let block = blockBytes.pointer()
+    heapStore<U32>(block, 0, handle)
+    heapStore<U32>(block, 4, flags)
+    heapStore<U64>(block, 16, point)
+    let exported = try sync.control(Drm.syncobjHandleToFd, block)
+    return .Ok(Descriptor { number: Number(heapLoad<U32>(block, 8)) })
+}
+
+function syncobjFromDescriptor(
+    sync: borrow Descriptor,
+    source: borrow Descriptor,
+    handle: U32,
+    flags: U32,
+    point: U64
+) -> Result<U32, TesseraError> {
+    let blockBytes = zeroedBlock(count: 24, alignment: 16)
+    let block = blockBytes.pointer()
+    heapStore<U32>(block, 0, handle)
+    heapStore<U32>(block, 4, flags)
+    heapStore<U32>(block, 8, U32(source.number))
+    heapStore<U64>(block, 16, point)
+    let imported = try sync.control(Drm.syncobjFdToHandle, block)
+    return .Ok(heapLoad<U32>(block, 0))
+}
+
+function syncobjDestroy(sync: borrow Descriptor, handle: U32) {
+    let blockBytes = zeroedBlock(count: 8, alignment: 16)
+    let block = blockBytes.pointer()
+    heapStore<U32>(block, 0, handle)
+    match sync.control(Drm.syncobjDestroy, block) {
+        Ok(value) -> {}
+        Error(failed) -> log warn("a syncobj was not destroyed", error: errorName(failed))
+    }
+}
+
+// `struct drm_syncobj_timeline_array` over one handle and one point; the
+// answer is the point after the call.
+function timeline(
+    sync: borrow Descriptor,
+    request: U64,
+    handle: U32,
+    point: U64,
+    flags: U32
+) -> Result<U64, TesseraError> {
+    let blockBytes = zeroedBlock(count: 40, alignment: 16)
+    let block = blockBytes.pointer()
+    heapStore<U32>(block, 24, handle)
+    heapStore<U64>(block, 32, point)
+    heapStore<U64>(block, 0, U64(pointerAddress(heapOffset(block, 24))))
+    heapStore<U64>(block, 8, U64(pointerAddress(heapOffset(block, 32))))
+    heapStore<U32>(block, 16, U32(1))
+    heapStore<U32>(block, 20, flags)
+    let done = try sync.control(request, block)
+    return .Ok(heapLoad<U64>(block, 32))
+}
+
+function addFence(syncobj: borrow Descriptor, handle: U32) -> Number {
+    let object = createObject(.Fence, .None, .Some(syncobj))
+    deviceLibrary.fences.append(FenceRecord { object: object, handle: handle })
+    return object
+}
+
+// A fence object around a syncobj descriptor this process owns.
+function fenceFrom(syncobj: borrow Descriptor, rights: RefRights) -> Result<Ref, TesseraError> {
+    let sync = try syncDevice()
+    let handle = try syncobjFromDescriptor(sync, syncobj, U32(0), U32(0), U64(0))
+    return .Ok(mintRef(addFence(syncobj, handle), rights))
+}
+
+// A new timeline at `initial`, as an object index.
+function newFence(initial: U64) -> Result<Number, TesseraError> {
+    let sync = try syncDevice()
+    let blockBytes = zeroedBlock(count: 8, alignment: 16)
+    let block = blockBytes.pointer()
+    let created = try sync.control(Drm.syncobjCreate, block)
+    let handle = heapLoad<U32>(block, 0)
+    if initial > U64(0) {
+        match timeline(sync, Drm.syncobjTimelineSignal, handle, initial, U32(0)) {
+            Ok(value) -> {}
+            Error(failed) -> {
+                syncobjDestroy(sync, handle)
+                return .Error(failed)
+            }
+        }
+    }
+    return match syncobjToDescriptor(sync, handle, U32(0), U64(0)) {
+        Ok(syncobj) -> .Ok(addFence(syncobj, handle))
+        Error(failed) -> {
+            syncobjDestroy(sync, handle)
+            return .Error(failed)
+        }
+    }
+}
+
+public function fenceCreate(initial: UNumber) -> Result<Ref, TesseraError> {
+    let object = try newFence(U64(initial))
+    return .Ok(mintRef(object, defaultRights(.Fence)))
+}
+
+function currentPoint(object: Number) -> Result<U64, TesseraError> {
+    let sync = try syncDevice()
+    let handle = try fenceOf(object)
+    return timeline(sync, Drm.syncobjQuery, handle, U64(0), U32(0))
+}
+
+public function fenceValue(fence: Ref) -> Result<UNumber, TesseraError> {
+    let object = try resolve(fence, .Fence, RefRights.read)
+    return .Ok(UNumber(try currentPoint(object)))
+}
+
+// Moves a fence to `value`; refused below its current value.
+function signalFence(object: Number, value: U64) -> Result<Void, TesseraError> {
+    let current = try currentPoint(object)
+    if value < current { return .Error(failure(.FenceRegressed, Number(current))) }
+    if value == current { return .Ok }
+    let sync = try syncDevice()
+    let handle = try fenceOf(object)
+    let reached = try timeline(sync, Drm.syncobjTimelineSignal, handle, value, U32(0))
+    return .Ok
+}
+
+public function fenceSignal(fence: Ref, value: UNumber) -> Result<Void, TesseraError> {
+    let object = try resolve(fence, .Fence, RefRights.write)
+    return signalFence(object, U64(value))
+}
+
+// Whether a wait's eventfd has fired. One that cannot be polled is taken as
+// fired, so it is closed rather than kept forever.
+function fired(event: borrow Descriptor) -> Bool {
+    return match event.ready(PollEvents.input, 0) {
+        Ok(seen) -> seen != PollEvents.none
+        Error(failed) -> {
+            log warn("a fence wait could not be polled; closing it", error: errorName(failed))
+            return true
+        }
+    }
+}
+
+// Closes the waits that have already fired, and with `all` every one of
+// `object`'s; an unfired one is still in a port's set and has to stay open.
+function sweepWaits(object: Number, all: Bool) {
+    var kept: [FenceWait] = []
+    for wait in deviceLibrary.fenceWaits {
+        if (all && wait.object == object) || fired(wait.event) {
+            wait.event.close()
+        } else {
+            kept.append(wait)
+        }
+    }
+    deviceLibrary.fenceWaits = kept
+}
+
+// Arms `reply`'s port for the fence reaching `value`: an eventfd the kernel
+// signals (`SYNCOBJ_EVENTFD`), polled by the port's engine.
+function armFence(
+    object: Number,
+    value: U64,
+    completion: borrow Completion,
+    reply: borrow Reply
+) -> Result<Void, TesseraError> {
+    sweepWaits(object, false)
+    let sync = try syncDevice()
+    let handle = try fenceOf(object)
+    let event = try eventObject()
+    let blockBytes = zeroedBlock(count: 24, alignment: 16)
+    let block = blockBytes.pointer()
+    heapStore<U32>(block, 0, handle)
+    heapStore<U64>(block, 8, value)
+    heapStore<U32>(block, 16, U32(event.number))
+    match sync.control(Drm.syncobjEventfd, block) {
+        Ok(done) -> {}
+        Error(failed) -> {
+            event.close()
+            return .Error(failed)
+        }
+    }
+    deviceLibrary.fenceWaits.append(FenceWait { object: object, event: event })
+    return reply.attach(
+        event,
+        SourceEvents.readable,
+        completion,
+        SourceOptions { mode: .Once, fillEvents: false }
+    )
+}
+
+public function fenceWaitAsync(
+    fence: Ref,
+    value: UNumber,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    let object = try resolve(fence, .Fence, RefRights.wait)
+    let current = try currentPoint(object)
+    let reply = Reply { port: port, key: key }
+    if current >= value {
+        return reply.post(.Ok(Answer { result0: value, result1: current }), .Fence)
+    }
+    return armFence(
+        object,
+        value,
+        packet(key, successOutcome, Answer { result0: value, result1: value }, .Fence),
+        reply
+    )
+}
+
+// `Ref.waitAsync(SIGNALED)` on a fence: its next point.
+function fenceArmNext(object: Number, reply: borrow Reply) -> Result<Void, TesseraError> {
+    let current = try currentPoint(object)
+    let completion = packet(
+        reply.key,
+        successOutcome,
+        Answer { result0: U64(DeviceEvents.signaled.raw), result1: U64(0) },
+        .Event
+    )
+    return armFence(object, current + U64(1), completion, reply)
+}
+
+public function fenceAttachNative(
+    fence: Ref,
+    value: UNumber,
+    native: borrow NativeHandle
+) -> Result<Void, TesseraError> {
+    let object = try resolve(fence, .Fence, RefRights.native | RefRights.write)
+    if native.kind != .SyncFileFd || native.value > U64(0x7FFFFFFF) {
+        return .Error(failure(.Unsupported))
+    }
+    let source = Descriptor { number: Number(native.value) }
+    let sync = try syncDevice()
+    let handle = try fenceOf(object)
+    let imported = try syncobjFromDescriptor(sync, source, handle, Drm.syncobjImportSyncFile, value)
+    return .Ok
+}
+
+public function fenceNativeAt(
+    fence: Ref,
+    value: UNumber,
+    kind: borrow NativeKind
+) -> Result<NativeHandle, TesseraError> {
+    let object = try resolve(fence, .Fence, RefRights.native)
+    if kind != .SyncFileFd { return .Error(failure(.Unsupported)) }
+    let sync = try syncDevice()
+    let handle = try fenceOf(object)
+    return match syncobjToDescriptor(sync, handle, Drm.syncobjExportSyncFile, value) {
+        Ok(file) -> .Ok(NativeHandle { kind: .SyncFileFd, value: U64(file.number) })
+        Error(failed) -> {
+            // Nothing submitted yet reaches that point.
+            match errnoOf(failed) {
+                Invalid -> return .Error(failure(.ShouldWait))
+                NoEntry -> return .Error(failure(.ShouldWait))
+                else -> return .Error(failed)
+            }
+        }
+    }
+}
+
+public function fenceNativeHandle(fence: Ref) -> Result<NativeHandle, TesseraError> {
+    let object = try resolve(fence, .Fence, RefRights.native)
+    let syncobj = try deviceOf(object)
+    let duplicate = try syncobj.duplicate()
+    return .Ok(NativeHandle { kind: .DrmSyncobjFd, value: U64(duplicate.number) })
+}
+
+function fenceRelease(object: Number) {
+    sweepWaits(object, true)
+    var kept: [FenceRecord] = []
+    for fence in deviceLibrary.fences {
+        if fence.object != object {
+            kept.append(fence)
+            continue
+        }
+        match deviceLibrary.syncDevice {
+            Some(sync) -> syncobjDestroy(sync, fence.handle)
+            None -> {}
+        }
+    }
+    deviceLibrary.fences = kept
+}

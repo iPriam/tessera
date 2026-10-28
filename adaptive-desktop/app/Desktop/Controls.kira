@@ -1,0 +1,58 @@
+import Foundation
+import PlatformKit
+import PlatformUI
+import KiraUI
+
+// Control Center on Adaptive Desktop (roadmap/11-adaptive-desktop.md, "Control
+// Center"): its symbol at the trailing end of the bar opens it under the bar,
+// as a Mac's does, and while it is out the platform holds the keyboard and the
+// pointer, as it does for a menu. A click off it, its symbol again or Escape
+// puts it away. Focus holds notification banners back, and its switch holds
+// over Focus's schedule until the schedule next changes; Stage Manager is the
+// switch F6 is.
+
+// Does what a person did in Control Center.
+function controlCenterAct(desktop: borrow mut Desktop, action: ControlCenterAction) {
+    if desktop.lock.locked { return }
+    match action {
+        Toggle -> {
+            if desktop.controls.open {
+                closeControlCenter(desktop)
+            } else {
+                openControlCenter(desktop)
+            }
+        }
+        Close -> closeControlCenter(desktop)
+        Focus -> {
+            let moment = focusMoment(desktop.zone, unixMillis())
+            toggleFocus(moment)
+            desktop.controls.focus = focusChoice().active(moment)
+        }
+        StageManager -> toggleStage(desktop)
+        // A Mac's windows always float free; the desk offers no switch for it.
+        WindowedApps -> {}
+    }
+    redrawAfter(0)
+}
+
+// Puts Control Center out, holding the input for it.
+function openControlCenter(desktop: borrow mut Desktop) {
+    if desktop.controls.open { return }
+    match holdInput(desktop, "hold the input for Control Center") {
+        Ok(sent) -> if !sent { return }
+        Error(failed) -> {
+            requestFailed("hold the input for Control Center", failed)
+            return
+        }
+    }
+    desktop.controls.open = true
+    log info("Control Center opened")
+}
+
+// Puts Control Center away, and lets the input go.
+function closeControlCenter(desktop: borrow mut Desktop) {
+    if !desktop.controls.open { return }
+    desktop.controls.open = false
+    giveBackKeyboard(desktop)
+    log info("Control Center closed")
+}

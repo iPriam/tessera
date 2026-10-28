@@ -1,0 +1,111 @@
+import Foundation
+import RenderBox
+
+// What can stop an icon from rendering, and the paints a document's colours
+// and gradients become.
+
+public enum IconRenderFailure {
+    Svg(SvgFailure)
+    Drawing(DisplayListFailure)
+    Rendering(RenderFailure)
+    // A layer's artwork is not in the bundle.
+    MissingArtwork(String)
+    // A part of IconRendering's path this port does not draw yet, by name.
+    Unported(String)
+}
+
+function svgDrawn(result: Result<Void, SvgFailure>) -> Result<Void, IconRenderFailure> {
+    return match result {
+        Ok -> .Ok
+        Error(failure) -> .Error(.Svg(failure))
+    }
+}
+
+function listDrawn(result: Result<Void, DisplayListFailure>) -> Result<Void, IconRenderFailure> {
+    return match result {
+        Ok -> .Ok
+        Error(failure) -> .Error(.Drawing(failure))
+    }
+}
+
+function rendered(
+    result: Result<TextureImage, RenderFailure>
+) -> Result<TextureImage, IconRenderFailure> {
+    return match result {
+        Ok(image) -> .Ok(image)
+        Error(failure) -> .Error(.Rendering(failure))
+    }
+}
+
+// The colour space a document colour's components are in.
+function colorSpaceOf(color: borrow IconColor) -> ColorSpace {
+    return match color.space {
+        DisplayP3 -> .DisplayP3
+        Srgb, ExtendedSrgb, Gray, ExtendedGray -> .StandardRgb
+    }
+}
+
+function rgbaOf(color: borrow IconColor) -> RGBAColor {
+    return RGBAColor { r: color.red, g: color.green, b: color.blue, a: color.alpha }
+}
+
+function solidFill(color: borrow IconColor) -> Fill {
+    var fill = Fill()
+    fill.setColor(rgbaOf(color), colorSpaceOf(color))
+    return fill
+}
+
+// A gradient whose points are shares of `box`, the layer's bounds on the
+// canvas, running between them in Display P3, as IconRendering lays a
+// layer's gradient fill out.
+function linearFill(gradient: borrow IconGradient, box: borrow Rect) -> Fill {
+    var fill = Fill()
+    fill.setGradient(
+        Gradient {
+            geometry: .Axial(
+                AxialGradient {
+                    startPoint: pointIn(box, gradient.start),
+                    endPoint: pointIn(box, gradient.stop)
+                }
+            ),
+            stops: [
+                GradientStop { color: rgbaOf(inDisplayP3(gradient.from)), location: 0 },
+                GradientStop { color: rgbaOf(inDisplayP3(gradient.to)), location: 1 }
+            ],
+            colorSpace: .DisplayP3,
+            edgeMode: .Clamp,
+            interpolation: .Smooth
+        }
+    )
+    return fill
+}
+
+function pointIn(box: borrow Rect, share: borrow IconPoint) -> Point {
+    return Point { x: box.x + share.x * box.width, y: box.y + share.y * box.height }
+}
+
+// The paint a layer's fill is, across `box`, the layer's bounds kept to
+// the canvas.
+function paintFill(fill: borrow IconFill, box: borrow Rect) -> Result<Fill, IconRenderFailure> {
+    return match fill {
+        Solid(color) -> .Ok(solidFill(color))
+        LinearGradient(gradient) -> .Ok(linearFill(gradient, box))
+        AutomaticGradient(color) -> .Ok(linearFill(automaticGradient(color), box))
+        Automatic, SystemLight, SystemDark, None -> .Error(.Unported("a fill that paints nothing"))
+    }
+}
+
+// Foundation's decoded image as RenderBox draws it: premultiplied.
+function premultiplied(width: Number, height: Number, pixels: borrow [UN8]) -> Bitmap {
+    var bytes: [UN8] = []
+    var at = 0
+    while at + 3 < pixels.count {
+        let alpha = Number(pixels[at + 3])
+        for channel in 0..3 {
+            bytes.append(UN8(round(Number(pixels[at + channel]) * alpha / 255)))
+        }
+        bytes.append(pixels[at + 3])
+        at += 4
+    }
+    return Bitmap { width: UN32(width), height: UN32(height), pixels: bytes }
+}

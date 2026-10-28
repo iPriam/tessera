@@ -1,0 +1,128 @@
+import Foundation
+import RenderBox
+
+// A shape's fill and stroke, and the clip paths elements name, recorded as
+// display list draws and clips.
+
+extend SvgPainter {
+    function drawShape(
+        element: borrow SvgElement,
+        style: borrow SvgStyle
+    ) -> Result<Void, SvgFailure> {
+        let path = try shapePath(element) otherwise return .Ok
+        let fillPaint = paintNamed(style.fill)
+        var fillShape = Shape()
+        fillShape.setPath(copy path, AffineTransform {})
+        fillShape.setEvenOddFill(style.fillRule == .EvenOdd)
+        try paintShape(fillShape, path, fillPaint, style.fillOpacity)
+        let strokePaint = paintNamed(style.stroke)
+        if style.strokeWidth <= 0 { return .Ok }
+        var strokeShape = Shape()
+        let stroke = StrokeStyle {
+            lineWidth: style.strokeWidth,
+            lineCap: style.lineCap,
+            lineJoin: style.lineJoin,
+            miterLimit: style.miterLimit
+        }
+        strokeShape.setStrokedPath(copy path, AffineTransform {}, move stroke)
+        return paintShape(strokeShape, path, strokePaint, style.strokeOpacity)
+    }
+
+    // `shape`, whose outline is `path`, filled with `paint` at `opacity`.
+    function paintShape(
+        shape: borrow Shape,
+        path: borrow Path,
+        paint: borrow SvgPaint,
+        opacity: Number
+    ) -> Result<Void, SvgFailure> {
+        match paint {
+            None -> {}
+            Color(color) -> {
+                var fill = Fill()
+                fill.setColor(
+                    RGBAColor { r: color.r, g: color.g, b: color.b, a: color.a * opacity },
+                    .StandardRgb
+                )
+                list.drawShape(shape, fill, 1, .Normal)
+            }
+            Gradient(gradient) -> try paintGradient(shape, path, gradient, opacity)
+        }
+        return .Ok
+    }
+
+    // Core Graphics clips to the shape, then lays the gradient out in its
+    // own units, so its lines stay straight however those units stretch.
+    function paintGradient(
+        shape: borrow Shape,
+        path: borrow Path,
+        gradient: borrow SvgGradient,
+        opacity: Number
+    ) -> Result<Void, SvgFailure> {
+        let box = pathBounds(path)
+        let units = gradient.boundingBox ? AffineTransform {
+            a : box.width,
+            d: box.height,
+            tx: box.x,
+            ty: box.y
+        }: AffineTransform {}
+        let space = gradient.transform.concatenating(units)
+        if space.inverted() == .None { return .Ok }
+        list.save()
+        list.clipShape(shape, 1, .Normal)
+        list.concat(space)
+        var everywhere = Shape()
+        everywhere.setInfinite()
+        var fill = Fill()
+        fill.setGradient(renderBoxGradient(gradient, opacity))
+        list.drawShape(everywhere, fill, 1, .Normal)
+        return drawn(list.restore())
+    }
+
+    // What `clip-path` names clips the element: one shape as a clip of its
+    // own, several as the layer they fill together.
+    function clipped(element: borrow SvgElement) -> Result<Void, SvgFailure> {
+        let written = try element.attribute("clip-path") otherwise return .Ok
+        let path = try referenced(written) otherwise return .Ok
+        var shapes: [(Path, AffineTransform, FillRule)] = []
+        for child in path.children {
+            let found = shapePath(child)
+            let outline = match found {
+                Some(outline) -> outline
+                None -> continue
+            }
+            let transform = match child.attribute("transform") {
+                Some(written) -> svgTransform(written)
+                // No transform leaves the clip in its own coordinate space.
+                None -> AffineTransform {}
+            }
+            let rule = styleOf(child, SvgStyle {}).fillRule
+            let clipRule = match child.attribute("clip-rule") {
+                Some(text) -> text.trim() == "evenodd" ? FillRule.EvenOdd : FillRule.NonZero
+                None -> rule
+            }
+            shapes.append((outline, transform, clipRule))
+        }
+        if shapes.count == 1 {
+            let (outline, transform, rule) = shapes[0]
+            var shape = Shape()
+            shape.setPath(copy outline, copy transform)
+            shape.setEvenOddFill(rule == .EvenOdd)
+            list.clipShape(shape, 1, .Normal)
+            return .Ok
+        }
+        return clipLayer(shapes)
+    }
+
+    function clipLayer(
+        shapes: borrow [(Path, AffineTransform, FillRule)]
+    ) -> Result<Void, SvgFailure> {
+        list.beginLayer(LayerFlags.none)
+        for (outline, transform, rule) in shapes {
+            var shape = Shape()
+            shape.setPath(copy outline, copy transform)
+            shape.setEvenOddFill(rule == .EvenOdd)
+            list.drawShape(shape, Fill(), 1, .Normal)
+        }
+        return drawn(list.clipLayer(1, .Normal))
+    }
+}

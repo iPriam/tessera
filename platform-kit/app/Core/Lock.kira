@@ -1,0 +1,79 @@
+//! The lock screen's state: whether it covers the output, whether its opening is over, and how far a pull has taken it.
+import Foundation
+
+/// The lock screen's state: whether it covers the output, when its opening is over, and where a finger pulling it down has it.
+///
+/// Every platform keeps one across its sessions with the display server, so a display server that starts again neither opens nor closes the lock screen.
+public struct LockState {
+    /// Whether the lock screen is closed over the output.
+    var locked: Bool = true
+    /// The time the opening that began last is over, in milliseconds since 1970. Zero when no opening is under way.
+    var openUntil: Number = 0
+    /// Where a finger pulling the lock screen down over the open output has it.
+    var pull: LockPull = .Resting
+}
+
+/// A lock screen pulled down over the open output by a finger.
+public enum LockPull {
+    /// Not pulled by a finger.
+    Resting
+    /// Following the finger, this many points down from the top of the output.
+    Following(Number)
+    /// Let go before the lock screen was all the way down: going back up until this time, in milliseconds since 1970.
+    Retracting(Number)
+}
+
+extend LockState {
+    /// Opens the lock screen at `now`, taking `seconds` to do it. One that is
+    /// open already stays as it is.
+    function open(borrow mut self, now: Number, seconds: Number) {
+        if !locked { return }
+        locked = false
+        openUntil = now + seconds * 1000
+    }
+
+    /// Closes the lock screen over the output, as the machine does when it
+    /// sleeps.
+    function lock(borrow mut self) {
+        locked = true
+        openUntil = 0
+        pull = .Resting
+    }
+
+    /// Has the lock screen follow a finger pulling it `distance` points down
+    /// over the open output.
+    function follow(borrow mut self, distance: Number) {
+        if locked { return }
+        pull = .Following(max(distance, 0.0))
+    }
+
+    /// Lets a lock screen pulled short go at `now`, taking `seconds` to go back
+    /// up.
+    function letGo(borrow mut self, now: Number, seconds: Number) {
+        pull = match pull {
+            Following -> .Retracting(now + seconds * 1000)
+            Resting, Retracting -> copy pull
+        }
+    }
+
+    /// Whether the lock screen covers the output at `now`: closed, still
+    /// opening, or pulled down by a finger and not yet back up.
+    function covers(borrow self, now: Number) -> Bool {
+        return locked || now < openUntil || pulled(now)
+    }
+
+    /// Whether a finger has the lock screen down over the open output at
+    /// `now`, or it is still going back up.
+    function pulled(borrow self, now: Number) -> Bool {
+        return match pull {
+            Resting -> false
+            Following -> !locked
+            Retracting(until) -> !locked && now < until
+        }
+    }
+
+    /// Whether the lock screen is opening at `now`.
+    function opening(borrow self, now: Number) -> Bool {
+        return !locked && now < openUntil
+    }
+}

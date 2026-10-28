@@ -1,0 +1,121 @@
+//! The menu bar on Tessera, where the platform draws one bar across the screen
+//! for whichever application is in front (roadmap/11-adaptive-desktop.md). An
+//! application draws no bar of its own: after each build it hands AppKit the
+//! menus its bar would hold, and AppKit hands them to the platform over the link
+//! PID 1 made between them. What the person chooses on the platform's bar comes
+//! back the same way, and runs as choosing the row in the window would.
+//!
+//! The platform reads the menus back from AppKit and draws them with `SystemBar`.
+
+import Foundation
+import KiraUI
+import AppKit
+
+/// The bridge's modifier for an event modifier, so the menus the platform shows match the keys pressed.
+function bridgeModifierOf(modifier: borrow EventModifier) -> BridgeModifier {
+    return match modifier {
+        Command -> .Command
+        Shift -> .Shift
+        Option -> .Option
+        Control -> .Control
+    }
+}
+
+/// The event modifier for a bridge modifier; the reverse of `bridgeModifierOf`.
+function eventModifierOf(modifier: borrow BridgeModifier) -> EventModifier {
+    return match modifier {
+        Command -> .Command
+        Shift -> .Shift
+        Option -> .Option
+        Control -> .Control
+    }
+}
+
+/// `menus`, exported by Kira UI, as AppKit carries them.
+public function bridgeMenusOf(menus: borrow [ExportedMenu]) -> [BridgeMenu] {
+    var bridged: [BridgeMenu] = []
+    for menu in menus {
+        var items: [BridgeMenuItem] = []
+        for item in menu.items {
+            var modifiers: [BridgeModifier] = []
+            for modifier in item.shortcut.modifiers {
+                modifiers.append(bridgeModifierOf(modifier))
+            }
+            items.append(
+                BridgeMenuItem {
+                    number: item.number,
+                    title: copy item.title,
+                    key: copy item.shortcut.key,
+                    modifiers: move modifiers,
+                    enabled: item.enabled,
+                    separator: item.separator
+                }
+            )
+        }
+        bridged.append(
+            BridgeMenu { title: copy menu.title, application: menu.application, items: move items }
+        )
+    }
+    return bridged
+}
+
+/// `menus`, as AppKit carried them, as `SystemBar` draws them.
+public function exportedMenusOf(menus: borrow [BridgeMenu]) -> [ExportedMenu] {
+    var exported: [ExportedMenu] = []
+    for menu in menus {
+        var items: [ExportedMenuItem] = []
+        for item in menu.items {
+            var modifiers: [EventModifier] = []
+            for modifier in item.modifiers {
+                modifiers.append(eventModifierOf(modifier))
+            }
+            items.append(
+                ExportedMenuItem {
+                    number: item.number,
+                    title: copy item.title,
+                    shortcut: KeyboardShortcut { key: copy item.key, modifiers: move modifiers },
+                    enabled: item.enabled,
+                    separator: item.separator
+                }
+            )
+        }
+        exported.append(
+            ExportedMenu {
+                title: copy menu.title,
+                application: menu.application,
+                items: move items
+            }
+        )
+    }
+    return exported
+}
+
+/// Hands the platform `menus`, when they changed or `force` asks: the
+/// application came to the front, or a new link to the platform came.
+function publishApplicationMenus(
+    bridge: borrow BridgeHandle,
+    menus: borrow [ExportedMenu],
+    force: Bool
+) {
+    match publishMenus(copy bridge, bridgeMenusOf(menus), force) {
+        Ok -> {}
+        Error(failure) -> log warn(
+            "the menus could not be handed to the platform",
+            failure: failure
+        )
+    }
+}
+
+/// Runs what the person chose on the platform's bar since the last call; whether
+/// anything ran.
+function performChosenItems(bridge: borrow BridgeHandle) -> Bool {
+    var ran = false
+    for number in takeChosenItems(copy bridge) {
+        if menuBarPerform(number) {
+            ran = true
+        } else {
+            log warn("the platform chose an item the menus do not have", item: number)
+        }
+    }
+    return ran
+}

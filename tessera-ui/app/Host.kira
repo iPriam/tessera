@@ -1,0 +1,316 @@
+//! Building an application's interface into Kira UI's retained tree, as the
+//! windowed driver in `RunKiraLayerApp.kira` does each frame: describe,
+//! caLayoutTree, reconcile, advance. Only what the display can deliver is
+//! carried over: its keys, and its pointer, which a slider or a drag held on an
+//! interactive surface follows.
+
+import Foundation
+import KiraUI
+import KCoreAnimation
+import KiraLayout
+import Ember
+import LibTessera
+import TesseraDisplayClient
+import AppKit
+
+/// One application or platform hosted on the display: its Kira UI state,
+/// whether it holds focus, and how far its frames have got.
+struct Host {
+    let title: String
+    let options: ApplicationOptions
+    // What Kira UI carries between frames: the retained tree and the input
+    // it has been given. The host holds it and hands it to Kira UI's dispatch.
+    var state: KiraLayerAppState
+    // Whether this is the platform, which draws the system's interface over
+    // every application rather than a window.
+    let platform: Bool
+    // The size MosaicDisplay configured the surface at, in points, and how
+    // many pixels a point is on its output.
+    var size: Size = Size {}
+    var scale: Number = 1
+    // The output's size in pixels, which a window resized is given room for.
+    var output: Size = Size {}
+    // How far round the window its buffer reaches, for the shadow it draws
+    // (roadmap/08-display-server.md, `set_margin`).
+    var margin: Number = 0
+    // The backdrop MosaicDisplay was last asked to draw under the window.
+    var backdrop: HostBackdrop = HostBackdrop {}
+    // The platform's glass lifted out of this frame, and what MosaicDisplay
+    // was last asked to draw under the surface for it.
+    var platformGlass: [WindowBackdropPiece] = []
+    var platformGlassSent: [WindowBackdropPiece] = []
+    // Where the platform draws over the surface, which the interface keeps
+    // clear as its safe area (roadmap/08-display-server.md, `insets`).
+    var insets: EdgeInsets = EdgeInsets {}
+    var badges: [DynamicPlatformBadge] = []
+    var frames: Number = 0
+    // An application draws only while it has focus, so it does not spend the
+    // machine on frames no one looks at; the platform draws whenever it changes.
+    // Only the first frame of a session is drawn without focus.
+    var focus: Focus = .Unfocused
+    // Whether the interface has to be built and drawn again.
+    var stale: Bool = true
+    // Whether layers the compositor animates on its own are still moving, so
+    // the retained tree has to be drawn again, though not built.
+    var drawOwed: Bool = false
+    // The menus the application's bar holds, as the last build exported
+    // them, and whether the platform must be told them though they did not
+    // change.
+    var menus: [ExportedMenu] = []
+    // Whether the window's last build asked for the status bar to be hidden,
+    // and what the platform was last told.
+    var statusBarHidden: Bool = false
+    var statusBarHiddenSent: Bool = false
+    // Whether the home screen was last told the platform as being edited.
+    var homeEditingSent: Bool = false
+    var menusOwed: Bool = true
+    // Where the pointer last was on the surface, in its pixels.
+    var pointerX: Number = 0
+    var pointerY: Number = 0
+    // Whether the pointer is on the surface: it came in, or moved on it, and
+    // has not left since.
+    var pointerInside: Bool = false
+    // When the window's bar was last pressed, in the display's milliseconds,
+    // for a second press to zoom it; zero when the last press was elsewhere.
+    var barPressed: Number = 0
+}
+
+/// Starts a build: a fresh action table, tap sequence and scroll scope, the
+/// clock advanced by what `frame` took, and the navigation's pending change
+/// landed, before anything reads it.
+function beginHostedBuild(frame: borrow RenderFrame) -> StateBuild {
+    layerActionsReset()
+    let build = stateBuildBegin()
+    tapSeqReset()
+    scrollScopeReset()
+    clockTick(frame)
+    clockBeginFrame()
+    navigationSettle()
+    return move build
+}
+
+extend Host {
+    /// Builds the interface `rootBuilder` gives into the retained tree for
+    /// `frame`. An application's is a window, whose menus are exported for the
+    /// platform's bar; the platform's is the system's interface, on nothing.
+    function build(
+        borrow mut self,
+        rootBuilder: borrow () -> Any Widget,
+        frame: borrow mut RenderFrame
+    ) {
+        state.ui.viewport = copy size
+        foundationWriteViewportSnapshot(size.width, size.height)
+        state.ui.frameCount = frames
+        var stateBuildGuard = beginHostedBuild(frame)
+        let build: borrow () -> Any Widget = rootBuilder
+        var context = buildContext(state.ui)
+        kiraLayerHeldContext(state, context)
+        let device = frame.safeAreaInsets()
+        context.systemSafeArea = EdgeInsets {
+            top: max(device.top, insets.top),
+            leading: max(device.leading, insets.leading),
+            bottom: max(device.bottom, insets.bottom),
+            trailing: max(device.trailing, insets.trailing)
+        }
+        context.safeArea = copy context.systemSafeArea
+        var described = CALayerDescription {}
+        if platform {
+            let badgeContext = copy context
+            described = systemFrame(build(), move context, size)
+            described = platformBadgeTree(move described, badges, badgeContext, size)
+        } else {
+            let exporting = copy context
+            statusBarRequestBegin()
+            described = match options.surface {
+                Window -> windowFrame(build(), copy title, move context, size)
+                Desktop -> desktopFrame(build(), copy title, move context, size)
+            }
+            statusBarHidden = statusBarHiddenRequested()
+            menus = menuBarExport(exporting, rootModifierContext())
+        }
+        if margin > 0 {
+            described.layout.widthFill = true
+            described.layout.heightFill = true
+            described = CALayerDescription {
+                layout: CALayoutIntent {
+                    widthFill: true,
+                    heightFill: true,
+                    paddingLeading: margin,
+                    paddingTop: margin,
+                    paddingTrailing: margin,
+                    paddingBottom: margin
+                },
+                sublayers: [described]
+            }
+        }
+        let drawn = drawnSize()
+        layOutLayerTree(described, drawn.width, drawn.height)
+        // Glass over the sidebar's hole is MosaicDisplay's to draw, over the
+        // backdrop it lays there, and so is all of the platform's, under its
+        // transparent surface.
+        if platform {
+            platformGlass = platformLiftGlass(described)
+        } else {
+            windowBackdropLiftGlass(described)
+        }
+        // While a widget resizes the content every frame on a spring of its
+        // own, as the sidebar sliding does, every layer takes its new frame
+        // at once, as in Kira UI's own window loop: an implicit animation on
+        // top would drag the content behind the cut and the glass, which
+        // follow the spring itself.
+        // What this build changes starts moving now, at its commit, as in Kira
+        // UI's own window loop: the tree's clock is otherwise the last frame
+        // drawn, which a press held to a long-press timer, or a slow build,
+        // leaves far enough behind that a short animation is over before the
+        // first frame that shows it.
+        state.compositor.tree.setClock(clockTime(frame))
+        if frames == 0 {
+            state.compositor.tree.reconcileImmediate(described)
+        } else if clockState().resizing {
+            state.compositor.tree.reconcileResizing(described)
+        } else {
+            state.compositor.tree.reconcile(described)
+        }
+        // What this build did not describe has left the interface, and its
+        // state with it. The guard is the safety net if this frame returns
+        // before it gets here.
+        stateBuildGuard.finish()
+        // A press is held by the layer it landed on, not by the key it had
+        // then: a rebuild that numbers the controls differently moves the
+        // keys, and the press follows its layer to its new one, as Kira UI's
+        // own window loop does.
+        state.ui.pressedKey = state.compositor.tree.hitKeyOf(state.compositor.tree.pressed())
+        state.pressSurface = state.compositor.tree.hitKeyOf(state.pressSurfaceLayer)
+        let under = pointerInside ? state.compositor.tree.hitTestTree(
+            state.ui.pointerX,
+            state.ui.pointerY
+        ) : CAHitResult {}
+        state.ui.hoveredKey = under.hit ? under.hitKey : 0
+        // The keyboard goes where the focus state just described asked, and a
+        // frame that moved it is built again to show the insertion point.
+        let focusedBefore = state.ui.focusedKey
+        kiraLayerFocusRequested(state)
+        if state.ui.focusedKey != focusedBefore { stale = true }
+        foundationWriteInputSnapshot(state.ui)
+        state.layersMoving = state.compositor.advance(frame)
+        state.builtEventCount = state.ui.eventCount
+    }
+
+    /// The size of the buffer, in points: the window, and its margin on every
+    /// side.
+    function drawnSize(borrow self) -> Size {
+        if platform {
+            return Size {
+                width: size.width + StageBadgeAtlas.tile,
+                height: max(size.height, StageBadgeAtlas.height)
+            }
+        }
+        return Size { width: size.width + margin * 2, height: size.height + margin * 2 }
+    }
+
+    /// The size of the buffer in pixels, at the output's scale.
+    function drawnPixels(borrow self) -> Size {
+        let drawn = drawnSize()
+        return Size { width: drawn.width * scale, height: drawn.height * scale }
+    }
+
+    /// The most a buffer resized on the screen can be, in pixels: the output,
+    /// and the margin on every side.
+    function roomPixels(borrow self) -> Size {
+        let around = (platform ? StageBadgeAtlas.tile : margin * 2) * scale
+        return Size { width: output.width + around, height: output.height + around }
+    }
+
+    /// The color under the interface: an application's canvas, so the
+    /// antialiased edges blend into what the root paints; nothing under the
+    /// platform's, so the applications show through, nor under the desktop's,
+    /// which paints its own picture edge to edge.
+    function canvas(borrow self) -> RGBAColor {
+        if platform || options.surface == .Desktop || windowDecorated() {
+            return RGBAColor { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }
+        }
+        let painted = colorFromFoundation(navigationCanvas(rootModifierContext()))
+        return RGBAColor { r: painted.r, g: painted.g, b: painted.b, a: painted.a }
+    }
+
+    /// Whether the interface moves on its own and needs the next frame.
+    function moving(borrow self) -> Bool {
+        return state.layersMoving || clockRunning()
+    }
+
+    /// Whether the interface should be drawn now: it changed. A window behind
+    /// is drawn as one in front is, as a Mac's are: a clock behind keeps time,
+    /// and a timer behind still ends.
+    function due(borrow self) -> Bool {
+        return stale || drawOwed || touched()
+    }
+
+    /// Whether `frame` has to build the interface again rather than draw the
+    /// retained tree on, as Kira UI's own window loop decides: the first
+    /// frame, or a motion a build carries -- a spring, a navigation's push --
+    /// still running or due to wake.
+    function buildOwed(borrow self, frame: borrow RenderFrame) -> Bool {
+        return frames == 0 || clockRunning() || clockWakeDue(clockTime(frame))
+    }
+
+    /// Draws `frame` from the retained tree as the last build left it, with
+    /// only the compositor's own animations advanced.
+    function carry(borrow mut self, frame: borrow mut RenderFrame) {
+        state.layersMoving = state.compositor.advance(frame)
+    }
+
+    /// Takes focus coming in or going: coming in puts the surface back on
+    /// screen, by drawing it, and its menus on the platform's bar.
+    function refocused(borrow mut self, moved: Focus) {
+        match moved {
+            Focused -> {
+                stale = true
+                menusOwed = true
+            }
+            // Drawn once more, as a window behind.
+            Unfocused -> stale = true
+        }
+        windowActiveSet(moved == .Focused)
+        focus = moved
+    }
+
+    /// Whether the surface is an application's window, which can draw its own
+    /// frame, rather than the platform or a desktop.
+    function isWindow(borrow self) -> Bool {
+        return !platform && options.surface == .Window
+    }
+
+    /// Takes the display's window model. An application's window draws its own
+    /// frame where it is a window, floating free or on a stage, as on a Mac and
+    /// in an iPad's Stage Manager; filling the screen, it has none, as on an
+    /// iPhone. MosaicDisplay clips a window to its frame and draws the shadow
+    /// round it, as a Mac's window server does, so its buffers reach no
+    /// further than the window.
+    function adoptMode(borrow mut self, mode: CompositorMode) {
+        let floating = match mode {
+            Freeform, Stage -> true
+            Exclusive, Stack -> false
+        }
+        windowDecorationSet(isWindow() && floating)
+        windowShadowHostedSet(true)
+        // MosaicDisplay draws what is behind a floating window under its holes.
+        windowBackdropAvailableSet(isWindow() && floating)
+        environmentNoteStageManager(mode == .Stage)
+        environmentNoteWindowedApps(mode == .Freeform)
+        if isWindow() { margin = windowShadowMargin() }
+        stale = true
+    }
+
+    /// Whether input arrived since the last build.
+    function touched(borrow self) -> Bool {
+        return state.ui.eventCount != state.builtEventCount
+    }
+
+    /// Hands the platform the menus the last build exported, when they changed
+    /// or are owed.
+    function publish(borrow mut self, bridge: borrow BridgeHandle) {
+        if platform { return }
+        publishApplicationMenus(bridge, menus, menusOwed)
+        menusOwed = false
+    }
+}

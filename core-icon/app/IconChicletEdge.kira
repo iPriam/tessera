@@ -1,0 +1,200 @@
+import Foundation
+import RenderBox
+
+// `FUN_1ccae22ec`: one highlight along the chiclet's edge. A stroke twice its
+// distance wide, centred on the edge and painted a conic gradient that is
+// brightest where its lights shine on the edge, is kept only inside the
+// chiclet and away from it by less than its distance, measured as a falloff;
+// the layer's alpha then runs through a ramp of the highlight's colour.
+
+namespace EdgeRamp {
+    // The conic gradient's colours around the edge, and the ramp's steps.
+    let turns: Number = 256
+    let steps: Number = 64
+    let least: Number = 0.000001
+    // The sharp highlights' falloff, `chicletHighlightCurvature` and
+    // `chicletDarklightCurvature`; a diffuse one falls off at 1.
+    let curvature: Number = 0.75
+}
+
+// The colours the highlight's lights paint around the edge, starting a
+// quarter turn before the key light and running clockwise: each light white
+// over the others, by how near the edge's angle is to its own within its
+// spread.
+function edgeColors(spec: borrow HighlightSpec, size: IconSizeClass) -> [RGBAColor] {
+    var colors: [RGBAColor] = []
+    for _ in 0..EdgeRamp.turns { colors.append(clear()) }
+    let spread = spec.spread.at(size)
+    let cosSpread = cos(spread)
+    let range = max(1 - cosSpread, EdgeRamp.least)
+    let everywhere = abs(spread / (2 * SvgAngle.halfTurn) - 0.5) < EdgeRamp.least
+    for longitude in spec.longitudes {
+        let start = longitude - SvgAngle.halfTurn / 2
+        for index in 0..EdgeRamp.turns {
+            let angle = start - 2 * SvgAngle.halfTurn * index / EdgeRamp.turns
+            let strength = everywhere ? 1 : max((cos(angle) - cosSpread) / range, 0)
+            if strength > 0 { colors[index] = whiteOver(colors[index], strength) }
+        }
+    }
+    return colors
+}
+
+// White at `alpha` over `under`, unpremultiplied again.
+function whiteOver(under: borrow RGBAColor, alpha: Number) -> RGBAColor {
+    let rest = 1 - alpha
+    let total = alpha + rest * under.a
+    return RGBAColor {
+        r: (alpha + rest * under.r * under.a) / total,
+        g: (alpha + rest * under.g * under.a) / total,
+        b: (alpha + rest * under.b * under.a) / total,
+        a: total
+    }
+}
+
+// The edge's colours as a conic gradient's stops, the first again at the end.
+function edgeStops(colors: borrow [RGBAColor]) -> [GradientStop] {
+    var stops: [GradientStop] = []
+    for index in 0..(EdgeRamp.turns + 1) {
+        stops.append(
+            GradientStop {
+                color: copy colors[index % EdgeRamp.turns],
+                location: index / EdgeRamp.turns
+            }
+        )
+    }
+    return stops
+}
+
+// The ramp the layer's alpha maps through: the highlight's colour, its alpha
+// rising with the falloff as the bias bends it.
+function edgeRamp(spec: borrow HighlightSpec, color: borrow RGBAColor) -> [GradientStop] {
+    let bend = 1 / spec.bias - 2
+    var stops: [GradientStop] = []
+    for step in 0..(EdgeRamp.steps + 1) {
+        let t = step / EdgeRamp.steps
+        let alpha = t / max(bend * (1 - t) + 1, EdgeRamp.least)
+        stops.append(
+            GradientStop {
+                color: RGBAColor { r: color.r, g: color.g, b: color.b, a: alpha },
+                location: t
+            }
+        )
+    }
+    return stops
+}
+
+function edgeBlend(spec: borrow HighlightSpec) -> BlendMode {
+    return spec.darklight ? .PlusDarker : .PlusLighter
+}
+
+// The matrix keeping only alpha, scaled by the highlight's falloff.
+function alphaOnly(scale: Number) -> [Number] {
+    return [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, scale, 0]
+}
+
+// The colour an edge highlight lightens or darkens with: its brightness, or
+// in a clear mode mask, a light's brightness in the blue alone.
+function edgeColor(spec: borrow HighlightSpec, masked: Bool) -> RGBAColor {
+    let level = spec.brightness
+    if masked && !spec.darklight { return RGBAColor { r: 0, g: 0, b: level, a: 1 } }
+    return RGBAColor { r: level, g: level, b: level, a: 1 }
+}
+
+function drawEdgeHighlight(
+    list: borrow DisplayList,
+    spec: borrow HighlightSpec,
+    size: IconSizeClass,
+    masked: Bool
+) -> Result<Void, DisplayListFailure> {
+    let distance = spec.distance.at(size)
+    list.save()
+    let ramp = edgeRamp(spec, edgeColor(spec, masked))
+    list.addGradientMap(.Alpha, 0, 1, move ramp, .Device, .Clamp, .Linear, .Device)
+    list.beginLayer(LayerFlags.none)
+    list.beginLayer(LayerFlags.none)
+    list.addColorMatrixFilter(
+        alphaOnly(spec.diffuse ? 1 : EdgeRamp.curvature),
+        ColorFilterFlags.none
+    )
+    var falloff = chicletShape()
+    falloff.setRenderingMode(.InnerDistance, distance)
+    list.drawShape(falloff, colorFill(white(), .DisplayP3), 1, .Normal)
+    try list.clipLayer(1, .Inverse)
+    var fill = Fill()
+    fill.setGradient(edgeGradient(spec, size))
+    list.drawShape(chicletStroke(2 * distance), fill, 1, .Normal)
+    try list.drawLayer(spec.opacity.at(size), edgeBlend(spec))
+    return list.restore()
+}
+
+function edgeGradient(spec: borrow HighlightSpec, size: IconSizeClass) -> Gradient {
+    let middle = IconGeometry.canvas / 2
+    return Gradient {
+        geometry: .Conic(ConicGradient { center: Point { x: middle, y: middle }, angle: 0 }),
+        stops: edgeStops(edgeColors(spec, size)),
+        colorSpace: .DisplayP3,
+        edgeMode: .Clamp,
+        interpolation: .Smooth
+    }
+}
+
+// Which of IconRendering's edge sets lights the chiclet.
+enum EdgeSet {
+    // `chicletDefault`, in colour.
+    Standard
+    // `chicletClear`, into a clear mode mask.
+    Clear
+    // `chicletScreened`, in colour, for a dark tinted icon.
+    Screened
+}
+
+// The edge highlights, alike ones lit together, each drawn where it shows.
+function drawEdgeHighlights(
+    list: borrow DisplayList,
+    size: IconSizeClass,
+    set: EdgeSet
+) -> Result<Void, DisplayListFailure> {
+    let specs = match set {
+        Standard -> chicletHighlights()
+        Clear -> chicletClearHighlights()
+        Screened -> chicletScreenedHighlights()
+    }
+    for spec in mergedHighlights(specs) {
+        if spec.opacity.at(size) <= 0 { continue }
+        try drawEdgeHighlight(list, spec, size, set == .Clear)
+    }
+    return .Ok
+}
+
+// `FUN_1ccb16c8c`, `_outlines` with `useDynamicOpacity`: a hairline inside
+// the chiclet's edge, `lineWidth` points wide, lightening what is dim under
+// it and darkening what is bright, by its luminance. The dark line on
+// bright content is left out under a chiclet shadow.
+function drawOutline(
+    list: borrow DisplayList,
+    size: IconSizeClass,
+    pixelsPerUnit: Number,
+    shadowed: Bool
+) -> Result<Void, DisplayListFailure> {
+    let darkens = !shadowed || OutlineDefaults.allowDespiteShadow
+    let onBright = darkens ? OutlineDefaults.opacityOnBright.at(size) : 0
+    let brightFrom = max(1 - OutlineDefaults.rangeOnBright, OutlineDefaults.rangeOnDim)
+    let stops = [
+        GradientStop {
+            color: RGBAColor { r: 1, g: 1, b: 1, a: OutlineDefaults.opacityOnDim.at(size) },
+            location: 0
+        },
+        GradientStop { color: clear(), location: OutlineDefaults.rangeOnDim },
+        GradientStop { color: clear(), location: brightFrom },
+        GradientStop { color: RGBAColor { r: 0, g: 0, b: 0, a: onBright }, location: 1 }
+    ]
+    list.save()
+    list.beginLayer(LayerFlags.none)
+    let width = 2 * OutlineDefaults.lineWidth.at(size) / pixelsPerUnit
+    list.drawShape(chicletStroke(width), colorFill(black(), .DisplayP3), 1, .Normal)
+    try list.clipLayer(1, .Normal)
+    list.addGradientMap(.Luminance, 0, 1, move stops, .Device, .Clamp, .Linear, .Device)
+    list.beginLayer(LayerFlags.needsBackground)
+    try list.drawLayer(1, .Normal)
+    return list.restore()
+}

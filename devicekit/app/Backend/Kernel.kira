@@ -1,0 +1,366 @@
+import Foundation
+import Heap
+import LibTessera
+
+// DeviceKit's calls into the kernel, through LibTessera's backend seam
+// (17 §6.3, §20.4, §25).
+//
+// This backend is Linux's: it speaks in descriptors, `open` flags, `ioctl`
+// numbers and the kernel's own structures. It makes no system call itself;
+// LibTessera's backend makes each one and carries the kernel's `errno` in a
+// failure's `detail`, which `kernelFailure` turns into DeviceKit's codes.
+
+// The `errno` values this backend tells apart. Any other survives as itself.
+@Open enum Errno: U32 {
+    NotPermitted = 1
+    NoEntry = 2
+    Interrupted = 4
+    InputOutput = 5
+    NoDeviceOrAddress = 6
+    BadDescriptor = 9
+    Again = 11
+    NoMemory = 12
+    AccessDenied = 13
+    Fault = 14
+    Busy = 16
+    Exists = 17
+    NoDevice = 19
+    Invalid = 22
+    NotTerminal = 25
+    NoSpace = 28
+    BrokenPipe = 32
+    OutOfRange = 34
+    NotImplemented = 38
+    NoData = 61
+    TimerExpired = 62
+    BadDescriptorState = 77
+    NotSupported = 95
+    NoBufferSpace = 105
+    TransportShutdown = 108
+    TimedOut = 110
+    ConnectionRefused = 111
+    InProgress = 115
+    Cancelled = 125
+}
+
+// The `errno` a backend failure carries; `InputOutput` when it carries none.
+function errnoOf(failed: borrow TesseraError) -> Errno {
+    if !failed.flags.has(ErrorFlags.hasBackendCode) || failed.detail == U64(
+        0
+    ) || failed.detail > U64(4095) { return .InputOutput }
+    return fromCode<Errno>(U32(failed.detail))
+}
+
+function errnoCode(errno: borrow Errno) -> ErrorCode {
+    return match errno {
+        NotPermitted -> .AccessDenied
+        AccessDenied -> .AccessDenied
+        NoEntry -> .NotFound
+        NoDeviceOrAddress -> .NotFound
+        NoData -> .NotFound
+        BadDescriptor -> .InvalidHandle
+        Again -> .ShouldWait
+        InProgress -> .ShouldWait
+        NoMemory -> .OutOfMemory
+        NoSpace -> .NoSpace
+        NoBufferSpace -> .OutOfMemory
+        Fault -> .InvalidArgument
+        Invalid -> .InvalidArgument
+        OutOfRange -> .InvalidArgument
+        Busy -> .DeviceBusy
+        Exists -> .AlreadyExists
+        NotSupported -> .Unsupported
+        NotTerminal -> .Unsupported
+        NotImplemented -> .Unsupported
+        Interrupted -> .Cancelled
+        Cancelled -> .Cancelled
+        InputOutput -> .DeviceLost
+        NoDevice -> .DeviceLost
+        BrokenPipe -> .DeviceLost
+        TransportShutdown -> .DeviceLost
+        TimedOut -> .Timeout
+        TimerExpired -> .Timeout
+        ConnectionRefused -> .ConnectionRefused
+        BadDescriptorState -> .BadState
+        else -> .Internal
+    }
+}
+
+// A backend failure as DeviceKit reports it: the code its `errno` means,
+// with the `errno` kept in `detail` (17 §5, `Internal`).
+function kernelFailure(failed: borrow TesseraError) -> TesseraError {
+    let errno = errnoOf(failed)
+    return TesseraError {
+        code: errnoCode(errno),
+        subsystem: .DeviceKit,
+        flags: ErrorFlags.hasBackendCode,
+        detail: U64(code(errno))
+    }
+}
+
+function kernelNumber(answer: borrow Result<Number, TesseraError>) -> Result<Number, TesseraError> {
+    return match answer {
+        Ok(value) -> .Ok(value)
+        Error(failed) -> .Error(kernelFailure(failed))
+    }
+}
+
+function kernelDone(answer: borrow Result<Void, TesseraError>) -> Result<Void, TesseraError> {
+    return match answer {
+        Ok -> .Ok
+        Error(failed) -> .Error(kernelFailure(failed))
+    }
+}
+
+// Flags for `open` that are the same number on both architectures.
+// `O_DIRECTORY` and `O_DIRECT` are not, and `Machine` answers them.
+distinct OpenFlags = U64
+
+namespace OpenFlags {
+    let readOnly: OpenFlags = OpenFlags(0)
+    let writeOnly: OpenFlags = OpenFlags(1)
+    let readWrite: OpenFlags = OpenFlags(2)
+    let nonBlock: OpenFlags = OpenFlags(0x800)
+    let closeOnExec: OpenFlags = OpenFlags(0x80000)
+    let path: OpenFlags = OpenFlags(0x200000)
+}
+
+// `poll` events.
+distinct PollEvents = U16
+
+namespace PollEvents {
+    let none: PollEvents = PollEvents(0)
+    let input: PollEvents = PollEvents(1)
+    let output: PollEvents = PollEvents(4)
+    let error: PollEvents = PollEvents(8)
+    let hangUp: PollEvents = PollEvents(0x10)
+}
+
+// `fcntl` commands.
+namespace FileControl {
+    let getFlags: U64 = U64(3)
+    let setFlags: U64 = U64(4)
+    let duplicateCloseOnExec: U64 = U64(1030)
+}
+
+// A kernel object this backend holds: on Linux, a descriptor.
+@Derive(Copy)
+struct Descriptor {
+    let number: Number
+
+    function read(borrow self, address: RawPtr, length: Number) -> Result<Number, TesseraError> {
+        return kernelNumber(backendRead(self.number, address, length))
+    }
+
+    function write(borrow self, address: RawPtr, length: Number) -> Result<Number, TesseraError> {
+        return kernelNumber(backendWrite(self.number, address, length))
+    }
+
+    function readAt(
+        borrow self,
+        address: RawPtr,
+        length: Number,
+        offset: Number
+    ) -> Result<Number, TesseraError> {
+        return kernelNumber(backendReadAt(self.number, address, length, offset))
+    }
+
+    function writeAt(
+        borrow self,
+        address: RawPtr,
+        length: Number,
+        offset: Number
+    ) -> Result<Number, TesseraError> {
+        return kernelNumber(backendWriteAt(self.number, address, length, offset))
+    }
+
+    // An `ioctl` whose argument is the structure at `argument`.
+    function control(borrow self, request: U64, argument: RawPtr) -> Result<Number, TesseraError> {
+        return kernelNumber(backendControl(self.number, request, argument))
+    }
+
+    // An `ioctl` whose argument is a value rather than an address, passed in
+    // the register a pointer would take.
+    function controlValue(
+        borrow self,
+        request: U64,
+        argument: Number
+    ) -> Result<Number, TesseraError> {
+        return self.control(request, pointerAt(argument))
+    }
+
+    // An `ioctl` whose argument is one `u32`.
+    function controlWord(borrow self, request: U64, value: U32) -> Result<Number, TesseraError> {
+        let blockBytes = zeroedBlock(count: 8, alignment: 16)
+        let block = blockBytes.pointer()
+        heapStore<U32>(block, 0, value)
+        return self.control(request, block)
+    }
+
+    // `fcntl`.
+    function objectControl(
+        borrow self,
+        command: U64,
+        argument: Number
+    ) -> Result<Number, TesseraError> {
+        return kernelNumber(backendObjectControl(self.number, command, argument))
+    }
+
+    // A new descriptor for the same open file, close-on-exec
+    // (`F_DUPFD_CLOEXEC`).
+    function duplicate(borrow self) -> Result<Descriptor, TesseraError> {
+        let number = try self.objectControl(FileControl.duplicateCloseOnExec, 0)
+        return .Ok(Descriptor { number: number })
+    }
+
+    // Turns on `O_NONBLOCK`, so a read with nothing waiting answers `Again`.
+    function setNonBlocking(borrow self) -> Result<Void, TesseraError> {
+        let flags = try self.objectControl(FileControl.getFlags, 0)
+        let set = try self.objectControl(
+            FileControl.setFlags,
+            Number(U64(flags) | OpenFlags.nonBlock.raw)
+        )
+        return .Ok
+    }
+
+    function directoryRead(
+        borrow self,
+        address: RawPtr,
+        length: Number
+    ) -> Result<Number, TesseraError> {
+        return kernelNumber(backendDirectoryRead(self.number, address, length))
+    }
+
+    function map(
+        borrow self,
+        length: Number,
+        protection: U64,
+        flags: U64,
+        offset: Number
+    ) -> Result<RawPtr, TesseraError> {
+        let address = try kernelNumber(
+            backendMap(nullPointer(), length, protection, flags, self.number, offset)
+        )
+        return .Ok(pointerAt(address))
+    }
+
+    function seek(borrow self, offset: Number, whence: U64) -> Result<Number, TesseraError> {
+        return kernelNumber(backendSeek(self.number, offset, whence))
+    }
+
+    function syncData(borrow self) -> Result<Void, TesseraError> {
+        return kernelDone(backendSyncData(self.number))
+    }
+
+    function bind(borrow self, address: RawPtr, length: Number) -> Result<Void, TesseraError> {
+        return kernelDone(backendBind(self.number, address, length))
+    }
+
+    function connect(borrow self, address: RawPtr, length: Number) -> Result<Void, TesseraError> {
+        return kernelDone(backendConnect(self.number, address, length))
+    }
+
+    function sendMessage(borrow self, message: RawPtr, flags: U64) -> Result<Number, TesseraError> {
+        return kernelNumber(backendSendMessage(self.number, message, flags))
+    }
+
+    function receiveMessage(
+        borrow self,
+        message: RawPtr,
+        flags: U64
+    ) -> Result<Number, TesseraError> {
+        return kernelNumber(backendReceiveMessage(self.number, message, flags))
+    }
+
+    // `timerfd_settime` with `struct itimerspec` at `value`.
+    function setTimer(borrow self, value: RawPtr) -> Result<Void, TesseraError> {
+        return kernelDone(backendTimerSet(self.number, U64(0), value, nullPointer()))
+    }
+
+    // The `poll` events the descriptor shows within `nanoseconds`; none when
+    // the time passes first.
+    function ready(
+        borrow self,
+        events: PollEvents,
+        nanoseconds: Number
+    ) -> Result<PollEvents, TesseraError> {
+        let blockBytes = zeroedBlock(count: 24, alignment: 16)
+        let block = blockBytes.pointer()
+        storeTimespec(block, 0, nanoseconds)
+        heapStore<U32>(block, 16, U32(self.number))
+        heapStore<U16>(block, 20, events.raw)
+        let count = try kernelNumber(backendPoll(heapOffset(block, 16), 1, block))
+        if count == 0 { return .Ok(PollEvents.none) }
+        return .Ok(PollEvents(heapLoad<U16>(block, 22)))
+    }
+
+    // Closes the descriptor. A close that fails has still let it go, so the
+    // failure is said and nothing more.
+    function close(borrow self) {
+        match backendClose(self.number) {
+            Ok -> {}
+            Error(failed) -> log warn(
+                "a kernel descriptor did not close cleanly",
+                errno: errnoOf(failed)
+            )
+        }
+    }
+}
+
+function openPath(path: borrow String, flags: OpenFlags) -> Result<Descriptor, TesseraError> {
+    let number = try kernelNumber(backendOpen(path, (flags | OpenFlags.closeOnExec).raw, U64(0)))
+    return .Ok(Descriptor { number: number })
+}
+
+// An eventfd, `EFD_CLOEXEC | EFD_NONBLOCK`.
+function eventObject() -> Result<Descriptor, TesseraError> {
+    let number = try kernelNumber(backendEventObject(0, U64(0x80800)))
+    return .Ok(Descriptor { number: number })
+}
+
+// A memfd, `MFD_CLOEXEC | MFD_ALLOW_SEALING`.
+function memoryObject(name: borrow String) -> Result<Descriptor, TesseraError> {
+    let number = try kernelNumber(backendMemoryObject(name, U64(3)))
+    return .Ok(Descriptor { number: number })
+}
+
+// A `CLOCK_MONOTONIC` timerfd, `TFD_NONBLOCK | TFD_CLOEXEC`.
+function timerObject() -> Result<Descriptor, TesseraError> {
+    let number = try kernelNumber(backendTimerObject(U64(1), U64(0x80800)))
+    return .Ok(Descriptor { number: number })
+}
+
+function socketObject(family: U64, kind: U64, protocol: U64) -> Result<Descriptor, TesseraError> {
+    let number = try kernelNumber(backendSocket(family, kind, protocol))
+    return .Ok(Descriptor { number: number })
+}
+
+function unmap(address: RawPtr, length: Number) {
+    match backendUnmap(address, length) {
+        Ok -> {}
+        Error(failed) -> log warn("a mapping did not unmap", errno: errnoOf(failed))
+    }
+}
+
+// `struct timespec` at `offset`, from nanoseconds.
+function storeTimespec(block: RawPtr, offset: Number, nanoseconds: Number) {
+    heapStore<U64>(block, offset, U64(floor(nanoseconds / Time.nanosecondsPerSecond)))
+    heapStore<U64>(block, offset + 8, U64(nanoseconds % Time.nanosecondsPerSecond))
+}
+
+// `struct timespec` or `struct timeval` at `offset`, in nanoseconds; `unit`
+// is the nanoseconds the second word counts in.
+function loadTime(block: RawPtr, offset: Number, unit: Number) -> Number {
+    return Number(heapLoad<U64>(block, offset)) * Time.nanosecondsPerSecond + Number(
+        heapLoad<U64>(block, offset + 8)
+    ) * unit
+}
+
+namespace Time {
+    let nanosecondsPerSecond: Number = 1000000000
+    let nanosecondsPerMillisecond: Number = 1000000
+    let nanosecondsPerMicrosecond: Number = 1000
+}
+
+// The monotonic clock, in nanoseconds.
+function monotonicNow() -> Result<Number, TesseraError> { return timeRead(.Monotonic) }

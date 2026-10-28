@@ -1,0 +1,169 @@
+import Foundation
+import Heap
+
+// The Presence service (roadmap/16 §14.1): it verifies an interaction token
+// before anything acts on the person's behalf. A token is only proof that a
+// hardware event reached a front-facing surface, so Presence asks MosaicDisplay
+// whether the token is one it minted, unspent, unexpired and still on a
+// front-facing surface, and spends it when it is.
+//
+// Callers reach Presence on `tessera.presence` with the device protocol, as the
+// pasteboard does: one request, one answer whose code is the verdict's error.
+// Presence and MosaicDisplay speak over the link PID 1 gives Presence, with the
+// fixed message below.
+
+namespace PresenceService {
+    let name: String = "tessera.presence"
+}
+
+// The operation a caller asks Presence for, as its device operation number.
+@Derive(Copy)
+enum PresenceOperation: U32 {
+    Verify = 1
+}
+
+// MosaicDisplay's answer to a token check.
+@Derive(Copy)
+public enum TokenVerdict: U32 {
+    Valid = 0
+    // Not a token MosaicDisplay minted, or one for another surface.
+    Unknown = 1
+    Spent = 2
+    Expired = 3
+    // The surface is not the front-facing one now.
+    NotFrontmost = 4
+    WrongSurface = 5
+}
+
+// The error a caller is refused with for a verdict; `Ok` for a valid token.
+public function verdictError(verdict: borrow TokenVerdict) -> ErrorCode {
+    return match verdict {
+        Valid -> ErrorCode.Ok
+        NotFrontmost -> ErrorCode.NotFrontmost
+        Unknown, Spent, Expired, WrongSurface -> ErrorCode.NoInteraction
+    }
+}
+
+// The fixed message on the link between Presence and MosaicDisplay: forty
+// bytes, the kind @0 (check or answer), the verdict @4, the token's id as two
+// 64-bit halves @8 and @16, and its surface @24.
+namespace TokenCheckWire {
+    let bytes: Number = 40
+    let kindAt: Number = 0
+    let verdictAt: Number = 4
+    let idLowAt: Number = 8
+    let idHighAt: Number = 16
+    let surfaceAt: Number = 24
+    let check: UN32 = UN32(1)
+    let answer: UN32 = UN32(2)
+}
+
+// One message on the Presence link.
+public struct TokenCheckMessage {
+    var kind: UN32
+    var verdict: UN32
+    var token: InteractionToken
+}
+
+// Closes handles a received message carried that the check does not keep.
+function closeReceivedHandles(handles: borrow [Handle]) {
+    if handles.count == 0 { return }
+    match handleCloseMany(handles) {
+        // The handles are gone, so there is nothing left to do.
+        Ok -> {}
+        Error(failed) -> log warn("handles could not be closed", error: errorName(failed))
+    }
+}
+
+// The answer to a token check: `verdict`, about `token`.
+public function tokenAnswer(verdict: TokenVerdict, token: InteractionToken) -> TokenCheckMessage {
+    return TokenCheckMessage { kind: TokenCheckWire.answer, verdict: verdict.rawValue(), token: token }
+}
+
+// The check for `token`, which MosaicDisplay answers.
+public function tokenCheck(token: InteractionToken) -> TokenCheckMessage {
+    return TokenCheckMessage { kind: TokenCheckWire.check, verdict: UN32(0), token: token }
+}
+
+// The verdict an answer carries. A value this does not know is Unknown.
+public function verdictOf(raw: UN32) -> TokenVerdict {
+    return match raw {
+        0 -> .Valid
+        2 -> .Spent
+        3 -> .Expired
+        4 -> .NotFrontmost
+        5 -> .WrongSurface
+        else -> .Unknown
+    }
+}
+
+// Sends `message` on the link.
+public function sendTokenCheck(
+    link: Handle,
+    message: borrow TokenCheckMessage
+) -> Result<Void, TesseraError> {
+    let body = zeroedBlock(count: TokenCheckWire.bytes, alignment: 16)
+    blockStore<U32>(body, TokenCheckWire.kindAt, message.kind)
+    blockStore<U32>(body, TokenCheckWire.verdictAt, message.verdict)
+    blockStore<U64>(body, TokenCheckWire.idLowAt, U64(message.token.idLow))
+    blockStore<U64>(body, TokenCheckWire.idHighAt, U64(message.token.idHigh))
+    blockStore<U64>(body, TokenCheckWire.surfaceAt, U64(message.token.surfaceId))
+    let buffer = Buffer { address: body.pointer(), length: TokenCheckWire.bytes }
+    return channelWrite(link, buffer, [])
+}
+
+// The next message on the link. A message of the wrong size, or one that
+// carries a handle, is `InvalidArgument`.
+public function receiveTokenCheck(link: Handle) -> Result<TokenCheckMessage, TesseraError> {
+    let body = zeroedBlock(count: TokenCheckWire.bytes, alignment: 16)
+    let buffer = Buffer { address: body.pointer(), length: TokenCheckWire.bytes }
+    let received = try channelRead(link, buffer, 1)
+    closeReceivedHandles(received.handles)
+    if received.bytes != TokenCheckWire.bytes {
+        return .Error(failureIn(.InvalidArgument, .Presence))
+    }
+    return .Ok(
+        TokenCheckMessage {
+            kind: UN32(blockLoad<U32>(body, TokenCheckWire.kindAt)),
+            verdict: UN32(blockLoad<U32>(body, TokenCheckWire.verdictAt)),
+            token: InteractionToken {
+                idLow: UNumber(blockLoad<U64>(body, TokenCheckWire.idLowAt)),
+                idHigh: UNumber(blockLoad<U64>(body, TokenCheckWire.idHighAt)),
+                surfaceId: UNumber(blockLoad<U64>(body, TokenCheckWire.surfaceAt)),
+                issued: 0,
+            },
+        }
+    )
+}
+
+// Asks Presence whether `token` may be acted on. Ok when it is a valid token,
+// and the verdict's error otherwise. A valid token is spent by this call.
+public function presenceVerify(token: InteractionToken) -> Result<Void, TesseraError> {
+    let connection = match serviceConnectFd(PresenceService.name) {
+        Ok(value) -> value
+        Error(failed) -> return .Error(failureIn(.NotFound, .Presence))
+    }
+    let operation = code(PresenceOperation.Verify)
+    let sent = deviceSend(connection, operation, token.idLow, token.idHigh, token.surfaceId, nullPointer(), U64(0))
+    if !succeeded(sent) {
+        kernelRelease(connection)
+        return .Error(failureIn(.DeviceLost, .Presence))
+    }
+    let answer = match deviceAwait(connection, .None, operation) {
+        Ok(value) -> value
+        Error(failed) -> {
+            kernelRelease(connection)
+            var error = failed
+            error.subsystem = .Presence
+            return .Error(error)
+        }
+    }
+    kernelRelease(connection)
+    if answer.code != U32(0) {
+        let refused = answer.code
+        deviceMessageRelease(answer)
+        return .Error(failureIn(errorCodeFrom(refused), .Presence))
+    }
+    deviceMessageRelease(answer)
+    return .Ok
+}

@@ -1,0 +1,243 @@
+import Foundation
+import Heap
+import LibTessera
+import DeviceKit
+
+// The pointer's cursor (roadmap/06-devices-and-input.md, "The pointer"). It is
+// the compositor's to draw, never a client's, and it is drawn on the display's
+// cursor plane: a hardware overlay the picture is never composed into, so the
+// pointer moving draws nothing and commits only where the plane sits. Every
+// commit of a picture carries the plane as well, so a flip never takes it off.
+//
+// Each shape is painted once, here, the way a Mac's cursor is drawn: black,
+// with a white edge so it reads on any picture, its hot spot the point the
+// pointer is at (CursorShapes.kira).
+
+namespace CursorImage {
+    // The side of the cursor plane's image, which is what cursor planes take.
+    let side: Number = 64
+    // Where the arrow's tip sits in the image.
+    let tip: Number = 2
+    // Samples a pixel is split into along each side, for smooth edges.
+    let samples: Number = 4
+    // How wide the white edge is, in pixels.
+    let edge: Number = 1.25
+    // `AR24`: 32-bit pixels, blue in the low byte, alpha in the top one, and
+    // premultiplied, as cursor planes blend them.
+    let format: FourCc = FourCc(0x34325241)
+}
+
+// One shape's image on the plane: the image, and the framebuffer made of it.
+struct CursorFrame {
+    var surface: Ref
+    var framebuffer: Ref
+}
+
+// The cursor on the plane: an image for each shape, in `cursorShapes` order,
+// the shape shown, and where the pointer is on the output.
+struct Cursor {
+    var plane: UN32
+    var frames: [CursorFrame]
+    var shape: CursorShape
+    var x: Number
+    var y: Number
+}
+
+// One premultiplied pixel: `black` and `white` are how much of the pixel each
+// covers, from 0 to 1.
+function cursorPixel(black: Number, white: Number) -> UN32 {
+    let alpha = UN32(clamp(round((black + white) * 255.0), 0.0, 255.0))
+    let level = UN32(clamp(round(white * 255.0), 0.0, 255.0))
+    return alpha * UN32(16777216) + level * UN32(65536) + level * UN32(256) + level
+}
+
+// Paints `shape` into `pixels`, `scale` pixels a point.
+function paintShape(pixels: RawPtr, pitch: Number, shape: borrow CursorShape, scale: Number) {
+    let painter = shapePainter(shape, scale)
+    let side = CursorImage.side
+    let stride = pitch
+    let bytes = PixelFormat.bytesPerPixel
+    for row in 0..side {
+        for column in 0..side {
+            let (black, white) = shapeCoverage(painter, row, column)
+            heapStore<U32>(
+                pixels,
+                row * stride + column * bytes,
+                cursorPixel(black, white)
+            )
+        }
+    }
+}
+
+// The scale the arrow is drawn at on `display`: the output's, so the arrow is
+// the same size in points on every display.
+function cursorScale(display: borrow Display) -> Number {
+    return display.scanout.scale
+}
+
+// Paints the cursor's shapes for the display's cursor plane, which the first
+// `moveCursor` puts it on. None, said, on a display without a cursor plane,
+// or one that will not take the images.
+function makeCursor(display: borrow Display) -> Cursor? {
+    let plane = match display.scanout.cursorPlane {
+        Some(value) -> value
+        None -> {
+            log info("the display has no cursor plane; the cursor is drawn into the picture")
+            return .None
+        }
+    }
+    let scale = cursorScale(display)
+    var frames: [CursorFrame] = []
+    for shape in cursorShapes {
+        match cursorFrame(display, shape, scale) {
+            Some(frame) -> frames.append(frame)
+            None -> {
+                for made in frames {
+                    closeRef(made.framebuffer)
+                    closeRef(made.surface)
+                }
+                return .None
+            }
+        }
+    }
+    log info("drew the cursor", plane: plane, scale: scale, shapes: frames.count)
+    return .Some(
+        Cursor {
+            plane: plane,
+            frames: frames,
+            shape: .Arrow,
+            // Nowhere yet: the first move puts it on the plane.
+            x: -1,
+            y: -1,
+        }
+    )
+}
+
+// One shape painted into an image the cursor plane takes, and made a
+// framebuffer. None, said, when the display will not take it.
+function cursorFrame(
+    display: borrow Display,
+    shape: borrow CursorShape,
+    scale: Number
+) -> CursorFrame? {
+    let image = match paintableSurfaceIn(CursorImage.side, CursorImage.side, CursorImage.format) {
+        Ok(value) -> value
+        Error(reason) -> return missingCursorImage(reason)
+    }
+    paintShape(image.pixels, image.pitch, shape, scale)
+    unmap(image)
+    match displayFramebuffer(display.device, image.surface) {
+        Ok(framebuffer) -> return .Some(
+            CursorFrame { surface: image.surface, framebuffer: framebuffer }
+        )
+        Error(reason) -> return missingCursorFramebuffer(image.surface, reason)
+    }
+}
+
+function missingCursorImage(reason: borrow TesseraError) -> CursorFrame? {
+    log warn("the cursor's image could not be made", error: errorName(reason))
+    return .None
+}
+
+function missingCursorFramebuffer(surface: Ref, reason: borrow TesseraError) -> CursorFrame? {
+    log warn("the cursor could not be made a framebuffer", error: errorName(reason))
+    closeRef(surface)
+    return .None
+}
+
+// How many plane records the cursor adds to a commit: one while it is drawn.
+function cursorPlaneCount(display: borrow Display) -> Number {
+    return display.cursor.isSome() ? 1 : 0
+}
+
+// Writes the cursor's plane record at `at` in `planes`, its tip at the pointer.
+function storeCursorPlane(display: borrow Display, planes: borrow ByteBlock, at: Number) {
+    let cursor = try display.cursor otherwise return
+    let side = UN32(CursorImage.side)
+    heapStore(
+        heapOffset(planes.pointer(), at),
+        PlaneStateRecord {
+            plane: cursor.plane,
+            crtc: display.scanout.crtc.raw,
+            framebuffer: cursor.frames[code(cursor.shape)].framebuffer.raw,
+            srcX: UN32(0),
+            srcY: UN32(0),
+            srcW: side << CommitRecord.fixedShift,
+            srcH: side << CommitRecord.fixedShift,
+            // The pointer is in points and the plane in pixels; the image
+            // is painted at the output's scale, its hot spot in pixels.
+            dstX: N32(cursor.x * display.scanout.scale - shapeHotSpot(cursor.shape)),
+            dstY: N32(cursor.y * display.scanout.scale - shapeHotSpot(cursor.shape)),
+            dstW: side,
+            dstH: side,
+            zpos: UN16(0),
+            alpha: CommitRecord.opaque,
+            rotation: UN32(0),
+            inFence: UNumber(0),
+            inFenceValue: UNumber(0),
+        }
+    )
+}
+
+// Moves the cursor to `x`, `y` on the output, held inside it, in `shape`, and
+// commits the cursor plane alone. Nothing else is drawn.
+function moveCursor(
+    display: borrow mut Display,
+    port: Handle,
+    x: Number,
+    y: Number,
+    shape: borrow CursorShape
+) -> Result<Void, TesseraError> {
+    match display.cursor {
+        Some(cursor) -> {
+            let heldX = clamp(x, 0, display.scanout.pointWidth() - 1)
+            let heldY = clamp(y, 0, display.scanout.pointHeight() - 1)
+            if heldX == cursor.x && heldY == cursor.y && shape == cursor.shape { return .Ok }
+            var moved = cursor
+            moved.x = heldX
+            moved.y = heldY
+            moved.shape = copy shape
+            display.cursor = .Some(moved)
+        }
+        None -> return .Ok
+    }
+    // A flip in flight carries the plane, or it is committed once it lands.
+    if display.flipping.isSome() {
+        display.cursorLate = true
+        return .Ok
+    }
+    return commitCursorPlane(display, port)
+}
+
+// Commits the cursor plane alone, without waiting: it lands as a flip does
+// (`flipLanded`), and nothing else is committed until then.
+function commitCursorPlane(
+    display: borrow mut Display,
+    port: Handle
+) -> Result<Void, TesseraError> {
+    let crtcs = zeroedBlock(count: CommitRecord.crtcBytes, alignment: 16)
+    heapStore(
+        crtcs.pointer(),
+        CrtcStateRecord {
+            crtc: display.scanout.crtc.raw,
+            flags: CommitRecord.active,
+            connector: display.scanout.connector,
+            mode: CommitRecord.keepMode,
+            gammaLut: UNumber(0),
+            ctm: UNumber(0),
+        }
+    )
+    let planes = zeroedBlock(count: CommitRecord.planeBytes, alignment: 16)
+    storeCursorPlane(display, planes, 0)
+    let serial = try displayCommit(
+        display.device,
+        Buffer { address: crtcs.pointer(), length: CommitRecord.crtcBytes },
+        Buffer { address: planes.pointer(), length: CommitRecord.planeBytes },
+        Buffer { address: nullPointer(), length: 0 },
+        CommitOptions.flipEvent | CommitOptions.nonBlock,
+        port,
+        UNumber(PortKey.flip)
+    )
+    display.flipping = .Some(serial)
+    return .Ok
+}

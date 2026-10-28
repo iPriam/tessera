@@ -1,0 +1,45 @@
+import Foundation
+
+// The volumes mounted in /Volumes, as Disk Utility lists them: a disk image
+// cannot be written, a data volume can.
+
+public enum VolumeAccess {
+    ReadOnly
+    Writable
+    // The system could not say, for the reason it gave.
+    Unknown(String)
+}
+
+public struct Volume {
+    let name: String
+    let path: String
+    let access: VolumeAccess
+}
+
+function accessAt(path: borrow String) -> VolumeAccess {
+    return match volumeReadOnlyAt(path) {
+        Ok(readOnly) -> readOnly ? VolumeAccess.ReadOnly : VolumeAccess.Writable
+        Error(failure) -> .Unknown(errorName(failure))
+    }
+}
+
+// Every volume in /Volumes, in the order of their names.
+public function mountedVolumes() -> [Volume] {
+    var volumes: [Volume] = []
+    for name in folderEntries("/" + SystemDirectory.volumes) {
+        let path = "/" + SystemDirectory.volumes + "/" + name
+        volumes.append(Volume { name: name, path: path, access: accessAt(path) })
+    }
+    return volumes.sorted({ left, right in nameComesBefore(left.name, right.name) })
+}
+
+// The volumes the machine runs from, which are not in /Volumes: the system,
+// mounted at the root, and the data volume, when the machine has one.
+public function systemVolumes() -> [Volume] {
+    var volumes: [Volume] = [Volume { name: "System", path: "/", access: accessAt("/") }]
+    let data = "/" + SystemDirectory.data
+    if pathExists(data) {
+        volumes.append(Volume { name: "Data", path: data, access: accessAt(data) })
+    }
+    return volumes
+}

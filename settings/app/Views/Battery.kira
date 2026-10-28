@@ -1,0 +1,86 @@
+import Foundation
+import KiraUI
+import LibTessera
+
+// Battery: the charge, where power comes from, and how warm the machine runs,
+// as the power service reports them.
+construct BatteryPane() extends Widget {
+    body {
+        let info = powerRead()
+        Form(children: batterySections(info))
+        .navigationTitle("Battery")
+    }
+}
+
+function batterySections(read: borrow Result<PowerInfo, TesseraError>) -> [Any Widget] {
+    let info = match read {
+        Ok(found) -> copy found
+        Error(failed) -> {
+            return [
+                Section(
+                    children: [Text("The power service cannot be reached.").foregroundColor(
+                        .Secondary
+                    )],
+                    footer: Text(errorName(failed))
+                )
+            ]
+        }
+    }
+    var sections: [Any Widget] = []
+    if info.batteryPercent == PowerInfo.noBattery {
+        sections.append(Section(children: [LabeledContent(label = "Battery") { Text("None") }]))
+    } else {
+        sections.append(
+            Section(
+                children: [
+                    LabeledContent(label = "Charge") { Text("\(info.batteryPercent)%") },
+                    ProgressView(value = Number(info.batteryPercent) / 100.0)
+                    .tint(info.batteryPercent <= 20 ? .Red : .Green),
+                    LabeledContent(label = "State") { Text(batteryStateText(info.batteryState)) }
+                ],
+                header: Text("Battery Level")
+            )
+        )
+    }
+    sections.append(
+        Section(
+            children: [
+                LabeledContent(label = "Power Source") {
+                    Text(externalPowerText(info.externalPower))
+                },
+                LabeledContent(label = "Low Power Mode") { Text(info.lowPowerMode ? "On" : "Off") },
+                LabeledContent(label = "Temperature") { Text(thermalText(info.thermalLevel)) }
+            ]
+        )
+    )
+    return sections
+}
+
+function batteryStateText(state: BatteryState) -> String {
+    return match state {
+        Unknown -> "Unknown"
+        Discharging -> "On Battery"
+        Charging -> "Charging"
+        Full -> "Charged"
+        NotCharging -> "Not Charging"
+    }
+}
+
+function externalPowerText(power: ExternalPower) -> String {
+    return match power {
+        None -> "Battery"
+        Usb -> "USB"
+        Wireless -> "Wireless Charger"
+        Dock -> "Dock"
+        Mains -> "Power Adapter"
+    }
+}
+
+function thermalText(level: ThermalLevel) -> String {
+    return match level {
+        Nominal -> "Normal"
+        Fair -> "Warm"
+        Serious -> "Hot"
+        Critical -> "Too Hot"
+    }
+}

@@ -1,0 +1,35 @@
+import Foundation
+import LibTessera
+import KiraUI
+import TesseraUI
+
+// Kira UI redraws Inlay when /Volumes or /Applications changes, so an image
+// opened or ejected, or an application installed or uninstalled, shows at
+// once. A folder another program asks Inlay to show is shown on its next
+// build.
+@Main
+function main() {
+    var heard: Number = -1
+    RunTesseraApplication(
+        "Inlay",
+        { in
+            let images = openedDiskImages()
+            // Another program asked for a folder: Inlay opens on it.
+            if settingsGeneration() != heard {
+                heard = settingsGeneration()
+                match takeOpenRequest("Inlay") {
+                    Some(place) -> if isDirectory(place) { showFolder(place) }
+                    // Nothing was asked for.
+                    None -> {}
+                }
+            }
+            selectChosenPlace(images)
+            return InlayView(
+                images = images,
+                installed = installedFromImages(),
+                notice = workspaceNotice()
+            )
+        },
+        ApplicationOptions { watches: [.Volumes, .Applications] }
+    )
+}

@@ -1,0 +1,131 @@
+//! The installer's entry point: serves install requests from init, or installs the version asked for.
+// Tessera's installer (roadmap/05-storage-and-state.md). It is the only
+// component allowed to create state, and runs two ways:
+//
+// - PID 1 of the installer image, which scripts/install-system.sh boots with
+//   the machine's disk as `vda` and a system image as `vdb`. It puts the
+//   btrfs volume on the disk when there is none, lays it out, writes the
+//   image's system as `system/<version>`, a read-only snapshot, and records
+//   that system as current in `boot/`, last, so an interrupted run leaves a
+//   machine that refuses to boot rather than one that boots into something
+//   half-written. A disk that already holds the volume keeps its data: an
+//   install onto it is an update. The version is the one word after `--` on
+//   the kernel command line, `tessera.version=<version>`, which the build
+//   computes from the image.
+// - /bin/installer --serve on the recovery media, the Install service
+//   Recovery asks to partition, erase and install (`Service.kira`).
+
+import Foundation
+import LibTessera
+
+/// The command-line flags the installer takes.
+namespace InstallerFlag {
+    let version: String = "tessera.version="
+    let serve: String = "--serve"
+    // Install the system as an update to try before it is trusted.
+    let update: String = "tessera.update"
+}
+
+/// Runs the installer: serves requests when init starts it with `--serve`, else installs the version asked for.
+@Main
+function main() -> UN8 {
+    if served() { return serve() }
+    match machinePrepare() {
+        Ok -> {}
+        Error(failed) -> log info("the machine is partly prepared", error: errorName(failed))
+    }
+    let version = try requestedVersion() otherwise return stop(
+        "no tessera.version= on the kernel command line"
+    )
+    // The machine's disk, with the volume's top mounted at /volume, and the
+    // system image at /image.
+    let installation = Installation {
+        disk: "vda",
+        volume: "/volume",
+        image: .Disk("vdb"),
+        imageAt: "/image"
+    }
+    var progress = CopyProgress { channel: .None, done: 0, total: 0 }
+    match install(installation, version, progress, requestedUpdate()) {
+        Ok -> {}
+        Error(problem) -> return stop(problem)
+    }
+    // The line scripts/install-system.sh waits for.
+    print("tessera: installed system \(version)")
+    match machineStop(.PowerOff) {
+        Ok -> {}
+        Error(failed) -> absorb failed
+    }
+    return 0
+}
+
+/// Says why the install stopped, and stops the machine.
+function stop(problem: borrow String) -> UN8 {
+    log fault("the install stopped", problem)
+    print("tessera: the install failed: \(problem)")
+    match machineStop(.PowerOff) {
+        Ok -> {}
+        Error(failed) -> absorb failed
+    }
+    return 1
+}
+
+/// Whether this is the Install service, which init starts with `--serve`.
+function served() -> Bool {
+    match processArguments() {
+        Ok(given) -> return given.contains(InstallerFlag.serve)
+        Error(failed) -> {
+            absorb failed
+            return false
+        }
+    }
+}
+
+/// The version the kernel command line names.
+function requestedVersion() -> String? {
+    let arguments = match processArguments() {
+        Ok(given) -> given
+        Error(failed) -> {
+            log warn("the kernel's arguments could not be read", error: errorName(failed))
+            return .None
+        }
+    }
+    for argument in arguments {
+        if argument.startsWith(InstallerFlag.version) {
+            let version = argument.substring(InstallerFlag.version.count, argument.count)
+            if version.count > 0 && !version.contains("/") && version != "dev" {
+                return .Some(version)
+            }
+        }
+    }
+    return .None
+}
+
+/// Installs the version asked for onto the volume, reporting its progress, and returns the exit status.
+function install(
+    installation: borrow Installation,
+    version: borrow String,
+    progress: borrow mut CopyProgress,
+    update: Bool
+) -> Result<Void, String> {
+    match mountVolume(installation) {
+        Ok -> {}
+        Error(problem) -> return .Error(problem)
+    }
+    match layOut(installation) {
+        Ok -> {}
+        Error(problem) -> return .Error(problem)
+    }
+    match writeSystem(installation, version, progress) {
+        Ok -> {}
+        Error(problem) -> return .Error(problem)
+    }
+    match recordInstalled(installation, version, update) {
+        Ok -> {}
+        Error(problem) -> return .Error(problem)
+    }
+    match machineFlush() {
+        Ok -> return .Ok
+        Error(failed) -> return .Error("the volume could not be flushed: \(errorName(failed))")
+    }
+}

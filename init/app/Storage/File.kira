@@ -1,0 +1,69 @@
+import Foundation
+import Heap
+import LibTessera
+
+// Whole-file reads for state, manifests and configuration.
+//
+// The size is taken before the first byte is read. A file that grows
+// afterwards is read to that size; a file that shrinks gives the bytes that
+// are still there.
+
+let fileReadChunkSize: Number = 65536
+
+// `node` opened with `mode`, or why not.
+function openNode(calls: Handle, node: Handle, mode: OpenMode) -> Result<Handle, TesseraError> {
+    return answeredHandle(calls, fileOpen(node, mode, calls, PortKey.call))
+}
+
+// The file at `path`, opened for reading.
+function openForReading(calls: Handle, path: borrow String) -> Result<Handle, TesseraError> {
+    let node = try lookup(
+        calls,
+        path,
+        Rights.read | Rights.inspect | Rights.transfer | Rights.duplicate
+    )
+    let opened = openNode(calls, node, OpenMode.read)
+    release(node)
+    return opened
+}
+
+function readWholeFile(calls: Handle, path: borrow String) -> Result<[UN8], TesseraError> {
+    var contents: [UN8] = []
+    let file = try openForReading(calls, path)
+    let expected = match fileInfo(file) {
+        Ok(info) -> info.size
+        Error(failed) -> {
+            release(file)
+            return .Error(failed)
+        }
+    }
+    let chunkBytes = zeroedBlock(count: fileReadChunkSize, alignment: 16)
+    let chunk = chunkBytes.pointer()
+    var consumed: Number = 0
+    while consumed < expected {
+        var request: Number = fileReadChunkSize
+        if expected - consumed < request { request = expected - consumed }
+        let buffers = [Buffer { address: chunk, length: request }]
+        match answer(calls, fileReadAt(file, consumed, buffers, calls, PortKey.call)) {
+            Error(failed) -> {
+                release(file)
+                return .Error(failed)
+            }
+            Ok(read) -> {
+                let got = Number(read.result0)
+                if got == 0 { break }
+                for index in 0..got { contents.append(heapLoad<U8>(chunk, index)) }
+                consumed += got
+            }
+        }
+    }
+    release(file)
+    return .Ok(contents)
+}
+
+function announceWholeFileRead(calls: Handle, path: borrow String) {
+    match readWholeFile(calls, path) {
+        Ok(contents) -> log info("read a file whole", path, bytes: contents.count)
+        Error(failed) -> log warn("could not read a file whole", path, error: errorName(failed))
+    }
+}

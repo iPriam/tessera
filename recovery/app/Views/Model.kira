@@ -1,0 +1,127 @@
+import Foundation
+
+// What the recovery shows: the disks the machine has, each with its
+// partitions, and the system the media installs.
+
+public struct RecoveryPartition {
+    let name: String
+    // What the partition holds, as Disk Utility names it: "btrfs", "FAT32",
+    // "Free space".
+    let format: String
+    let bytes: Number
+    let usedBytes: Number
+    let mountPoint: String
+}
+
+public struct RecoveryDisk {
+    let name: String
+    // The drive's own name, as the disk reports it.
+    let model: String
+    let bytes: Number
+    let external: Bool
+    // The partition map: "GUID Partition Map", or "None" for a blank disk.
+    let scheme: String
+    let partitions: [RecoveryPartition]
+}
+
+public struct RecoveryModel {
+    let version: String
+    let disks: [RecoveryDisk]
+}
+
+// Where the install the person started is, as the Install service last said.
+public struct RecoveryInstall {
+    // An `InstallPhase`.
+    let phase: Number = 0
+    let done: Number = 0
+    let total: Number = 0
+    let problem: String = ""
+}
+
+namespace InstallPhase {
+    let idle: Number = 0
+    let copying: Number = 1
+    let installed: Number = 2
+    let failed: Number = 3
+}
+
+// What the panes ask the machine to do: install onto a disk, by its name, and
+// restart once it is installed.
+public struct RecoveryActions {
+    let install: (String) -> Void
+    let restart: () -> Void
+}
+
+// Actions that do nothing, as a preview has them.
+public function idleRecoveryActions() -> RecoveryActions {
+    return RecoveryActions { install: { disk in return }, restart: { in return } }
+}
+
+// The panes of the recovery window. A Binding carries a Number, so a pane is
+// one.
+namespace RecoveryPane {
+    let utilities: Number = 0
+    let install: Number = 1
+    let diskUtility: Number = 2
+    let startupDisk: Number = 3
+    let terminal: Number = 4
+}
+
+// A size as Disk Utility writes it: decimal units, three figures.
+public function byteText(bytes: Number) -> String {
+    let units = ["bytes", "KB", "MB", "GB", "TB"]
+    var value = bytes
+    var unit = 0
+    while value >= 1000.0 && unit < units.count - 1 {
+        value = value / 1000.0
+        unit = unit + 1
+    }
+    if unit == 0 { return String(floor(value)) + " bytes" }
+    let shown = value >= 100.0 ? floor(value + 0.5) : floor(value * 10.0 + 0.5) / 10.0
+    return String(shown) + " " + units[unit]
+}
+
+// The disk a volume is on, and the volume, as one line: "Tessera HD (vda2)".
+public function partitionTitle(partition: borrow RecoveryPartition) -> String {
+    return copy partition.name
+}
+
+// Two disks, one blank, as a preview has them.
+public function sampleRecoveryModel() -> RecoveryModel {
+    return RecoveryModel {
+        version: "0.1.0",
+        disks: [
+            RecoveryDisk {
+                name: "vda",
+                model: "VirtIO Block Device",
+                bytes: 64000000000.0,
+                external: false,
+                scheme: "GUID Partition Map",
+                partitions: [
+                    RecoveryPartition {
+                        name: "EFI",
+                        format: "FAT32",
+                        bytes: 536870912.0,
+                        usedBytes: 41000000.0,
+                        mountPoint: ""
+                    },
+                    RecoveryPartition {
+                        name: "Tessera HD",
+                        format: "btrfs",
+                        bytes: 63400000000.0,
+                        usedBytes: 9100000000.0,
+                        mountPoint: "/Volumes/Tessera HD"
+                    },
+                ]
+            },
+            RecoveryDisk {
+                name: "vdb",
+                model: "VirtIO Block Device",
+                bytes: 32000000000.0,
+                external: true,
+                scheme: "None",
+                partitions: []
+            },
+        ]
+    }
+}

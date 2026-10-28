@@ -1,0 +1,408 @@
+import Foundation
+import Heap
+import LibTessera
+
+// Installing a root on top of the stack, and taking one off from anywhere in
+// it.
+//
+// The rule for each path is the stack's order and nothing else, which is
+// what makes the order roots are taken off in not matter: what is on disk at a
+// path is always the version of the highest layer that has it, the base layer
+// below every root, or nothing. The base layer is the sealed system, mounted
+// read-only (Store.kira), so nothing a root replaces has to be kept.
+
+// Why a request line was not carried out.
+enum RootFailure {
+    // A file could not be read, written, kept or put back.
+    Storage(TesseraError)
+    RefusedArchive(ArchiveProblem)
+    // This many files were changed since a root installed them; `force`
+    // replaces them.
+    ChangedSince(Number)
+    NotInstalled
+    // A root's archive does not hold what its manifest says.
+    DamagedLayer(String)
+    NoRoot
+    UnknownAction(String)
+}
+
+function describe(failure: borrow RootFailure) -> String {
+    match failure {
+        Storage(failed) -> return errorName(failed)
+        RefusedArchive(problem) -> return describe(problem)
+        ChangedSince(files) -> return "\(files) files were changed since a root installed them"
+        NotInstalled -> return "no dev root by that name is installed"
+        DamagedLayer(root) -> return "\(root) does not hold what its manifest says"
+        NoRoot -> return "the line names no root"
+        UnknownAction(action) -> return "\(action) is neither install nor uninstall"
+    }
+}
+
+// The manifest entry of the highest root at or below `top` that has a path,
+// and that root's name.
+struct OwnedEntry {
+    let root: String
+    let entry: ManifestEntry
+}
+
+function ownedEntry(layers: borrow [Layer], top: Number, path: borrow String) -> OwnedEntry? {
+    for offset in 0.. (top + 1) {
+        let index = top - offset
+        match manifestIndex(layers[index].entries, path) {
+            Some(at) -> return .Some(
+                OwnedEntry { root: copy layers[index].name, entry: layers[index].entries[at] }
+            )
+            // This root does not have it; look lower.
+            None -> {}
+        }
+    }
+    return .None
+}
+
+// Whether a root above `index` has `path`.
+function coveredAbove(layers: borrow [Layer], index: Number, path: borrow String) -> Bool {
+    for above in (index + 1)..layers.count {
+        if manifestHas(layers[above].entries, path) { return true }
+    }
+    return false
+}
+
+// Whether a root other than the one at `index` has `path`.
+function otherHas(layers: borrow [Layer], index: Number, path: borrow String) -> Bool {
+    for (other, layer) in layers.enumerated() {
+        if other != index && manifestHas(layer.entries, path) { return true }
+    }
+    return false
+}
+
+function withoutLayer(layers: borrow [Layer], index: Number) -> [Layer] {
+    var kept: [Layer] = []
+    for (at, layer) in layers.enumerated() {
+        if at != index { kept.append(layer) }
+    }
+    return kept
+}
+
+// Whether the file at `entry`'s path still holds what the root `root` says it
+// wrote. A file that changed, or is gone, is said in the log and is not the
+// root's any more. A file that cannot be read is a failure for the caller.
+function unchangedSince(
+    files: borrow Files,
+    root: borrow String,
+    entry: borrow ManifestEntry
+) -> Result<Bool, TesseraError> {
+    match fileDigest(files, entry.path) {
+        Ok(found) -> {
+            if entry.digest == .Some(found) { return .Ok(true) }
+            log warn("a file a dev root installed was changed since", path: entry.path, root)
+            return .Ok(false)
+        }
+        Error(failed) -> {
+            if failed.code == .NotFound {
+                log warn("a file a dev root installed is gone", path: entry.path, root)
+                return .Ok(false)
+            }
+            return .Error(failed)
+        }
+    }
+}
+
+// What `archive` holds, digested here rather than trusted from the host, in
+// the archive's order.
+function manifestOf(archive: borrow Archive) -> [ManifestEntry] {
+    var manifest: [ManifestEntry] = []
+    for entry in archive.entries {
+        let digest: String? = match entry.kind {
+            Directory -> .None
+            File -> .Some(digestSha256(entryBytes(archive, entry)))
+        }
+        manifest.append(
+            ManifestEntry {
+                kind: entry.kind,
+                executable: entry.executable,
+                digest: digest,
+                path: copy entry.path
+            }
+        )
+    }
+    return manifest
+}
+
+// Nothing is written until every file a root owns is known to be what that
+// root wrote: a file changed since was changed by someone, and is not
+// overwritten unless the request says so.
+function refuseChanged(
+    files: borrow Files,
+    layers: borrow [Layer],
+    top: Number,
+    manifest: borrow [ManifestEntry],
+    force: Bool
+) -> Result<Void, RootFailure> {
+    var changedSince: Number = 0
+    for entry in manifest {
+        if entry.kind == .File {
+            match ownedEntry(layers, top, entry.path) {
+                Some(owned) -> {
+                    let same = match unchangedSince(files, owned.root, owned.entry) {
+                        Ok(value) -> value
+                        Error(failed) -> return .Error(.Storage(failed))
+                    }
+                    if !same { changedSince++ }
+                }
+                // No root wrote it; the base layer keeps its own copy.
+                None -> {}
+            }
+        }
+    }
+    if changedSince > 0 && !force { return .Error(.ChangedSince(changedSince)) }
+    return .Ok
+}
+
+// Writes what `archive` holds over the stack; how many files it wrote.
+function writeEntries(
+    files: borrow Files,
+    archive: borrow Archive,
+    manifest: borrow [ManifestEntry],
+    changed: borrow mut [String],
+) -> Result<Number, RootFailure> {
+    var written: Number = 0
+    for (index, entry) in manifest.enumerated() {
+        match entry.kind {
+            Directory -> {
+                match files.ensureDirectories(entry.path) {
+                    Ok -> {}
+                    Error(failed) -> return .Error(.Storage(failed))
+                }
+            }
+            File -> {
+                match files.ensureDirectories(directoryOf(entry.path)) {
+                    Ok -> {}
+                    Error(failed) -> return .Error(.Storage(failed))
+                }
+                match files.store(
+                    entry.path,
+                    entryBytes(archive, archive.entries[index]),
+                    entry.executable
+                ) {
+                    Ok -> {}
+                    Error(failed) -> return .Error(.Storage(failed))
+                }
+                changed.append(copy entry.path)
+                written++
+            }
+        }
+    }
+    return .Ok(written)
+}
+
+// Installs the root `name` from the archive at `archivePath` on top of the
+// stack, and adds every file it writes to `changed`. A root already on the
+// stack is taken off first, so installing one again puts it on top.
+function installRoot(
+    files: borrow Files,
+    name: borrow String,
+    archivePath: borrow String,
+    force: Bool,
+    changed: borrow mut [String]
+) -> Result<Void, RootFailure> {
+    let block = match files.load(archivePath) {
+        Ok(value) -> move value
+        Error(failed) -> return .Error(.Storage(failed))
+    }
+    let archive = match readArchive(move block) {
+        Ok(value) -> move value
+        Error(problem) -> return .Error(.RefusedArchive(problem))
+    }
+    var layers = match loadStack(files) {
+        Ok(value) -> value
+        Error(failed) -> return .Error(.Storage(failed))
+    }
+    if stackIndex(layers, name).isSome() {
+        try uninstallRoot(files, name, force, changed)
+        layers = match loadStack(files) {
+            Ok(value) -> value
+            Error(failed) -> return .Error(.Storage(failed))
+        }
+    }
+    let manifest = manifestOf(archive)
+    try refuseChanged(files, layers, layers.count - 1, manifest, force)
+    let written = try writeEntries(files, archive, manifest, changed)
+    let directory = layerDirectory(name)
+    match files.ensureDirectories(directory) {
+        Ok -> {}
+        Error(failed) -> return .Error(.Storage(failed))
+    }
+    match files.store("\(directory)/archive", archiveBytes(archive), false) {
+        Ok -> {}
+        Error(failed) -> return .Error(.Storage(failed))
+    }
+    match files.writeText("\(directory)/manifest", formatManifest(manifest)) {
+        Ok -> {}
+        Error(failed) -> return .Error(.Storage(failed))
+    }
+    layers.append(Layer { name: copy name, entries: move manifest })
+    match saveStack(files, layers) {
+        Ok -> {}
+        Error(failed) -> return .Error(.Storage(failed))
+    }
+    log info("installed a dev root", root: name, files: written, depth: layers.count)
+    return .Ok
+}
+
+// Puts the file at `path` back from the root `root`'s archive.
+function restoreFromRoot(
+    files: borrow Files,
+    root: borrow String,
+    path: borrow String
+) -> Result<Void, RootFailure> {
+    let block = match files.load("\(layerDirectory(root))/archive") {
+        Ok(value) -> move value
+        Error(failed) -> return .Error(.Storage(failed))
+    }
+    let archive = match readArchive(move block) {
+        Ok(value) -> move value
+        Error(problem) -> {
+            log fault("a lower root's archive was refused", root, problem: describe(problem))
+            return .Error(.DamagedLayer(copy root))
+        }
+    }
+    match archiveEntry(archive, path) {
+        Some(entry) -> {
+            match files.store(path, entryBytes(archive, entry), entry.executable) {
+                Ok -> return .Ok
+                Error(failed) -> return .Error(.Storage(failed))
+            }
+        }
+        None -> return .Error(.DamagedLayer(copy root))
+    }
+}
+
+// Puts the version of `path` the layer below the root at `index` has back on
+// disk: a lower root's, the sealed system's, shared from it, or nothing.
+function restoreBelow(
+    files: borrow Files,
+    layers: borrow [Layer],
+    index: Number,
+    path: borrow String
+) -> Result<Void, RootFailure> {
+    match ownedEntry(layers, index - 1, path) {
+        Some(lower) -> return restoreFromRoot(files, lower.root, path)
+        // No lower root has it; the base layer may.
+        None -> {}
+    }
+    let base = basePath(path)
+    let inBase = match files.kindAt(base) {
+        Ok(found) -> found == .Some(.File)
+        Error(failed) -> return .Error(.Storage(failed))
+    }
+    let restored = inBase ? files.storeShared(path, base) : files.remove(
+        path,
+        DeleteOptions.permanent
+    )
+    match restored {
+        Ok -> return .Ok
+        Error(failed) -> return .Error(.Storage(failed))
+    }
+}
+
+// Puts back every file of the root at `index` no root above it covers; how
+// many it put back.
+function restoreFiles(
+    files: borrow Files,
+    layers: borrow [Layer],
+    index: Number,
+    changed: borrow mut [String],
+) -> Result<Number, RootFailure> {
+    var restored: Number = 0
+    for entry in layers[index].entries {
+        if entry.kind == .File && !coveredAbove(layers, index, entry.path) {
+            try restoreBelow(files, layers, index, entry.path)
+            changed.append(copy entry.path)
+            restored++
+        }
+    }
+    return .Ok(restored)
+}
+
+// Directories last, deepest first, as the archive lists each before what it
+// holds. One only this root had goes if it is empty; one the sealed system
+// has stays, and so does one the base layer cannot be asked about.
+function removeDirectories(files: borrow Files, layers: borrow [Layer], index: Number) {
+    for entry in layers[index].entries.reversed() {
+        if entry.kind == .Directory && !otherHas(layers, index, entry.path) {
+            let inBase = match files.isDirectory(basePath(entry.path)) {
+                Ok(present) -> present
+                Error(failed) -> {
+                    log warn(
+                        "could not look in the base layer",
+                        path: entry.path,
+                        error: errorName(failed)
+                    )
+                    true
+                }
+            }
+            if !inBase { removeEmptyDirectory(files, entry.path) }
+        }
+    }
+}
+
+// Removes the directory at `path`; one something else put files in stays.
+function removeEmptyDirectory(files: borrow Files, path: borrow String) {
+    match files.remove(path, DeleteOptions.permanent) {
+        Ok -> {}
+        Error(failed) -> {
+            if failed.code != .NotEmpty {
+                log warn("could not remove a directory", path, error: errorName(failed))
+            }
+        }
+    }
+}
+
+// Takes the root `name` off the stack, wherever it is in it, and adds every
+// file whose contents that changes to `changed`.
+function uninstallRoot(
+    files: borrow Files,
+    name: borrow String,
+    force: Bool,
+    changed: borrow mut [String]
+) -> Result<Void, RootFailure> {
+    var layers = match loadStack(files) {
+        Ok(value) -> value
+        Error(failed) -> return .Error(.Storage(failed))
+    }
+    let index = try stackIndex(layers, name) otherwise return .Error(.NotInstalled)
+    var changedSince: Number = 0
+    for entry in layers[index].entries {
+        if entry.kind == .File && !coveredAbove(layers, index, entry.path) {
+            let same = match unchangedSince(files, name, entry) {
+                Ok(value) -> value
+                Error(failed) -> return .Error(.Storage(failed))
+            }
+            if !same { changedSince++ }
+        }
+    }
+    if changedSince > 0 && !force { return .Error(.ChangedSince(changedSince)) }
+    let restored = try restoreFiles(files, layers, index, changed)
+    removeDirectories(files, layers, index)
+    // The stack is saved below, and that save is the commit point: the root is
+    // gone from it, and its files are back. A records directory that cannot be
+    // removed after the files are restored is left behind and read by nothing;
+    // installing the same root again rewrites it. Failing here would leave the
+    // stack naming a root whose files are already gone, so the failure is said
+    // and the uninstall stands.
+    match files.remove(layerDirectory(name), DeleteOptions.permanent | DeleteOptions.recursive) {
+        Ok -> {}
+        Error(failed) -> log warn(
+            "could not remove a dev root's records",
+            root: name,
+            error: errorName(failed)
+        )
+    }
+    layers = withoutLayer(layers, index)
+    match saveStack(files, layers) {
+        Ok -> {}
+        Error(failed) -> return .Error(.Storage(failed))
+    }
+    log info("uninstalled a dev root", root: name, files: restored, depth: layers.count)
+    return .Ok
+}

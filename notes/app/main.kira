@@ -1,0 +1,17 @@
+//! Notes' entry point: runs the Notes window on Tessera's display.
+import KiraUI
+import TesseraUI
+
+/// Runs Notes on Tessera's display until the person closes it.
+@Main
+function main() {
+    firstShown(loadFolders())
+    let search = NotesSearch {}
+    RunTesseraApplication(
+        "Notes",
+        { in
+            return NotesView(search = search)
+        },
+        ApplicationOptions {}
+    )
+}

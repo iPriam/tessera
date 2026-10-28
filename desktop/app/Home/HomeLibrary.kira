@@ -1,0 +1,445 @@
+import Foundation
+import HomeLayout
+import LibTessera
+import KiraUI
+import TesseraUI
+import PlatformUI
+
+// App Library (roadmap/24-home-and-personalisation.md, "App Library and
+// discovery"): the page after Home's last, listing every installed
+// application by name, those taken off Home among them, with a search field
+// over the list. Pressed, an application opens; one that is not on Home has a
+// button to put it back on the page Home was last on.
+
+namespace HomeLibraryLook {
+    let icon: Number = 40
+    let row: Number = 16
+    let width: Number = 520
+    let top: Number = 24
+    // One unit of spacing: the page's side inset, the gap under the search
+    // field, and the gaps between folders and between rows.
+    let unit: Number = 16
+    let inset: Number = 16
+    let gap: Number = 16
+    // A category square's padding and the gap between its four icons.
+    let square: Number = 12
+    let miniGap: Number = 8
+    let corner: Number = 26
+    // The search field's padding above and below its text.
+    let field: Number = 12
+}
+
+// A category in App Library: its name, which is `Other` for an application
+// with none, and its applications, A to Z.
+struct LibraryFolder {
+    var name: String
+    var apps: [Application]
+}
+
+// `applications` by name, from A.
+function alphabetical(applications: borrow [Application]) -> [Application] {
+    var sorted: [Application] = []
+    for application in applications {
+        var at = sorted.count
+        while at > 0 && nameBefore(application.name, sorted[at - 1].name) { at = at - 1 }
+        var placed: [Application] = []
+        for index in 0..sorted.count {
+            if index == at { placed.append(copy application) }
+            placed.append(copy sorted[index])
+        }
+        if at == sorted.count { placed.append(copy application) }
+        sorted = move placed
+    }
+    return sorted
+}
+
+// Whether `name` comes before `other` A to Z, ignoring case.
+function nameBefore(name: borrow String, other: borrow String) -> Bool {
+    return stringToCodepoints(name.lowercased()) < stringToCodepoints(other.lowercased())
+}
+
+// The category App Library lists an application under.
+function libraryNameOf(application: borrow Application) -> String {
+    return match application.category {
+        Some(category) -> copy category
+        None -> "Other"
+    }
+}
+
+// Whether folder `a` comes before `b`: A to Z, with Other last.
+function folderBefore(a: borrow LibraryFolder, b: borrow LibraryFolder) -> Bool {
+    if a.name == "Other" { return false }
+    if b.name == "Other" { return true }
+    return nameBefore(a.name, b.name)
+}
+
+// Every installed application grouped by category: each category's
+// applications A to Z, and the categories A to Z with Other last.
+function libraryFolders(applications: borrow [Application]) -> [LibraryFolder] {
+    var folders: [LibraryFolder] = []
+    for application in alphabetical(applications) {
+        let name = libraryNameOf(application)
+        var found = false
+        for index in 0..folders.count {
+            if folders[index].name == name {
+                folders[index].apps.append(copy application)
+                found = true
+            }
+        }
+        if !found { folders.append(LibraryFolder { name: copy name, apps: [copy application] }) }
+    }
+    var sorted: [LibraryFolder] = []
+    for folder in folders {
+        var at = sorted.count
+        while at > 0 && folderBefore(folder, sorted[at - 1]) { at = at - 1 }
+        var placed: [LibraryFolder] = []
+        for index in 0..sorted.count {
+            if index == at { placed.append(copy folder) }
+            placed.append(copy sorted[index])
+        }
+        if at == sorted.count { placed.append(copy folder) }
+        sorted = move placed
+    }
+    return sorted
+}
+
+// The id an application keeps as it moves between its category's square and
+// the opened category: its place among every installed application, A to Z.
+function libraryHeroId(applications: borrow [Application], name: borrow String) -> Number {
+    var index = 0
+    for application in alphabetical(applications) {
+        if application.name == name { return index }
+        index += 1
+    }
+    return index
+}
+
+// The icon at `at` of `names` on a category's square: a gap where the category
+// has no application for that square, and where the square is open, since the
+// icon has flown out of it.
+function miniSlot(
+    names: borrow [String],
+    at: Number,
+    side: Number,
+    applications: borrow [Application],
+    flown: Bool
+) -> Any Widget {
+    if at >= names.count || flown { return FixedGap(width = side, height = side) }
+    let name = copy names[at]
+    let id = libraryHeroId(applications, name)
+    return ApplicationIcon(name = copy name, side = side).matchedGeometryEffect(id: id)
+}
+
+// One category in App Library: its first four applications as a 2 by 2 grid
+// on a glass square, and its name under it. Pressed, it opens.
+function libraryFolder(
+    folder: borrow LibraryFolder,
+    side: Number,
+    applications: borrow [Application],
+    opened: borrow String,
+    open: (String) -> Void
+) -> Any Widget {
+    var first: [String] = []
+    for application in folder.apps {
+        if first.count < 4 { first.append(copy application.name) }
+    }
+    let flown = folder.name == opened
+    let mini = (side - 2 * HomeLibraryLook.square - HomeLibraryLook.miniGap) / 2
+    let name = copy folder.name
+    return Button(action = { in open(copy name) }) {
+        VStack(spacing = .Small, alignment = .Center) {
+            VStack(spacing = .Length(HomeLibraryLook.miniGap), alignment = .Center) {
+                HStack(spacing = .Length(HomeLibraryLook.miniGap), alignment = .Center) {
+                    miniSlot(first, 0, mini, applications, flown)
+                    miniSlot(first, 1, mini, applications, flown)
+                }
+                HStack(spacing = .Length(HomeLibraryLook.miniGap), alignment = .Center) {
+                    miniSlot(first, 2, mini, applications, flown)
+                    miniSlot(first, 3, mini, applications, flown)
+                }
+            }
+            .padding(resolvedLength(HomeLibraryLook.square))
+            .width(resolvedLength(side))
+            .height(resolvedLength(side))
+            .glassEffect(shape: .Squircle(HomeLibraryLook.corner))
+            .opacity(flown ? 0.0 : 1.0)
+            .animation(.Smooth)
+            Text(copy folder.name).font(size: resolvedLength(13), weight: .Medium).textColor(
+                tileInk
+            )
+        }
+    }
+    .buttonStyle(.Plain)
+}
+
+// The category squares, two to a row, in the order `libraryFolders` gives.
+function libraryFolderRows(
+    applications: borrow [Application],
+    side: Number,
+    opened: borrow String,
+    open: (String) -> Void
+) -> [Any Widget] {
+    let folders = libraryFolders(applications)
+    var rows: [Any Widget] = []
+    var index = 0
+    while index < folders.count {
+        var pair: [Any Widget] = [libraryFolder(
+            folders[index],
+            side,
+            applications,
+            opened,
+            copy open
+        )]
+        if index + 1 < folders.count {
+            pair.append(libraryFolder(folders[index + 1], side, applications, opened, copy open))
+        }
+        rows.append(
+            HStack(spacing = .Length(HomeLibraryLook.gap), alignment = .Top, children = pair)
+        )
+        index += 2
+    }
+    return rows
+}
+
+namespace LibraryFolderLook {
+    let title: Number = 34
+    let icon: Number = 60
+    let label: Number = 12
+    let gap: Number = 24
+    let top: Number = 64
+    let across: Number = 4
+    // How many of an opened category's applications fly out of its square.
+    let flying: Number = 4
+}
+
+// An application's icon in an opened category: it flies out of its square when
+// it was on the square, and fades in otherwise.
+function libraryFolderIcon(name: borrow String, id: Number, flies: Bool) -> Any Widget {
+    let icon = ApplicationIcon(name = copy name, side = LibraryFolderLook.icon)
+    if flies { return icon.matchedGeometryEffect(id: id) }
+    return icon.transition(opacityTransition())
+}
+
+// One application in an opened App Library category: its icon and name in a
+// cell `cell` points wide. Pressed, it opens.
+function libraryFolderTile(
+    application: borrow Application,
+    id: Number,
+    flies: Bool,
+    cell: Number
+) -> Any Widget {
+    let opened = copy application
+    let name = copy application.name
+    return Button(action = { in openApplication(copy opened) }) {
+        VStack(spacing = .Small, alignment = .Center) {
+            libraryFolderIcon(name, id, flies)
+            Text(copy name)
+            .font(size: resolvedLength(LibraryFolderLook.label), weight: .Medium)
+            .textColor(tileInk)
+        }
+        .width(resolvedLength(cell))
+    }
+    .buttonStyle(.Plain)
+}
+
+// An App Library category opened over the page: its name as the title,
+// left-aligned, and every application in it in a grid four across, A to Z.
+// The first four fly out of their square; a press off the grid closes it.
+function libraryFolderScreen(
+    name: String,
+    applications: borrow [Application],
+    close: () -> Void
+) -> Any Widget {
+    let cell = (viewportWidth() - 2 * HomeLibraryLook.inset) / LibraryFolderLook.across
+    var members: [Application] = []
+    for application in alphabetical(applications) {
+        if libraryNameOf(application) == name { members.append(copy application) }
+    }
+    var tiles: [Any Widget] = []
+    for index in 0..members.count {
+        let id = libraryHeroId(applications, members[index].name)
+        let flies = index < LibraryFolderLook.flying
+        tiles.append(libraryFolderTile(members[index], id, flies, cell))
+    }
+    var rows: [Any Widget] = []
+    var start = 0
+    while start < tiles.count {
+        var row: [Any Widget] = []
+        for column in 0..LibraryFolderLook.across {
+            if start + column < tiles.count {
+                row.append(tiles[start + column])
+            } else {
+                row.append(FixedGap(width = cell, height = 0))
+            }
+        }
+        rows.append(HStack(spacing = .None, alignment = .Top, children = row))
+        start += LibraryFolderLook.across
+    }
+    let dismiss = copy close
+    let title = copy name
+    return ZStack(alignment = .Top) {
+        Rectangle()
+        .fill(folderDim)
+        .fillWidth()
+        .fillHeight()
+        .onClick(move dismiss)
+        VStack(spacing = .Length(LibraryFolderLook.gap), alignment = .Leading) {
+            FixedGap(width = 0, height = LibraryFolderLook.top)
+            Text(copy title)
+            .font(size: resolvedLength(LibraryFolderLook.title), weight: .Bold)
+            .textColor(tileInk)
+            VStack(spacing = .Length(LibraryFolderLook.gap), alignment = .Leading, children = rows)
+        }
+        .edgePadding(EdgeSet.horizontal, resolvedLength(HomeLibraryLook.inset))
+        .fillWidth()
+    }
+    .fillWidth()
+    .fillHeight()
+}
+
+// App Library's page: the search field, and under it either the categories,
+// or every application matching the search, A to Z. `opened` is the category
+// whose square has flown out, or nothing.
+function homeLibrary(
+    applications: borrow [Application],
+    arrangement: borrow HomeArrangement,
+    metrics: borrow LauncherMetrics,
+    query: Binding<String>,
+    opened: String,
+    add: (String, Number) -> Void,
+    open: (String) -> Void
+) -> Any Widget {
+    var rows: [Any Widget] = []
+    let side = (viewportWidth() - 2 * HomeLibraryLook.inset - HomeLibraryLook.gap) / 2
+    let searching = query.get().count > 0
+    if searching {
+        let docks = keptInDock()
+        let pages = arrangement.shownPages()
+        for application in alphabetical(matching(applications, query.get())) {
+            let onHome = arrangement.slotOf(application.name).isSome()
+            let place = LibraryRowPlace { onHome: onHome, pages: copy pages }
+            rows.append(libraryRow(copy application, move place, docks, copy add))
+        }
+        if rows.count == 0 {
+            rows.append(
+                Text("No Results").font(size: resolvedLength(17), weight: .SemiBold).textColor(
+                    tileInk
+                )
+            )
+        }
+    } else {
+        rows = libraryFolderRows(applications, side, opened, copy open)
+    }
+    return VStack(spacing = .None, alignment = .Center) {
+        FixedGap(width = 0, height = metrics.top - HomeScreenGrid.firstRow + HomeLibraryLook.top)
+        TextField(title = "App Library", text = query)
+        .edgePadding(EdgeSet.horizontal, resolvedLength(HomeLibraryLook.field))
+        .edgePadding(EdgeSet.vertical, resolvedLength(HomeLibraryLook.field))
+        .maxWidth(resolvedLength(HomeLibraryLook.width))
+        .glassEffect()
+        FixedGap(width = 0, height = HomeLibraryLook.unit)
+        ScrollView {
+            VStack(spacing = .Length(HomeLibraryLook.row), alignment = .Center, children = rows)
+        }
+        .maxWidth(resolvedLength(HomeLibraryLook.width))
+        Spacer()
+    }
+    .edgePadding(EdgeSet.horizontal, resolvedLength(HomeLibraryLook.inset))
+    .fillHeight()
+}
+
+// Where an application in App Library stands on Home: whether it is there,
+// and the pages shown, which it can be put back on.
+struct LibraryRowPlace {
+    let onHome: Bool
+    let pages: [Number]
+}
+
+// One application in App Library: its icon and name, which open it, a menu
+// of the pages shown to put it back on one when it is not on Home, a button
+// to put it in the Dock or take it out, and one that deletes it when it was
+// installed from a disk image, keeping its documents.
+function libraryRow(
+    application: Application,
+    place: LibraryRowPlace,
+    docks: borrow [String],
+    add: (String, Number) -> Void
+) -> Any Widget {
+    let opened = copy application
+    let deleted = copy application
+    let name = copy application.name
+    let deletable = application.place == .InstalledImage
+    let docked = docks.contains(application.name)
+    let undocked = copy application.name
+    return HStack(spacing = .Medium, alignment = .Center) {
+        Button(action = { in openApplication(opened) }) {
+            HStack(spacing = .Medium, alignment = .Center) {
+                ApplicationIcon(name = copy application.name, side = HomeLibraryLook.icon)
+                Text(copy application.name)
+                .font(size: resolvedLength(17), weight: .Medium)
+                .textColor(tileInk)
+                Spacer()
+            }
+        }
+        .buttonStyle(.Plain)
+        if !place.onHome {
+            Menu(
+                title = "Add to Home Screen",
+                systemImage = .PlusCircleFill,
+                children = libraryPageChoices(name, place.pages, copy add)
+            )
+        }
+        if docked {
+            Button(action = { in removeDockFavourite(undocked) }) {
+                Label(title = "Remove from Dock", systemImage = .MinusCircleFill)
+                .textColor(tileInk)
+            }
+            .buttonStyle(.Plain)
+        } else {
+            Button(action = { in addDockFavourite(undocked) }) {
+                Label(title = "Add to Dock", systemImage = .PlusCircleFill)
+                .textColor(tileInk)
+            }
+            .buttonStyle(.Plain)
+        }
+        if deletable {
+            Button(role = .Destructive, action = { in deleteApplication(deleted) }) {
+                Label(title = "Delete App", systemImage = .Trash)
+                .textColor(tileInk)
+            }
+            .buttonStyle(.Plain)
+        }
+    }
+    .fillWidth()
+}
+
+// One choice for each page shown, "Page 1" first, that puts `name` on it.
+function libraryPageChoices(
+    name: borrow String,
+    pages: borrow [Number],
+    add: (String, Number) -> Void
+) -> [Any Widget] {
+    var choices: [Any Widget] = []
+    for (place, page) in pages.enumerated() {
+        let added = copy name
+        let chosen = copy add
+        choices.append(
+            Button(action = { in chosen(added, page) }) {
+                Text("Page \(place + 1)")
+            }
+        )
+    }
+    return choices
+}
+
+// Asks PID 1 to uninstall `application`; Home drops it once /Applications
+// no longer lists it.
+function deleteApplication(application: borrow Application) {
+    match uninstallApplication(application) {
+        Ok -> log info("an application is being deleted", application: copy application.name)
+        Error(refusal) -> log warn(
+            "an application could not be deleted",
+            application: copy application.name
+        )
+    }
+}

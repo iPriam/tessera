@@ -1,0 +1,98 @@
+//! What the display check waits on once its frames are shown: its display
+//! channel, and the channel PID 1 started it with, on one port, as an
+//! application's session waits (Waits.kira). PID 1 hands the check its end of
+//! the link to the platform after its display link, and the notification the
+//! check posted goes to the platform once the link is taken; a display link
+//! handed over meanwhile is the one the next session runs on.
+
+import Foundation
+import KiraUI
+import LibTessera
+import TesseraDisplayClient
+import AppKit
+
+/// The next message `session` acts on. What PID 1 sends meanwhile is taken as
+/// it comes: a link to the platform is AppKit's, and a display link goes into
+/// `replacement`, for the session after this one.
+function awaitCheckMessage(
+    session: borrow Session,
+    waits: borrow mut Waits,
+    replacement: borrow mut DisplayLink?,
+    bridge: borrow BridgeHandle
+) -> Result<DisplayMessage, SessionEnd> {
+    while true {
+        let woke = match waits.next(session.channel, .None, bridge) {
+            Ok(value) -> value
+            Error(failure) -> return .Error(.Broken(failure))
+        }
+        match woke {
+            // What the wait was for may have been read already.
+            Message -> while true {
+                let polled = try session.pollMessage()
+                let message = match polled {
+                    Some(value) -> value
+                    None -> break
+                }
+                let arrived = try session.arrival(message)
+                match arrived {
+                    Moves -> return .Ok(message)
+                    // Handled where it arrived.
+                    Absorbed, Refocused, Resized, Moded, Inset, IconFlight -> {}
+                }
+            }
+            Parent -> takeCheckParentMessage(waits, replacement, bridge)
+            Link(key) -> match platformLinkWoke(copy bridge, key) {
+                Ok -> {}
+                Error(failure) -> log warn(
+                    "a link to the platform could not be read",
+                    failure: failure
+                )
+            }
+            Platform(key) -> log warn("a platform's wait completed in the display check", key: key)
+            // The check waits with no time limit, watches no directory and asks
+            // PID 1 nothing.
+            Time, Volumes, Applications, Answer, System -> {}
+        }
+    }
+    return .Error(.Closed)
+}
+
+/// Takes the link PID 1 sent while the session ran.
+function takeCheckParentMessage(
+    waits: borrow mut Waits,
+    replacement: borrow mut DisplayLink?,
+    bridge: borrow BridgeHandle
+) {
+    let received = match takeServiceLink() {
+        Ok(value) -> value
+        Error(failure) -> {
+            log warn("a link from PID 1 could not be read", error: errorName(failure))
+            waits.parentGone()
+            return
+        }
+    }
+    match received {
+        Some(link) -> match link {
+            Platform(platformLink) -> match adoptPlatformLink(
+                copy bridge,
+                platformLink.channel,
+                platformLink.clientIndex,
+                platformLink.application
+            ) {
+                Ok -> log info("took a link to the platform", client: platformLink.clientIndex)
+                Error(failure) -> log warn("a link to the platform was not taken", failure: failure)
+            }
+            Display(displayLink) -> {
+                match replacement {
+                    Some(older) -> closeDisplayLink(older)
+                    None -> {}
+                }
+                replacement = .Some(displayLink)
+            }
+        }
+        None -> {
+            log info("PID 1 closed its channel")
+            waits.parentGone()
+        }
+    }
+}

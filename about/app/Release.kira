@@ -1,0 +1,29 @@
+//! The About app's read of its system's release file.
+//!
+//! The file's text is parsed by the `ReleaseText` library; this file only reads it.
+
+import Foundation
+import LibTessera
+import ReleaseText
+
+/// Reads the system's release file once; a file that cannot be read is said, and the
+/// window shows no version.
+function readRelease() -> Release {
+    let text = match readFile("/" + SystemFile.systemVersion) {
+        Ok(contents) -> contents.text
+        Error(failure) -> {
+            log warn("could not read the release file", failure)
+            ""
+        }
+    }
+    return Release {
+        version: match releaseValue(text, "VERSION") {
+            Some(value) -> value
+            None -> ""
+        },
+        architecture: match releaseValue(text, "ARCH") {
+            Some(value) -> value
+            None -> ""
+        }
+    }
+}

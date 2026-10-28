@@ -1,0 +1,189 @@
+import Foundation
+import Heap
+import LibTessera
+import DeviceKit
+
+// Audio streams through DeviceKit's Audio family.
+//
+// A slot is whole frames; `progress` counts the bytes of the front slot
+// already moved.
+
+namespace AudioDefault {
+    let rate: Number = 48000
+    let channels: Number = 2
+    let periods: UN32 = 2
+    // A period is a hundredth of a second when nothing says otherwise.
+    let periodsPerSecond: Number = 100
+    // How many xruns in a row are recovered before the stream waits.
+    let xrunRetries: Number = 4
+}
+
+function pcmFormatOf(format: borrow AudioSampleFormat) -> PcmFormat {
+    return match format {
+        I16 -> PcmFormat.I16
+        I24 -> PcmFormat.I24
+        I32 -> PcmFormat.I32
+        F32 -> PcmFormat.F32
+    }
+}
+
+// A sample's bytes; 24-bit samples travel in four.
+function sampleBytesOf(format: borrow AudioSampleFormat) -> Number {
+    return match format {
+        I16 -> 2
+        I24 -> 4
+        I32 -> 4
+        F32 -> 4
+    }
+}
+
+function configureAudio(service: borrow mut Service, stream: Number) -> Result<Void, TesseraError> {
+    let descriptor = service.streams[stream].descriptor
+    let format = descriptor.format
+    let rate = format.sampleRate == 0 ? AudioDefault.rate : format.sampleRate
+    let channels = format.channels == 0 ? AudioDefault.channels : format.channels
+    let frameBytes = sampleBytesOf(format.sampleFormat) * channels
+    var frames = format.framesPerBuffer
+    if frames == 0 && descriptor.bufferSize != 0 {
+        frames = floor(descriptor.bufferSize / frameBytes)
+    }
+    if frames == 0 { frames = floor(rate / AudioDefault.periodsPerSecond) }
+    let asked = AudioConfig {
+        sampleRate: UN32(rate),
+        channels: UN32(channels),
+        sampleFormat: pcmFormatOf(format.sampleFormat),
+        periodFrames: UN32(frames),
+        periods: AudioDefault.periods,
+        channelMap: UNumber(0),
+    }
+    let chosen = try audioConfigure(service.streams[stream].connection, asked)
+    var size = descriptor.bufferSize
+    if size == 0 { size = Number(chosen.periodFrames) * frameBytes }
+    size = floor(size / frameBytes) * frameBytes
+    if size == 0 { return .Error(failure(.FormatUnsupported)) }
+    service.streams[stream].descriptor.format.sampleRate = Number(chosen.sampleRate)
+    service.streams[stream].descriptor.format.channels = Number(chosen.channels)
+    service.streams[stream].descriptor.format.framesPerBuffer = Number(chosen.periodFrames)
+    service.streams[stream].descriptor.bufferSize = size
+    service.streams[stream].frameBytes = frameBytes
+    return .Ok
+}
+
+enum AudioRecovery {
+    Wait
+    Xrun
+    Failed(TesseraError)
+}
+
+function audioRecovery(reason: borrow TesseraError, xrun: borrow ErrorCode) -> AudioRecovery {
+    if reason.code == .ShouldWait { return .Wait }
+    if reason.code == xrun { return .Xrun }
+    return .Failed(reason)
+}
+
+// Writes the front slots until the device has no room.
+function play(service: borrow mut Service, stream: Number) {
+    let connection = service.streams[stream].connection
+    let frameBytes = service.streams[stream].frameBytes
+    var xruns: Number = 0
+    while true {
+        let front = match frontSlot(service, stream) {
+            Some(value) -> value
+            None -> return
+        }
+        let progress = service.streams[stream].progress
+        let slot = service.streams[stream].slots[front]
+        if slot.length - progress < frameBytes {
+            service.streams[stream].progress = 0
+            let now = match streamTime(service, stream) {
+                Some(value) -> value
+                None -> return
+            }
+            done(service, stream, front, .Ok, now, slot.length, slot.flags)
+            continue
+        }
+        match audioWrite(
+            connection,
+            Buffer { address: heapOffset(slot.address, progress), length: slot.length - progress }
+        ) {
+            Ok(frames) -> {
+                if frames == 0 {
+                    arm(service, stream, DeviceEvents.writable)
+                    return
+                }
+                service.streams[stream].progress = progress + frames * frameBytes
+            }
+            Error(failed) -> match audioRecovery(failed, .Underrun) {
+                Wait -> {
+                    arm(service, stream, DeviceEvents.writable)
+                    return
+                }
+                Failed(reason) -> fail(service, stream, reason)
+                Xrun -> {
+                // The PCM was prepared again; the next write starts it.
+                service.streams[stream].underruns += 1
+                xruns += 1
+                if xruns > AudioDefault.xrunRetries {
+                    arm(service, stream, DeviceEvents.writable)
+                    return
+                }
+                }
+            }
+        }
+        if service.streams[stream].state == .Failed { return }
+    }
+}
+
+// Fills the front slots until the device has nothing more.
+function capture(service: borrow mut Service, stream: Number) {
+    let connection = service.streams[stream].connection
+    let frameBytes = service.streams[stream].frameBytes
+    var xruns: Number = 0
+    while true {
+        let front = match frontSlot(service, stream) {
+            Some(value) -> value
+            None -> return
+        }
+        let progress = service.streams[stream].progress
+        let slot = service.streams[stream].slots[front]
+        let size = floor(slot.size / frameBytes) * frameBytes
+        if progress >= size {
+            service.streams[stream].progress = 0
+            let now = match streamTime(service, stream) {
+                Some(value) -> value
+                None -> return
+            }
+            done(service, stream, front, .Ok, now, size, PacketFlags.none)
+            continue
+        }
+        match audioRead(
+            connection,
+            Buffer { address: heapOffset(slot.address, progress), length: size - progress }
+        ) {
+            Ok(frames) -> {
+                if frames == 0 {
+                    arm(service, stream, DeviceEvents.readable)
+                    return
+                }
+                service.streams[stream].progress = progress + frames * frameBytes
+            }
+            Error(failed) -> match audioRecovery(failed, .Overrun) {
+                Wait -> {
+                    arm(service, stream, DeviceEvents.readable)
+                    return
+                }
+                Failed(reason) -> fail(service, stream, reason)
+                Xrun -> {
+                // What the device took while nothing read it is lost.
+                service.streams[stream].dropped += 1
+                xruns += 1
+                if xruns > AudioDefault.xrunRetries {
+                    arm(service, stream, DeviceEvents.readable)
+                    return
+                }
+                }
+            }
+        }
+        if service.streams[stream].state == .Failed { return }
+    }
+}

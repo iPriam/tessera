@@ -1,0 +1,40 @@
+//! The release file's text: the version and architecture a system's release file names.
+//!
+//! The file holds `KEY="value"` lines. [`Release`] is what the About window shows,
+//! and [`releaseValue`] reads one key out of the file's text.
+
+import Foundation
+
+/// The system's version and machine, as its release file names them.
+public struct Release {
+    /// The system's version, as the release file names it; empty when the file has no `VERSION` line.
+    let version: String
+    /// The machine's architecture, as the release file names it; empty when the file has no `ARCH` line.
+    let architecture: String
+}
+
+/// The value of `KEY="value"` in `text`, or `.None` when no line holds the key.
+///
+/// The first line whose text starts with `key` and `=` answers. Surrounding double quotes are
+/// removed only when both ends have one, so `""` is an empty value and a lone quote stays.
+/// A value keeps any `=` after its first one, and single quotes are kept as written.
+///
+/// # Examples
+///
+/// ```
+/// releaseValue("VERSION=\"14.2\"", "VERSION")  // .Some("14.2")
+/// releaseValue("ARCH=arm64", "ARCH")           // .Some("arm64")
+/// releaseValue("VERSION_CODE=\"9\"", "VERSION") // .None
+/// ```
+public function releaseValue(text: borrow String, key: borrow String) -> String? {
+    for line in text.split("\n") {
+        if line.startsWith(key + "=") {
+            var value = line.substring(key.count + 1, line.count)
+            if value.count >= 2 && value.startsWith("\"") && value.endsWith("\"") {
+                value = value.substring(1, value.count - 1)
+            }
+            return .Some(value)
+        }
+    }
+    return .None
+}

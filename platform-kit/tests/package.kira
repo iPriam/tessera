@@ -1,0 +1,6 @@
+//! The PlatformKit test package: the Stage Manager, lock, Focus and notification history checks.
+construct PlatformKitTests extends Package {
+    let version: String = "0.1.0"
+    let kind: PackageKind = .App
+    let dependencies: [Dependency] = [Dependency { name: "PlatformKit", path: "../" }]
+}

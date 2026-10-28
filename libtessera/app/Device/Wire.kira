@@ -1,0 +1,244 @@
+import Foundation
+import Heap
+
+// The Devices service's wire (17 §25). The service listens as `devices`;
+// every message on a connection is a 32-byte header, then the operation's
+// bytes, with any Memory handles beside it:
+//
+//   `op: u32 @0`, `code: u32 @4` (an `ErrorCode` value, 0 in a request),
+//   `a: u64 @8`, `b: u64 @16`, `c: u64 @24`.
+//
+// A reply carries the request's `op`. `Done` is the service's own: a slot
+// has come back, `a` the slot, `b` the timestamp, `c` `length | flags << 32`.
+//
+// A `StreamDescriptor` travels as 96 bytes: class @0, device id @8, buffer
+// count @16, buffer size @20, flags @24, then the format @32: sample rate,
+// channels, sample format and frames per buffer (`u32` @0..@12), channel
+// mask (`u64` @16), pixel format, width, height, frames per second (Q16),
+// color space and HDR mode (`u32` @24..@44), sensor rate (`u32` @48),
+// sensor format and pattern format (`u16` @52, @54), and the report latency
+// (`u64` @56).
+
+struct DeviceMessage {
+    var op: U32
+    var code: U32
+    var a: U64
+    var b: U64
+    var c: U64
+    var payload: RawPtr
+    var length: U64
+    var handles: [Handle]
+}
+
+@Derive(Copy)
+enum DeviceOperation: U32 {
+    List = 1
+    Open = 2
+    Enqueue = 3
+    Start = 4
+    Stop = 5
+    Flush = 6
+    Reconfigure = 7
+    Control = 8
+    Info = 9
+    Done = 16
+}
+
+namespace Device {
+    let headerBytes: U64 = U64(32)
+    let descriptorBytes: U64 = U64(96)
+    // How long a request waits for its answer.
+    let answerNanoseconds: U64 = U64(5000000000)
+}
+
+function deviceSend(
+    connection: Number,
+    op: U32,
+    a: U64,
+    b: U64,
+    c: U64,
+    payload: RawPtr,
+    length: U64
+) -> Result<Void, TesseraError> {
+    let size = Device.headerBytes + length
+    let blockBytes = zeroedBlock(count: size, alignment: 16)
+    let block = blockBytes.pointer()
+    heapStore<U32>(block, 0, op)
+    heapStore<U64>(block, 8, a)
+    heapStore<U64>(block, 16, b)
+    heapStore<U64>(block, 24, c)
+    if length > U64(0) {
+        copyBytes(heapOffset(block, Device.headerBytes), payload, length)
+    }
+    let handles: [Handle] = []
+    let sent = channelSend(connection, Buffer { address: block, length: size }, handles)
+    return sent
+}
+
+// The next message on `connection`, or `ShouldWait`. Its payload is a block of its
+// own, released by `deviceMessageRelease`.
+function deviceReceive(connection: Number) -> Result<DeviceMessage, TesseraError> {
+    let message = try channelReceive(connection)
+    let length = messagePayloadLength(message)
+    let at = messagePayloadOffset(message)
+    if length < Device.headerBytes {
+        messageDiscard(message)
+        return .Error(failureIn(.Internal, .Devices))
+    }
+    let rest = length - Device.headerBytes
+    let payload = allocateZeroed(memoryLayout(Number(rest + U64(8)), 16))
+    if isNull(payload) {
+        messageDiscard(message)
+        return .Error(failure(.OutOfMemory))
+    }
+    copyBytes(payload, heapOffset(message.block, at + Device.headerBytes), rest)
+    let answer = DeviceMessage {
+        op: heapLoad<U32>(message.block, at),
+        code: heapLoad<U32>(message.block, Number(at + U64(4))),
+        a: heapLoad<U64>(message.block, Number(at + U64(8))),
+        b: heapLoad<U64>(message.block, Number(at + U64(16))),
+        c: heapLoad<U64>(message.block, Number(at + U64(24))),
+        payload: payload,
+        length: rest,
+        handles: messageHandles(message),
+    }
+    deallocate(message.block)
+    return .Ok(answer)
+}
+
+function deviceMessageRelease(message: borrow DeviceMessage) {
+    deallocate(message.payload)
+    for index in 0..message.handles.count {
+        handleDrop(message.handles[index])
+    }
+}
+
+function deviceMessageError(message: borrow DeviceMessage) -> Result<Void, TesseraError> {
+    let code = errorCodeFrom(message.code)
+    if code == .Ok { return .Ok }
+    return .Error(failureIn(code, .Devices))
+}
+
+// Sleeps until `connection` is readable or `wait` nanoseconds pass.
+function deviceSleep(connection: Number, wait: U64) {
+    kernelWaitOn(connection, Ready.readable, wait)
+}
+
+// The answer to the request `op` just sent on `connection`, which is the
+// stream `object`'s once there is one. What arrives before it belongs to the
+// stream's slots and is handed to them.
+function deviceAwait(
+    connection: Number,
+    object: Number?,
+    op: U32
+) -> Result<DeviceMessage, TesseraError> {
+    let deadline = monotonicNow() + Device.answerNanoseconds
+    while monotonicNow() < deadline {
+        match deviceReceive(connection) {
+            Ok(message) -> {
+                if message.op == op { return .Ok(message) }
+                match object {
+                    Some(stream) -> streamDispatch(stream, message)
+                    None -> {}
+                }
+                deviceMessageRelease(message)
+            }
+            Error(failed) -> {
+                if failed.code != .ShouldWait { return .Error(failureIn(.DeviceLost, .Devices)) }
+                deviceSleep(connection, U64(100000000))
+            }
+        }
+    }
+    return .Error(failureIn(.Timeout, .Devices))
+}
+
+// A request and its answer, with nothing else to say about it.
+function deviceCall(
+    connection: Number,
+    object: Number?,
+    op: borrow DeviceOperation,
+    a: U64,
+    payload: RawPtr,
+    length: U64
+) -> Result<DeviceMessage, TesseraError> {
+    let sent = deviceSend(connection, code(op), a, U64(0), U64(0), payload, length)
+    if !succeeded(sent) { return .Error(failureIn(.DeviceLost, .Devices)) }
+    return deviceAwait(connection, move object, code(op))
+}
+
+function descriptorWrite(block: RawPtr, descriptor: borrow StreamDescriptor) {
+    zeroBytes(block, Device.descriptorBytes)
+    heapStore<U32>(block, 0, code(descriptor.streamClass))
+    heapStore<U64>(block, 8, descriptor.deviceId)
+    heapStore<U32>(block, 16, descriptor.bufferCount)
+    heapStore<U32>(block, 20, descriptor.bufferSize)
+    heapStore<U32>(block, 24, descriptor.flags.raw)
+    let format = descriptor.format
+    heapStore<U32>(block, 32, format.sampleRate)
+    heapStore<U32>(block, 36, format.channels)
+    heapStore<U32>(block, 40, code(format.sampleFormat))
+    heapStore<U32>(block, 44, format.framesPerBuffer)
+    heapStore<U64>(block, 48, format.channelMask)
+    heapStore<U32>(block, 56, format.pixelFormat)
+    heapStore<U32>(block, 60, format.width)
+    heapStore<U32>(block, 64, format.height)
+    heapStore<U32>(block, 68, format.framesPerSecondQ16)
+    heapStore<U32>(block, 72, format.colorSpace)
+    heapStore<U32>(block, 76, format.hdrMode)
+    heapStore<U32>(block, 80, format.rateHz)
+    heapStore<U16>(block, 84, U16(code(format.sensorFormat)))
+    heapStore<U16>(block, 86, U16(code(format.patternFormat)))
+    heapStore<U64>(block, 88, format.maxReportLatency)
+}
+
+let deviceClasses: [DeviceClass] = [DeviceClass.Sensor, DeviceClass.AudioInput, DeviceClass.AudioOutput, DeviceClass.Camera, DeviceClass.Haptic]
+let audioSampleFormats: [AudioSampleFormat] = [AudioSampleFormat.I16, AudioSampleFormat.I24, AudioSampleFormat.I32, AudioSampleFormat.F32]
+let sensorSampleFormats: [SensorSampleFormat] = [SensorSampleFormat.Vector3F32, SensorSampleFormat.ScalarF32, SensorSampleFormat.QuaternionF32, SensorSampleFormat.U64Count]
+let hapticPatternFormats: [HapticPatternFormat] = [HapticPatternFormat.AmplitudeF32AtHz]
+
+// The descriptor the device service answers. A class or format no case
+// names is the service's fault, never this process's to trap on.
+function descriptorRead(block: RawPtr) -> Result<StreamDescriptor, TesseraError> {
+    let streamClass = try caseWithCode(
+        deviceClasses,
+        heapLoad<U32>(block, 0)
+    ) otherwise return .Error(failureIn(.Internal, .Devices))
+    let sampleFormat = try caseWithCode(
+        audioSampleFormats,
+        heapLoad<U32>(block, 40)
+    ) otherwise return .Error(failureIn(.Internal, .Devices))
+    let sensorFormat = try caseWithCode(
+        sensorSampleFormats,
+        heapLoad<U16>(block, 84)
+    ) otherwise return .Error(failureIn(.Internal, .Devices))
+    let patternFormat = try caseWithCode(
+        hapticPatternFormats,
+        heapLoad<U16>(block, 86)
+    ) otherwise return .Error(failureIn(.Internal, .Devices))
+    return .Ok(
+        StreamDescriptor {
+            streamClass: streamClass,
+            deviceId: heapLoad<U64>(block, 8),
+            bufferCount: heapLoad<U32>(block, 16),
+            bufferSize: heapLoad<U32>(block, 20),
+            flags: StreamFlags(heapLoad<U32>(block, 24)),
+            format: StreamFormat {
+                sampleRate: heapLoad<U32>(block, 32),
+                channels: heapLoad<U32>(block, 36),
+                sampleFormat: sampleFormat,
+                framesPerBuffer: heapLoad<U32>(block, 44),
+                channelMask: heapLoad<U64>(block, 48),
+                pixelFormat: heapLoad<U32>(block, 56),
+                width: heapLoad<U32>(block, 60),
+                height: heapLoad<U32>(block, 64),
+                framesPerSecondQ16: heapLoad<U32>(block, 68),
+                colorSpace: heapLoad<U32>(block, 72),
+                hdrMode: heapLoad<U32>(block, 76),
+                rateHz: heapLoad<U32>(block, 80),
+                maxReportLatency: heapLoad<U64>(block, 88),
+                sensorFormat: sensorFormat,
+                patternFormat: patternFormat,
+            },
+        }
+    )
+}

@@ -1,0 +1,147 @@
+import Foundation
+import Heap
+import LibTessera
+
+// DeviceKit's failures (17 §5): LibTessera's `TesseraError`, with
+// `subsystem = DeviceKit`, and the completions it posts (§6).
+
+function failure(code: borrow ErrorCode) -> TesseraError {
+    return TesseraError {
+        code: code,
+        subsystem: .DeviceKit,
+        flags: ErrorFlags.none,
+        detail: U64(0)
+    }
+}
+
+// A failure whose `detail` says more: a byte offset, a size needed, a
+// record index.
+function failure(code: borrow ErrorCode, detail: Number) -> TesseraError {
+    return TesseraError {
+        code: code,
+        subsystem: .DeviceKit,
+        flags: ErrorFlags.none,
+        detail: U64(detail)
+    }
+}
+
+let successOutcome: TesseraError = TesseraError {
+    code: .Ok,
+    subsystem: .DeviceKit,
+    flags: ErrorFlags.none,
+    detail: U64(0)
+}
+
+// `BufferTooSmall` unless `buffer` holds `needed` bytes.
+function requireRoom(buffer: borrow Buffer, needed: Number) -> Result<Void, TesseraError> {
+    if buffer.length < needed || isNull(buffer.address) {
+        return .Error(failure(.BufferTooSmall, needed))
+    }
+    return .Ok
+}
+
+// What an asynchronous call's completion carries besides its error.
+@Derive(Copy)
+struct Answer {
+    var result0: U64
+    var result1: U64
+}
+
+namespace Answer {
+    let none: Answer = Answer { result0: U64(0), result1: U64(0) }
+}
+
+// The completion packet of `kind` for `key`.
+function packet(
+    key: U64,
+    error: borrow TesseraError,
+    answer: borrow Answer,
+    kind: borrow DeviceCompletion
+) -> Completion {
+    return Completion {
+        key: key,
+        error: error,
+        kind: .Device,
+        flags: CompletionFlags(0),
+        result0: answer.result0,
+        result1: answer.result1,
+        aux: U64(code(kind)),
+        timestamp: U64(0),
+    }
+}
+
+// Where an asynchronous call's completion goes (§3.4).
+@Derive(Copy)
+struct Reply {
+    let port: Handle
+    let key: U64
+
+    // Posts a finished operation. The call's own answer is whether the port
+    // took it; a failed operation is in the completion, with `result0` 0.
+    function post(
+        borrow self,
+        outcome: borrow Result<Answer, TesseraError>,
+        kind: borrow DeviceCompletion
+    ) -> Result<Void, TesseraError> {
+        let completion = match outcome {
+            Ok(answer) -> packet(self.key, successOutcome, answer, kind)
+            Error(failed) -> packet(self.key, failed, Answer.none, kind)
+        }
+        return portPostDevice(self.port, completion)
+    }
+
+    // Arms a readiness source on `descriptor`: the port posts `completion`
+    // when it shows any of `events`, filling in the events seen when
+    // `fillEvents` asks.
+    function attach(
+        borrow self,
+        descriptor: borrow Descriptor,
+        events: SourceEvents,
+        completion: borrow Completion,
+        options: borrow SourceOptions
+    ) -> Result<Void, TesseraError> {
+        let spec = SourceSpec {
+            kind: .Readiness,
+            events: events,
+            source: descriptor.number,
+            offset: 0,
+            buffer: Buffer { address: nullPointer(), length: 0 },
+        }
+        return portAttachSource(
+            self.port,
+            spec,
+            completion,
+            SourceOptions { mode: options.mode, fillEvents: options.fillEvents }
+        )
+    }
+
+    // Arms a read or write at `offset` into `buffer`; the port fills the
+    // byte count into `result0`.
+    function attachTransfer(
+        borrow self,
+        descriptor: borrow Descriptor,
+        kind: borrow SourceKind,
+        offset: Number,
+        buffer: borrow Buffer
+    ) -> Result<Void, TesseraError> {
+        let spec = SourceSpec {
+            kind: kind,
+            events: SourceEvents.none,
+            source: descriptor.number,
+            offset: offset,
+            buffer: buffer
+        }
+        let completion = packet(
+            self.key,
+            successOutcome,
+            Answer { result0: U64(0), result1: U64(offset) },
+            .Transfer
+        )
+        return portAttachSource(
+            self.port,
+            spec,
+            completion,
+            SourceOptions { mode: .Once, fillEvents: false }
+        )
+    }
+}

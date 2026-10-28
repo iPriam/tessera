@@ -1,0 +1,56 @@
+import Foundation
+import Heap
+
+// The program a release names in `ValgrindLaunch.program`, which `kira build
+// --valgrind <component>` writes, is started under Valgrind's memcheck: the
+// launch runs Valgrind's launcher in its place and hands it the program as
+// `/proc/self/fd/<ValgrindLaunch.descriptor>`, a descriptor the child keeps
+// across both execs, the launcher's own and the one into memcheck.
+
+namespace ValgrindLaunch {
+    // The absolute path of the program started under memcheck; Tessera's
+    // build names the same file `ValgrindLayout.program`.
+    let program: String = "/etc/tessera-valgrind"
+    let launcher: String = "/usr/lib/valgrind/bin/valgrind"
+    // The descriptor the program is reached through, after the three standard
+    // streams.
+    let descriptor: Number = 3
+}
+
+// The argument vector that starts `arguments` under memcheck, when the
+// release names `executable` for it, or none.
+function valgrindArguments(executable: Number, arguments: borrow [String]) -> [String]? {
+    let named = match readSmallFileIfPresent(AtDirectory.current, ValgrindLaunch.program) {
+        Ok(found) -> match found {
+            Some(text) -> text.trim()
+            None -> return .None
+        }
+        Error(failed) -> {
+            absorb failed
+            return .None
+        }
+    }
+    let path = match openedPath(executable) {
+        Ok(found) -> found
+        Error(failed) -> {
+            absorb failed
+            return .None
+        }
+    }
+    if path != named { return .None }
+    var wrapped = [
+        ValgrindLaunch.launcher, "--tool=memcheck", "--num-callers=40", "--error-limit=no",
+        descriptorPath(Number(ValgrindLaunch.descriptor))
+    ]
+    for index in 1..arguments.count { wrapped.append(copy arguments[index]) }
+    return .Some(wrapped)
+}
+
+// The path the descriptor `fd` was opened at.
+function openedPath(fd: Number) -> Result<String, TesseraError> {
+    let blockBytes = zeroedBlock(count: 256, alignment: 16)
+    let block = blockBytes.pointer()
+    let read = readlinkat(AtDirectory.current, cStringFrom(descriptorPath(fd)), block, U64(255))
+    if answerFailed(read) { return .Error(errnoFailure(answerErrno(read))) }
+    return .Ok(stringFromCBytes(block, read))
+}

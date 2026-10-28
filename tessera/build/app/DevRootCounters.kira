@@ -1,0 +1,64 @@
+import Foundation
+import Build
+
+// What programs counted with `traceCounter` while the machine was sampled,
+// from the `counter <pid> <count> <total> <least> <most> <name>` lines: each frame's GPU
+// time, pass by pass, in nanoseconds (`gpu:frame`, `gpu:<pass label>`), and
+// the draws each pass recorded (`draws:<pass label>`).
+
+struct SampledCount {
+    let pid: Number
+    let count: Number
+    let total: Number
+    let least: Number
+    let most: Number
+    let name: String
+}
+
+function sampledCount(line: borrow String, words: borrow [String]) -> SampledCount? {
+    if words.count < 7 { return .None }
+    var skipped = 0
+    for index in 0..6 { skipped += words[index].count + 1 }
+    return .Some(
+        SampledCount {
+            pid: wordNumber(words[1]),
+            count: wordNumber(words[2]),
+            total: wordNumber(words[3]),
+            least: wordNumber(words[4]),
+            most: wordNumber(words[5]),
+            name: line.substring(skipped, line.count)
+        }
+    )
+}
+
+function countersReportText(
+    counts: borrow [SampledCount],
+    processes: borrow Map<Number, SampledProcessFacts>
+) -> String {
+    if counts.count == 0 { return "\nno trace counters: nothing measured its GPU time\n" }
+    let sorted = counts.sorted({ left, right in return left.total > right.total })
+    var text = "\nthe GPU, by process and pass: ms in all, times, us each, least, most\n"
+    var draws = "\ndraws, by process and pass: in all, times, each, least, most\n"
+    for count in sorted {
+        let process = match processes.value(count.pid) {
+            Some(facts) -> copy facts.name
+            None -> "pid \(count.pid)"
+        }
+        if count.name.startsWith("draws:") {
+            let each = count.count > 0 ? trunc(count.total / count.count) : 0
+            var shown = "\(count.total)"
+            while shown.count < 10 { shown = " " + shown }
+            draws.append(
+                "\(shown)  \(count.count)x  \(each)  \(count.least)  \(count.most)  \(process): \(count.name)\n"
+            )
+            continue
+        }
+        let each = count.count > 0 ? trunc(count.total / count.count / 1000) : 0
+        var shown = millisText(trunc(count.total / 1000))
+        while shown.count < 10 { shown = " " + shown }
+        text.append(
+            "\(shown)  \(count.count)x  \(each) us  \(trunc(count.least / 1000))  \(trunc(count.most / 1000))  \(process): \(count.name)\n"
+        )
+    }
+    return text + draws
+}

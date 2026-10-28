@@ -1,0 +1,55 @@
+TessIcon {
+    fill: Choice { light: .LinearGradient(Gradient { from: Color { space: .DisplayP3, red: 1, green: 0.76, blue: 0.2, alpha: 1 }, to: Color { space: .Srgb, red: 1, green: 0.7, blue: 0, alpha: 1 }, start: Point { x: 0.5, y: 0 }, stop: Point { x: 0.5, y: 0.7 } }), dark: .Automatic },
+    groups: [
+        Group {
+            name: "Group",
+            layers: [
+                Layer { name: "6.bulb", image: "6.bulb.svg", fill: Choice { light: .Solid(Color { space: .Srgb, red: 1, green: 0.988, blue: 0, alpha: 0 }), dark: .Solid(Color { space: .Srgb, red: 1, green: 0.954, blue: 0, alpha: 0 }) }, opacity: 0.9, position: Position { scale: 1, x: 0, y: -1 } },
+                Layer { name: "5.tfilament", image: "5.tfilament.svg", glass: false, fill: Choice { light: .LinearGradient(Gradient { from: Color { space: .DisplayP3, red: 0.9, green: 0.9, blue: 0.9, alpha: 0 }, to: Color { space: .Srgb, red: 1, green: 1, blue: 1, alpha: 1 }, start: Point { x: 0.5, y: 1 }, stop: Point { x: 0.5, y: 0.066 } }), dark: .LinearGradient(Gradient { from: Color { space: .Srgb, red: 1, green: 1, blue: 1, alpha: 1 }, to: Color { space: .ExtendedSrgb, red: 0, green: 0.78, blue: 0.745, alpha: 0 }, start: Point { x: 0.5, y: 0 }, stop: Point { x: 0.5, y: 1 } }) }, position: Position { scale: 1.08008, x: 0, y: 0 } }
+            ],
+            lighting: .Individual,
+            specular: .Inside,
+            translucency: Translucency { enabled: false, amount: 0 },
+            shadow: Choice { light: Shadow { kind: .Neutral, opacity: 0.1 }, dark: Shadow { kind: .Chromatic, opacity: 0.5 } },
+            blend: Choice { light: .Normal, dark: .PlusLighter }
+        },
+        Group {
+            name: "Group 2",
+            layers: [
+                Layer { name: "6.bulb", image: "6.bulb.svg", opacity: Choice { light: 0.9, dark: 0.8 }, position: Position { scale: 1, x: 0, y: -1 } },
+                Layer { name: "6.bulb", image: "6.bulb.svg", glass: Choice { light: false, dark: true }, fill: Choice { light: .LinearGradient(Gradient { from: Color { space: .DisplayP3, red: 1, green: 0, blue: 0.017, alpha: 0 }, to: Color { space: .DisplayP3, red: 1, green: 0.979, blue: 0.804, alpha: 1 }, start: Point { x: 0.5, y: 0.399 }, stop: Point { x: 0.513, y: 0.873 } }), dark: .LinearGradient(Gradient { from: Color { space: .DisplayP3, red: 1, green: 0, blue: 0.017, alpha: 0 }, to: Color { space: .DisplayP3, red: 1, green: 0.993, blue: 0.926, alpha: 1 }, start: Point { x: 0.5, y: 0.399 }, stop: Point { x: 0.517, y: 1 } }) }, opacity: Choice { light: 0, dark: 1 }, position: Position { scale: 1, x: 0, y: -1 } }
+            ],
+            lighting: .Individual,
+            specular: Choice { light: .Off, dark: .Inside },
+            translucency: Translucency { enabled: false, amount: 0 },
+            shadow: Shadow { kind: .None, opacity: 0.5 },
+            opacity: Choice { light: 0.9, dark: 1 },
+            blend: Choice { light: .Screen, dark: .HardLight },
+            blur: Blur { enabled: true, amount: 0.35 },
+            refraction: Choice { light: Refraction { enabled: true, depth: 0.39, spread: 0.22 }, dark: Refraction { enabled: true, depth: 0.45, spread: 0.18 } }
+        },
+        Group {
+            name: "Group 3",
+            layers: [
+                Layer { name: "4.captop", image: "4.captop.svg", fill: Choice { light: .Solid(Color { space: .Srgb, red: 0.655, green: 0.542, blue: 0.176, alpha: 1 }), dark: .Solid(Color { space: .Srgb, red: 1, green: 0.75, blue: 0, alpha: 1 }) } },
+                Layer { name: "3.capmiddle", image: "3.capmiddle.svg", fill: Choice { light: .Solid(Color { space: .Srgb, red: 0.645, green: 0.534, blue: 0.174, alpha: 1 }), dark: .Solid(Color { space: .Srgb, red: 1, green: 0.75, blue: 0, alpha: 1 }) }, position: Position { scale: 1, x: 0, y: -1 } },
+                Layer { name: "2.capbottom", image: "2.capbottom.svg", fill: Choice { light: .Solid(Color { space: .Srgb, red: 0.385, green: 0.319, blue: 0.104, alpha: 1 }), dark: .Solid(Color { space: .Srgb, red: 0.677, green: 0.511, blue: 0, alpha: 1 }) }, position: Position { scale: 1, x: 0, y: -2 } }
+            ],
+            lighting: .Individual,
+            specular: .Inside,
+            translucency: Translucency { enabled: true, amount: 0.2 },
+            shadow: Shadow { kind: .Neutral, opacity: 0.5 }
+        },
+        Group {
+            name: "Group 4",
+            layers: [
+                Layer { name: "5.tfilament", image: "5.tfilament.svg", glass: false, fill: Choice { light: .LinearGradient(Gradient { from: Color { space: .DisplayP3, red: 0.9, green: 0.9, blue: 0.9, alpha: 0 }, to: Color { space: .Srgb, red: 1, green: 1, blue: 1, alpha: 1 }, start: Point { x: 0.5, y: 1 }, stop: Point { x: 0.5, y: 0.066 } }), dark: .LinearGradient(Gradient { from: Color { space: .Srgb, red: 1, green: 1, blue: 1, alpha: 1 }, to: Color { space: .ExtendedSrgb, red: 0, green: 0.78, blue: 0.745, alpha: 0 }, start: Point { x: 0.5, y: 0 }, stop: Point { x: 0.5, y: 1 } }) }, position: Position { scale: 1.08008, x: 0, y: 0 } }
+            ],
+            lighting: .Individual,
+            specular: .Off,
+            translucency: Translucency { enabled: false, amount: 0 },
+            shadow: Shadow { kind: .Neutral, opacity: 0.5 },
+            blend: Choice { light: .Normal, dark: .PlusLighter }
+        }
+    ]
+}

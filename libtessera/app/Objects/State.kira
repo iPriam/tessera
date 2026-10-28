@@ -1,0 +1,382 @@
+import Foundation
+
+// What each kind of object keeps besides its backings: the case is the
+// object's kind, and a kind with state of its own carries it.
+enum ObjectState {
+    None
+    Port(PortObject)
+    Event(EventObject)
+    EventPair(EventPairObject)
+    Timer(TimerObject)
+    Channel(ChannelRole)
+    Memory(MemoryObject)
+    Thread(ThreadObject)
+    Process(ProcessObject)
+    Job(JobObject)
+    Node
+    File(FileObject)
+    Watch(WatchObject)
+    Endpoint(EndpointObject)
+    Stream(StreamObject)
+    WakeLock(WakeLockObject)
+    Presence
+}
+
+// A port: how many of its queued packets were posted by users.
+struct PortObject {
+    var userQueued: U64
+}
+
+// One end of an event pair: what the peer last sent, and what this end
+// last sent the peer.
+struct EventPairObject {
+    var observed: Signals
+    var sent: Signals
+}
+
+// What a channel is for: carrying messages, or taking a service's or the
+// broker's connections.
+enum ChannelRole {
+    Plain
+    // A service's connection whose client program the broker named.
+    Connection(String)
+    ServiceListener
+    BrokerListener
+}
+
+// A timer: whether it has fired since it was armed, the expirations not yet
+// delivered, and the clock it is on.
+struct TimerObject {
+    var fired: Bool
+    var undelivered: U64
+    var clock: ClockSource
+}
+
+// A process: its pid and start time (none when the kernel no longer had it
+// when asked), the job it was launched into (its id, 0 for none), and
+// whether this library killed it.
+struct ProcessObject {
+    var pid: U64
+    var started: U64?
+    var job: U64
+    var killedByUs: Bool
+}
+
+// A job: the policy in force, whether it was killed or has had a process,
+// the id of the job above it (0 for one above this process), and the watch
+// that reports when its last process has gone. `path` names the kernel's
+// job for one this process made, which goes when the object does; it is
+// empty for a job this process was given or runs in.
+struct JobObject {
+    var policy: JobPolicy
+    var killed: Bool
+    var populated: Bool
+    var parent: U64
+    var watch: Number
+    var path: String
+}
+
+// A watch: the bytes of events read from the kernel and not yet given to
+// the caller, the changes it asked for, its own backing for the node (none
+// for a watch another process passed) and the buffer the events wait in.
+@Derive(Copy)
+struct WatchObject {
+    var pending: U64
+    var mask: WatchMask
+    var node: Number?
+    var events: RawPtr
+}
+
+// An endpoint: its family and protocol, whether receives carry a
+// timestamp, its state, and the bytes it has sent and received.
+struct EndpointObject {
+    var family: AddressFamily
+    var protocol: Protocol
+    var timestamps: Bool
+    var state: EndpointState
+    var sent: U64
+    var received: U64
+}
+
+// Memory: its size and where it starts in its backing, the options it was
+// made with, whether it is locked or has been mapped, its cache policy, and
+// the id of the object it was sliced from (0 for none).
+struct MemoryObject {
+    var size: U64
+    var offset: U64
+    var options: MemoryOptions
+    var locked: Bool
+    var mapped: Bool
+    var policy: CachePolicy
+    var source: U64
+}
+
+// An event: its word, mapped.
+struct EventObject {
+    var word: RawPtr
+}
+
+// A thread: its kernel id and the scheduling class it was given.
+struct ThreadObject {
+    var id: U64
+    var qos: Qos
+}
+
+// An open file: the mode it was opened with.
+struct FileObject {
+    var mode: OpenMode
+}
+
+// A device stream: its entry in the library's streams.
+struct StreamObject {
+    var stream: Number
+}
+
+// A wake lock: when it lapses (monotonic), what it keeps up, and why.
+struct WakeLockObject {
+    var deadline: U64
+    var kind: WakeLockKind
+    var reason: String
+}
+
+function kindOf(state: borrow ObjectState) -> ObjectType {
+    return match state {
+        None -> .None
+        Port -> .Port
+        Event -> .Event
+        EventPair -> .EventPair
+        Timer -> .Timer
+        Channel -> .Channel
+        Memory -> .Memory
+        Thread -> .Thread
+        Process -> .Process
+        Job -> .Job
+        Node -> .Node
+        File -> .File
+        Watch -> .Watch
+        Endpoint -> .Endpoint
+        Stream -> .Stream
+        WakeLock -> .WakeLock
+        Presence -> .Presence
+    }
+}
+
+// The state of a fresh `kind` object, when that kind keeps none of its
+// own; a kind that does must be made with its state.
+function plainState(kind: borrow ObjectType) -> ObjectState? {
+    return match kind {
+        None -> .Some(.None)
+        Port -> .None
+        Event -> .None
+        EventPair -> .None
+        Timer -> .None
+        Channel -> .None
+        Memory -> .None
+        Thread -> .None
+        Process -> .None
+        Job -> .None
+        Node -> .Some(.Node)
+        File -> .None
+        Watch -> .None
+        Endpoint -> .None
+        Stream -> .None
+        WakeLock -> .None
+        Presence -> .Some(.Presence)
+    }
+}
+
+// The state of `object`, a Port object.
+function portOf(object: Number) -> Result<PortObject, TesseraError> {
+    return match library.objects[object].state {
+        Port(state) -> .Ok(state)
+        None, Event, EventPair, Timer, Channel, Memory, Thread, Process, Job, Node, File, Watch, Endpoint, Stream, WakeLock, Presence -> .Error(
+            failure(.WrongType)
+        )
+    }
+}
+
+function setPort(object: Number, state: PortObject) {
+    library.objects[object].state = .Port(move state)
+}
+
+// The state of `object`, a Thread object.
+function threadOf(object: Number) -> Result<ThreadObject, TesseraError> {
+    return match library.objects[object].state {
+        Thread(state) -> .Ok(state)
+        None, Port, Event, EventPair, Timer, Channel, Memory, Process, Job, Node, File, Watch, Endpoint, Stream, WakeLock, Presence -> .Error(
+            failure(.WrongType)
+        )
+    }
+}
+
+function setThread(object: Number, state: ThreadObject) {
+    library.objects[object].state = .Thread(move state)
+}
+
+// The state of `object`, a File object.
+function fileOf(object: Number) -> Result<FileObject, TesseraError> {
+    return match library.objects[object].state {
+        File(state) -> .Ok(state)
+        None, Port, Event, EventPair, Timer, Channel, Memory, Thread, Process, Job, Node, Watch, Endpoint, Stream, WakeLock, Presence -> .Error(
+            failure(.WrongType)
+        )
+    }
+}
+
+function setFile(object: Number, state: FileObject) {
+    library.objects[object].state = .File(move state)
+}
+
+// The state of `object`, a Stream object.
+function streamOf(object: Number) -> Result<StreamObject, TesseraError> {
+    return match library.objects[object].state {
+        Stream(state) -> .Ok(state)
+        None, Port, Event, EventPair, Timer, Channel, Memory, Thread, Process, Job, Node, File, Watch, Endpoint, WakeLock, Presence -> .Error(
+            failure(.WrongType)
+        )
+    }
+}
+
+function setStream(object: Number, state: StreamObject) {
+    library.objects[object].state = .Stream(move state)
+}
+
+// The state of `object`, a WakeLock object.
+function wakeLockOf(object: Number) -> Result<WakeLockObject, TesseraError> {
+    return match library.objects[object].state {
+        WakeLock(state) -> .Ok(state)
+        None, Port, Event, EventPair, Timer, Channel, Memory, Thread, Process, Job, Node, File, Watch, Endpoint, Stream, Presence -> .Error(
+            failure(.WrongType)
+        )
+    }
+}
+
+function setWakeLock(object: Number, state: WakeLockObject) {
+    library.objects[object].state = .WakeLock(move state)
+}
+
+// The state of `object`, a EventPair object.
+function eventPairOf(object: Number) -> Result<EventPairObject, TesseraError> {
+    return match library.objects[object].state {
+        EventPair(state) -> .Ok(state)
+        None, Port, Event, Timer, Channel, Memory, Thread, Process, Job, Node, File, Watch, Endpoint, Stream, WakeLock, Presence -> .Error(
+            failure(.WrongType)
+        )
+    }
+}
+
+function setEventPair(object: Number, state: EventPairObject) {
+    library.objects[object].state = .EventPair(move state)
+}
+
+// The state of `object`, a Channel object.
+function channelOf(object: Number) -> Result<ChannelRole, TesseraError> {
+    return match library.objects[object].state {
+        Channel(state) -> .Ok(state)
+        None, Port, Event, EventPair, Timer, Memory, Thread, Process, Job, Node, File, Watch, Endpoint, Stream, WakeLock, Presence -> .Error(
+            failure(.WrongType)
+        )
+    }
+}
+
+function setChannel(object: Number, state: ChannelRole) {
+    library.objects[object].state = .Channel(move state)
+}
+
+// The state of `object`, a Timer object.
+function timerOf(object: Number) -> Result<TimerObject, TesseraError> {
+    return match library.objects[object].state {
+        Timer(state) -> .Ok(state)
+        None, Port, Event, EventPair, Channel, Memory, Thread, Process, Job, Node, File, Watch, Endpoint, Stream, WakeLock, Presence -> .Error(
+            failure(.WrongType)
+        )
+    }
+}
+
+function setTimer(object: Number, state: TimerObject) {
+    library.objects[object].state = .Timer(move state)
+}
+
+// The state of `object`, a Process object.
+function processOf(object: Number) -> Result<ProcessObject, TesseraError> {
+    return match library.objects[object].state {
+        Process(state) -> .Ok(state)
+        None, Port, Event, EventPair, Timer, Channel, Memory, Thread, Job, Node, File, Watch, Endpoint, Stream, WakeLock, Presence -> .Error(
+            failure(.WrongType)
+        )
+    }
+}
+
+function setProcess(object: Number, state: ProcessObject) {
+    library.objects[object].state = .Process(move state)
+}
+
+// The state of `object`, a Job object.
+function jobOf(object: Number) -> Result<JobObject, TesseraError> {
+    return match library.objects[object].state {
+        Job(state) -> .Ok(state)
+        None, Port, Event, EventPair, Timer, Channel, Memory, Thread, Process, Node, File, Watch, Endpoint, Stream, WakeLock, Presence -> .Error(
+            failure(.WrongType)
+        )
+    }
+}
+
+function setJob(object: Number, state: JobObject) {
+    library.objects[object].state = .Job(move state)
+}
+
+// The state of `object`, a Watch object.
+function watchOf(object: Number) -> Result<WatchObject, TesseraError> {
+    return match library.objects[object].state {
+        Watch(state) -> .Ok(state)
+        None, Port, Event, EventPair, Timer, Channel, Memory, Thread, Process, Job, Node, File, Endpoint, Stream, WakeLock, Presence -> .Error(
+            failure(.WrongType)
+        )
+    }
+}
+
+function setWatch(object: Number, state: WatchObject) {
+    library.objects[object].state = .Watch(move state)
+}
+
+// The state of `object`, a Endpoint object.
+function endpointOf(object: Number) -> Result<EndpointObject, TesseraError> {
+    return match library.objects[object].state {
+        Endpoint(state) -> .Ok(state)
+        None, Port, Event, EventPair, Timer, Channel, Memory, Thread, Process, Job, Node, File, Watch, Stream, WakeLock, Presence -> .Error(
+            failure(.WrongType)
+        )
+    }
+}
+
+function setEndpoint(object: Number, state: EndpointObject) {
+    library.objects[object].state = .Endpoint(move state)
+}
+
+// The state of `object`, a Memory object.
+function memoryOf(object: Number) -> Result<MemoryObject, TesseraError> {
+    return match library.objects[object].state {
+        Memory(state) -> .Ok(state)
+        None, Port, Event, EventPair, Timer, Channel, Thread, Process, Job, Node, File, Watch, Endpoint, Stream, WakeLock, Presence -> .Error(
+            failure(.WrongType)
+        )
+    }
+}
+
+function setMemory(object: Number, state: MemoryObject) {
+    library.objects[object].state = .Memory(move state)
+}
+
+// The state of `object`, a Event object.
+function eventOf(object: Number) -> Result<EventObject, TesseraError> {
+    return match library.objects[object].state {
+        Event(state) -> .Ok(state)
+        None, Port, EventPair, Timer, Channel, Memory, Thread, Process, Job, Node, File, Watch, Endpoint, Stream, WakeLock, Presence -> .Error(
+            failure(.WrongType)
+        )
+    }
+}
+
+function setEvent(object: Number, state: EventObject) {
+    library.objects[object].state = .Event(move state)
+}

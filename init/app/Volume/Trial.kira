@@ -1,0 +1,171 @@
+import Foundation
+import LibTessera
+
+// Trying an update before trusting it (roadmap/13-security-and-updates.md,
+// "Updates"). The installer records an update in `boot/trial` and keeps the
+// current system. PID 1 boots the trial once, writing `boot/tried` first;
+// the system's init makes the trial current once its services are up. A
+// trial PID 1 finds already tried never got there, whatever stopped it, so
+// it is dropped and the current system boots: the update rolls back on its
+// own. The data subvolume is not touched by either.
+
+// The trial system to boot instead of the current one, with the volume's
+// top mounted at `System.volumeTop`; none when there is no trial to try.
+function trialToBoot(calls: Handle, current: borrow String) -> Result<String?, TesseraError> {
+    let boot = System.volumeTop + "/" + VolumeLayout.boot
+    let recorded = System.volumeTop + "/" + VolumeLayout.trial
+    // No record is the usual boot, with no update waiting.
+    let recordedExists = try nodeExists(calls, recorded)
+    if !recordedExists { return .Ok(.None) }
+    let trialBytes = try readWholeFile(calls, recorded)
+    let trial = match textFromBytes(trialBytes) {
+        Some(text) -> text.trim()
+        None -> ""
+    }
+    if trial.count == 0 || trial == current { return .Ok(.None) }
+    let tried = try nodeExists(calls, System.volumeTop + "/" + VolumeLayout.tried)
+    let candidateExists = try nodeExists(
+        calls,
+        "\(System.volumeTop)/\(VolumeLayout.systems)/\(trial)"
+    )
+    if tried || !candidateExists {
+        rollBack(calls, trial, current)
+        return .Ok(.None)
+    }
+    match atomicWriteFile(calls, boot, nameOf(VolumeLayout.tried), (trial + "\n").utf8()) {
+        Ok -> {}
+        Error(failed) -> {
+            // Otherwise this trial would be tried forever.
+            log warn(
+                "the trial system is not booted: it could not be marked tried",
+                trial,
+                error: errorName(failed)
+            )
+            return .Ok(.None)
+        }
+    }
+    log info("booting the trial system", trial, current)
+    return .Ok(.Some(trial))
+}
+
+// Drops the trial `trial`, which did not reach its services, and its system.
+function rollBack(calls: Handle, trial: borrow String, current: borrow String) {
+    let boot = System.volumeTop + "/" + VolumeLayout.boot
+    for marker in [nameOf(VolumeLayout.trial), nameOf(VolumeLayout.tried)] {
+        match removeFrom(calls, boot, marker) {
+            Ok -> {}
+            Error(failed) -> log warn(
+                "a rolled-back trial marker remains",
+                marker,
+                error: errorName(failed)
+            )
+        }
+    }
+    let system = "\(System.volumeTop)/\(VolumeLayout.systems)/\(trial)"
+    match nodeExists(calls, system) {
+        Ok(exists) -> if exists {
+            match volumeDeleteSubvolume(system) {
+                Ok -> {}
+                Error(failed) -> log warn(
+                    "the trial system stays on the volume",
+                    trial,
+                    error: errorName(failed)
+                )
+            }
+        }
+        Error(failed) -> log warn(
+            "could not check for the trial system",
+            trial,
+            error: errorName(failed)
+        )
+    }
+    log warn("rolled back an update that did not reach its services", trial, to: current)
+}
+
+// Makes the trial this machine booted current, once its services are up.
+// Run by the system's init; nothing is done when no trial was booted.
+function markSystemGood(calls: Handle) {
+    match ensureDirectory(calls, System.volumeTop) {
+        Ok -> {}
+        Error(failed) -> {
+            log warn("cannot mark the system good: no mount directory", error: errorName(failed))
+            return
+        }
+    }
+    var mounted = false
+    let names = match disks() {
+        Ok(value) -> value
+        Error(failed) -> {
+            log warn("the machine would not list its disks", error: errorName(failed))
+            return
+        }
+    }
+    for disk in names {
+        if mounted { break }
+        match volumeMount(disk, System.volumeTop, .Btrfs, VolumeOptions.none) {
+            Ok -> mounted = true
+            // Not btrfs: the next disk is tried.
+            Error(failed) -> {
+                if failed.code != .InvalidArgument {
+                    log warn("a disk would not mount", disk, error: errorName(failed))
+                }
+            }
+        }
+    }
+    if !mounted {
+        log warn("the volume could not be mounted to mark the system good")
+        return
+    }
+    let boot = System.volumeTop + "/" + VolumeLayout.boot
+    let tried = System.volumeTop + "/" + VolumeLayout.tried
+    var trial = ""
+    match nodeExists(calls, tried) {
+        Ok(exists) -> if exists {
+            match readWholeFile(calls, tried) {
+                Ok(triedBytes) -> {
+                    trial = match textFromBytes(triedBytes) {
+                        Some(text) -> text.trim()
+                        None -> ""
+                    }
+                }
+                Error(failed) -> {
+                    log warn("cannot read the trial version", error: errorName(failed))
+                    return
+                }
+            }
+        }
+        Error(failed) -> {
+            log warn(
+                "cannot check whether the trial system reached its services",
+                error: errorName(failed)
+            )
+            return
+        }
+    }
+    if trial.count > 0 {
+        match atomicWriteFile(calls, boot, nameOf(VolumeLayout.current), (trial + "\n").utf8()) {
+            Ok -> {
+                for marker in [nameOf(VolumeLayout.trial), nameOf(VolumeLayout.tried)] {
+                    match removeFrom(calls, boot, marker) {
+                        Ok -> {}
+                        Error(failed) -> log warn(
+                            "a committed trial marker remains",
+                            marker,
+                            error: errorName(failed)
+                        )
+                    }
+                }
+                log info("marked the system good", version: trial)
+            }
+            Error(failed) -> log warn(
+                "the trial system could not be made current",
+                trial,
+                error: errorName(failed)
+            )
+        }
+    }
+    match volumeUnmount(System.volumeTop, VolumeUnmountOptions.none) {
+        Ok -> {}
+        Error(failed) -> log warn("the volume's top stays mounted", error: errorName(failed))
+    }
+}

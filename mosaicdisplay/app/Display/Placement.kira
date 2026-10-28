@@ -1,0 +1,168 @@
+import Foundation
+import TesseraDisplayClient
+
+// Where each surface goes on the output: the platform's policy, chosen by its
+// window mode, carried out here (roadmap/08-display-server.md).
+
+// The frame a surface is given in a mode.
+//
+// The platform's surface is the whole output: it draws its bar along the top,
+// and the menus that drop from it over the applications, and is transparent
+// everywhere else. The desktop's is the whole output too, under everything.
+// In `Freeform` every other surface is placed in the output less the band
+// the bar takes and the band the dock takes, as a Mac lays windows out below
+// its menu bar and above its Dock; in `Stack` and `Exclusive` an application
+// fills the screen, as on an iPad, and is told the two bands as its insets. `Exclusive` fills that. `Stack` fills it too, or splits it
+// left and right when the platform asked for a split. `Freeform` gives a window:
+// two thirds of it, stepped down the screen so a second one is not hidden
+// behind the first.
+function geometryFor(server: borrow Server, index: Number) -> Geometry {
+    let width = server.display.scanout.pointWidth()
+    let output = server.display.scanout.pointHeight()
+    // The desktop lies under the bar as well, which lets it show through as
+    // a Mac's menu bar lets the desktop picture through.
+    if index < server.clients.count
+        && (server.clients[index].role == .Platform || server.clients[index].role == .Desktop) {
+        return Geometry { x: 0, y: 0, width: width, height: output }
+    }
+    let freeform = windowed(server.mode)
+    let top = freeform ? server.bar : 0
+    let floor = freeform ? server.dock : 0
+    let height = output - top - floor
+    return match server.mode {
+        // With a split, the two applications last opened share the screen,
+        // the earlier on the left, as an iPad's Split View puts the one added
+        // on the right. One alone fills it, and any older one fills it behind
+        // them.
+        Stack -> {
+            let full = Geometry { x: 0, y: top, width: width, height: height }
+            if !server.split { return full }
+            let shown = shownApplications(server)
+            let place = try arrayIndex(shown, index) otherwise return full
+            if shown.count < 2 || place < shown.count - 2 { return full }
+            let half = trunc(width / 2)
+            place == shown.count - 2
+            ? Geometry { x : 0, y: top, width: half, height: height }
+            : Geometry { x: half, y: top, width: width - half, height: height }
+        }
+        // A new window is centred in the room windows have, as a Mac
+        // centres one, and each later one stepped down and across from the
+        // one before so it is not hidden behind it.
+        Freeform -> {
+            if index < server.clients.count {
+                match server.clients[index].windowFrame {
+                    Some(kept) -> return kept
+                    None -> {}
+                }
+            }
+            let step = 28 * (applicationsBefore(server, index) % 6)
+            let windowWidth = trunc(width * 2 / 3)
+            let windowHeight = trunc(height * 2 / 3)
+            Geometry {
+                x: trunc((width - windowWidth) / 2) - 70 + step,
+                y: top + trunc((height - windowHeight) / 3) + step,
+                width: windowWidth,
+                height: windowHeight
+            }
+        }
+        // Every window enters the stage centred on it (Stage.kira).
+        Stage -> stageGeometry(server, index)
+        Exclusive -> Geometry { x: 0, y: top, width: width, height: height }
+    }
+}
+
+// The applications shown, in the order they were admitted.
+function shownApplications(server: borrow Server) -> [Number] {
+    var shown: [Number] = []
+    for index in 0..server.clients.count {
+        let client = server.clients[index]
+        if client.alive && client.role == .Application && !client.hidden { shown.append(index) }
+    }
+    return shown
+}
+
+// What is shown changed: in `Stack`, where a place follows from what else is
+// shown, every surface is laid out again. Freeform windows stay where they
+// were put.
+function relayoutStack(server: borrow mut Server) {
+    if server.mode == .Stack { relayoutAll(server) }
+}
+
+// How many applications admitted before the client at `index` are still
+// open, which is how far down the cascade of new windows it starts: a window
+// opened after the others closed starts at the top again, as on a Mac.
+function applicationsBefore(server: borrow Server, index: Number) -> Number {
+    var count = 0
+    for before in 0..min(index, server.clients.count) {
+        let client = server.clients[before]
+        if client.alive && client.role == .Application { count += 1 }
+    }
+    return count
+}
+
+// How far in from the top and the bottom of a surface the platform draws over
+// it.
+struct SurfaceInsets {
+    var top: Number = 0
+    var bottom: Number = 0
+}
+
+// The insets the client at `index` is told (roadmap/08-display-server.md,
+// `insets`): in `Stack` and `Exclusive` an application fills the screen under
+// the bar and the dock's band, and keeps clear of both. A freeform window is
+// placed clear of them, and the platform and the desktop draw the bands or lie
+// under them on purpose.
+function insetsFor(server: borrow Server, index: Number) -> SurfaceInsets {
+    if server.clients[index].role != .Application || windowed(server.mode) {
+        return SurfaceInsets {}
+    }
+    return SurfaceInsets { top: server.bar, bottom: server.dock }
+}
+
+// Tells every application whose insets changed what they are now.
+function tellInsets(server: borrow mut Server) {
+    for index in 0..server.clients.count {
+        if server.clients[index].alive { tellInsetsTo(server, index) }
+    }
+}
+
+// Tells the client at `index` its insets, if they changed since it was last
+// told; a client never told any has none.
+function tellInsetsTo(server: borrow mut Server, index: Number) {
+    let insets = insetsFor(server, index)
+    let client = server.clients[index]
+    if insets.top == client.insets.top && insets.bottom == client.insets.bottom { return }
+    server.clients[index].insets = copy insets
+    tell(
+        client.channel,
+        .Insets(
+            DisplayInsets {
+                surface: client.surface,
+                top: UNumber(insets.top),
+                bottom: UNumber(insets.bottom),
+            }
+        )
+    )
+    log info(
+        "told a surface where the platform draws over it",
+        surface: client.surface.raw,
+        top: insets.top,
+        bottom: insets.bottom
+    )
+}
+
+// Puts the client at `index` where the person or the platform placed it -- a
+// move, a resize, a zoom. While windows are freeform an application window
+// keeps that frame from then on, so laying the windows out again, as a dock
+// that grows or shrinks does, leaves it where it is. A window nobody has placed
+// yet follows the room windows have, as one a Mac opens before its menu bar
+// is up is still opened clear of it.
+function placeFrame(server: borrow mut Server, index: Number, frame: borrow Geometry) {
+    server.clients[index].frame = copy frame
+    if server.mode == .Freeform && server.clients[index].role == .Application {
+        server.clients[index].windowFrame = .Some(copy frame)
+    }
+    if server.mode == .Stage && server.clients[index].role == .Application {
+        server.clients[index].stageFrame = .Some(copy frame)
+    }
+}

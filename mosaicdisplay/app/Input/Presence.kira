@@ -1,0 +1,122 @@
+import Foundation
+import LibTessera
+import TesseraDisplayClient
+
+// The Presence link (roadmap/16 §14.1): the one link PID 1 gives the Presence
+// service, on which it asks whether an interaction token may be acted on. The
+// token was minted for a hardware event (Tokens.kira). A check is valid when
+// the token is one MosaicDisplay minted, for the surface named, unspent,
+// unexpired, and on the surface that is front-facing now. A valid check spends
+// the token. The link is no client: it has no surface and draws nothing.
+
+// The link for the Presence service among the links handed at boot.
+function presenceLink(links: borrow [ClientLink]) -> Handle? {
+    for link in links {
+        if link.role == .Presence { return .Some(link.channel) }
+    }
+    return .None
+}
+
+// The links that carry a client: every link but the Presence one.
+function clientLinks(links: borrow [ClientLink]) -> [ClientLink] {
+    var clients: [ClientLink] = []
+    for link in links {
+        if link.role != .Presence { clients.append(copy link) }
+    }
+    return clients
+}
+
+// The Presence service's link arrived after boot. It replaces an earlier one.
+function adoptPresence(server: borrow mut Server, channel: Handle) {
+    if server.presence.isSome() { dropPresence(server) }
+    server.presence = .Some(channel)
+    listenPresence(server)
+}
+
+// Forgets the Presence link and closes it.
+function dropPresence(server: borrow mut Server) {
+    match server.presence {
+        Some(channel) -> closeHandles([channel])
+        None -> {}
+    }
+    server.presence = .None
+}
+
+// Asks the port to wake the loop when the Presence link has a check or has
+// gone. A missing link has nothing to arm.
+function armPresence(server: borrow Server) -> Result<Void, TesseraError> {
+    let link = match server.presence {
+        Some(channel) -> channel
+        None -> return .Ok
+    }
+    return objectWaitAsync(
+        link,
+        Signals.readable | Signals.peerClosed,
+        .Once,
+        server.port,
+        UNumber(PortKey.presence)
+    )
+}
+
+function presenceFailed(server: borrow mut Server, reason: borrow TesseraError) {
+    log warn("the presence link ended", error: errorName(reason))
+    dropPresence(server)
+}
+
+function listenPresence(server: borrow mut Server) {
+    match armPresence(server) {
+        Ok -> {}
+        Error(reason) -> presenceFailed(server, reason)
+    }
+}
+
+// The Presence service asked for a token check: answers it, then listens
+// again. A link that cannot be read or answered is dropped.
+function servePresence(server: borrow mut Server) {
+    match answerPresence(server) {
+        Ok -> {}
+        Error(reason) -> presenceFailed(server, reason)
+    }
+}
+
+function answerPresence(server: borrow mut Server) -> Result<Void, TesseraError> {
+    let link = match server.presence {
+        Some(channel) -> channel
+        None -> return .Ok
+    }
+    let check = try receiveTokenCheck(link)
+    let verdict = try checkToken(server, check.token)
+    let answer = tokenAnswer(verdict, check.token)
+    try sendTokenCheck(link, answer)
+    return armPresence(server)
+}
+
+// The verdict on `id`. A valid token is spent by the check.
+function checkToken(
+    server: borrow mut Server,
+    id: borrow InteractionToken
+) -> Result<TokenVerdict, TesseraError> {
+    var found: Number? = .None
+    for (index, minted) in server.tokens.enumerated() {
+        if minted.id.idLow == id.idLow && minted.id.idHigh == id.idHigh { found = .Some(index) }
+    }
+    let index = match found {
+        Some(value) -> value
+        None -> return .Ok(.Unknown)
+    }
+    let minted = server.tokens[index]
+    if minted.surface.raw != id.surfaceId { return .Ok(.WrongSurface) }
+    if minted.spent { return .Ok(.Spent) }
+    let now = try nowMillis()
+    if now >= minted.issued + InteractionTokens.lifetime { return .Ok(.Expired) }
+    let front = match server.focus {
+        Some(
+            focused
+        ) -> server.clients[focused].alive && server.clients[focused].surface.raw == minted.surface.raw
+        None -> false
+    }
+    if !front { return .Ok(.NotFrontmost) }
+    server.tokens[index].spent = true
+    log info("an interaction token was verified", surface: minted.surface.raw)
+    return .Ok(.Valid)
+}

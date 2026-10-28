@@ -1,0 +1,127 @@
+import Foundation
+import LibTessera
+import TesseraDisplayClient
+
+// Key repeat (roadmap/06-devices-and-input.md, "Repeat"). The kernel's own
+// repeats are dropped as they are read; a key held down repeats from the
+// server's timer instead, at Tessera's delay and rate, to the client its
+// press went to. It stops when the key comes up or another key that repeats
+// goes down, and when where keys go changes: focus moving, or the platform
+// taking the input or giving it back. A modifier held does not repeat, and
+// one pressed while a key repeats changes what the repeats type, as on a Mac.
+
+namespace KeyRepeat {
+    // A key held half a second starts repeating, and repeats thirty times a
+    // second, in milliseconds.
+    let delay: Number = 500
+    let interval: Number = 33
+    let nanosecondsPerMillisecond: Number = 1000000
+}
+
+// A key repeating: its usage, and the client its press went to.
+struct RepeatingKey {
+    var key: UNumber
+    var target: Number?
+}
+
+// The timer keys repeat from. None when the system will not give one, which
+// is said; keys then do not repeat.
+function makeRepeatTimer() -> Handle? {
+    return match timerCreate(.Monotonic) {
+        Ok(timer) -> .Some(timer)
+        Error(failed) -> unavailableRepeatTimer(failed)
+    }
+}
+
+function unavailableRepeatTimer(reason: borrow TesseraError) -> Handle? {
+    log warn("keys cannot repeat without a timer", error: errorName(reason))
+    return .None
+}
+
+// Starts or stops a repeat for `key`, just delivered.
+function followRepeat(server: borrow mut Server, key: borrow PendingKey) {
+    match key.state {
+        Pressed -> {
+            if isModifierKey(key.code) || arrayContains(server.grabbed, key.code) { return }
+            server.repeating = .Some(RepeatingKey { key: key.code, target: keyTarget(server) })
+            armRepeat(server, KeyRepeat.delay)
+        }
+        Released -> match server.repeating {
+            Some(repeating) -> if repeating.key == key.code { stopRepeat(server) }
+            None -> {}
+        }
+        Repeated -> {}
+    }
+}
+
+// Arms the timer `after` milliseconds from now. A timer armed again replaces
+// its last arming, which ends cancelled.
+function armRepeat(server: borrow mut Server, after: Number) {
+    let timer = try server.repeatTimer otherwise return
+    let armed = match monotonic() {
+        Ok(now) -> timerSet(
+            timer,
+            UNumber(now + after * KeyRepeat.nanosecondsPerMillisecond),
+            0,
+            TimerOptions.none,
+            server.port,
+            PortKey.repeat
+        )
+        Error(failed) -> .Error(failed)
+    }
+    match armed {
+        Ok -> {}
+        Error(reason) -> repeatArmFailed(server, reason)
+    }
+}
+
+function repeatArmFailed(server: borrow mut Server, reason: borrow TesseraError) {
+    log warn("a key could not be set to repeat", error: errorName(reason))
+    server.repeating = .None
+}
+
+// Stops the key repeating. The timer's cancelled arming still completes, and
+// is ignored.
+function stopRepeat(server: borrow mut Server) {
+    server.repeating = .None
+    match server.repeatTimer {
+        Some(timer) -> match timerCancel(timer) {
+            Ok -> {}
+            Error(failed) -> log warn("a key repeat could not be stopped", error: errorName(failed))
+        }
+        None -> {}
+    }
+}
+
+// The timer fired: the key repeats once more, while keys still go where its
+// press went. A cancelled arming does nothing.
+function repeatFired(server: borrow mut Server, fired: borrow Completion) {
+    if fired.error.code != .Ok { return }
+    let repeating = try server.repeating otherwise return
+    if keyTarget(server) != repeating.target {
+        stopRepeat(server)
+        return
+    }
+    let time = match nowMillis() {
+        Ok(value) -> value
+        Error(reason) -> {
+            repeatClockFailed(server, reason)
+            return
+        }
+    }
+    deliverKey(server, PendingKey { code: repeating.key, state: .Repeated, time: time })
+    armRepeat(server, KeyRepeat.interval)
+}
+
+// The monotonic clock in milliseconds, as key and pointer events carry time.
+function nowMillis() -> Result<UNumber, TesseraError> {
+    return match monotonic() {
+        Ok(now) -> .Ok(UNumber(trunc(now / KeyRepeat.nanosecondsPerMillisecond)))
+        Error(reason) -> .Error(reason)
+    }
+}
+
+function repeatClockFailed(server: borrow mut Server, reason: borrow TesseraError) {
+    log warn("the clock could not be read for a key", error: errorName(reason))
+    stopRepeat(server)
+}

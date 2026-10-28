@@ -1,0 +1,218 @@
+import Foundation
+import KCoreAnimation
+import KiraUI
+import TesseraDisplayClient
+
+// Glass a client asked for under its surface (roadmap/08-display-server.md,
+// "Surfaces"). What is behind a surface is other clients' pixels, so the
+// server draws the glass: the toolkit's glass of the recipe the client named,
+// with the batch the surfaces are composed with, refracting everything drawn
+// into it before.
+
+// The surface's state a commit makes take effect (roadmap/08-display-server.md,
+// "Surfaces"): what a client sets is staged until its next commit, so its
+// glass and its margin change with the picture drawn for them and never a
+// frame before it.
+struct StagedSurface {
+    var margin: Number = 0
+    var corner: Number = 0
+    var glass: [DisplayGlass] = []
+    var badges: [DisplayStageBadge] = []
+}
+
+// Gives the client at `index` the margin and the glass it staged, as the
+// frame it committed is shown.
+function applyStaged(server: borrow mut Server, index: Number) {
+    let staged = server.clients[index].staged
+    server.clients[index].margin = staged.margin
+    server.clients[index].corner = staged.corner
+    server.clients[index].glass = copy staged.glass
+    server.clients[index].badges = copy staged.badges
+}
+
+// Keeps, replaces or takes away one of the client's pieces of glass, from its
+// next commit.
+function setGlass(server: borrow mut Server, index: Number, asked: borrow DisplayGlass) {
+    let client = server.clients[index]
+    if asked.surface != client.surface {
+        log warn("a client asked for glass on a surface not its own", surface: asked.surface.raw)
+        return
+    }
+    // Kept in the order of their numbers, which is the order they are drawn
+    // in: a window's backdrop, piece 0, under the glass over it.
+    var kept: [DisplayGlass] = []
+    let shown = asked.width > 0 && asked.height > 0
+    var placed = !shown
+    for piece in client.staged.glass {
+        if !placed && piece.piece > asked.piece {
+            kept.append(copy asked)
+            placed = true
+        }
+        if piece.piece != asked.piece { kept.append(copy piece) }
+    }
+    if !placed { kept.append(copy asked) }
+    server.clients[index].staged.glass = move kept
+    log info(
+        "a surface's glass changed",
+        surface: asked.surface.raw,
+        piece: asked.piece,
+        width: asked.width,
+        height: asked.height,
+        shown: shown
+    )
+}
+
+// Draws `client`'s glass, before its buffer, which is drawn over `frame`
+// from a buffer `points` wide and tall. The glass is cut to `clip`, the
+// window with its corners, as its buffer is: a sidebar's glass runs past the
+// window's edges and is never seen there.
+function drawClientGlass(
+    composer: borrow Composer,
+    client: borrow Client,
+    frame: borrow Geometry,
+    pointWidth: Number,
+    pointHeight: Number,
+    clip: borrow GlassWindowClip
+) {
+    if pointWidth <= 0 || pointHeight <= 0 { return }
+    let scaleX = frame.width / pointWidth
+    let scaleY = frame.height / pointHeight
+    for piece in client.glass {
+        drawGlassPiece(composer, piece, frame, scaleX, scaleY, clip)
+    }
+}
+
+// The window a client's glass is cut to, and the radius of its corners.
+struct GlassWindowClip {
+    var window: Geometry
+    var radius: Number = 0
+}
+
+function drawGlassPiece(
+    composer: borrow Composer,
+    piece: borrow DisplayGlass,
+    frame: borrow Geometry,
+    scaleX: Number,
+    scaleY: Number,
+    clip: borrow GlassWindowClip
+) {
+    let x = frame.x + piece.x * scaleX
+    let y = frame.y + piece.y * scaleY
+    let width = piece.width * scaleX
+    let height = piece.height * scaleY
+    let corner = piece.corner * min(scaleX, scaleY)
+    let shape: ContainerShape = match piece.shape {
+        Arc -> .RoundedRect(corner)
+        Continuous -> .Squircle(corner)
+        Capsule -> .Capsule
+    }
+    let radius = piece.shape == .Capsule ? min(width, height) * 0.5 : corner
+    let interface: InterfaceMode = match piece.interface {
+        Touch -> .AdaptiveMobile
+        Desktop -> .AdaptiveDesktop
+    }
+    // A window's backdrop is a Mac's sidebar material, not Liquid Glass.
+    let glass = piece.recipe == .WindowBackdrop ? windowBackdropGlass(
+        piece.dark ? .Dark : .Light,
+        piece.active
+    ) : systemLiquidGlass(move shape, recipeGlass(piece.recipe), interface)
+    let tint = RGBAColor { r: glass.tint.r, g: glass.tint.g, b: glass.tint.b, a: glass.tint.a }
+    composer.batch.beginGlassCapture(composer.device.graphics(), x, y, width, height, false)
+    match glass.style {
+        Some(asked) -> {
+            // In the client's appearance, not this process's: the display
+            // server follows no scheme, and the toolkit's own default is dark.
+            var style = copy asked
+            style.dark = piece.dark
+            // No touch light and no second shape; cut to the window.
+            composer.batch.pushRecipeGlass(
+                x,
+                y,
+                width,
+                height,
+                GlassRecipeSurface {
+                    style: style,
+                    radius: radius,
+                    shapeKind: Number(glass.shapeKind),
+                    tint: copy tint
+                },
+                GlassRecipeClip {
+                    minX: clip.window.x,
+                    minY: clip.window.y,
+                    maxX: clip.window.x + clip.window.width,
+                    maxY: clip.window.y + clip.window.height,
+                    radius: clip.radius,
+                    shapeKind: WindowShape.continuous
+                }
+            )
+            return
+        }
+        None -> {}
+    }
+    composer.batch.pushGlass(
+        x,
+        y,
+        width,
+        height,
+        radius,
+        tint,
+        glass.blurAt(width, height),
+        glass.edgeRefraction,
+        clip.window.x,
+        clip.window.y,
+        clip.window.x + clip.window.width,
+        clip.window.y + clip.window.height,
+        glass.materialAt(width, height),
+        // No touch light and no second shape; upright, whole, and cut to the
+        // window.
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        Number(glass.shapeKind),
+        1.0,
+        0.0,
+        1.0,
+        clip.radius,
+        WindowShape.continuous
+    )
+}
+
+// The toolkit's glass a piece on the wire is made of.
+function recipeGlass(recipe: DisplayGlassRecipe) -> Glass {
+    return match recipe {
+        Regular -> .Regular
+        Clear -> .Clear
+        Dock -> .Platform(.Dock)
+        ControlCenter -> .Platform(.ControlCenter)
+        NotificationCenter -> .Platform(.NotificationCenter)
+        AbuttedSidebar -> .Platform(.AbuttedSidebar)
+        AppIcons -> .Platform(.AppIcons)
+        AVPlayer -> .Platform(.AVPlayer)
+        Bubbles -> .Platform(.Bubbles)
+        Camera -> .Platform(.Camera)
+        CarPlayUltra -> .Platform(.CarPlayUltra)
+        CartouchePopover -> .Platform(.CartouchePopover)
+        Control -> .Platform(.Control)
+        FaceTime -> .Platform(.FaceTime)
+        Identity -> .Platform(.Identity)
+        Inspector -> .Platform(.Inspector)
+        Keyboard -> .Platform(.Keyboard)
+        Loupe -> .Platform(.Loupe)
+        Menu -> .Platform(.Menu)
+        Monogram -> .Platform(.Monogram)
+        Sidebar -> .Platform(.Sidebar)
+        Siri -> .Platform(.Siri)
+        SiriSnippet -> .Platform(.SiriSnippet)
+        Slider -> .Platform(.Slider)
+        Text -> .Platform(.Text)
+        Widgets -> .Platform(.Widgets)
+        WindowBackdrop -> .Regular
+        DockRegular -> .Platform(.DockRegular)
+    }
+}

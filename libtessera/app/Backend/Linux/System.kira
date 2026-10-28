@@ -1,0 +1,315 @@
+import Foundation
+import Heap
+
+// What the system is, and where diagnostics go, on Linux (§19, §20).
+//
+// `System.info` is gathered from `uname`, `sysinfo`, the auxiliary vector,
+// `/sys/devices/system/cpu` and DMI. Until the system logger exists, log
+// lines go to the kernel's ring buffer through `/dev/kmsg` (standard error
+// when it cannot be opened); trace events go to the kernel tracer through
+// `trace_marker`.
+
+// A field of `uname`.
+function unameField(field: UnameField) -> Result<String, TesseraError> {
+    let blockBytes = zeroedBlock(count: 390, alignment: 16)
+    let block = blockBytes.pointer()
+    let answer = uname(block)
+    if answerFailed(answer) { return .Error(errnoFailure(answerErrno(answer))) }
+    return .Ok(stringFromCBytes(heapOffset(block, code(field)), 65))
+}
+
+// `BackendInfo.kind`.
+let kernelBackendKind: BackendKind = BackendKind.Linux
+
+// The kernel's release as major, minor, patch.
+function kernelBackendVersion() -> Result<[U32], TesseraError> {
+    let release = try unameField(.Release)
+    let numbers = release.split(".")
+    var version: [U32] = []
+    for index in 0..3 {
+        if index < numbers.count { version.append(U32(parseUnsigned(numbers[index]))) } else {
+            version.append(U32(0))
+        }
+    }
+    return .Ok(version)
+}
+
+// The text naming this kernel build, for `VersionInfo.buildId`.
+function kernelBuildText() -> Result<String, TesseraError> { return unameField(.Version) }
+
+// `MachineInfo.arch`.
+function kernelArchitecture() -> Architecture { return isArm() ? .Arm64 : .X64 }
+
+// The CPUs in a sysfs list such as `0-3,6`.
+function cpuListCount(text: borrow String) -> U32 {
+    if text.count == 0 { return U32(1) }
+    var count = U32(0)
+    let ranges = text.trim().split(",")
+    for index in 0..ranges.count {
+        if ranges[index].contains("-") {
+            let ends = ranges[index].split("-")
+            count += U32(parseUnsigned(ends[1]) - parseUnsigned(ends[0]) + U64(1))
+        } else if ranges[index].count > 0 {
+            count += U32(1)
+        }
+    }
+    return count
+}
+
+function kernelCpuCount() -> Result<U32, TesseraError> {
+    let online = try readSmallFile(AtDirectory.current, "/sys/devices/system/cpu/online")
+    return .Ok(cpuListCount(online))
+}
+
+// CPUs at the highest `cpu_capacity`; all of them when it is not reported.
+function kernelPerformanceCpus(total: U32) -> Result<U32, TesseraError> {
+    var best = U64(0)
+    var count = U32(0)
+    for cpu in 0..total {
+        let path = "/sys/devices/system/cpu/cpu" + stringFromUnsigned(U64(cpu)) + "/cpu_capacity"
+        let reported = try readSmallFileIfPresent(AtDirectory.current, path)
+        let capacity = match reported {
+            Some(text) -> parseUnsigned(text.trim())
+            None -> U64(0)
+        }
+        if capacity > best {
+            best = capacity
+            count = U32(1)
+        } else if capacity == best && capacity > U64(0) {
+            count += U32(1)
+        }
+    }
+    return .Ok(best == U64(0) ? total : count)
+}
+
+// `sysinfo`: `totalram` at 32, `mem_unit` at 104.
+function kernelMemoryTotal() -> Result<U64, TesseraError> {
+    let systemBytes = zeroedBlock(count: 128, alignment: 16)
+    let system = systemBytes.pointer()
+    try answerStatus(sysinfo(system))
+    var unit = U64(heapLoad<U32>(system, 104))
+    if unit == U64(0) { unit = U64(1) }
+    return .Ok(heapLoad<U64>(system, 32) * unit)
+}
+
+function kernelCacheLine() -> Result<U32, TesseraError> {
+    let path = "/sys/devices/system/cpu/cpu0/cache/index0/coherency_line_size"
+    let reported = try readSmallFileIfPresent(AtDirectory.current, path)
+    // A machine that does not report it has the common 64-byte line.
+    let line = match reported {
+        Some(text) -> parseUnsigned(text.trim())
+        None -> U64(64)
+    }
+    return .Ok(U32(line))
+}
+
+// The architecture's feature bits: `AT_HWCAP` low, `AT_HWCAP2` high.
+function kernelCpuFeatures() -> Result<U64, TesseraError> {
+    let low = try auxiliaryValue(.HardwareCaps)
+    let high = try auxiliaryValue(.HardwareCaps2)
+    var features = U64(0)
+    match low {
+        Some(bits) -> features = bits
+        None -> {}
+    }
+    match high {
+        Some(bits) -> features = features | (bits << U64(32))
+        None -> {}
+    }
+    return .Ok(features)
+}
+
+// The machine's model name, from the device tree or DMI.
+function kernelModelName() -> Result<String, TesseraError> {
+    let tree = try readSmallFileIfPresent(AtDirectory.current, "/proc/device-tree/model")
+    match tree {
+        Some(model) -> return .Ok(model)
+        None -> {}
+    }
+    let product = try readSmallFileIfPresent(AtDirectory.current, "/sys/class/dmi/id/product_name")
+    return match product {
+        Some(model) -> .Ok(model.trim())
+        None -> .Ok("")
+    }
+}
+
+// The SMBIOS chassis type, on a machine that has SMBIOS.
+// The SMBIOS chassis types the device class is told from; the
+// specification defines many more, which keep their code.
+@Open enum Chassis: U32 {
+    Portable = 8
+    Laptop = 9
+    Notebook = 10
+    SubNotebook = 14
+    Tablet = 30
+    Convertible = 31
+    Detachable = 32
+}
+
+// The machine's SMBIOS chassis type; none on a machine without DMI.
+function kernelChassisType() -> Result<Chassis?, TesseraError> {
+    let reported = try readSmallFileIfPresent(AtDirectory.current, "/sys/class/dmi/id/chassis_type")
+    return match reported {
+        Some(text) -> .Ok(.Some(fromCode<Chassis>(parseUnsigned(text.trim()))))
+        None -> .Ok(.None)
+    }
+}
+
+// The words the kernel was booted with; none where it does not say.
+function kernelBootWords() -> Result<[String], TesseraError> {
+    let line = try readSmallFileIfPresent(AtDirectory.current, "/proc/cmdline")
+    var words: [String] = []
+    match line {
+        Some(text) -> {
+            for word in text.trim().split(" ") {
+                if word.count > 0 { words.append(copy word) }
+            }
+        }
+        None -> {}
+    }
+    return .Ok(words)
+}
+
+// The argument vector the kernel started this process with, its own name
+// first.
+function kernelProcessArguments() -> Result<[String], TesseraError> {
+    return readSmallStrings(AtDirectory.current, "/proc/self/cmdline")
+}
+
+function kernelThreadLimit() -> Result<U32, TesseraError> {
+    let limit = try readSmallFile(AtDirectory.current, "/proc/sys/kernel/threads-max")
+    return .Ok(U32(parseUnsigned(limit.trim())))
+}
+
+// The bytes of address space a process has.
+function kernelAddressSpaceBytes() -> U64 {
+    return isArm() ? (U64(1) << U64(48)) : (U64(1) << U64(47))
+}
+
+// Fills `length` bytes at `target` from the kernel's generator.
+function kernelRandomFill(target: RawPtr, length: U64) -> Result<Void, TesseraError> {
+    var done = U64(0)
+    while done < length {
+        let got = getrandom(heapOffset(target, done), length - done, U32(0))
+        if answerFailed(got) {
+            if answerErrno(got) != code(Errno.Interrupted) {
+                return .Error(errnoFailure(answerErrno(got)))
+            }
+        } else {
+            done += U64(got)
+        }
+    }
+    return .Ok
+}
+
+// The name the kernel knows the process by.
+function kernelProgramName() -> Result<String, TesseraError> {
+    let name = try readSmallFile(AtDirectory.current, "/proc/self/comm")
+    return .Ok(name.trim())
+}
+
+function writeText(fd: Number, text: borrow String) -> Result<Void, TesseraError> {
+    let bytesBytes = bytesOfText(text)
+    let wrote = write(fd, bytesBytes.pointer(), U64(text.count))
+    return answerStatus(wrote)
+}
+
+// The `syslog` priority of `level`.
+function logPriority(level: borrow LogLevel) -> Number {
+    match level {
+        Trace, Debug -> return 7
+        Info -> return 6
+        Notice -> return 5
+        Warning -> return 4
+        Error -> return 3
+        Fault -> return 2
+    }
+}
+
+// A kernel file the backend opens for writing when first needed.
+enum LazyDescriptor {
+    Unopened
+    // The kernel would not open it; it is not asked again.
+    Unavailable
+    Open(Number)
+}
+
+// `path` opened for writing, or `Unavailable`.
+function lazyOpen(path: borrow String) -> LazyDescriptor {
+    let fd = openat(
+        AtDirectory.current,
+        cStringFrom(path),
+        LinuxOpen.writeOnly | LinuxOpen.closeOnExec,
+        0
+    )
+    // Not there or not this process's to write: the caller has another way.
+    if answerFailed(fd) { return .Unavailable }
+    return .Open(fd)
+}
+
+// One log line at `level` to the kernel's ring buffer, or to standard error
+// when it cannot take it.
+function kernelLogWrite(level: borrow LogLevel, line: borrow String) -> Result<Void, TesseraError> {
+    match library.logDescriptor {
+        Unopened -> library.logDescriptor = lazyOpen("/dev/kmsg")
+        Unavailable, Open -> {}
+    }
+    match library.logDescriptor {
+        Open(fd) -> match writeText(fd, "<\(logPriority(level))>" + line) {
+            Ok -> return .Ok
+            // The ring buffer would not take the line; standard error is next.
+            Error(failed) -> absorb failed
+        }
+        Unopened, Unavailable -> {}
+    }
+    return writeText(Number(code(StandardStream.Error)), line)
+}
+
+// Opens the kernel tracer for writing; whether it could be.
+function kernelTraceOpen() -> Bool {
+    match library.traceDescriptor {
+        Unopened -> library.traceDescriptor = lazyOpen("/sys/kernel/tracing/trace_marker")
+        Unavailable, Open -> {}
+    }
+    return match library.traceDescriptor {
+        Open -> true
+        Unopened, Unavailable -> false
+    }
+}
+
+// Whether the kernel tracer is recording.
+function kernelTraceRecording() -> Result<Bool, TesseraError> {
+    let state = try readSmallFileIfPresent(AtDirectory.current, "/sys/kernel/tracing/tracing_on")
+    return match state {
+        Some(text) -> .Ok(text.trim() == "1")
+        None -> .Ok(false)
+    }
+}
+
+// One trace line, in the systrace format, to the open tracer.
+function kernelTraceWrite(line: borrow String) {
+    let fd = match library.traceDescriptor {
+        Open(value) -> value
+        Unopened, Unavailable -> return
+    }
+    // A line the tracer will not take is lost, as systrace loses it; tracing
+    // never fails the call it traces.
+    match writeText(fd, line) {
+        Ok -> {}
+        Error(failed) -> absorb failed
+    }
+}
+
+function kernelDebuggerAttached() -> Result<Bool, TesseraError> {
+    let tracer = try procStatusField(U64(getpid()), "TracerPid:")
+    return .Ok(tracer != U64(0))
+}
+
+// `SIGTRAP` to the calling thread, which cannot be refused: a breakpoint
+// has no caller to answer.
+function kernelBreakpoint() {
+    match answerStatus(tgkill(getpid(), gettid(), Signal.trap)) {
+        Ok -> {}
+        Error(failed) -> absorb failed
+    }
+}

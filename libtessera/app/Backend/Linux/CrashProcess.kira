@@ -1,0 +1,445 @@
+import Foundation
+import Heap
+
+// What /proc says of a process the kernel is dumping, and its threads'
+// frames: each a frame record (the caller's frame pointer, then the return
+// address) chained from the thread's frame pointer through the stacks the
+// core held.
+
+namespace CrashWalk {
+    let frameLimit: Number = 256
+    // User addresses fit in 48 bits; above them a return address carries a
+    // pointer authentication code.
+    let addressMask: U64 = U64(0x0000FFFFFFFFFFFF)
+    // USER_HZ, what /proc counts a process's start time in.
+    let ticksPerSecond: Number = 100
+}
+
+namespace CrashTrap {
+    // `SI_QUEUE`: a signal sent with a value.
+    let queued: Number = -1
+}
+
+// A process the kernel starts to take a core has no standard streams; the
+// first files it opened would take their numbers and its output would go
+// into them. Standard output and error go to the kernel's log.
+function kernelCrashStreams() {
+    for stream in [1, 2] {
+        if !answerFailed(fcntl(stream, Fcntl.getFlags, RawPtr(0))) { continue }
+        let fd = openat(AtDirectory.current, cStringFrom("/dev/kmsg"), LinuxOpen.writeOnly, 0)
+        if answerFailed(fd) { return }
+        if fd != stream {
+            dup3(fd, stream, 0)
+            closeBacking(fd)
+        }
+    }
+}
+
+// Says which trap it was, unblocks SIGTRAP and sends it to this thread with
+// the trap's number as the signal's value, which the core's signal note
+// keeps. PID 1 is not ended by a signal it sends itself, and goes on to exit.
+function kernelCrashOnTrap(code: Number) {
+    match writeText(2, "runtime trap KLF-RT-\(zeroPadded(code, 4))\n") {
+        Ok -> {}
+        // The report says what the core says either way.
+        Error(failed) -> absorb failed
+    }
+    let maskBytes = zeroedBlock(count: 8, alignment: 8)
+    heapStore<U64>(maskBytes.pointer(), 0, U64(1) << U64(Signal.trap - 1))
+    sigprocmask(SignalMaskHow.unblock, maskBytes.pointer(), nullPointer(), U64(8))
+    // `siginfo_t` as `rt_sigqueueinfo` takes it: the signal, `SI_QUEUE`, the
+    // sender and its user, then the value.
+    let info = zeroedBlock(count: 128, alignment: 8)
+    heapStore<I32>(info.pointer(), 0, I32(Signal.trap))
+    heapStore<I32>(info.pointer(), 8, I32(CrashTrap.queued))
+    heapStore<I32>(info.pointer(), 16, I32(getpid()))
+    heapStore<I32>(info.pointer(), 24, I32(code))
+    let sent = wideAnswer(
+        tgsigqueueinfo(U64(getpid()), U64(gettid()), U64(Signal.trap), info.pointer())
+    )
+    if answerFailed(sent) {
+        tgkill(getpid(), gettid(), Signal.trap)
+    }
+}
+
+// /proc is read first: once the core is read and its pipe closed, the kernel
+// no longer lends the dying process's memory to /proc, which its mappings
+// and arguments are read from. Each image's file is opened then, for its
+// symbols once the frames are known.
+function kernelCrashCapture(pid: Number) -> Result<CrashCapture, TesseraError> {
+    var capture = CrashCapture { pid: pid }
+    let directory = "/proc/" + stringFromUnsigned(U64(pid))
+    try readCrashedProcess(capture, directory)
+    try readMappings(capture, directory)
+    capture.files = try crashFiles(directory)
+    let names = try threadNames(directory)
+    var opened: Map<String, Number> = Map {}
+    for image in capture.images {
+        if !image.executable { continue }
+        match openSymbols(directory, image.path) {
+            Some(fd) -> opened.set(copy image.path, fd)
+            None -> {}
+        }
+    }
+    let processName = copy capture.name
+    let stacks = readCore(capture, directory)
+    if capture.pid != pid {
+        capture.problems.append("the core is of process \(capture.pid), not \(pid)")
+        capture.pid = pid
+    }
+    // The core's name is cut to 15 bytes; /proc's is the same name.
+    if !processName.isEmpty() { capture.name = processName }
+    var tables: Map<String, CrashSymbols> = Map {}
+    for index in 0..capture.threads.count {
+        capture.threads[index].name = match names.value(capture.threads[index].id) {
+            Some(value) -> value
+            None -> ""
+        }
+        capture.threads[index].frames = threadFrames(
+            capture.architecture,
+            capture.threads[index].registers,
+            stacks,
+            capture.images
+        )
+        capture.threads[index].symbols = frameSymbols(
+            capture.threads[index].frames,
+            capture.images,
+            opened,
+            tables
+        )
+    }
+    for image in capture.images {
+        match opened.value(image.path) {
+            Some(fd) -> {
+                closeBacking(fd)
+                opened.remove(image.path)
+            }
+            None -> {}
+        }
+    }
+    return .Ok(move capture)
+}
+
+// Each thread's name, by its id.
+function threadNames(directory: borrow String) -> Result<Map<Number, String>, TesseraError> {
+    var names: Map<Number, String> = Map {}
+    let listing = try listPath(directory + "/task")
+    for entry in listing {
+        match entry.name.toNumber() {
+            Some(id) -> names.set(id, try readSmallFile(
+                AtDirectory.current,
+                "\(directory)/task/\(entry.name)/comm"
+            ))
+            None -> {}
+        }
+    }
+    return .Ok(names)
+}
+
+// The name of a running process, as /proc gives it; none when there is none.
+function kernelProcessName(pid: Number) -> Result<String?, TesseraError> {
+    if pid <= 0 { return .Ok(.None) }
+    let text = try readSmallFile(AtDirectory.current, "/proc/\(stringFromUnsigned(U64(pid)))/comm")
+    return .Ok(.Some(text))
+}
+
+function readCrashedProcess(
+    capture: borrow mut CrashCapture,
+    directory: borrow String
+) -> Result<Void, TesseraError> {
+    let linkBytes = zeroedBlock(count: 4097, alignment: 16)
+    let got = readlinkat(
+        AtDirectory.current,
+        cStringFrom(directory + "/exe"),
+        linkBytes.pointer(),
+        U64(4096)
+    )
+    if answerFailed(got) {
+        capture.problems.append(
+            "the process's program could not be read: errno \(answerErrno(got))"
+        )
+    } else {
+        capture.path = stringFromCBytes(linkBytes.pointer(), got)
+    }
+    capture.arguments = try readSmallStrings(AtDirectory.current, directory + "/cmdline")
+    if capture.name.isEmpty() {
+        capture.name = try readSmallFile(AtDirectory.current, directory + "/comm")
+    }
+    capture.status = try kernelReadText(directory + "/status")
+    let stat = try kernelReadText(directory + "/stat")
+    match stat.lastIndexOf(")") {
+        // Field 22, the start time, is the 20th after the name.
+        Some(closing) -> {
+            let fields = stat.substring(closing + 2, stat.count).split(" ")
+            if fields.count > 1 {
+                capture.parentPid = Number(decimalPrefix(fields[1]))
+                capture.parentName = try kernelProcessName(capture.parentPid)
+            }
+            if fields.count > 19 {
+                capture.startedAfterBoot = trunc(
+                    Number(decimalPrefix(fields[19])) / CrashWalk.ticksPerSecond
+                )
+            }
+        }
+        None -> {}
+    }
+    capture.uptime = Number(decimalPrefix(try kernelReadText("/proc/uptime")))
+    return .Ok
+}
+
+// The digits `text` starts with, as a number.
+function decimalPrefix(text: borrow String) -> U64 {
+    var value = U64(0)
+    for index in 0..text.count {
+        let byte = text.charAt(index)
+        if byte < 48 || byte > 57 { return value }
+        value = value * U64(10) + U64(byte - 48)
+    }
+    return value
+}
+
+// Every mapping of the process, and every file it had mapped, that file's
+// mappings merged, in address order. Without them no frame can be named, so
+// a failure to read them is told in the report.
+function readMappings(
+    capture: borrow mut CrashCapture,
+    directory: borrow String
+) -> Result<Void, TesseraError> {
+    match kernelReadText(directory + "/maps") {
+        Ok(text) -> match processRegions(text) {
+            Ok(regions) -> {
+            capture.regions = regions
+            if capture.regions.count == 0 {
+                capture.problems.append("\(directory)/maps listed no mappings")
+            }
+            }
+            Error(failed) -> capture.problems.append("\(directory)/maps are invalid: \(traceText(failed))")
+        }
+        Error(failed) -> capture.problems.append(
+            "\(directory)/maps could not be read: \(traceText(failed))"
+        )
+    }
+    var images: [CrashedImage] = []
+    var named: Map<String, Number> = Map {}
+    for region in capture.regions {
+        if !region.path.startsWith("/") { continue }
+        let executable = region.permissions.count >= 3 && region.permissions.substring(2, 3) == "x"
+        match named.value(region.path) {
+            Some(index) -> {
+                if region.end > images[index].end { images[index].end = region.end }
+                if executable { images[index].executable = true }
+            }
+            None -> {
+                named.set(copy region.path, images.count)
+                images.append(
+                    CrashedImage {
+                        start: region.start,
+                        end: region.end,
+                        path: copy region.path,
+                        executable: executable
+                    }
+                )
+            }
+        }
+    }
+    for index in 0..images.count {
+        images[index].identifier = buildIdentifier(directory + "/root" + images[index].path)
+    }
+    capture.images = images
+    return .Ok
+}
+
+// Each mapping /proc/<pid>/maps lists: `start-end perms offset dev inode path`.
+function processRegions(maps: borrow String) -> Result<[CrashedRegion], TesseraError> {
+    var regions: [CrashedRegion] = []
+    for line in maps.split("\n") {
+        var fields: [String] = []
+        for field in line.split(" ") {
+            if !field.isEmpty() { fields.append(copy field) }
+        }
+        if fields.count < 5 { continue }
+        let bounds = fields[0].split("-")
+        if bounds.count != 2 { continue }
+        let start = try parseHexadecimal(bounds[0])
+        let end = try parseHexadecimal(bounds[1])
+        var pieces: [String] = []
+        for index in 5..fields.count { pieces.append(copy fields[index]) }
+        regions.append(
+            CrashedRegion {
+                start: start,
+                end: end,
+                permissions: copy fields[1],
+                path: joined(pieces, " "),
+            }
+        )
+    }
+    return .Ok(regions)
+}
+
+// The process's open file descriptors, each with what it names.
+function crashFiles(directory: borrow String) -> Result<[CrashedFile], TesseraError> {
+    let listing = try listPath(directory + "/fd")
+    var files: [CrashedFile] = []
+    let linkBytes = zeroedBlock(count: 4097, alignment: 16)
+    for entry in listing {
+        match entry.name.toNumber() {
+            Some(descriptor) -> {
+                let got = readlinkat(
+                    AtDirectory.current,
+                    cStringFrom("\(directory)/fd/\(entry.name)"),
+                    linkBytes.pointer(),
+                    U64(4096)
+                )
+                if answerFailed(got) { return .Error(errnoFailure(answerErrno(got))) }
+                files.append(
+                    CrashedFile {
+                        descriptor: descriptor,
+                        target: stringFromCBytes(linkBytes.pointer(), got)
+                    }
+                )
+            }
+            None -> {}
+        }
+    }
+    return .Ok(files.sorted({ left, right in return left.descriptor < right.descriptor }))
+}
+
+// The GNU build ID note of the ELF file at `path`, as hex; empty when it has
+// none or cannot be read.
+// A mapped image's file, opened to be read, when it is a regular file. A
+// process maps devices and memory files too: a GPU's render node, whose read
+// waits for its events, held the reporter, and the dying process with it.
+function openImage(path: borrow String) -> Number? {
+    let fd = openat(
+        AtDirectory.current,
+        cStringFrom(path),
+        LinuxOpen.readOnly | LinuxOpen.closeOnExec | LinuxOpen.nonBlock,
+        0
+    )
+    if answerFailed(fd) { return .None }
+    let regular = match statAt(fd, "") {
+        Ok(stat) -> stat.kind == .File
+        Error(failed) -> {
+            // A file that cannot be told a regular one is not read: the
+            // report names its frames by address instead.
+            absorb failed
+            false
+        }
+    }
+    if !regular {
+        closeBacking(fd)
+        return .None
+    }
+    return .Some(fd)
+}
+
+// What names an image's functions: its debug information on a dev machine,
+// which has every function, else the image itself, stripped to its dynamic
+// symbols.
+function openSymbols(directory: borrow String, path: borrow String) -> Number? {
+    let name = match path.lastIndexOf("/") {
+        Some(slash) -> path.substring(slash + 1, path.count)
+        None -> copy path
+    }
+    let bundle = "\(directory)/root/\(SystemDirectory.developerSymbols)\(path).dSYM/Contents/Resources/DWARF/\(name)"
+    match openImage(bundle) {
+        Some(fd) -> return .Some(fd)
+        None -> return openImage(directory + "/root" + path)
+    }
+}
+
+function buildIdentifier(path: borrow String) -> String? {
+    let fd = try openImage(path) otherwise return .None
+    let found = buildIdentifierOf(fd)
+    closeBacking(fd)
+    return found
+}
+
+function buildIdentifierOf(fd: Number) -> String? {
+    let headerBytes = zeroedBlock(count: 64, alignment: 16)
+    let header = headerBytes.pointer()
+    if pread(fd, header, U64(64), U64(0)) != 64 || heapLoad<U32>(header, 0) != U32(0x464C457F) {
+        return .None
+    }
+    let offset = heapLoad<U64>(header, 32)
+    let count = U64(heapLoad<U16>(header, 56))
+    let entryBytes = U64(heapLoad<U16>(header, 54))
+    if count == U64(0) || count > U64(256) || entryBytes < U64(56) { return .None }
+    let headersBytes = zeroedBlock(count: Number(count * entryBytes), alignment: 16)
+    let headers = headersBytes.pointer()
+    if pread(fd, headers, count * entryBytes, offset) != Number(count * entryBytes) { return .None }
+    for index in 0..Number(count) {
+        let entry = heapOffset(headers, U64(index) * entryBytes)
+        if fromCode<ElfSegment>(heapLoad<U32>(entry, 0)) != .Note { continue }
+        let size = heapLoad<U64>(entry, 32)
+        if size == U64(0) || size > U64(65536) { continue }
+        let notesBytes = zeroedBlock(count: Number(size), alignment: 16)
+        let notes = notesBytes.pointer()
+        if pread(fd, notes, size, heapLoad<U64>(entry, 8)) != Number(size) { continue }
+        let found = noteBuildIdentifier(notes, size)
+        if found.isSome() { return found }
+    }
+    return .None
+}
+
+// NT_GNU_BUILD_ID, type 3 under the name "GNU".
+function noteBuildIdentifier(notes: RawPtr, size: U64) -> String? {
+    var at = U64(0)
+    while at + U64(12) <= size {
+        let nameBytes = U64(heapLoad<U32>(notes, at))
+        let descriptionBytes = U64(heapLoad<U32>(notes, at + U64(4)))
+        let kind = heapLoad<U32>(notes, at + U64(8))
+        let description = at + U64(12) + ((nameBytes + U64(3)) & ~U64(3))
+        if description + descriptionBytes > size { return .None }
+        if kind == U32(3) && nameBytes == U64(4) && heapLoad<U32>(notes, at + U64(12)) == U32(
+            0x00554E47
+        ) {
+            let digits = "0123456789abcdef"
+            var text = ""
+            for index in 0..Number(descriptionBytes) {
+                let byte = heapLoad<U8>(notes, description + U64(index))
+                text += digits.substring(byte / 16, byte / 16 + 1) + digits.substring(
+                    byte % 16,
+                    byte % 16 + 1
+                )
+            }
+            return .Some(text)
+        }
+        at = description + ((descriptionBytes + U64(3)) & ~U64(3))
+    }
+    return .None
+}
+
+// The program counter, then each return address the frame records chain
+// through. A function that saved no record of its own (a leaf such as
+// memcpy) is still named on arm64: its return address is in the link
+// register, and is not the first record's.
+function threadFrames(
+    architecture: Architecture,
+    registers: borrow [U64],
+    stacks: borrow [CoreStack],
+    images: borrow [CrashedImage]
+) -> [U64] {
+    var frames = [threadProgramCounter(architecture, registers)]
+    let link = architecture == .Arm64 ? registers[30] & CrashWalk.addressMask : U64(0)
+    var frame = threadFramePointer(architecture, registers)
+    var first = true
+    while frames.count < CrashWalk.frameLimit {
+        let caller = match stackWord(stacks, frame) {
+            Some(value) -> value
+            None -> break
+        }
+        let returned = match stackWord(stacks, frame + U64(8)) {
+            Some(value) -> value & CrashWalk.addressMask
+            None -> break
+        }
+        if first && link != returned && crashImageOf(images, link).isSome() { frames.append(link) }
+        first = false
+        if returned == U64(0) { break }
+        frames.append(returned)
+        if caller <= frame { break }
+        frame = caller
+    }
+    if first && crashImageOf(images, link).isSome() { frames.append(link) }
+    return frames
+}

@@ -1,0 +1,61 @@
+import Foundation
+import Heap
+import LibTessera
+
+// The messages PID 1 and a service it started send each other on the
+// service's ParentChannel.
+//
+// Every message begins with the same sixteen bytes: an opcode, the length of
+// the whole message, the sender's serial, and a detail word. Four words,
+// little-endian, because both ends are the same machine and always will be.
+// `roadmap/04-ipc.md` is where this is written down. A handle the message
+// carries travels beside it, as a channel carries handles.
+
+@FFI.Struct { layout: c }
+struct ServiceHeader {
+    var opcode: U32
+    var length: U32
+    var serial: U32
+    var detail: U32
+}
+
+// Writes the header, then `text` as the body, and `handles` on `channel`; the
+// handles leave this process whether or not the write succeeds.
+function sendMessage(
+    channel: Handle,
+    opcode: borrow ServiceOpcode,
+    detail: UN32,
+    handles: borrow [Handle],
+    text: borrow String = ""
+) -> Result<Void, TesseraError> {
+    let bytes = text.utf8()
+    let total = ServiceMessage.headerBytes + bytes.count
+    let bodyBytes = zeroedBlock(count: total, alignment: 16)
+    let body = bodyBytes.pointer()
+    heapStore(
+        body,
+        ServiceHeader {
+            opcode: opcode.rawValue(),
+            length: UN32(total),
+            serial: UN32(1),
+            detail: detail,
+        }
+    )
+    for (index, byte) in bytes.enumerated() {
+        heapStore<U8>(body, ServiceMessage.headerBytes + index, byte)
+    }
+    return channelWrite(channel, Buffer { address: body, length: total }, handles)
+}
+
+// Waits until `channel` has a message or its peer has gone.
+function awaitReadable(calls: Handle, channel: Handle) -> Result<Void, TesseraError> {
+    let armed = objectWaitAsync(
+        channel,
+        Signals.readable | Signals.peerClosed,
+        .Once,
+        calls,
+        PortKey.call
+    )
+    let _completion = try answer(calls, armed)
+    return .Ok
+}

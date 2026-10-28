@@ -1,0 +1,25 @@
+import Foundation
+import KiraUI
+import KCoreAnimation
+
+// How far a change on `animation` has come after `elapsed` seconds, from 0 at
+// its start to 1 where it lands, on the same curve Kira UI moves a widget on.
+// What the compositor draws beside a widget in step with its motion, as the
+// glass under a banner, reads its position off this rather than off a curve
+// of its own.
+function animationFraction(animation: borrow Animation, elapsed: Number) -> Number {
+    let timing = animation.timing()
+    if timing.disableActions || timing.mode == .Immediate {
+        return 1.0
+    }
+    if timing.mode == .Ease {
+        if timing.duration <= 0.0 { return 1.0 }
+        return motionEase(timing.easing, elapsed / timing.duration)
+    }
+    var spring = motionCurveFor(timing.curve, 1.0, timing.reducedMotion)
+    if timing.response > 0.0 {
+        spring = MotionSpring { response: timing.response, damping: timing.damping, target: 1.0 }
+        if timing.reducedMotion { spring = motionCurveReduced(spring) }
+    }
+    return motionSpringSample(motionSpringStart(move spring, 0.0, 0.0), elapsed).value
+}

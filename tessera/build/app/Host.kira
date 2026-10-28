@@ -1,0 +1,253 @@
+import Foundation
+
+// What the machine running the build has: the LLVM bundle Kira provisioned,
+// and the paths the build keeps its own state under. Each is read once, while
+// the graph is described.
+struct Host {
+    let architecture: Architecture
+    // Whether the build runs on macOS, which builds its own architecture with
+    // the kernel's LLVM flow and Homebrew's GNU tools (scripts/build-kernel.sh).
+    let darwin: Bool
+    let home: String
+    // The `PATH` every command is started with.
+    let path: String
+    // Where the build keeps what lives outside its store: the Python
+    // environment setup makes, the keys, the machines and their logs. The
+    // `sysroot` step links the staged sysroots here.
+    let buildRoot: String
+    // The LLVM bundle's directory, whose `bin/` holds the binary tools.
+    let llvm: String
+}
+
+// The architecture the build program itself was compiled for, folded while
+// it is compiled.
+comptime macro buildProgramArchitecture {
+    kind { function }
+    // The macro takes no arguments, so `input` is never read.
+    expand(input: Syntax) -> Syntax {
+        if Build.target().startsWith("aarch64") { return quote { Architecture.Aarch64 } }
+        return quote { Architecture.X86_64 }
+    }
+}
+
+function hostArchitecture() -> Architecture {
+    return buildProgramArchitecture!()
+}
+
+// Whether the build program itself was compiled for macOS, folded while it is
+// compiled.
+comptime macro buildProgramIsDarwin {
+    kind { function }
+    // The macro takes no arguments, so `input` is never read.
+    expand(input: Syntax) -> Syntax {
+        if Build.target().contains("apple-darwin") { return quote { true } }
+        return quote { false }
+    }
+}
+
+function hostIsDarwin() -> Bool {
+    return buildProgramIsDarwin!()
+}
+
+// Homebrew's GNU make, coreutils, findutils, sed and bc, ahead of Darwin's own,
+// and e2fsprogs, whose mkfs.ext4 makes the disks a boot attaches. They are
+// keg-only, so their bins are not on PATH by themselves. The kernel
+// needs make 4 or newer, where Darwin ships 3.81; `nproc` and `sha256sum` are
+// coreutils; arch/arm64/kvm runs `find -printf`, which BSD find lacks; and
+// arch/arm64/tools/gen-kernel-hwcaps.sh uses a GNU sed pattern that BSD sed
+// matches nothing with, silently.
+function darwinToolPath() -> String {
+    let brew = "/opt/homebrew/opt"
+    return "\(brew)/make/libexec/gnubin:\(brew)/coreutils/libexec/gnubin:"
+        + "\(brew)/findutils/libexec/gnubin:\(brew)/gnu-sed/libexec/gnubin:\(brew)/bc/bin:"
+        + "\(brew)/e2fsprogs/sbin"
+}
+
+// The tz database the system's time zones are taken from: the host's own,
+// at this path on macOS and on Linux alike.
+function hostZoneInfo() -> String {
+    return "/usr/share/zoneinfo"
+}
+
+// The host, or what it lacks.
+function readHost(root: borrow String) -> Result<Host, String> {
+    let home = environmentValue("HOME")
+    let buildRoot = environmentIsSet("TESSERA_BUILD_ROOT")
+    ? environmentValue("TESSERA_BUILD_ROOT")
+    : fileExists(root + "/../workspace.kten")
+    ? parentOf(root) + "/.tessera-state"
+    : home + "/.tessera-build"
+    let llvm = match llvmBundle(home) {
+        Ok(directory) -> directory
+        Error(problem) -> return .Error(problem)
+    }
+    let darwin = hostIsDarwin()
+    let path = darwin
+    ? darwinToolPath() + ":" + environmentValue("PATH")
+    : environmentValue("PATH")
+    return .Ok(
+        Host {
+            architecture: hostArchitecture(),
+            darwin: darwin,
+            home: home,
+            path: path,
+            buildRoot: buildRoot,
+            llvm: llvm
+        }
+    )
+}
+
+// The newest LLVM bundle Kira provisioned that carries clang: the one the
+// framework links with, and so the binary tools that read what it linked.
+// TESSERA_LLVM, then KIRA_LLVM_HOME, name one outright.
+function llvmBundle(home: borrow String) -> Result<String, String> {
+    for name in ["TESSERA_LLVM", "KIRA_LLVM_HOME"] {
+        if environmentIsSet(name) { return .Ok(environmentValue(name)) }
+    }
+    let bundles = home + "/.kira/toolchains/llvm"
+    let versions = match listDirectory(bundles) {
+        Ok(listing) -> listing.entries
+        Error(failure) -> {
+            // No directory is no bundle, which the error says.
+            absorb failure
+            return .Error("no LLVM bundle under \(bundles)")
+        }
+    }
+    var newest = ""
+    var newestVersion: [Number] = []
+    for version in versions {
+        let directory = "\(bundles)/\(version)/\(hostBundleKey())"
+        if fileExists(directory + "/bin/clang") {
+            let parts = versionParts(version)
+            if newest.count == 0 || versionBefore(newestVersion, parts) {
+                newest = directory
+                newestVersion = parts
+            }
+        }
+    }
+    if newest.count == 0 { return .Error("no LLVM bundle under \(bundles) carries clang") }
+    return .Ok(newest)
+}
+
+// The key Kira names this host's LLVM bundle by.
+function hostBundleKey() -> String {
+    if hostIsDarwin() {
+        return match hostArchitecture() {
+            X86_64 -> "x86_64-macos"
+            Aarch64 -> "aarch64-macos"
+        }
+    }
+    return match hostArchitecture() {
+        X86_64 -> "x86_64-linux-gnu"
+        Aarch64 -> "aarch64-linux-gnu"
+    }
+}
+
+// `21.1.8` as `[21, 1, 8]`; a part that is not a number counts as 0.
+function versionParts(version: borrow String) -> [Number] {
+    var parts: [Number] = []
+    for part in version.split(".") {
+        parts.append(
+            match parseNumber(part) {
+                Some(value) -> value
+                None -> 0
+            }
+        )
+    }
+    return parts
+}
+
+// Whether version `a` is older than `b`, part by part.
+function versionBefore(a: borrow [Number], b: borrow [Number]) -> Bool {
+    let shared = min(a.count, b.count)
+    for index in 0..shared {
+        if a[index] != b[index] { return a[index] < b[index] }
+    }
+    return a.count < b.count
+}
+
+extend Host {
+    // The Python environment `kira build setup` makes, whose meson and Mako
+    // build Mesa: Mesa looks for Mako in the Python meson runs on.
+    function pythonBin(borrow self) -> String {
+        return "\(buildRoot)/python/bin"
+    }
+
+    // The root `knvm valgrind install` landed for `target`, from the newest
+    // version knvm keeps: a tree to lay over a system, whose `usr/lib/valgrind`
+    // is the prefix it was built for.
+    function valgrind(borrow self, target: Architecture) -> Result<String, String> {
+        return newestTool("Valgrind", "valgrind", target, "usr/lib/valgrind/bin/valgrind")
+    }
+
+    // The root LLVM's lldb-server and lldb were landed in for `target`, from
+    // the newest version kept: a `usr` tree to lay over a system. They are
+    // cross-built on the build host, which then lands them here.
+    function lldb(borrow self, target: Architecture) -> Result<String, String> {
+        return newestTool("LLDB", "lldb", target, "usr/bin/lldb-server")
+    }
+
+    // The newest `<klfd>/tools/<directory>/<version>/<multiarch>` holding
+    // `marker`, which is what makes the tree the tool. KLFD_HOME relocates
+    // knvm's home.
+    function newestTool(
+        borrow self,
+        tool: borrow String,
+        directory: borrow String,
+        target: Architecture,
+        marker: borrow String
+    ) -> Result<String, String> {
+        let klfd = environmentIsSet("KLFD_HOME") ? environmentValue("KLFD_HOME") : home + "/.klf"
+        let base = "\(klfd)/tools/\(directory)"
+        let versions = match listDirectory(base) {
+            Ok(listing) -> listing.entries
+            Error(failure) -> {
+                // No directory is no tool landed, which the error says.
+                absorb failure
+                return .Error("no \(tool) under \(base)")
+            }
+        }
+        var newest = ""
+        var newestVersion: [Number] = []
+        for version in versions {
+            let root = "\(base)/\(version)/\(target.multiarch())"
+            if fileExists("\(root)/\(marker)") {
+                let parts = versionParts(version)
+                if newest.count == 0 || versionBefore(newestVersion, parts) {
+                    newest = root
+                    newestVersion = parts
+                }
+            }
+        }
+        if newest.count == 0 {
+            return .Error("no \(tool) for \(target.multiarch()) under \(base)")
+        }
+        return .Ok(newest)
+    }
+
+    // The program `name` in the first directory of `path` holding it, or
+    // `name` itself when none does.
+    function find(borrow self, name: borrow String) -> String {
+        for directory in path.split(":") {
+            let candidate = "\(directory)/\(name)"
+            if directory.count > 0 && fileExists(candidate) { return candidate }
+        }
+        return copy name
+    }
+
+    // Where a boot writes the guest's serial line, QEMU's own messages and
+    // the monitor's sockets.
+    function logDirectory(borrow self) -> String {
+        return "\(buildRoot)/logs"
+    }
+
+    // What a boot keeps for `target` from one boot to the next: the
+    // machine's volume and the disks it attaches.
+    function machineDirectory(borrow self, target: Architecture) -> String {
+        return "\(buildRoot)/out/\(target.name())"
+    }
+
+    function llvmTool(borrow self, name: borrow String) -> String {
+        return "\(llvm)/bin/\(name)"
+    }
+}

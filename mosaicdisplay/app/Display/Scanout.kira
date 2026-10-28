@@ -1,0 +1,295 @@
+import Foundation
+import Heap
+import LibTessera
+import DeviceKit
+
+// Putting a surface on the screen, through DeviceKit.
+//
+// A surface becomes a framebuffer, and a commit puts a framebuffer on the
+// primary plane of the CRTC this program drives. The first commit also sets the
+// mode; every one after it changes only the plane. Each commit asks for a flip
+// event, which arrives on the display's own port once the picture has changed,
+// and only then is what the screen showed before safe to let go of.
+
+// A framebuffer held while it is on screen, and the surface it was made from
+// when nothing else holds that: none for a client's frame, which its content
+// holds, or for a composed picture, whose image is the composer's.
+struct Shown {
+    var framebuffer: Ref
+    var surface: Ref?
+}
+
+// Lets go of what a flip has replaced. The framebuffer stays on the plane until
+// a later commit takes it off, so this is only ever done after one has.
+function forget(shown: borrow Shown?) {
+    match shown {
+        Some(held) -> {
+            closeRef(held.framebuffer)
+            match held.surface {
+                Some(surface) -> closeRef(surface)
+                None -> {}
+            }
+        }
+        None -> {}
+    }
+}
+
+namespace PixelFormat {
+    // `XR24`: 32-bit pixels, blue in the low byte, the top byte unused. What the
+    // splash is painted in and what the UI renders.
+    let xrgb8888: FourCc = FourCc(0x34325258)
+    let bytesPerPixel: Number = 4
+}
+
+// A surface the display can scan out and this program can paint, mapped.
+struct Paintable {
+    var surface: Ref
+    var pixels: RawPtr
+    var pitch: Number
+}
+
+function paintableSurface(width: Number, height: Number) -> Result<Paintable, TesseraError> {
+    return paintableSurfaceIn(width, height, PixelFormat.xrgb8888)
+}
+
+// A surface the display can scan out, in `format`, mapped for painting.
+function paintableSurfaceIn(
+    width: Number,
+    height: Number,
+    format: FourCc
+) -> Result<Paintable, TesseraError> {
+    let descriptor = SurfaceDescriptor {
+        width: UN32(width),
+        height: UN32(height),
+        format: format,
+        usage: SurfaceUsage.scanout | SurfaceUsage.cpuWrite,
+        gpu: EntryId(0),
+        modifierCount: UN32(0),
+        flags: SurfaceFlags.none,
+        modifier0: Modifier(0),
+        modifier1: Modifier(0),
+        modifier2: Modifier(0),
+        modifier3: Modifier(0),
+    }
+    let surface = try surfaceCreate(descriptor)
+    match mapPaintable(surface) {
+        Ok(value) -> return .Ok(value)
+        Error(reason) -> return closeUnpaintable(surface, reason)
+    }
+}
+
+function closeUnpaintable(surface: Ref, reason: borrow TesseraError) -> Result<Paintable, TesseraError> {
+    closeRef(surface)
+    return .Error(reason)
+}
+
+function mapPaintable(surface: Ref) -> Result<Paintable, TesseraError> {
+    let info = try surfaceInfo(surface)
+    let pixels = try surfaceMap(surface)
+    return .Ok(Paintable { surface: surface, pixels: pixels, pitch: Number(info.plane0.stride) })
+}
+
+function unmap(paintable: borrow Paintable) {
+    match surfaceUnmap(paintable.surface) {
+        Ok -> {}
+        Error(failed) -> log warn("a scanout surface would not unmap", error: errorName(failed))
+    }
+}
+
+// One `CrtcState`: the CRTC @0, its flags @4, the connector @8 and the mode
+// @12, the first of the connector's or the mode the CRTC already has. One
+// `PlaneState`: the plane @0, the CRTC @4, the framebuffer @8, the source
+// size in 16.16 @24, the destination size @40, and alpha @50.
+namespace CommitRecord {
+    let crtcBytes: Number = 32
+    let planeBytes: Number = 72
+    let active: UN32 = UN32(1)
+    let firstMode: UN32 = UN32(0)
+    let keepMode: UN32 = UN32(0xFFFFFFFF)
+    let fixedShift: UN32 = UN32(16)
+    let opaque: UN16 = UN16(0xFFFF)
+    let key: UNumber = UNumber(2)
+}
+
+// Commits `framebuffer` to the primary plane, full screen, and waits for the
+// flip. `modeset` also sets the connector's preferred mode on the CRTC. The
+// answer is the commit's serial.
+function present(
+    display: borrow Display,
+    framebuffer: Ref,
+    modeset: Bool
+) -> Result<UNumber, TesseraError> {
+    let serial = try commitPicture(
+        display,
+        framebuffer,
+        modeset,
+        display.flips,
+        CommitRecord.key,
+        false
+    )
+    let flipped = try awaitAnswer(display.flips)
+    if flipped.aux != UNumber(DeviceCompletion.Flip.rawValue()) || flipped.result0 != serial {
+        return .Error(failure(.Internal))
+    }
+    return .Ok(serial)
+}
+
+// Commits `framebuffer` as `present` does without waiting: its flip completes
+// on `port` under `key`. The answer is the commit's serial.
+function commitPicture(
+    display: borrow Display,
+    framebuffer: Ref,
+    modeset: Bool,
+    port: Handle,
+    key: UNumber,
+    nonBlock: Bool
+) -> Result<UNumber, TesseraError> {
+    let scanout = display.scanout
+    let crtcs = zeroedBlock(count: CommitRecord.crtcBytes, alignment: 16)
+    heapStore(
+        crtcs.pointer(),
+        CrtcStateRecord {
+            crtc: scanout.crtc.raw,
+            flags: CommitRecord.active,
+            connector: scanout.connector,
+            mode: modeset ? CommitRecord.firstMode : CommitRecord.keepMode,
+            gammaLut: UNumber(0),
+            ctm: UNumber(0),
+        }
+    )
+    let cursors = cursorPlaneCount(display)
+    let planes = zeroedBlock(count: CommitRecord.planeBytes * (1 + cursors), alignment: 16)
+    storeCursorPlane(display, planes, CommitRecord.planeBytes)
+    heapStore(
+        planes.pointer(),
+        PlaneStateRecord {
+            plane: scanout.plane,
+            crtc: scanout.crtc.raw,
+            framebuffer: framebuffer.raw,
+            srcX: UN32(0),
+            srcY: UN32(0),
+            srcW: UN32(scanout.width) << CommitRecord.fixedShift,
+            srcH: UN32(scanout.height) << CommitRecord.fixedShift,
+            dstX: N32(0),
+            dstY: N32(0),
+            dstW: UN32(scanout.width),
+            dstH: UN32(scanout.height),
+            zpos: UN16(0),
+            alpha: CommitRecord.opaque,
+            rotation: UN32(0),
+            inFence: UNumber(0),
+            inFenceValue: UNumber(0),
+        }
+    )
+    var options = modeset ? CommitOptions.flipEvent | CommitOptions.allowModeset : CommitOptions.flipEvent
+    // A flip that is not waited for returns before it lands; the kernel
+    // otherwise holds the commit until the host has shown it.
+    if nonBlock { options = options | CommitOptions.nonBlock }
+    let serial = try displayCommit(
+        display.device,
+        Buffer { address: crtcs.pointer(), length: CommitRecord.crtcBytes },
+        Buffer { address: planes.pointer(), length: CommitRecord.planeBytes * (1 + cursors) },
+        Buffer { address: nullPointer(), length: 0 },
+        options,
+        port,
+        key
+    )
+    return .Ok(serial)
+}
+
+// Puts `framebuffer` on the screen without waiting for it: what the screen
+// showed is let go of once the flip lands (`flipLanded`), and nothing else is
+// committed until then. `surface` is let go of with it, when it is ours.
+function flipTo(
+    display: borrow mut Display,
+    framebuffer: Ref,
+    surface: Ref?,
+    modeset: Bool,
+    port: Handle
+) -> Result<Void, TesseraError> {
+    let serial = try commitPicture(display, framebuffer, modeset, port, UNumber(PortKey.flip), true)
+    display.flipping = .Some(serial)
+    display.retiring = display.shown
+    display.shown = .Some(Shown { framebuffer: framebuffer, surface: surface })
+    return .Ok
+}
+
+// Shows `paintable` once it is painted: unmapped, made a framebuffer and
+// committed. What the screen showed before is let go of.
+function show(
+    display: borrow mut Display,
+    paintable: borrow Paintable,
+    modeset: Bool
+) -> Result<UNumber, TesseraError> {
+    unmap(paintable)
+    let framebuffer = try displayFramebuffer(display.device, paintable.surface)
+    let serial = try present(display, framebuffer, modeset)
+    forget(display.shown)
+    display.shown = .Some(Shown { framebuffer: framebuffer, surface: .Some(paintable.surface) })
+    return .Ok(serial)
+}
+
+// Takes the display: opens it, sets the mode on a cleared surface, then flips
+// to the splash on a second one. None when there is no display to drive.
+function driveDisplay() -> Result<Display?, TesseraError> {
+    let flips = try portCreate(.None)
+    let device = match openDisplay(flips) {
+        Ok(value) -> value
+        Error(reason) -> return closeDisplayPort(flips, reason)
+    }
+    match driveOpenedDisplay(device, flips) {
+        Ok(value) -> return .Ok(value)
+        Error(reason) -> return closeUndrivenDisplay(device, flips, reason)
+    }
+}
+
+function closeDisplayPort(flips: Handle, reason: borrow TesseraError) -> Result<Display?, TesseraError> {
+    closeHandle(flips)
+    return .Error(reason)
+}
+
+function closeUndrivenDisplay(device: Ref, flips: Handle, reason: borrow TesseraError) -> Result<Display?, TesseraError> {
+    closeRef(device)
+    return closeDisplayPort(flips, reason)
+}
+
+function driveOpenedDisplay(device: Ref, flips: Handle) -> Result<Display?, TesseraError> {
+    let found = try findScanout(device)
+    let scanout = match found {
+        Some(value) -> value
+        None -> {
+            closeRef(device)
+            closeHandle(flips)
+            return .Ok(.None)
+        }
+    }
+    var display = Display { device: device, flips: flips, scanout: scanout, shown: .None }
+    let width = scanout.width
+    let height = scanout.height
+
+    // Two surfaces: the mode is set on a cleared one, so the console's last
+    // screen is gone before the splash arrives, and the splash is flipped to
+    // on the other.
+    let cleared = try paintableSurface(width, height)
+    let splash = match paintableSurface(width, height) {
+        Ok(value) -> value
+        Error(reason) -> return closeClearedSurface(cleared, reason)
+    }
+    log info("made two scanout surfaces", width: width, height: height, pitch: cleared.pitch)
+
+    fillBackground(cleared.pixels, cleared.pitch, width, height)
+    try show(display, cleared, true)
+    log info("the mode is set; the display is Tessera's")
+    drawSplash(splash.pixels, splash.pitch, width, height)
+    match show(display, splash, false) {
+        Ok(serial) -> log info("the splash is on the screen", commit: serial)
+        Error(failed) -> log warn("the splash could not be shown", error: errorName(failed))
+    }
+    return .Ok(.Some(display))
+}
+
+function closeClearedSurface(cleared: borrow Paintable, reason: borrow TesseraError) -> Result<Display?, TesseraError> {
+    unmap(cleared)
+    closeRef(cleared.surface)
+    return .Error(reason)
+}

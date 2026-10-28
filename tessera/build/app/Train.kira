@@ -1,0 +1,253 @@
+import Foundation
+import Build
+import Kten
+
+// A train pins complete component outputs and boot inputs in the shared
+// artifact store. Its metadata maps names to artifact indices.
+function trainOption(graph: borrow mut Graph) -> String {
+    var fallback = ""
+    let basePath = parentOf(graph.root) + "/workspace.base"
+    if fileExists(basePath) {
+        match readFile(basePath) {
+            Ok(contents) -> fallback = contents.text.trim()
+            Error(failure) -> graph.problems.append("cannot read workspace base: \(traceText(failure))")
+        }
+    }
+    return graph.option(Choice {
+        name: "base", summary: "the immutable release train snapshot to boot or overlay",
+        fallback: fallback
+    })
+}
+
+function trainMetadataText(value: borrow Kten, key: borrow String) -> String {
+    return match value.field(key) {
+        Ok(found) -> match found.text() {
+            Ok(text) -> text
+            Error(failure) -> ""
+        }
+        Error(failure) -> ""
+    }
+}
+
+function trainMetadataNumber(value: borrow Kten, key: borrow String) -> Number? {
+    return match value.field(key) {
+        Ok(found) -> match found.number() {
+            Ok(number) -> .Some(number)
+            Error(failure) -> .None
+        }
+        Error(failure) -> .None
+    }
+}
+
+function trainMetadataItems(value: borrow Kten, key: borrow String) -> Result<[Kten], String> {
+    return match value.field(key) {
+        Ok(found) -> match found.items() {
+            Ok(items) -> .Ok(items)
+            Error(failure) -> .Error("train has invalid \(key)")
+        }
+        Error(failure) -> .Error("train has no \(key)")
+    }
+}
+
+function trainRepository(root: borrow String, location: borrow String) -> Result<Kten, String> {
+    let path = joinedPath(root, location)
+    let empty: [UN8] = []
+    let statusCommand = ProcessCommand {
+        program: "git", arguments: ["-C", path, "status", "--porcelain"], input: .Null
+    }
+    let status = match statusCommand.run(empty) {
+        Ok(found) -> found
+        Error(failure) -> return .Error("cannot inspect \(location): \(traceText(failure))")
+    }
+    if !status.succeeded() || status.output.count > 0 {
+        return .Error("train capture requires committed sources: \(location)")
+    }
+    let revisionCommand = ProcessCommand {
+        program: "git", arguments: ["-C", path, "rev-parse", "HEAD"], input: .Null
+    }
+    let revision = match revisionCommand.run(empty) {
+        Ok(found) -> found
+        Error(failure) -> return .Error("cannot read \(location)'s revision: \(traceText(failure))")
+    }
+    if !revision.succeeded() { return .Error("cannot read \(location)'s revision") }
+    let text = match textFromBytes(revision.output) {
+        Some(found) -> found.trim()
+        None -> return .Error("invalid revision text for \(location)")
+    }
+    return .Ok(ktenBare([
+        ktenField("location", .Text(copy location)), ktenField("commit", .Text(text))
+    ]))
+}
+
+function describeTrain(
+    graph: borrow mut Graph,
+    context: borrow BuildContext,
+    release: borrow DescribedRelease,
+    booted: borrow [Artifact],
+    roles: borrow [String]
+) {
+    var artifacts: [Artifact] = []
+    var components: [Kten] = []
+    var repositories: [Kten] = []
+    for described in release.components {
+        let start = artifacts.count
+        artifacts.append(copy described.roots.install)
+        artifacts.append(copy described.roots.symbols)
+        artifacts.append(copy described.roots.binary)
+        let overlay = componentTrainRoot(graph, context.architecture, described)
+        artifacts.append(move overlay)
+        var fields = [
+            ktenField("name", .Text(copy described.component.name)),
+            ktenField("install", .Number(start)),
+            ktenField("symbols", .Number(start + 1)),
+            ktenField("binary", .Number(start + 2)),
+            ktenField("overlay", .Number(start + 3))
+        ]
+        match described.roots.contracts {
+            Some(contract) -> {
+                fields.append(ktenField("contracts", .Number(artifacts.count)))
+                artifacts.append(contract)
+            }
+            None -> {}
+        }
+        components.append(ktenBare(move fields))
+    }
+    if graph.requested("train") {
+        let scanned = match workspaceRepositories(graph.root) {
+            Ok(found) -> found
+            Error(problem) -> {
+                graph.problems.append(problem)
+                return
+            }
+        }
+        for repository in scanned {
+            match trainRepository(graph.root, repository.location) {
+                Ok(repository) -> repositories.append(repository)
+                Error(problem) -> graph.problems.append(problem)
+            }
+        }
+    }
+    let sdk = artifacts.count
+    artifacts.append(copy release.sdk)
+    let bootStart = artifacts.count
+    for artifact in booted { artifacts.append(copy artifact) }
+    var bootRoles: [Kten] = []
+    for role in roles { bootRoles.append(.Text(copy role)) }
+    let metadata = ktenObject("TesseraTrain", [
+        ktenField("schema", .Text("tessera-train-1")),
+        ktenField("architecture", .Text(context.architecture.name())),
+        ktenField("profile", .Text(context.release ? "release" : "debug")),
+        ktenField("symbols", .Text(context.symbols == .Developer ? "developer" : "none")),
+        ktenField("lldb", .Text(context.lldb ? "on" : "off")),
+        ktenField("components", .List(components)),
+        ktenField("repositories", .List(repositories)),
+        ktenField("sdk", .Number(sdk)),
+        ktenField("bootStart", .Number(bootStart)),
+        ktenField("bootRoles", .List(bootRoles))
+    ])
+    graph.step(Step {
+        name: "train", summary: "capture an immutable release train in the shared artifact store",
+        produces: artifacts, snapshot: .Some(metadata), materialize: false
+    })
+}
+
+function trainBootArtifacts(
+    graph: borrow mut Graph,
+    context: borrow BuildContext,
+    digest: borrow String
+) -> Result<([Artifact], [String]), String> {
+    let snapshot = match loadBuildSnapshot(digest) {
+        Ok(found) -> found
+        Error(failure) -> return .Error("cannot load train: \(traceText(failure))")
+    }
+    let metadata = snapshot.metadata
+    try validateTrainConfiguration(metadata, context)
+    let start = match trainMetadataNumber(metadata, "bootStart") {
+        Some(index) -> index
+        None -> return .Error("train has no boot artifact index")
+    }
+    let written = try trainMetadataItems(metadata, "bootRoles")
+    if start < 0 || start != trunc(start) || start + written.count > snapshot.artifacts.count {
+        return .Error("train boot artifact indices are invalid")
+    }
+    var artifacts: [Artifact] = []
+    var roles: [String] = []
+    for (index, value) in written.enumerated() {
+        let role = match value.text() {
+            Ok(text) -> text
+            Error(failure) -> return .Error("train has an invalid boot role")
+        }
+        artifacts.append(graph.reference(copy snapshot.artifacts[start + index]))
+        roles.append(role)
+    }
+    return .Ok((artifacts, roles))
+}
+
+function bootTrain(
+    host: borrow Host,
+    architecture: Architecture,
+    digest: borrow String,
+    options: borrow BootOptions,
+    roles: borrow [String],
+    overlay: borrow TrainOverlayDescription,
+    run: borrow StepRun
+) -> Number {
+    var paths: [String] = []
+    for index in 0..roles.count {
+        match resolveBuildArtifact(run.artifacts[index]) {
+            Ok(path) -> paths.append(path)
+            Error(failure) -> {
+                log fault("cannot resolve train boot artifact", traceText(failure))
+                return 1
+            }
+        }
+    }
+    match makePathTree(host.buildRoot) {
+        Ok -> {}
+        Error(failure) -> {
+            log fault("cannot make workspace state directory", traceText(failure))
+            return 1
+        }
+    }
+    match writeFile(host.buildRoot + "/train.base", digest + "\n") {
+        Ok -> {}
+        Error(failure) -> {
+            log fault("cannot record booted release train", traceText(failure))
+            return 1
+        }
+    }
+    var roots: [ArtifactReference] = []
+    var digests: [String] = []
+    for index in roles.count..run.artifacts.count {
+        roots.append(copy run.artifacts[index])
+        digests.append(copy run.digests[index])
+    }
+    let overlayRun = StepRun { paths: [], digests: digests, artifacts: roots, arguments: [] }
+    let machine = copy host
+    let target = copy architecture
+    let pinned = copy digest
+    let names = copy overlay.names
+    let base = copy overlay.base
+    let started: (() -> Number)? = names.count == 0 ? .None : .Some({ in
+        let ready = carryOutDevRoot(machine, target, names, DevRootSelection { install: [], left: [] },
+            StepRun { paths: [], digests: [], arguments: ["wait"] })
+        if ready != 0 { return ready }
+        return installTrainOverlay(machine, target, pinned, names, base, overlayRun)
+    })
+    var effectiveOptions = copy options
+    effectiveOptions.train = copy digest
+    return boot(host, architecture, effectiveOptions, roles, StepRun {
+        paths: paths, digests: copy run.digests, arguments: copy run.arguments
+    }, move started)
+}
+
+function validateTrainConfiguration(metadata: borrow Kten, context: borrow BuildContext) -> Result<Void, String> {
+    if trainMetadataText(metadata, "schema") != "tessera-train-1"
+        || trainMetadataText(metadata, "architecture") != context.architecture.name()
+        || trainMetadataText(metadata, "profile") != (context.release ? "release" : "debug")
+        || trainMetadataText(metadata, "symbols") != (context.symbols == .Developer ? "developer" : "none")
+        || trainMetadataText(metadata, "lldb") != (context.lldb ? "on" : "off") {
+        return .Error("the train's schema, target or build settings do not match this build")
+    }
+    return .Ok
+}

@@ -1,0 +1,155 @@
+import Foundation
+import TesseraDisplayClient
+
+// Stage Manager in the compositor (roadmap/15-form-factors.md): in `Stage`
+// the application in front is on the stage, at the frame it was configured
+// to, and every other application shown is drawn small in the strip down the
+// leading edge, the most recently in front at the top. A picture in the strip
+// is the application's whole buffer scaled down; the application is not
+// configured to it and goes on drawing at its own size, so coming back to the
+// stage costs it nothing. A press on a picture is a press on a surface without
+// focus: the platform is told, and brings it forward by granting it focus. The
+// layout's numbers are display-client's (`StageLayout`), which the platform
+// draws the strip's icons with.
+
+// The application on the stage: the focused one, or else the shown one in
+// front of the others.
+function stageFront(server: borrow Server) -> Number? {
+    match server.focus {
+        Some(index) -> {
+            if onStage(server.clients[index]) { return .Some(index) }
+            if server.clients[index].role == .Desktop { return .None }
+        }
+        None -> {}
+    }
+    var chosen: Number? = .None
+    var highest = 0
+    for index in 0..server.clients.count {
+        let client = server.clients[index]
+        if onStage(client) && (chosen.isNone() || client.zOrder >= highest) {
+            chosen = .Some(index)
+            highest = client.zOrder
+        }
+    }
+    return chosen
+}
+
+// Whether `client` is an application that can be on the stage.
+function onStage(client: borrow Client) -> Bool {
+    return client.alive && client.role == .Application && !client.hidden
+}
+
+// The applications in the strip, the most recently in front first, as many
+// as it shows.
+function stripApplications(server: borrow Server) -> [Number] {
+    let front = stageFront(server)
+    var strip: [Number] = []
+    for index in 0..server.clients.count {
+        if onStage(server.clients[index]) && front != .Some(index) {
+            var at = strip.count
+            strip.append(index)
+            // Kept in order by insertion, the most recent first.
+            while at > 0 && server.clients[strip[at - 1]].zOrder < server.clients[index].zOrder {
+                strip[at] = strip[at - 1]
+                strip[at - 1] = index
+                at -= 1
+            }
+        }
+    }
+    var shown: [Number] = []
+    for place in 0..min(strip.count, StageLayout.shown) { shown.append(strip[place]) }
+    return shown
+}
+
+// Whether the client at `index` is drawn in the strip rather than where it
+// was configured.
+function inStrip(server: borrow Server, index: Number) -> Bool {
+    if server.mode != .Stage || !onStage(server.clients[index]) { return false }
+    return stageFront(server) != .Some(index)
+}
+
+// The window's rectangle in the strip. Shadows are expanded from this same
+// rectangle by placedFrame, so they do not change the preview's aspect or
+// the badge's anchor. None when the strip has no room for it.
+function stripPicture(server: borrow Server, index: Number) -> Geometry? {
+    let applications = stripApplications(server)
+    let place = try arrayIndex(applications, index) otherwise return .None
+    let slot = stageSlot(
+        server.display.scanout.pointWidth(),
+        server.display.scanout.pointHeight(),
+        server.bar,
+        server.stageFloor,
+        place,
+        applications.count
+    )
+    let client = server.clients[index]
+    let picture = stageThumbnail(slot, client.frame.width, client.frame.height)
+    return .Some(
+        Geometry { x: picture.x, y: picture.y, width: picture.width, height: picture.height }
+    )
+}
+
+// The frame a window entering the stage is configured to.
+function stageGeometry(server: borrow Server, index: Number) -> Geometry {
+    let room = stageRoom(
+        server.display.scanout.pointWidth(),
+        server.display.scanout.pointHeight(),
+        server.bar,
+        server.stageFloor
+    )
+    let client = server.clients[index]
+    match client.stageFrame {
+        Some(kept) -> {
+            let fitted = stageWindowFrame(room, kept.width, kept.height)
+            return Geometry {
+                x: clamp(kept.x, room.x, max(room.x, room.x + room.width - fitted.width)),
+                y: clamp(kept.y, room.y, max(room.y, room.y + room.height - fitted.height)),
+                width: fitted.width,
+                height: fitted.height,
+            }
+        }
+        None -> {}
+    }
+    let preferred = match client.windowFrame {
+        Some(kept) -> kept
+        None -> client.frame
+    }
+    let frame = preferred.width > 0 && preferred.height > 0
+    ? stageWindowFrame(room, preferred.width, preferred.height)
+    : stageWindow(
+        server.display.scanout.pointWidth(),
+        server.display.scanout.pointHeight(),
+        server.bar,
+        server.stageFloor
+    )
+    return Geometry { x: frame.x, y: frame.y, width: frame.width, height: frame.height }
+}
+
+// Where the pointer finds the client at `index`: its picture in the strip,
+// or the frame it was configured to.
+function hitFrame(server: borrow Server, index: Number) -> Geometry? {
+    let frame = try presentedWindow(server, index) otherwise return .None
+    if !inStrip(server, index) { return .Some(frame) }
+    let badge = stageBadge(
+        StageFrame { x: frame.x, y: frame.y, width: frame.width, height: frame.height }
+    )
+    let x = min(frame.x, badge.x)
+    let y = min(frame.y, badge.y)
+    return .Some(
+        Geometry {
+            x: x,
+            y: y,
+            width: max(frame.x + frame.width, badge.x + badge.width) - x,
+            height: max(frame.y + frame.height, badge.y + badge.height) - y,
+        }
+    )
+}
+
+// Whether `mode` gives applications windows, with edges, moved and resized by
+// the person and kept clear of the bar and the dock.
+function windowed(mode: borrow CompositorMode) -> Bool {
+    return match mode {
+        Freeform, Stage -> true
+        Exclusive, Stack -> false
+    }
+}

@@ -1,0 +1,407 @@
+import Foundation
+import KiraUI
+
+// Control Center's modules, from the iOS 27 kit's `Control Center - iPad`:
+// round toggles, the connectivity module, the tall sliders, the Focus tile
+// and Now Playing. Every length is the kit's in points, times the interface's
+// `ControlCenterMetrics.scale`.
+
+extend Widget {
+    // The module on its own glass, in `shape`. On a platform's surface the
+    // glass is lifted out for the compositor, which draws it over the screen.
+    function controlGround(shape: ContainerShape) -> Any Widget {
+        return self.glassEffect(.Platform(.ControlCenter), copy shape, true)
+    }
+}
+
+// The round toggle Control Center is made of. While it is on the circle is
+// filled with its tint and the glyph turns to `onForeground`; while it is off
+// it stands on its ground.
+construct ControlToggleStyle(
+    diameter: Number,
+    onTint: PrimaryColor = .White,
+    onForeground: PrimaryColor = .Black,
+) extends ToggleStyle {
+    function makeBody(configuration: borrow ToggleStyleConfiguration) -> Any Widget {
+        let isOn = copy configuration.isOn
+        let on = isOn.get()
+        let face = Button(action = { in isOn.set(!isOn.get()) }) {
+            ZStack(alignment = .Center) {
+                configuration.label
+                .font(
+                    size: resolvedLength(diameter * ControlToggleStyle.glyphRatio),
+                    weight: .Medium
+                )
+                .foregroundColor(on ? onForeground : .White)
+            }
+            .width(resolvedLength(diameter))
+            .height(resolvedLength(diameter))
+        }
+        .buttonStyle(.Plain)
+        .animation(.Smooth)
+        if on {
+            return face.background(Circle().foregroundColor(copy onTint))
+        }
+        return face.controlGround(.Circle)
+    }
+}
+
+namespace ControlToggleStyle {
+    // The glyph's size as a share of the circle's diameter.
+    let glyphRatio: Number = 0.44
+}
+
+// A round toggle named `title`, showing its glyph.
+construct ControlButton(
+    isOn: Binding<Bool>,
+    title: String,
+    style: ControlToggleStyle
+) extends Widget {
+    let glyph: some Widget
+
+    init(title: String, systemImage: Symbol, isOn: Binding<Bool>, style: ControlToggleStyle) {
+        return ControlButton(isOn = isOn, title = title, style = style) {
+            Icon(symbol = systemImage)
+        }
+    }
+
+    body {
+        Toggle(isOn = isOn) {
+            glyph
+            .accessibilityLabel(copy title)
+        }
+        .toggleStyle(copy style)
+    }
+}
+
+// A binding to a switch that stays off: a control that opens something
+// rather than turning on.
+function controlMomentary() -> Binding<Bool> {
+    return Binding<Bool> {
+        get: { in
+            return false
+        },
+        set: { value in }
+    }
+}
+
+// Airplane Mode, AirDrop, Wi-Fi, and the four small toggles, on one module
+// two units square.
+construct ConnectivityModule(
+    metrics: ControlCenterMetrics,
+    airplane: Binding<Bool>,
+    airDrop: Binding<Bool>,
+    wifi: Binding<Bool>,
+    cellular: Binding<Bool>,
+    bluetooth: Binding<Bool>,
+    hotspot: Binding<Bool>,
+    vpn: Binding<Bool>
+) extends Widget {
+    body {
+        let large = metrics.pt(58)
+        let small = metrics.pt(26)
+        GlassEffectContainer(spacing = metrics.pt(2)) {
+            Grid(
+                horizontalSpacing = .Length(metrics.pt(14)),
+                verticalSpacing = .Length(metrics.pt(14))
+            ) {
+                GridRow {
+                    ControlButton(
+                        title = "Airplane Mode",
+                        systemImage = .Airplane,
+                        isOn = airplane,
+                        style = ControlToggleStyle(diameter = large)
+                    )
+                    ControlButton(
+                        title = "AirDrop",
+                        systemImage = .DotRadiowavesLeftRight,
+                        isOn = airDrop,
+                        style = ControlToggleStyle(
+                            diameter = large,
+                            onTint = .Blue,
+                            onForeground = .White
+                        )
+                    )
+                }
+                GridRow {
+                    ControlButton(
+                        title = "Wi-Fi",
+                        systemImage = .Wifi,
+                        isOn = wifi,
+                        style = ControlToggleStyle(
+                            diameter = large,
+                            onTint = .Blue,
+                            onForeground = .White
+                        )
+                    )
+                    Grid(
+                        horizontalSpacing = .Length(metrics.pt(6)),
+                        verticalSpacing = .Length(metrics.pt(6))
+                    ) {
+                        GridRow {
+                            ControlButton(
+                                title = "Cellular Data",
+                                systemImage = .AntennaRadiowavesLeftRight,
+                                isOn = cellular,
+                                style = ControlToggleStyle(
+                                    diameter = small,
+                                    onTint = .Green,
+                                    onForeground = .White
+                                )
+                            )
+                            ControlButton(
+                                isOn = bluetooth,
+                                title = "Bluetooth",
+                                style = ControlToggleStyle(
+                                    diameter = small,
+                                    onTint = .Blue,
+                                    onForeground = .White
+                                )
+                            ) {
+                                BluetoothGlyph(size = small * ControlToggleStyle.glyphRatio)
+                            }
+                        }
+                        GridRow {
+                            ControlButton(
+                                title = "Personal Hotspot",
+                                systemImage = .Personalhotspot,
+                                isOn = hotspot,
+                                style = ControlToggleStyle(
+                                    diameter = small,
+                                    onTint = .Green,
+                                    onForeground = .White
+                                )
+                            )
+                            ControlButton(
+                                title = "VPN",
+                                systemImage = .Globe,
+                                isOn = vpn,
+                                style = ControlToggleStyle(
+                                    diameter = small,
+                                    onTint = .Blue,
+                                    onForeground = .White
+                                )
+                            )
+                        }
+                    }
+                    .width(resolvedLength(large))
+                    .height(resolvedLength(large))
+                }
+            }
+            .padding(resolvedLength(metrics.pt(14)))
+        }
+        .width(resolvedLength(metrics.span(2)))
+        .height(resolvedLength(metrics.span(2)))
+        .controlGround(.RoundedRect(metrics.pt(metrics.moduleCorner)))
+    }
+}
+
+// Bluetooth's rune, `size` points tall, which the symbol set lacks.
+construct BluetoothGlyph(size: Number) extends Widget {
+    body {
+        GeometryReader { proxy in
+            let w = proxy.size.width
+            let h = proxy.size.height
+            return Path { path in
+                path.move (to: Point { x: 0.05 * w, y: 0.27 * h })
+                path.addLine(to: Point { x: 0.95 * w, y: 0.73 * h })
+                path.addLine(to: Point { x: 0.50 * w, y: h })
+                path.addLine(to: Point { x: 0.50 * w, y: 0.0 })
+                path.addLine(to: Point { x: 0.95 * w, y: 0.27 * h })
+                path.addLine(to: Point { x: 0.05 * w, y: 0.73 * h })
+                return
+            }
+            .stroke(style: StrokeStyle { lineWidth: w * 0.12, lineCap: .Round, lineJoin: .Round })
+        }
+        .aspectRatio(0.62, .Fit)
+        .height(resolvedLength(size * 0.95))
+    }
+}
+
+// A tall pill slider, its level filled white from the bottom, its glyph at
+// the bottom. A drag moves the level by as far as it goes up or down, from
+// where the level stood when it began.
+construct ControlSlider(
+    value: Binding<Number>,
+    title: String,
+    metrics: ControlCenterMetrics,
+) extends Widget {
+    let glyph: some Widget
+    @State var from: Number = 0
+    @State var dragging: Bool = false
+
+    body {
+        let width = metrics.pt(metrics.cell)
+        let height = metrics.span(2)
+        let level = min(max(value.get(), 0.0), 1.0)
+        let adjust = copy value
+        let dragged = copy value
+        let origin = $from
+        let began = $dragging
+        ZStack(alignment = .Bottom) {
+            Rectangle()
+            .fill(RGBAColor { r: 1.0, g: 1.0, b: 1.0, a: 1.0 })
+            .height(resolvedLength(height * level))
+            glyph
+            .font(size: resolvedLength(metrics.pt(34)))
+            .width(resolvedLength(width))
+            .height(resolvedLength(width))
+        }
+        .width(resolvedLength(width))
+        .height(resolvedLength(height))
+        .controlGround(.Capsule)
+        .gesture(
+            DragGesture(minimumDistance: 0).onChanged { drag in
+                if !began.get() {
+                    origin.set(dragged.get())
+                    began.set(true)
+                }
+                dragged.set(min(max(origin.get() - drag.translation.height / height, 0.0), 1.0))
+            }.onEnded { drag in
+                began.set(false)
+            }
+        )
+        .accessibilityElement()
+        .accessibilityLabel(copy title)
+        .accessibilityValue("\(trunc(level * 100.0 + 0.5))%")
+        .accessibilityAdjustableAction(
+            { direction in
+                match direction {
+                    Increment -> adjust.set(min(adjust.get() + 0.1, 1.0))
+                    Decrement -> adjust.set(max(adjust.get() - 0.1, 0.0))
+                }
+            }
+        )
+        .animation(.Smooth)
+    }
+}
+
+// The Focus modes, as the kit's Focus menu lists them.
+@Derive(CaseIterable)
+enum FocusMode {
+    DoNotDisturb
+    Personal
+    Work
+    Sleep
+    ReduceInterruptions
+}
+
+extend FocusMode {
+    function title() -> String {
+        return match self {
+            DoNotDisturb -> "Do Not Disturb"
+            Personal -> "Personal"
+            Work -> "Work"
+            Sleep -> "Sleep"
+            ReduceInterruptions -> "Reduce Interruptions"
+        }
+    }
+
+    // The title as the tile sets it, broken by hand, as the kit's is.
+    function tileTitle() -> String {
+        return self == .ReduceInterruptions ? "Reduce\nInterrup-\ntions" : title()
+    }
+
+    function systemImage() -> Symbol {
+        return match self {
+            DoNotDisturb -> .MoonFill
+            Personal -> .PersonFill
+            Work -> .BriefcaseFill
+            Sleep -> .BedDoubleFill
+            ReduceInterruptions -> .Sparkles
+        }
+    }
+
+    function tint() -> PrimaryColor {
+        return match self {
+            DoNotDisturb -> .Indigo
+            Personal -> .Pink
+            Work -> .Teal
+            Sleep -> .Orange
+            ReduceInterruptions -> .Purple
+        }
+    }
+}
+
+// The mode titled `title`, Do Not Disturb when none is.
+function focusModeNamed(title: String) -> FocusMode {
+    for mode in allCases_FocusMode() {
+        if mode.title() == title { return mode }
+    }
+    return .DoNotDisturb
+}
+
+// The Focus tile two units wide: the mode in use, and a menu of the modes.
+// Choosing a mode turns Focus on in it; choosing the mode in use turns it off.
+construct FocusTile(
+    focus: ControlCenterControl,
+    mode: Binding<String>,
+    metrics: ControlCenterMetrics,
+) extends Widget {
+    body {
+        let current = focusModeNamed(mode.get())
+        let diameter = metrics.pt(metrics.cell * 0.6)
+        let on = focus.on
+        let toggle = copy focus.toggle
+        let chosen = copy mode
+        let selection = Binding<String> {
+            get: { in
+                return on ? chosen.get() : ""
+            },
+            set: { value in
+                if on && value == chosen.get() {
+                    toggle()
+                    return
+                }
+                chosen.set(move value)
+                if !on { toggle() }
+            }
+        }
+        var options: [Any Widget] = []
+        for option in allCases_FocusMode() {
+            options.append(
+                Label(title = option.title(), systemImage = option.systemImage()).tag(
+                    option.title()
+                )
+            )
+        }
+        Menu {
+            Picker(title = "Focus", selection = selection, children = move options)
+            .pickerStyle(.Inline)
+        } label: {
+            HStack(spacing = .Length(metrics.pt(9)), alignment = .Center) {
+                ZStack(alignment = .Center) {
+                    Circle()
+                    .foregroundColor(on ? .White : .Clear)
+                    Icon(symbol = current.systemImage())
+                    .font(size: resolvedLength(diameter * 0.58), weight: .Medium)
+                    .foregroundColor(on ? current.tint() : .White)
+                }
+                .width(resolvedLength(diameter))
+                .height(resolvedLength(diameter))
+
+                Text(content = on ? current.tileTitle() : "Focus")
+                .font(size: resolvedLength(metrics.pt(15)), weight: .Medium)
+                .lineSpacing(-2)
+                .multilineTextAlignment(.Leading)
+                .fixedSize(horizontal = false, vertical = true)
+
+                Spacer(minLength = resolvedLength(0))
+
+                Icon(symbol = .ChevronUpChevronDown)
+                .font(size: resolvedLength(metrics.pt(10)), weight: .SemiBold)
+                .foregroundColor(.Secondary)
+            }
+            .edgePadding(EdgeSet.horizontal, resolvedLength(metrics.pt(12)))
+            .width(resolvedLength(metrics.span(2)))
+            .height(resolvedLength(metrics.pt(metrics.cell)))
+        }
+        .menuStyle(.Button)
+        .menuIndicator(.Hidden)
+        .buttonStyle(.Plain)
+        .foregroundColor(.White)
+        .controlGround(.Capsule)
+        .accessibilityLabel("Focus")
+        .accessibilityValue(on ? current.title() : "Off")
+    }
+}

@@ -1,0 +1,148 @@
+//! A platform's state: its applications and windows, where each stands, and the lookups over them.
+import Foundation
+
+/// Where the application is among the state's applications, if it is known.
+function applicationIndex(state: borrow PlatformState, id: PlatformApplicationId) -> Number? {
+    for (index, application) in state.applications.enumerated() {
+        if application.id == id { return .Some(index) }
+    }
+    return .None
+}
+
+/// Where the surface is among the state's surfaces, if it is known.
+function surfaceIndex(state: borrow PlatformState, id: PlatformSurfaceId) -> Number? {
+    for (index, surface) in state.surfaces.enumerated() {
+        if surface.id == id { return .Some(index) }
+    }
+    return .None
+}
+
+/// Where the surface is among the state's surfaces; `UnknownSurface` when the
+/// platform does not know it, so a caller that acts on the reason sees it.
+function surfaceIndexOrFail(
+    state: borrow PlatformState,
+    id: PlatformSurfaceId
+) -> Result<Number, PlatformStateFailure> {
+    return match surfaceIndex(state, id) {
+        Some(index) -> .Ok(index)
+        None -> .Error(.UnknownSurface(id))
+    }
+}
+
+/// Where the application is among the state's applications; `UnknownApplication`
+/// when the platform does not know it.
+function applicationIndexOrFail(
+    state: borrow PlatformState,
+    id: PlatformApplicationId
+) -> Result<Number, PlatformStateFailure> {
+    return match applicationIndex(state, id) {
+        Some(index) -> .Ok(index)
+        None -> .Error(.UnknownApplication(id))
+    }
+}
+
+extend PlatformState {
+    /// Records an application as running, or marks one already known as
+    /// running again under its new name and kind.
+    function registerApplication(
+        borrow mut self,
+        id: PlatformApplicationId,
+        name: String,
+        kind: ApplicationKind,
+    ) {
+        match applicationIndex(self, id) {
+            Some(index) -> {
+                applications[index].name = copy name
+                applications[index].kind = kind
+                applications[index].running = true
+                if kind == .Application { noteUsed(name) }
+            }
+            None -> {
+                if kind == .Application { noteUsed(name) }
+                applications.append(
+                    PlatformApplication { id: id, name: name, kind: kind, running: true, }
+                )
+            }
+        }
+    }
+
+    /// Marks an application as no longer running. Its surfaces are hidden, and
+    /// focus they held goes back to the platform.
+    function applicationEnded(
+        borrow mut self,
+        id: PlatformApplicationId,
+    ) -> Result<Void, PlatformStateFailure> {
+        let index = try applicationIndexOrFail(self, id)
+        let heldFocus = focusedApplication() == .Some(id)
+        applications[index].running = false
+        if switcherSelection == .Some(id) { switcherSelection = .None }
+        for surface in 0..surfaces.count {
+            if surfaces[surface].application == id {
+                surfaces[surface].visible = .Hidden
+                surfaces[surface].focused = false
+            }
+        }
+        if heldFocus { returnFocusToPlatform() }
+        return .Ok
+    }
+
+    /// Records a surface of `application`, visible, or moves one already known
+    /// to the frame and z-order given.
+    function registerSurface(
+        borrow mut self,
+        id: PlatformSurfaceId,
+        application: PlatformApplicationId,
+        frame: SurfaceFrame,
+        zOrder: Number,
+    ) {
+        match surfaceIndex(self, id) {
+            Some(index) -> {
+                surfaces[index].application = application
+                surfaces[index].visible = .Visible
+                surfaces[index].frame = frame
+                surfaces[index].zOrder = zOrder
+            }
+            None -> surfaces.append(
+                PlatformSurface {
+                    id: id,
+                    application: application,
+                    visible: .Visible,
+                    focused: false,
+                    frame: frame,
+                    zOrder: zOrder,
+                }
+            )
+        }
+    }
+
+    /// Shows or hides a surface. A hidden surface gives up its focus to the
+    /// platform.
+    function setSurfaceVisibility(
+        borrow mut self,
+        id: PlatformSurfaceId,
+        visibility: SurfaceVisibility,
+    ) -> Result<Void, PlatformStateFailure> {
+        let index = try surfaceIndexOrFail(self, id)
+        match visibility {
+            Visible -> surfaces[index].visible = .Visible
+            Hidden -> {
+                let lostFocus = surfaces[index].focused
+                surfaces[index].visible = .Hidden
+                surfaces[index].focused = false
+                if lostFocus { returnFocusToPlatform() }
+            }
+        }
+        return .Ok
+    }
+
+    /// Opens the launcher.
+    function openLauncher(borrow mut self) {
+        launcherOpen = true
+        switcherOpen = false
+    }
+
+    /// Closes the launcher.
+    function closeLauncher(borrow mut self) {
+        launcherOpen = false
+    }
+}

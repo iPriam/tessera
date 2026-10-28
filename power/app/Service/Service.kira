@@ -1,0 +1,213 @@
+import Foundation
+import LibTessera
+import DeviceKit
+
+// The service's state: its ports, its listener, its page and the devices
+// it is read from, its connections, and the wakes it has been asked for.
+// `main` makes it and lends it to everything that runs.
+
+struct Service {
+    var port: Handle
+    // Device opens wait here, so no other completion is taken in their place.
+    var openPort: Handle
+    var listener: Handle
+    var page: Page
+    var devices: Devices
+    var nextRefresh: Number
+    var clock: ClockWatch
+    var clients: [Client]
+    var nextClient: Number
+    // Boot-clock deadlines still ahead, and the one the clock is armed for.
+    var wakes: [Number]
+    var armed: Number?
+}
+
+namespace ServiceName {
+    let power: String = "tessera.power"
+}
+
+// The keys this service's waits are made under. A connection's key is its
+// id times `lanes` plus `channel`; the listener and the termination watch
+// take keys no connection has, since connection ids start at 1.
+namespace PortKey {
+    let listener: Number = 1
+    let termination: Number = 2
+    let lanes: Number = 16
+    let channel: Number = 1
+    // The most completions taken in one wait.
+    let batch: Number = 32
+}
+
+// What a completion key names.
+enum Waker {
+    Listener
+    Termination
+    Channel(Number)
+    Unknown
+}
+
+function channelKey(client: Number) -> Number { return client * PortKey.lanes + PortKey.channel }
+
+function wakerOf(key: Number) -> Waker {
+    if key == PortKey.listener { return .Listener }
+    if key == PortKey.termination { return .Termination }
+    let owner = floor(key / PortKey.lanes)
+    if key - owner * PortKey.lanes == PortKey.channel { return .Channel(owner) }
+    return .Unknown
+}
+
+function failure(code: borrow ErrorCode) -> TesseraError {
+    return TesseraError {
+        code: code,
+        subsystem: .Power,
+        flags: ErrorFlags.none,
+        detail: UNumber(0)
+    }
+}
+
+// The ports, the page, the devices and the listener. It listens before the
+// first refresh, which opens every device through devicekitd: a client that
+// connects meanwhile waits in the backlog rather than finding nobody there.
+function startService() -> Result<Service, TesseraError> {
+    let port = try portCreate(.None)
+    let openPort = try portCreate(.None)
+    match processWatchTermination(port, PortKey.termination) {
+        // The watch is set, and its completion arrives on the port when asked to stop.
+        Ok -> {}
+        Error(failed) -> log warn("cannot hear a request to stop", error: errorName(failed))
+    }
+    let page = try createPage()
+    let listener = try serviceListen(ServiceName.power)
+    var service = Service {
+        port: port,
+        openPort: openPort,
+        listener: listener,
+        page: page,
+        devices: Devices { sources: [], zones: [], clocks: [], stale: true },
+        nextRefresh: 0,
+        clock: ClockWatch { offset: .None },
+        clients: [],
+        nextClient: 1,
+        wakes: [],
+        armed: .None,
+    }
+    try watchClock(service)
+    try refresh(service)
+    try objectWaitAsync(listener, Signals.readable, .Repeat, port, PortKey.listener)
+    return .Ok(service)
+}
+
+// Takes completions until asked to stop.
+function run(service: borrow mut Service) -> Result<Void, TesseraError> {
+    while true {
+        match portWait(service.port, PortKey.batch, nextDeadline(service)) {
+            Ok(completions) -> {
+                for completion in completions {
+                    match wakerOf(Number(completion.key)) {
+                        Termination -> {
+                            log info("asked to stop")
+                            return .Ok
+                        }
+                        Listener -> accept(service)
+                        Channel(client) -> serveClient(service, client)
+                        Unknown -> log warn(
+                            "a completion no wait was made for",
+                            key: completion.key
+                        )
+                    }
+                }
+            }
+            Error(failed) -> {
+                if failed.code != .Timeout { return .Error(failed) }
+            }
+        }
+        try runDueWork(service)
+    }
+}
+
+// The earliest moment something is due: a refresh or a lock's expiry.
+function nextDeadline(service: borrow Service) -> Number {
+    var next = service.nextRefresh
+    for client in service.clients {
+        match client.lock {
+            Some(lock) -> next = min(next, lock.expiry)
+            // A connection without a lock has no expiry to wait for.
+            None -> {}
+        }
+    }
+    return next
+}
+
+// Watches the clock, lets go of the locks that have expired, and refreshes
+// the page when it is due.
+function runDueWork(service: borrow mut Service) -> Result<Void, TesseraError> {
+    try watchClock(service)
+    let now = try monotonic()
+    var expired: [Number] = []
+    for client in service.clients {
+        match client.lock {
+            Some(lock) -> if now >= lock.expiry { expired.append(client.id) }
+            // A connection without a lock has nothing to expire.
+            None -> {}
+        }
+    }
+    for id in expired { closeClient(service, id) }
+    if now >= service.nextRefresh {
+        try refresh(service)
+        match armClock(service) {
+            Ok -> {}
+            Error(failed) -> log warn("cannot arm the next wake", error: errorName(failed))
+        }
+    }
+    return .Ok
+}
+
+function clockRead(clock: borrow Clock) -> Result<Number, TesseraError> {
+    return timeRead(clock)
+}
+
+// The monotonic and boot clocks, in nanoseconds.
+function monotonic() -> Result<Number, TesseraError> { return clockRead(.Monotonic) }
+function boottime() -> Result<Number, TesseraError> { return clockRead(.Boottime) }
+
+function closeHandle(handle: Handle) {
+    match handleClose(handle) {
+        // The handle is gone, so there is nothing left to do.
+        Ok -> {}
+        Error(failed) -> log warn("a handle could not be closed", error: errorName(failed))
+    }
+}
+
+function closeHandles(handles: borrow [Handle]) {
+    if handles.count == 0 { return }
+    match handleCloseMany(handles) {
+        // The handles are gone, so there is nothing left to do.
+        Ok -> {}
+        Error(failed) -> log warn("handles could not be closed", error: errorName(failed))
+    }
+}
+
+function closeRef(reference: Ref) {
+    match refClose(reference) {
+        // The connection is gone, so there is nothing left to do.
+        Ok -> {}
+        Error(failed) -> log warn(
+            "a device connection could not be closed",
+            error: errorName(failed)
+        )
+    }
+}
+
+// Cancels what is armed under `key`; a closing client may have nothing
+// armed, and then there is nothing to cancel.
+function cancelWaits(port: Handle, key: Number) {
+    match portCancel(port, key) {
+        // The waits are cancelled, and how many there were is not needed.
+        Ok -> {}
+        Error(failed) -> {
+            if failed.code != .NotFound {
+                log warn("a wait could not be cancelled", key, error: errorName(failed))
+            }
+        }
+    }
+}

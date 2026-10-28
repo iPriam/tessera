@@ -1,0 +1,16 @@
+import Foundation
+
+// Numbers as the lexer reads them: at most eighteen decimal places, and
+// integers up to nineteen digits.
+
+@Test
+function decimalPlacesPastEighteenAreRefused() {
+    expect!(outcome("0.1234567890123456789") == "At most 18 decimal places")
+    expect!(outcome("0.123456789012345678") == "0.123456789012345678")
+}
+
+@Test
+function integersHoldNineteenDigits() {
+    expect!(outcome("9999999999999999999") == "9999999999999999999")
+    expect!(outcome("10000000000000000000") == "The result is too large")
+}

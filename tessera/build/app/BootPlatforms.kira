@@ -1,0 +1,238 @@
+import Foundation
+
+// The services boots of the other platforms against the same display
+// server, and what each services boot prints besides the device services.
+
+// The media boot: Media connects, is configured full-screen and runs, and a
+// USB stick plugged in while it runs is mounted at /Volumes/stick and
+// forgotten when it goes. `diskutil activity`, which init runs, prints both
+// once it has said what volumes are there already.
+function mediaScenario(machine: borrow mut TestMachine) -> Bool {
+    machine.await(200, { written in return written.shows("Media.main]: running") })
+    let started = machine.read()
+    if !started.has("Media.main]: configured|x: 0|y: 0|width: 1280|height: 800")
+        || !started.has("Media.main]: window policy|policy: \"fullscreen\"")
+        || !started.has("Media.main]: arranged|arrangement: \"exclusive\"")
+        || !started.shows("Media.main]: running")
+        || !machine.running() {
+        return machine.fail("services media platform failed", 100)
+    }
+    machine.await(200, { written in return written.shows("***DAIdle") })
+    plugStick(machine)
+    machine.await(
+        200,
+        { written in
+            return written.has("mounted a volume|disk: \"sda\"|mountPoint: \"/Volumes/stick\"")
+        }
+    )
+    machine.monitor.send("device_del stick")
+    machine.await(
+        200,
+        { written in
+            return written.has("a disk went away; its volume was unmounted|disk: \"sda\"")
+        }
+    )
+    machine.await(50, { written in return written.shows("***DiskDisappeared ('sda'") })
+    let written = machine.read()
+    let entries = [
+        "mounted a volume|disk: \"sda\"|mountPoint: \"/Volumes/stick\"|filesystem: \"ext4\"|readOnly: false|holds: \"lost+found\"",
+        "a disk went away; its volume was unmounted|disk: \"sda\"|mountPoint: \"/Volumes/stick\""
+    ]
+    let printed = [
+        "***DiskAppeared ('vda', DAVolumePath = '/Volumes/scratch', DAVolumeKind = 'ext4')",
+        "***DiskAppeared ('sda', DAVolumePath = '<null>', DAVolumeKind = 'ext4')",
+        "***DiskDescriptionChanged ('sda', DAVolumePath = '/Volumes/stick', DAVolumeKind = 'ext4')",
+        "***DiskDisappeared ('sda', DAVolumePath = '/Volumes/stick', DAVolumeKind = 'ext4')"
+    ]
+    for entry in entries {
+        if !written.has(entry) { return machine.fail("services USB stick hotplug failed", 100) }
+    }
+    for line in printed {
+        if !written.shows(line) { return machine.fail("services USB stick hotplug failed", 100) }
+    }
+    return true
+}
+
+// The browser boot: the Browser starts WebKit's web process and network
+// process, loads a page that needs no network, and imports the first frame
+// the web process drew into the window it shows. That the pixels are right
+// is judged by the screenshot of the output, which this boot also takes.
+function browserScenario(machine: borrow mut TestMachine) -> Bool {
+    machine.await(300, { written in return written.has("the web engine is running") })
+    machine.await(300, { written in return written.has("the browser shows a page|") })
+    let written = machine.read()
+    if !written.has("the web engine is running") || !written.has("the browser shows a page|")
+        || !machine.running() {
+        return machine.fail("services browser failed", 100)
+    }
+    return true
+}
+
+// The mobile boot: Adaptive Mobile runs Stack, the application in front
+// filling the output as on an iPad; Stage Manager on and off; display sleep and a key that
+// wakes the output; and a click that opens the lock screen again.
+function mobileScenario(machine: borrow mut TestMachine) -> Bool {
+    let monitor = copy machine.monitor
+    let stack = "laid the surfaces out|layout: \"2 at 0,0 1280x800, 3 at 0,0 1280x800\""
+    machine.await(200, { written in return written.has(stack) })
+    // caffeinate holds its wake lock for a second, which can outlast the
+    // platform's stack.
+    machine.await(
+        100,
+        { written in
+            return written.shows("]: a wake lock was released") && written.has(
+                "a service exited|service: \"caffeinate\""
+            )
+        }
+    )
+    // Once the lock screen is open, F6 turns Stage Manager on, under the
+    // 24-point status bar and above the 24-point home indicator; F6 again
+    // gives the stack back, the second time it is laid out so.
+    openLockScreen(machine)
+    monitor.send("sendkey f6")
+    machine.await(50, { written in return written.has(StageLayouts.mobileOn) })
+    monitor.send("sendkey f6")
+    machine.await(50, { written in return written.count(StageLayouts.mobileOff) >= 2 })
+    awaitBanners(machine)
+    // Started with twenty seconds of display sleep (`tessera.idle-test`):
+    // left alone the output dims, then blanks, and the platform closes its
+    // lock screen; a key wakes the output and reaches no client.
+    machine.await(400, { written in return written.has(StageLayouts.blanked) })
+    monitor.send("sendkey a")
+    machine.await(50, { written in return written.has(StageLayouts.awake) })
+    let idle = [
+        StageLayouts.dimmed,
+        StageLayouts.blanked,
+        StageLayouts.awake,
+        "AdaptiveMobile.Mobile.Idle]: the output changed for want of input|state: \"blanked\"",
+        "AdaptiveMobile.main]: the lock screen closed"
+    ]
+    for spec in idle {
+        if !machine.read().has(spec) { return machine.fail("services mobile idle failed", 100) }
+    }
+    // The lock screen the output woke to opens on a click. MosaicDisplay
+    // reads the virtio mouse, so it is the one the monitor drives.
+    monitor.takeVirtioMouse()
+    monitor.send("mouse_move 640 400")
+    monitor.click()
+    let opened = "AdaptiveMobile.main]: the lock screen opened"
+    machine.await(50, { written in return written.count(opened) >= 2 })
+    if machine.read().count(opened) < 2 {
+        return machine.fail("services mobile lock screen click failed", 100)
+    }
+    let written = machine.read()
+    if !written.has("AdaptiveMobile.main]: arranged|arrangement: \"stack\"")
+        || !written.has("AdaptiveMobile.main]: asked the compositor for its mode|split: false")
+        || !written.has(stack)
+        || !written.has(StageLayouts.mobileOn)
+        || written.count(StageLayouts.mobileOff) < 2
+        || !machine.running() {
+        return machine.fail("services mobile platform failed", 100)
+    }
+    return true
+}
+
+// The lines a services boot's own scenario prints, as `BootLog.seen` takes
+// them.
+function scenarioServiceLines(mode: borrow BootMode) -> [String] {
+    var lines: [String] = []
+    if mode.multi {
+        // date sets the clock to 2030, the Power service sees it jump and
+        // posts timeChanged, and the platform shows the new time, or reads
+        // 2030 when it starts watching, if date ran first.
+        for line in [
+            "Tue Jan  1 00:00:00 UTC 2030",
+            "log:a service exited|service: \"date\"|status: 0",
+            "log:Power.Service.Clock]: the clock was set|forward: true",
+            "log:a service posted an event|service: \"tessera.power\"",
+            "log:AdaptiveDesktop.Desktop.Clock]: the clock was set|now: \"2030-01-01 00:0 || log:AdaptiveDesktop.Desktop.Devices]: watching for devices|now: \"2030-01-01 00:0",
+            // diskutil asks the Volume service to let go of the scratch disk.
+            "log:unmounted a volume|disk: \"vda\"|mountPoint: \"/Volumes/scratch\"",
+            "Volume scratch on vda unmounted",
+            "log:a service exited|service: \"diskutil\"|status: 0",
+            "log:TesseraDevices.Service.Changes]: a device was added|kind: \"audio output\"",
+            "log:a service posted an event|service: \"tessera.devices\"",
+            "log:AdaptiveDesktop.Desktop.Devices]: a device was added|kind: \"audio output\"|name: \"Audio 0\"",
+            "log:TesseraDevices.Service.Changes]: a device was removed|kind: \"audio output\"",
+            "log:AdaptiveDesktop.Desktop.Devices]: a device was removed|kind: \"audio output\"|name: \"Audio 0\"",
+            "log:found a keyboard|keyboards: 2",
+            "log:a keyboard went away|keyboards: 1",
+            "log:a key repeated|client: 2|key: 5",
+            "log:a key arrived|client: 3|key: 4|state: \"pressed\"|provenance: DisplayProvenance.Hardware|text: \"a\"",
+            "log:the stacking order changed|stack: \"2 3 1\"",
+            "log:a service posted an event|service: \"tessera.volume\"",
+            "log:AdaptiveDesktop.Desktop.Devices]: a volume was mounted|path: \"/Volumes/stick\"",
+            "log:AdaptiveDesktop.Desktop.Devices]: a volume was unmounted|path: \"/Volumes/stick\""
+        ] { lines.append(copy line) }
+    }
+    if mode.restart {
+        for line in [
+            "log:unmounted a volume|disk: \"vda\"",
+            "log:ejected a disk|disk: \"vda\"",
+            "Disk vda ejected",
+            "log:a service exited|service: \"diskutil\"|status: 0",
+            // diskutil ejects the CD, and the drive lets it go.
+            "log:mounted a volume|disk: \"sr|mountPoint: \"/Volumes/disc\"|readOnly: true",
+            "log:unmounted a volume|disk: \"sr",
+            "log:the drive let its medium go|disk: \"sr",
+            "log:a service exited|service: \"diskutil-disc\"|status: 0",
+            // ioreg prints the registry's block devices.
+            "  <class BlockDevice, id 0x",
+            "    \"size\" = 4194304",
+            "log:a service exited|service: \"ioreg\"|status: 0"
+        ] { lines.append(copy line) }
+    }
+    // pmset reads the Power service's page: QEMU's machine has no battery.
+    if mode.media {
+        for line in [
+            "Now drawing from 'AC Power'",
+            "Note: No thermal warning level has been recorded",
+            "log:a service exited|service: \"pmset\"|status: 0"
+        ] { lines.append(copy line) }
+    }
+    if mode.mobile {
+        // caffeinate holds a wake lock for a second, which the Power service
+        // takes and lets go of; diskutil describes the scratch disk.
+        for line in [
+            "log:a wake lock was taken|program: \"/bin/caffeinate\"|kind: \"CPU\"|seconds: 1|reason: \"caffeinate command-line tool\"",
+            "log:a wake lock was released|program: \"/bin/caffeinate\"|reason: \"caffeinate command-line tool\"",
+            "log:a service exited|service: \"caffeinate\"|status: 0",
+            "   Device Identifier:         vda",
+            "   Mount Point:               /Volumes/scratch",
+            "   Volume Read-Only:          Yes",
+            "log:a service exited|service: \"diskutil\"|status: 0"
+        ] { lines.append(copy line) }
+    }
+    // Each Display Check client posts a notification through AppKit, and the
+    // adaptive platforms show it as a banner.
+    if mode.multi || mode.mobile {
+        for client in [2, 3] {
+            lines.append(
+                "log:a notification banner appeared|title: \"Display Check\"|body: \"Client \(client) is on the display\""
+            )
+        }
+    }
+    if !mode.scenario() {
+        // MosaicDisplay composes the platform and the application on the GPU,
+        // application on top, and logs once the flip was accepted; diskutil
+        // lists the scratch disk as macOS's does.
+        for line in [
+            "log:compositing on the GPU",
+            "log:composed a picture|surfaces: 2|stack: \"2 1\"",
+            "/dev/vda (internal):",
+            "ext4 scratch",
+            "*4.2 MB   vda",
+            "log:a service exited|service: \"diskutil\"|status: 0"
+        ] { lines.append(copy line) }
+    }
+    // Recovery lists the two virtio disks and not the loop device the system
+    // image is mounted from, and is the one surface composed.
+    if mode.recoveryTest {
+        for line in [
+            "log:Recovery.main]: listed the disks|count: 2",
+            "log:compositing on the GPU",
+            "log:composed a picture|surfaces: 1"
+        ] { lines.append(copy line) }
+    }
+    return lines
+}

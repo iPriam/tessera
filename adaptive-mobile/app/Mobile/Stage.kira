@@ -1,0 +1,173 @@
+//! Stage Manager and the windows' placement on Adaptive Mobile: toggling the stage and the windowed mode, the
+//! badges the home screen shows, and where an application goes home.
+import Foundation
+import LibTessera
+import PlatformKit
+import PlatformUI
+import TesseraDisplayClient
+import KiraUI
+import TesseraUI
+
+// How applications share the output on Adaptive Mobile, as on an iPad
+// (roadmap/15-form-factors.md): the stack at start, Stage Manager, or
+// Windowed Apps, chosen in Control Center.
+//
+// Stage Manager: F6 on a keyboard turns it on and off, as Adaptive Desktop's
+// does. On, the compositor puts the application in front on the stage and
+// draws the others small in the strip down the leading edge, and the platform
+// supplies their badge artwork to the compositor, as Adaptive Desktop does.
+// A tap on a picture brings that application to the stage. The
+// window on the stage draws its own close, minimize and zoom buttons, and
+// what is put away waits in the strip (`stripPutAway`).
+//
+// Windowed Apps: applications open as windows that float free, each drawing
+// its own close, minimize and zoom buttons, as on an iPad with Windowed Apps
+// on and as on Adaptive Desktop (Windows.kira).
+//
+// Turning either off gives the stack back.
+
+/// Turns Stage Manager on, or back to the stack when it is on.
+function toggleStage(mobile: borrow mut Mobile) {
+    arrange(mobile, mobile.mode == .Stage ? .Stack : .Stage)
+}
+
+/// Turns Windowed Apps on, or back to the stack when it is on.
+function toggleWindowed(mobile: borrow mut Mobile) {
+    arrange(mobile, mobile.mode == .Freeform ? .Stack : .Freeform)
+}
+
+/// Asks the compositor for `mode`. The stack is never split: the
+/// application in front fills the screen.
+function arrange(mobile: borrow mut Mobile, mode: CompositorMode) {
+    if mobile.lock.locked { return }
+    let channel = match mobile.channel {
+        Some(value) -> value
+        None -> return
+    }
+    match sendSetMode(channel, copy mode, false) {
+        Ok -> {
+            mobile.mode = copy mode
+            redrawAfter(0)
+            log info("the arrangement changed", stage: mode == .Stage, windowed: mode == .Freeform)
+        }
+        Error(failed) -> log warn(
+            "could not change how applications share the output",
+            mode: mode,
+            error: errorName(failed)
+        )
+    }
+}
+
+/// What Control Center shows of the arrangement.
+function arrangementOf(mobile: borrow Mobile) -> ControlCenterArrangement {
+    return ControlCenterArrangement {
+        staged: mobile.mode == .Stage,
+        windowed: .Some(mobile.mode == .Freeform)
+    }
+}
+
+/// Artwork for waiting and active windows, ready before focus changes, and
+/// where each application's icon stands, which its window flies into going
+/// home and grows out of coming back, as an iPad's does.
+function stageBadgesOf(mobile: borrow Mobile) -> [DynamicPlatformBadge] {
+    let dock = shownDockItems(mobile)
+    let hidden = mobile.state.hiddenApplicationSurfaces()
+    var badges: [DynamicPlatformBadge] = []
+    for item in stageBadgeItems(mobile.state) {
+        let home = badgeHomeOf(mobile, dock, item.name, !hidden.contains(item.surface))
+        badges.append(
+            DynamicPlatformBadge {
+                surface: DisplaySurfaceId(item.surface.raw),
+                icon: ApplicationIcon(name = copy item.name, side = StageBadgeAtlas.icon),
+                home: home.frame,
+                homeCorner: home.corner,
+                // The Dock is the home screen's too, which draws it: every
+                // icon a window flies by is the home screen's.
+                homeScreen: true
+            }
+        )
+    }
+    return badges
+}
+
+/// Where an application's window goes home to, or comes back out of: a window
+/// shown goes into its icon on the home screen's page, or else in the Dock; one
+/// put away comes back out of the Dock's, as a tap there brings it, and a tap on
+/// the home screen says its own icon (`DisplayLaunchOrigin`).
+struct BadgeHome {
+    let frame: StageFrame
+    let corner: Number
+}
+
+/// Where `name` goes home: into its icon on the home screen's page, unless it was opened from the Dock, which takes it back.
+function badgeHomeOf(
+    mobile: borrow Mobile,
+    dock: borrow [DockItem],
+    name: borrow String,
+    shown: Bool
+) -> BadgeHome {
+    // An application goes home into the icon it was opened from: the Dock's
+    // when it was opened there, else its icon on the home screen's page.
+    if shown && !mobile.fromDock.contains(name) {
+        match homeScreenIconOf(mobile.bridge, name) {
+            Some(icon) -> return BadgeHome {
+                frame: StageFrame { x: icon.x, y: icon.y, width: icon.width, height: icon.height },
+                corner: icon.corner
+            }
+            None -> {}
+        }
+    }
+    let frame = match dockIconFrame(dock, name, mobile.output.width, mobile.output.height) {
+        Some(found) -> StageFrame {
+            x: found.x,
+            y: found.y,
+            width: found.width,
+            height: found.height
+        }
+        None -> StageFrame { x: 0, y: 0, width: 0, height: 0 }
+    }
+    return BadgeHome { frame: frame, corner: iconCorner(frame.width) }
+}
+
+/// Every application put away, by going home or with its yellow button, waits
+/// in the strip once one comes to the stage, as on an iPad with Stage Manager
+/// on: the compositor draws each shown window not on the stage in the strip.
+enum StripPutAwayFailure {
+    Display(TesseraError)
+    State(PlatformStateFailure)
+}
+
+/// Logs why an application could not be put away into the strip.
+function reportStripPutAwayFailure(failure: borrow StripPutAwayFailure) {
+    match failure {
+        Display(reason) -> log warn(
+            "an application could not be shown in the strip",
+            error: errorName(reason)
+        )
+        State(reason) -> log warn("the platform lost track of a window", reason)
+    }
+}
+
+/// Shows again the hidden application windows other than `except`, so they sit in the strip while Stage Manager is on.
+function stripPutAway(
+    mobile: borrow mut Mobile,
+    except: PlatformSurfaceId
+) -> Result<Void, StripPutAwayFailure> {
+    if mobile.mode != .Stage { return .Ok }
+    let channel = match mobile.channel {
+        Some(value) -> value
+        None -> return .Ok
+    }
+    for surface in mobile.state.hiddenApplicationSurfaces() {
+        if surface == except { continue }
+        match sendSetHidden(copy channel, DisplaySurfaceId(surface.raw), false) {
+            Ok -> {}
+            Error(failed) -> return .Error(.Display(failed))
+        }
+        match mobile.state.setSurfaceVisibility(surface, .Visible) {
+            Ok -> {}
+            Error(failure) -> return .Error(.State(failure))
+        }
+    }
+    return .Ok
+}

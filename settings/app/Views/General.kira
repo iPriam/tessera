@@ -1,0 +1,75 @@
+import Foundation
+import KiraUI
+import LibTessera
+
+// General: the machine, what it keeps, and what it runs.
+construct GeneralPane(release: Release, choices: SettingsChoices) extends Widget {
+    body {
+        Form {
+            Section {
+                NavigationLink(value = AboutRoute(release = copy release)) {
+                    PaneLabel(title = "About", symbol = .InfoCircleFill, tint = .Gray)
+                }
+            }
+
+            Section {
+                NavigationLink(value = DateTimeRoute(choices = choices)) {
+                    PaneLabel(title = "Date & Time", symbol = .ClockFill, tint = .Blue)
+                }
+
+                NavigationLink(value = KeyboardRoute()) {
+                    PaneLabel(title = "Language & Keyboard", symbol = .Keyboard, tint = .Gray)
+                }
+            }
+
+            Section {
+                NavigationLink(value = PlatformRoute()) {
+                    HStack(spacing = .Medium, alignment = .Center) {
+                        PaneLabel(title = "Platform", symbol = .Desktopcomputer, tint = .Blue)
+                        Spacer()
+                        Text(platformTitle(runningPlatform())).foregroundColor(.Secondary)
+                    }
+                }
+            }
+
+            Section {
+                NavigationLink(value = StorageRoute()) {
+                    PaneLabel(title = "Storage", symbol = .SquareStack3dUp, tint = .Indigo)
+                }
+
+                NavigationLink(value = AppsRoute()) {
+                    PaneLabel(title = "Apps", symbol = .SquareGrid2x2Fill, tint = .Purple)
+                }
+            }
+        }
+        .navigationTitle("General")
+    }
+}
+
+// About: the system's version and the machine it runs on.
+construct AboutPane(release: Release) extends Widget {
+    body {
+        let volumes = systemVolumes().count + mountedVolumes().count
+        Form {
+            Section {
+                LabeledContent(label = "Name") { Text("Tessera") }
+                LabeledContent(label = "Version") { Text(shownOr(release.version, "Unknown")) }
+                LabeledContent(label = "Architecture") {
+                    Text(shownOr(release.architecture, "Unknown"))
+                }
+            }
+
+            Section {
+                LabeledContent(label = "Volumes") { Text(String(volumes)) }
+                LabeledContent(label = "Applications") {
+                    Text(String(installedApplications().count))
+                }
+            }
+        }
+        .navigationTitle("About")
+    }
+}
+
+function shownOr(text: borrow String, fallback: borrow String) -> String {
+    return text.count > 0 ? copy text : copy fallback
+}

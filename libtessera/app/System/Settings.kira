@@ -1,0 +1,299 @@
+import Foundation
+import Heap
+
+// The Settings service (`tessera.settings`), which keeps the machine's
+// settings as files on the data volume (roadmap/05-storage-and-state.md,
+// `/data/system/`) and answers them to anyone who asks (16 §14.4). Only the
+// system writes them: a program under `/bin`, and Settings, which a person
+// changes them in. Every other application reads, and asks Settings to be
+// opened on a setting when it wants one changed.
+//
+// A setting is a key, a dotted name such as `appearance.scheme`, and its
+// value as text. A key the service holds no value for reads as none, and
+// whoever reads it takes its own default.
+//
+// The wire: a 32-byte header, `op` @0, `code` @4 (an `ErrorCode` value), `a`
+// @8, `b` @16, `c` @24, then the operation's text. An answer carries the
+// request's `op`.
+//
+//   1 `Read`: the text is the key; the answer's text its value, `NotFound`
+//     when there is none.
+//   2 `Write`: the text is the key, `a` bytes, then the value.
+//   3 `List`: every setting, the answer's text one `key=value` line each.
+//   4 `Remove`: the text is the key; it reads as none again.
+//
+// A write or a removal is posted to every process as
+// `System/settingsChanged`, its body the key's length @0 and its bytes @8.
+
+public namespace SettingsWire {
+    let service: String = "tessera.settings"
+    let changed: String = "System/settingsChanged"
+    let headerBytes: Number = 32
+    let messageBytes: Number = 4096
+    let alignment: Number = 16
+    let answerWait: Number = 5000000000
+    let readyKey: Number = 1
+    // The longest key: a `settingsChanged` body holds it after its length.
+    let longestKey: Number = 128
+    // The longest value.
+    let longestValue: Number = 1024
+}
+
+@Derive(Copy)
+enum SettingsOperation: U32 {
+    Read = 1
+    Write = 2
+    List = 3
+    Remove = 4
+}
+
+// One setting as `List` answers it.
+public struct Setting {
+    let key: String
+    let value: String
+}
+
+struct SettingsAnswer {
+    let operation: U32
+    let code: ErrorCode
+    let text: String
+}
+
+// A connection to the Settings service.
+public function settingsConnect() -> Result<Handle, TesseraError> {
+    return serviceConnect(SettingsWire.service)
+}
+
+// Whether `key` can name a setting: a dotted name, of letters, digits, `.`,
+// `-` and `_`, at most `SettingsWire.longestKey` bytes.
+public function settingKeyValid(key: borrow String) -> Bool {
+    if key.count == 0 || key.count > SettingsWire.longestKey { return false }
+    for index in 0..key.count {
+        let byte = key.charAt(index)
+        let letter = (byte >= 97 && byte <= 122) || (byte >= 65 && byte <= 90)
+        let digit = byte >= 48 && byte <= 57
+        if !letter && !digit && byte != 46 && byte != 45 && byte != 95 { return false }
+    }
+    return true
+}
+
+// The value of `key`, none when the service holds none.
+public function settingsRead(channel: Handle, key: borrow String) -> Result<String?, TesseraError> {
+    if !settingKeyValid(key) { return .Error(failure(.InvalidArgument)) }
+    try settingsSend(channel, .Read, 0, key)
+    match settingsAwait(channel, .Read) {
+        Ok(answer) -> return .Ok(.Some(copy answer.text))
+        Error(failed) -> {
+            if failed.code == .NotFound { return .Ok(.None) }
+            return .Error(failed)
+        }
+    }
+}
+
+// Sets `key` to `value`. Only the system may: anyone else is refused
+// `NotEntitled`.
+public function settingsWrite(
+    channel: Handle,
+    key: borrow String,
+    value: borrow String
+) -> Result<Void, TesseraError> {
+    if !settingKeyValid(key) || value.count > SettingsWire.longestValue || value.contains("\n") {
+        return .Error(failure(.InvalidArgument))
+    }
+    try settingsSend(channel, .Write, key.count, key + value)
+    try settingsAwait(channel, .Write)
+    return .Ok
+}
+
+// Forgets `key`'s value, so it reads as none and its reader's default holds.
+public function settingsRemove(channel: Handle, key: borrow String) -> Result<Void, TesseraError> {
+    if !settingKeyValid(key) { return .Error(failure(.InvalidArgument)) }
+    try settingsSend(channel, .Remove, 0, key)
+    try settingsAwait(channel, .Remove)
+    return .Ok
+}
+
+// Every setting the service holds, by key.
+public function settingsList(channel: Handle) -> Result<[Setting], TesseraError> {
+    try settingsSend(channel, .List, 0, "")
+    let answer = try settingsAwait(channel, .List)
+    return .Ok(settingsFromLines(answer.text))
+}
+
+// The settings `key=value` lines hold, as the service's file and `List` write
+// them; a line that is not one is skipped.
+public function settingsFromLines(text: borrow String) -> [Setting] {
+    var settings: [Setting] = []
+    for line in text.split("\n") {
+        let at = match line.indexOf("=") {
+            Some(found) -> found
+            None -> continue
+        }
+        if at == 0 { continue }
+        let key = line.substring(0, at)
+        if !settingKeyValid(key) { continue }
+        settings.append(Setting { key: key, value: line.substring(at + 1, line.count) })
+    }
+    return settings
+}
+
+// `settings` as `key=value` lines.
+public function settingsLines(settings: borrow [Setting]) -> String {
+    var text = ""
+    for setting in settings { text += setting.key + "=" + setting.value + "\n" }
+    return text
+}
+
+// The value of `key`, read over a connection of its own, or `fallback` when
+// there is none or the service cannot be reached: what a program reads once,
+// at start.
+public function settingValue(key: borrow String, fallback: borrow String) -> String {
+    let channel = match settingsConnect() {
+        Ok(value) -> value
+        Error(failed) -> {
+            absorb failed
+            return copy fallback
+        }
+    }
+    let read = settingsRead(channel, key)
+    match handleClose(channel) {
+        Ok -> {}
+        Error(failed) -> absorb failed
+    }
+    return match read {
+        Ok(found) -> match found {
+            Some(value) -> value
+            None -> copy fallback
+        }
+        Error(failed) -> {
+            absorb failed
+            copy fallback
+        }
+    }
+}
+
+// The key a message read off the System channel says changed, none when it
+// is no `System/settingsChanged` event: `block` holds the message, `bytes`
+// long.
+public function settingsChangedIn(block: RawPtr, bytes: Number) -> String? {
+    if bytes < Wire.headerBytes { return .None }
+    if !MessageFlags(heapLoad<U32>(block, 16)).has(MessageFlags.event) { return .None }
+    if heapLoad<U64>(block, 8) != wireOrdinal(SettingsWire.changed) { return .None }
+    return settingsChangedKey(
+        Buffer {
+            address: heapOffset(block, Wire.headerBytes),
+            length: U64(bytes - Wire.headerBytes)
+        }
+    )
+}
+
+// The key a `System/settingsChanged` body names, none when it names none.
+public function settingsChangedKey(body: borrow Buffer) -> String? {
+    if body.length < U64(8) { return .None }
+    let length = Number(heapLoad<U64>(body.address, 0))
+    if length <= 0 || length > SettingsWire.longestKey || U64(8 + length) > body.length {
+        return .None
+    }
+    return .Some(stringFromCBytes(heapOffset(body.address, 8), length))
+}
+
+function settingsSend(
+    channel: Handle,
+    operation: SettingsOperation,
+    a: Number,
+    text: borrow String
+) -> Result<Void, TesseraError> {
+    if SettingsWire.headerBytes + text.count > SettingsWire.messageBytes {
+        return .Error(failure(.InvalidArgument))
+    }
+    let block = zeroedBlock(
+        count: SettingsWire.headerBytes + text.count,
+        alignment: SettingsWire.alignment
+    )
+    heapStore<U32>(block.pointer(), 0, code(operation))
+    heapStore<U64>(block.pointer(), 8, U64(a))
+    copyBytes(heapOffset(block.pointer(), SettingsWire.headerBytes), text.data, text.count)
+    let none: [Handle] = []
+    return channelWrite(
+        channel,
+        Buffer { address: block.pointer(), length: SettingsWire.headerBytes + text.count },
+        none
+    )
+}
+
+function settingsTake(channel: Handle) -> Result<SettingsAnswer, TesseraError> {
+    let block = zeroedBlock(count: SettingsWire.messageBytes, alignment: SettingsWire.alignment)
+    let received = try channelRead(
+        channel,
+        Buffer { address: block.pointer(), length: SettingsWire.messageBytes },
+        UNumber(0)
+    )
+    if received.bytes < SettingsWire.headerBytes { return .Error(failure(.InvalidArgument)) }
+    return .Ok(
+        SettingsAnswer {
+            operation: heapLoad<U32>(block.pointer(), 0),
+            code: errorCodeFrom(heapLoad<U32>(block.pointer(), 4)),
+            text: stringFromCBytes(
+                heapOffset(block.pointer(), SettingsWire.headerBytes),
+                received.bytes - SettingsWire.headerBytes
+            )
+        }
+    )
+}
+
+// Waits for the answer to `operation`, its failure the error.
+function settingsAwait(
+    channel: Handle,
+    operation: SettingsOperation
+) -> Result<SettingsAnswer, TesseraError> {
+    let port = try portCreate(.None)
+    let answer = settingsAwaitOn(channel, port, operation)
+    match handleClose(port) {
+        Ok -> {}
+        Error(failed) -> absorb failed
+    }
+    let taken = try answer
+    if taken.code != .Ok { return .Error(failure(taken.code)) }
+    return .Ok(taken)
+}
+
+function settingsAwaitOn(
+    channel: Handle,
+    port: Handle,
+    operation: SettingsOperation
+) -> Result<SettingsAnswer, TesseraError> {
+    let deadline = try timeRead(.Monotonic) + SettingsWire.answerWait
+    while true {
+        match settingsTake(channel) {
+            Ok(answer) -> {
+                if answer.operation == code(operation) { return .Ok(answer) }
+            }
+            Error(failed) -> {
+                if failed.code != .ShouldWait { return .Error(failed) }
+                try objectWaitAsync(
+                    channel,
+                    Signals.readable | Signals.peerClosed,
+                    .Once,
+                    port,
+                    SettingsWire.readyKey
+                )
+                try portWait(port, 1, deadline)
+            }
+        }
+    }
+    return .Error(failure(.Internal))
+}
+
+// Whether the first-run setup was completed: `yes` once Welcome finished it.
+// PID 1 opens Welcome on a desktop boot until it is, reading the settings
+// file (`SystemFile.settings`) itself.
+public namespace SetupSetting {
+    let completed: String = "setup.completed"
+    let yes: String = "yes"
+}
+
+// The language the person chose, as a BCP 47 code: `en`, `de`, `fr`.
+public namespace LanguageSetting {
+    let preferred: String = "language.preferred"
+    let fallback: String = "en"
+}

@@ -1,0 +1,129 @@
+//! An application or platform drawn with no display, for a picture of it. On a
+//! machine with no MosaicDisplay, such as the host Tessera is built on, its
+//! frames go into a texture of its own and one is written out as a PPM.
+//!
+//! It is asked for as Ember's harness asks a windowed run for a frame:
+//! `KIRA_GRAPHICS_CAPTURE_FRAME` names the file, `KIRA_GRAPHICS_CAPTURE_AT` the
+//! frame, `KIRA_GRAPHICS_QUIT_AFTER_FRAMES` how many are drawn, and
+//! `KIRA_GRAPHICS_SCALE` the scale. So the tool that captures any Kira UI
+//! application captures a Tessera one the same way.
+
+import Foundation
+import KiraUI
+import Ember
+import TesseraDisplayClient
+
+/// The output a capture is drawn for: the 1440x900-point output at 2x that
+/// the platforms are laid out against (roadmap/10-toolkit.md, "Checkpoints").
+namespace CaptureOutput {
+    let width: Number = 1440
+    let height: Number = 900
+    let scale: Number = 2
+    // A display grants a frame each refresh, and an animation plays against
+    // the time between them, so a capture is paced as a 60 Hz output paces it.
+    let refreshSeconds: Number = 1 / 60
+}
+
+/// What a capture draws: how many frames, which one it writes, where, and at
+/// how many pixels a point.
+struct CaptureRequest {
+    let path: String
+    let frame: UNumber
+    let frames: UNumber
+    let scale: Number
+}
+
+/// Why a capture wrote nothing.
+enum HostCaptureFailure {
+    NoTextures(RendererFailure)
+    NotDrawn(SessionEnd)
+    NotWritten(CaptureFailure)
+}
+
+/// The capture the environment asks for, if it asks for one.
+function captureRequest() -> CaptureRequest? {
+    let knobs = environmentHarnessKnobs()
+    let asked = try knobs.capture otherwise return .None
+    // Ember's harness settles the frame: the one asked for, else the last drawn.
+    let frame = match asked.frame {
+        Some(value) -> value
+        None -> max(knobs.quitAfterFrames, 1)
+    }
+    return .Some(
+        CaptureRequest {
+            path: copy asked.path,
+            frame: frame,
+            frames: max(knobs.quitAfterFrames, frame),
+            scale: knobs.scale > 0 ? knobs.scale : CaptureOutput.scale
+        }
+    )
+}
+
+/// The window model a capture is drawn in: an Adaptive Mobile surface fills
+/// the screen, and a desktop's window floats free.
+function captureMode() -> CompositorMode {
+    return match interfaceMode() {
+        AdaptiveMobile -> .Exclusive
+        AdaptiveDesktop -> .Freeform
+    }
+}
+
+extend Host {
+    /// The size the display would configure the surface at: the whole output
+    /// for the platform, a desktop and a surface that fills the screen, and
+    /// for a window floating free, the two thirds of the output MosaicDisplay
+    /// places a first one at.
+    function captureSize(borrow self, mode: CompositorMode) -> Size {
+        let output = Size { width: CaptureOutput.width, height: CaptureOutput.height }
+        if !isWindow() || mode != .Freeform { return output }
+        return Size { width: trunc(output.width * 2 / 3), height: trunc(output.height * 2 / 3) }
+    }
+}
+
+/// Draws the frames `request` asks for, focused, as the display would grant
+/// them, and writes the one it names.
+function captureFrames(
+    hosting: borrow mut Hosting,
+    rootBuilder: borrow () -> Any Widget,
+    request: borrow CaptureRequest
+) -> Result<Void, HostCaptureFailure> {
+    let mode = captureMode()
+    hosting.host.adoptMode(mode)
+    hosting.host.size = hosting.host.captureSize(mode)
+    hosting.host.scale = request.scale
+    hosting.host.refocused(.Focused)
+    for index in 1..request.frames + 1 {
+        let serial = FrameSerial(index)
+        let texture = try drawCaptureFrame(hosting, rootBuilder, serial)
+        if index == request.frame {
+            match hosting.drawing.renderer.device.capture(texture, request.path) {
+                Ok -> log info("captured a frame", frame: index, path: request.path)
+                Error(failure) -> return .Error(.NotWritten(failure))
+            }
+        }
+        harnessSleepSeconds(CaptureOutput.refreshSeconds)
+    }
+    return .Ok
+}
+
+/// Draws frame `serial` and answers the texture it is in.
+function drawCaptureFrame(
+    hosting: borrow mut Hosting,
+    rootBuilder: borrow () -> Any Widget,
+    serial: FrameSerial
+) -> Result<GraphicsTexture, HostCaptureFailure> {
+    let textures = match hosting.drawing.renderer.fit(
+        hosting.host.drawnPixels(),
+        hosting.host.drawnPixels()
+    ) {
+        Ok(value) -> value
+        Error(failure) -> return .Error(.NoTextures(failure))
+    }
+    hosting.host.stale = false
+    match drawFrame(hosting, rootBuilder, textures, serial, true) {
+        Ok -> {}
+        Error(end) -> return .Error(.NotDrawn(end))
+    }
+    hosting.host.frames = serial.raw
+    return .Ok(textures.textureFor(serial))
+}

@@ -1,0 +1,87 @@
+//! Exact arithmetic on `Number`s, refusing any operation whose result would
+//! trap.
+//!
+//! An operator traps when its result's integer part is beyond what a `Number`
+//! holds. Each operation is therefore refused first, from its operands alone,
+//! and every comparison here stays inside the range a `Number` holds.
+
+import Foundation
+
+/// Applies a binary operator to two `Number`s.
+///
+/// # Errors
+///
+/// Returns `.DivideByZero` when `operator` is `.Divide` and `right` is zero.
+/// Returns `.Overflow` when the result would reach `CalcLimit.bound`.
+function applyOperator(
+    operator: Operator,
+    left: Number,
+    right: Number
+) -> Result<Number, CalculationFailure> {
+    if operator == .Divide && right == 0 {
+        return .Error(.DivideByZero)
+    }
+    if exceedsLimit(operator, left, right) {
+        return .Error(.Overflow)
+    }
+    match operator {
+        Add -> { return .Ok(left + right) }
+        Subtract -> { return .Ok(left - right) }
+        Multiply -> { return .Ok(left * right) }
+        Divide -> { return .Ok(left / right) }
+    }
+}
+
+/// Whether `left operator right` reaches `CalcLimit.bound`.
+///
+/// A sum of same-signed operands is their magnitudes added, and a difference
+/// of opposite-signed ones is too. The check is written as
+/// `magnitude >= bound - other`, so it never computes the sum itself.
+function exceedsLimit(operator: Operator, left: Number, right: Number) -> Bool {
+    let magnitudeLeft = absolute(left)
+    let magnitudeRight = absolute(right)
+    match operator {
+        Add -> { return sameSign(left, right) && magnitudeLeft >= CalcLimit.bound - magnitudeRight }
+        Subtract -> {
+            return !sameSign(left, right) && magnitudeLeft >= CalcLimit.bound - magnitudeRight
+        }
+        Multiply -> { return productExceeds(magnitudeLeft, magnitudeRight) }
+        Divide -> { return quotientExceeds(magnitudeLeft, magnitudeRight) }
+    }
+}
+
+/// Whether the product of two magnitudes reaches `CalcLimit.bound`.
+///
+/// A product is at least its larger operand when the smaller is one or more,
+/// and at most the larger operand when the smaller is below one. The latter
+/// cannot reach the bound, so only the first case is tested.
+function productExceeds(magnitudeLeft: Number, magnitudeRight: Number) -> Bool {
+    let smaller = min(magnitudeLeft, magnitudeRight)
+    let larger = max(magnitudeLeft, magnitudeRight)
+    if smaller < 1 {
+        return false
+    }
+    return larger >= CalcLimit.bound / smaller
+}
+
+/// Whether the quotient of a dividend and a divisor reaches `CalcLimit.bound`.
+///
+/// A divisor of one or more never grows the dividend. A divisor below one does,
+/// so the dividend is compared with the bound scaled down by the divisor.
+/// The divisor is never zero: [`applyOperator`] refuses that first.
+function quotientExceeds(dividend: Number, divisor: Number) -> Bool {
+    if divisor >= 1 {
+        return false
+    }
+    return dividend >= CalcLimit.bound * divisor
+}
+
+/// Whether two numbers lie on the same side of zero, with zero on the positive side.
+function sameSign(left: Number, right: Number) -> Bool {
+    return (left < 0) == (right < 0)
+}
+
+/// The magnitude of a `Number`: the value with its sign removed.
+function absolute(value: Number) -> Number {
+    return value < 0 ? 0 - value : value
+}

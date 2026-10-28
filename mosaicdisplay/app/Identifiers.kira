@@ -1,0 +1,5 @@
+// Nominal identifiers used inside MosaicDisplay. Raw U32 values stay at the
+// DRM seam, so unrelated ids cannot be passed across subsystem boundaries.
+// Surfaces are named as the display protocol names them, by
+// `DisplaySurfaceId`.
+distinct CrtcId = U32

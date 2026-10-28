@@ -1,0 +1,487 @@
+import Foundation
+import Heap
+
+// Operations waiting for the kernel (§2.4, §5.3).
+//
+// Each one names the handle it was submitted on, the port and key its
+// completion goes to, and what it is waiting for, with that work's own
+// state. A call has a deadline of its own. `Port.wait` advances the
+// port's operations, then sleeps in the kernel on the backings they wait on
+// until one is ready or the deadline passes. State that lives in shared memory
+// (an event) has no backing and is looked at again every
+// `pendingSliceNanoseconds`.
+
+struct PendingOperation {
+    var live: Bool
+    var work: PendingWork
+    var slot: Number?
+    var object: Number
+    var port: Number
+    var key: U64
+    var inFlight: Bool
+}
+
+// What a pending operation is waiting to do, with what it needs to do it.
+enum PendingWork {
+    WaitAsync(SignalWait)
+    Timer(TimerWork)
+    Accept(AcceptWork)
+    Connect
+    Send(EndpointWork)
+    Receive(EndpointWork)
+    // Waits on the object the operation made for it.
+    Wake
+    Stream(StreamWork)
+    Call(CallWork)
+    Lock(LockWork)
+    Source(SourceWait)
+    Transfer(SourceTransfer)
+}
+
+// `Object.waitAsync`: the signals wanted, how it posts, and what was
+// asserted when it last looked (for `Edge`).
+@Derive(Copy)
+struct SignalWait {
+    var signals: Signals
+    var mode: WaitOptions
+    var observed: U32
+}
+
+// An armed timer: its period, 0 for once.
+@Derive(Copy)
+struct TimerWork {
+    var period: U64
+}
+
+// An accept: where the caller wants the peer's address, if anywhere.
+struct AcceptWork {
+    var peer: RawPtr?
+}
+
+// A send or receive: what it moves and how, the bytes moved so far, the
+// address block it owns (none for `Plain`), where the caller wants the
+// sender's address, and for `Batched` how many `Datagram`s.
+struct EndpointWork {
+    var form: TransferForm
+    var buffers: [Buffer]
+    var flags: U32
+    var moved: U64
+    var address: RawPtr?
+    var source: RawPtr?
+    var count: U64
+}
+
+// A stream operation: a slot enqueued, or a flush.
+enum StreamWork {
+    Slot(U64)
+    Flush
+}
+
+// A call: its transaction, its deadline, and where the reply and its
+// handles go.
+struct CallWork {
+    var txid: U64
+    var deadline: U64
+    var response: Buffer
+    var handles: Buffer
+}
+
+// A byte-range lock.
+@Derive(Copy)
+struct LockWork {
+    var offset: U64
+    var length: U64
+    var mode: LockMode
+}
+
+// A readiness source: the backend's object, the readiness wanted, how it
+// posts, and the packet's results.
+@Derive(Copy)
+struct SourceWait {
+    var backing: Number
+    var events: SourceEvents
+    var mode: WaitOptions
+    var fillEvents: Bool
+    var result0: U64
+    var result1: U64
+    var aux: U64
+}
+
+// A read or write at an offset of the backend's object into a caller's
+// buffer.
+struct SourceTransfer {
+    var backing: Number
+    var write: Bool
+    var offset: U64
+    var aux: U64
+    var buffer: Buffer
+}
+
+// The kind of `work`.
+function operationOf(work: borrow PendingWork) -> PendingOp {
+    return match work {
+        WaitAsync -> .WaitAsync
+        Timer -> .Timer
+        Accept -> .Accept
+        Connect -> .Connect
+        Send -> .Send
+        Receive -> .Receive
+        Wake -> .Wake
+        Stream -> .Stream
+        Call -> .Call
+        Lock -> .Lock
+        Source -> .Source
+        Transfer -> .Transfer
+    }
+}
+
+// What an operation sleeps on: a kernel backing and the readiness wanted.
+struct Interest {
+    var backing: Number
+    var ready: Number
+}
+
+// What a pending operation is waiting to do.
+@Derive(Copy)
+enum PendingOp {
+    WaitAsync
+    Timer
+    Accept
+    Connect
+    Send
+    Receive
+    Wake
+    Stream
+    Call
+    Lock
+    Source
+    Transfer
+}
+
+let pendingSliceNanoseconds: U64 = U64(10000000)
+
+namespace Ready {
+    // Readiness bits, what a kernel backing can report.
+    let readable: Number = 1
+    let priority: Number = 2
+    let writable: Number = 4
+    let error: Number = 8
+    let hangUp: Number = 16
+    let invalid: Number = 32
+    let readHangUp: Number = 64
+}
+
+// Who a pending operation belongs to: the handle it was started through, or
+// an object of its own when no handle stands for it.
+enum PendingHolder {
+    Handle(Number)
+    Object(Number)
+}
+
+function pendingAdd(work: PendingWork, holder: PendingHolder, port: Number, key: U64) -> Number {
+    var slot: Number? = .None
+    var object = port
+    match holder {
+        Handle(held) -> { slot = .Some(held) object = objectOfSlot(held) }
+        Object(held) -> object = held
+    }
+    let entry = PendingOperation {
+        live: true,
+        work: move work,
+        slot: move slot,
+        object: object,
+        port: port,
+        key: key,
+        inFlight: false,
+    }
+    for index in 0..library.pending.count {
+        if !library.pending[index].live {
+            library.pending[index] = entry
+            return index
+        }
+    }
+    library.pending.append(entry)
+    return library.pending.count - 1
+}
+
+function pendingKind(operation: borrow PendingOp) -> CompletionKind {
+    match operation {
+        WaitAsync -> return .Signal
+        Timer -> return .Timer
+        Wake -> return .Power
+        Stream -> return .Stream
+        Call -> return .Service
+        Lock -> return .Io
+        Source, Transfer -> return .Device
+        Accept, Connect, Send, Receive -> return .Net
+    }
+}
+
+// Ends the operation with `error` and its results.
+function pendingFinish(
+    index: Number,
+    outcome: borrow Result<Void, TesseraError>,
+    result0: U64,
+    result1: U64,
+    aux: U64
+) {
+    let port = library.pending[index].port
+    let completion = completionMake(
+        library.pending[index].key,
+        outcome,
+        pendingKind(operationOf(library.pending[index].work)),
+        CompletionFlags.none,
+        result0,
+        result1,
+        aux
+    )
+    pendingDrop(index)
+    portDeliver(port, completion, .None)
+}
+
+// A packet from an operation that stays armed, flagged `MORE`.
+function pendingDeliverMore(index: Number, result0: U64, result1: U64, aux: U64) {
+    let completion = completionMake(
+        library.pending[index].key,
+        .Ok,
+        pendingKind(operationOf(library.pending[index].work)),
+        CompletionFlags.more,
+        result0,
+        result1,
+        aux
+    )
+    library.pending[index].inFlight = true
+    portDeliver(library.pending[index].port, completion, .Some(index))
+}
+
+function pendingDrop(index: Number) {
+    library.pending[index].live = false
+    let owned = library.pending[index].object
+    match library.pending[index].work {
+        Wake -> {
+            match library.pending[index].slot {
+                Some -> {}
+                None -> {
+                    if library.objects[owned].refs <= 0 { objectDestroy(owned) }
+                }
+            }
+        }
+        Send(transfer) -> endpointRelease(transfer)
+        Receive(transfer) -> endpointRelease(transfer)
+        WaitAsync, Timer, Accept, Connect, Stream, Call, Lock, Source, Transfer -> {}
+    }
+}
+
+// A packet an operation queued has been taken.
+function pendingDelivered(index: Number) {
+    if index < library.pending.count { library.pending[index].inFlight = false }
+}
+
+// Frees the address block a send or receive owns.
+function endpointRelease(transfer: borrow EndpointWork) {
+    match transfer.address {
+        Some(block) -> deallocate(block)
+        None -> {}
+    }
+}
+
+function pendingCancel(index: Number) {
+    match library.pending[index].work {
+        Timer -> {
+            // The operation ends `Cancelled` either way; a timer that still
+            // fires finds nothing waiting on it.
+            match timerDisarm(library.pending[index].object) {
+                Ok -> {}
+                Error(failed) -> absorb failed
+            }
+        }
+        Stream(stream) -> {
+            match stream {
+                Slot(slot) -> {
+                    streamFinish(index, slot, .Error(failure(.Cancelled)), U64(0), U64(0), U32(0))
+                    return
+                }
+                Flush -> {}
+            }
+        }
+        WaitAsync, Accept, Connect, Send, Receive, Wake, Call, Lock, Source, Transfer -> {}
+    }
+    pendingFinish(index, .Error(failure(.Cancelled)), U64(0), U64(0), U64(0))
+}
+
+function pendingCancelHandle(slot: Number) {
+    for index in 0..library.pending.count {
+        if !library.pending[index].live { continue }
+        match library.pending[index].slot {
+            Some(held) -> {
+                if held == slot { pendingCancel(index) }
+            }
+            None -> {}
+        }
+    }
+}
+
+function pendingCancelKey(port: Number, key: U64) -> U32 {
+    var count = U32(0)
+    for index in 0..library.pending.count {
+        if library.pending[index].live && library.pending[index].port == port && library.pending[index].key == key {
+            pendingCancel(index)
+            count += U32(1)
+        }
+    }
+    return count
+}
+
+// Cancels the operations of kind `operation` on `object`.
+function pendingCancelAll(object: Number, operation: borrow PendingOp) {
+    for index in 0..library.pending.count {
+        if library.pending[index].live && library.pending[index].object == object && operationOf(
+            library.pending[index].work
+        ) == operation {
+            pendingCancel(index)
+        }
+    }
+}
+
+// Cancels the operations of kind `operation` on `object`; answers whether
+// there were any.
+function pendingCancelOn(object: Number, operation: borrow PendingOp) -> Bool {
+    var cancelled = 0
+    for index in 0..library.pending.count {
+        if library.pending[index].live && library.pending[index].object == object && operationOf(
+            library.pending[index].work
+        ) == operation {
+            pendingCancel(index)
+            cancelled += 1
+        }
+    }
+    return cancelled > 0
+}
+
+function pendingForgetPort(port: Number) {
+    for index in 0..library.pending.count {
+        if library.pending[index].live && library.pending[index].port == port { pendingDrop(index) }
+    }
+}
+
+// One step of every operation reaching `port`.
+function pendingAdvance(port: Number) {
+    var backings: [Number] = []
+    for index in 0..library.pending.count {
+        if library.pending[index].live && library.pending[index].port == port {
+            match library.pending[index].work {
+                Source(source) -> backings.append(source.backing)
+                Transfer(transfer) -> backings.append(transfer.backing)
+                WaitAsync, Timer, Wake, Stream, Call, Lock, Accept, Connect, Send, Receive -> match library.objects[library.pending[index].object].backing {
+                    Some(backing) -> backings.append(backing)
+                    None -> {}
+                }
+            }
+        }
+    }
+    kernelReadySnapshot(backings)
+    for index in 0..library.pending.count {
+        if library.pending[index].live && library.pending[index].port == port { pendingStep(index) }
+    }
+    kernelReadyForget()
+}
+
+function pendingStep(index: Number) {
+    match library.pending[index].work {
+        WaitAsync(wait) -> waitAsyncStep(index, move wait)
+        Timer(timer) -> timerStep(index, timer)
+        Wake -> wakeStep(index)
+        Stream -> streamStep(index)
+        Call(call) -> callStep(index, call)
+        Lock(lock) -> fileLockStep(index, lock)
+        Source(source) -> sourceStep(index, source)
+        Transfer(transfer) -> sourceTransferStep(index, transfer)
+        Accept, Connect, Send, Receive -> endpointStep(index)
+    }
+}
+
+// What an operation sleeps on; none for state that has to be looked at
+// again.
+function pendingWant(index: Number) -> Interest? {
+    let object = library.pending[index].object
+    match library.pending[index].work {
+        WaitAsync(wait) -> return objectWant(object, wait.signals.raw)
+        Timer, Wake, Accept, Receive, Call, Stream -> return objectReady(object, Ready.readable)
+        Connect, Send -> return objectReady(object, Ready.writable)
+        Lock -> return .None
+        Source(source) -> return .Some(sourceWant(source))
+        Transfer(transfer) -> return .Some(transferWant(transfer))
+    }
+}
+
+// `ready` on the backing of `object`; none for an object without one.
+function objectReady(object: Number, ready: Number) -> Interest? {
+    return match library.objects[object].backing {
+        Some(backing) -> .Some(Interest { backing: backing, ready: ready })
+        None -> .None
+    }
+}
+
+// Sleeps until an operation reaching `port` may advance, or `deadline`.
+function pendingBlock(port: Number, deadline: U64, now: U64) {
+    var wants: [Interest] = []
+    var slice = false
+    var wake = deadline
+    for index in 0..library.pending.count {
+        if library.pending[index].live && library.pending[index].port == port {
+            match pendingWant(index) {
+                Some(want) -> wants.append(want)
+                None -> slice = true
+            }
+            match library.pending[index].work {
+                Call(call) -> {
+                    if call.deadline < wake { wake = call.deadline }
+                }
+                WaitAsync, Timer, Accept, Connect, Send, Receive, Wake, Stream, Lock, Source, Transfer -> {}
+            }
+        }
+    }
+    var wait = Deadline.infinite
+    if wake != Deadline.infinite {
+        wait = U64(0)
+        if wake > now { wait = wake - now }
+    }
+    if slice && wait > pendingSliceNanoseconds { wait = pendingSliceNanoseconds }
+    kernelWaitFor(wants, wait)
+}
+
+// `Object.waitAsync`: one packet when a wanted signal is asserted (`Once`),
+// one each time the last was taken and it still is (`Repeat`), or one each
+// time it becomes asserted (`Edge`).
+function waitAsyncStep(index: Number, wait: SignalWait) {
+    if library.pending[index].inFlight { return }
+    let asserted = objectSignals(library.pending[index].object) & wait.signals.raw
+    match wait.mode {
+        Once -> if asserted != U32(0) { pendingFinish(index, .Ok, U64(asserted), U64(0), U64(0)) }
+        Edge -> {
+            let rising = asserted & complement32(wait.observed)
+            var seen = wait
+            seen.observed = asserted
+            library.pending[index].work = .WaitAsync(seen)
+            if rising != U32(0) { pendingDeliverMore(index, U64(rising), U64(0), U64(0)) }
+        }
+        Repeat -> if asserted != U32(0) { pendingDeliverMore(index, U64(asserted), U64(0), U64(0)) }
+    }
+}
+
+public function objectWaitAsync(
+    handle: Handle,
+    signals: Signals,
+    options: WaitOptions,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    if signals == Signals.none { return .Error(failure(.InvalidArgument)) }
+    let slot = try resolve(handle, .None, Rights.wait)
+    let portObject = try resolveObject(port, .Port, Rights.none)
+    var observed = U32(0)
+    if options == .Edge { observed = objectSignals(objectOfSlot(slot)) & signals.raw }
+    let wait = SignalWait { signals: signals, mode: options, observed: observed }
+    pendingAdd(.WaitAsync(wait), .Handle(slot), portObject, key)
+    return .Ok
+}

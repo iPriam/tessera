@@ -1,0 +1,353 @@
+//! What editing Home does to its arrangement: moving an item to another place
+//! or page, dropping an application on another to make a folder or into one,
+//! taking one out of its folder, taking one off Home and putting it back, and
+//! adding, moving and hiding pages and widgets. A page given more than it
+//! holds passes its last item on to the next.
+
+import Foundation
+
+extend HomeArrangement {
+    // Where the application `app` stands, itself or in a folder.
+    function slotOf(borrow self, app: borrow String) -> HomeSlot? {
+        for page in 0..self.pages.count {
+            for index in 0..self.pages[page].items.count {
+                if self.pages[page].items[index].holds(app) {
+                    return .Some(HomeSlot { page: page, index: index })
+                }
+            }
+        }
+        return .None
+    }
+
+    // The item at `slot`, when one is there.
+    function itemAt(borrow self, slot: borrow HomeSlot) -> HomeItem? {
+        if slot.page < 0 || slot.page >= self.pages.count { return .None }
+        let items = self.pages[slot.page].items
+        if slot.index < 0 || slot.index >= items.count { return .None }
+        return .Some(copy items[slot.index])
+    }
+
+    // How many items `page` holds: a page of `space`, less the rows its
+    // widgets take.
+    function room(borrow self, page: Number, space: borrow HomeSpace) -> Number {
+        if page < 0 || page >= self.pages.count || self.pages[page].widgets.count == 0 {
+            return space.perPage
+        }
+        return max(space.perPage - HomeWidgetRows.count * space.columns, 0)
+    }
+
+    // Puts `item` at the end of the last page with room, or on a new page.
+    function place(borrow mut self, item: HomeItem, space: borrow HomeSpace) {
+        if self.pages.count == 0 || self.pages[self.pages.count - 1].items.count >= self.room(
+            self.pages.count - 1,
+            space
+        ) {
+            self.pages.append(HomePage {})
+        }
+        self.pages[self.pages.count - 1].items.append(move item)
+    }
+
+    // Takes the item at `slot` off its page.
+    function remove(borrow mut self, slot: borrow HomeSlot) {
+        if self.itemAt(slot).isNone() { return }
+        var kept: [HomeItem] = []
+        for index in 0..self.pages[slot.page].items.count {
+            if index != slot.index { kept.append(copy self.pages[slot.page].items[index]) }
+        }
+        self.pages[slot.page].items = move kept
+    }
+
+    // Puts `item` at `slot`, or at its page's end when the place is past it;
+    // what no longer fits the page moves on to the next.
+    function insert(
+        borrow mut self,
+        item: HomeItem,
+        slot: borrow HomeSlot,
+        space: borrow HomeSpace
+    ) {
+        while self.pages.count <= slot.page { self.pages.append(HomePage {}) }
+        var items: [HomeItem] = []
+        let at = min(max(slot.index, 0), self.pages[slot.page].items.count)
+        for index in 0..self.pages[slot.page].items.count {
+            if index == at { items.append(copy item) }
+            items.append(copy self.pages[slot.page].items[index])
+        }
+        if at == self.pages[slot.page].items.count { items.append(move item) }
+        self.pages[slot.page].items = move items
+        self.spill(slot.page, space)
+    }
+
+    // Moves what is past the room on `page` to the start of the next page,
+    // in order, and on down the pages while each overflows.
+    function spill(borrow mut self, page: Number, space: borrow HomeSpace) {
+        var at = page
+        while at < self.pages.count && self.pages[at].items.count > self.room(at, space) {
+            let room = self.room(at, space)
+            var kept: [HomeItem] = []
+            var over: [HomeItem] = []
+            for (index, item) in self.pages[at].items.enumerated() {
+                if index < room { kept.append(copy item) } else { over.append(copy item) }
+            }
+            self.pages[at].items = move kept
+            if at + 1 >= self.pages.count { self.pages.append(HomePage {}) }
+            for item in self.pages[at + 1].items { over.append(copy item) }
+            self.pages[at + 1].items = move over
+            at = at + 1
+        }
+    }
+
+    // Moves the item at `from` to `to`.
+    function moveItem(
+        borrow mut self,
+        from: borrow HomeSlot,
+        to: borrow HomeSlot,
+        space: borrow HomeSpace
+    ) {
+        let item = try self.itemAt(from) otherwise return
+        self.remove(from)
+        self.insert(move item, to, space)
+    }
+
+    // Drops the item at `from` on the one at `onto`: an application on an
+    // application makes a folder of the two where the second stood, and one
+    // on a folder goes into it. A folder dropped on anything only moves.
+    function dropItem(
+        borrow mut self,
+        from: borrow HomeSlot,
+        onto: borrow HomeSlot,
+        space: borrow HomeSpace
+    ) {
+        let target = try self.itemAt(onto) otherwise return
+        let moving = try self.itemAt(from) otherwise return
+        let app = match moving {
+            App(name) -> name
+            Folder -> {
+                self.moveItem(from, onto, space)
+                return
+            }
+        }
+        let joined = match target {
+            App(name) -> HomeFolder { name: HomeFolderName.made, apps: [move name, copy app] }
+            Folder(folder) -> {
+                var grown = copy folder
+                grown.apps.append(copy app)
+                grown
+            }
+        }
+        self.pages[onto.page].items[onto.index] = .Folder(move joined)
+        self.remove(from)
+    }
+
+    // Takes `app` off Home, leaving it in App Library.
+    function removeFromHome(borrow mut self, app: borrow String) {
+        self.leave(app)
+        if !self.removed.contains(app) { self.removed.append(copy app) }
+    }
+
+    // Puts `app` back on Home, on `page` when it has room.
+    function addToHome(borrow mut self, app: borrow String, page: Number, space: borrow HomeSpace) {
+        var kept: [String] = []
+        for each in self.removed {
+            if each != app { kept.append(copy each) }
+        }
+        self.removed = move kept
+        if self.slotOf(app).isSome() { return }
+        if page >= 0 && page < self.pages.count && self.pages[page].items.count < self.room(
+            page,
+            space
+        ) {
+            self.pages[page].items.append(.App(copy app))
+        } else {
+            self.place(.App(copy app), space)
+        }
+    }
+
+    // Takes `app` out of wherever it stands; a folder left empty goes.
+    function leave(borrow mut self, app: borrow String) {
+        let slot = try self.slotOf(app) otherwise return
+        let item = try self.itemAt(slot) otherwise return
+        match item {
+            App -> self.remove(slot)
+            Folder(folder) -> {
+                var apps: [String] = []
+                for each in folder.apps {
+                    if each != app { apps.append(copy each) }
+                }
+                if apps.count == 0 {
+                    self.remove(slot)
+                } else {
+                    self.pages[slot.page].items[slot.index] = .Folder(
+                        HomeFolder { name: copy folder.name, apps: apps }
+                    )
+                }
+            }
+        }
+    }
+
+    // Takes `app` out of its folder onto `page`.
+    function moveOut(borrow mut self, app: borrow String, page: Number, space: borrow HomeSpace) {
+        self.leave(app)
+        self.insert(.App(copy app), HomeSlot { page: page, index: space.perPage }, space)
+    }
+
+    // Moves `app` to `index` in the folder at `slot`.
+    function reorderFolder(
+        borrow mut self,
+        slot: borrow HomeSlot,
+        app: borrow String,
+        index: Number
+    ) {
+        let item = try self.itemAt(slot) otherwise return
+        let folder = match item {
+            Folder(value) -> value
+            App -> return
+        }
+        var apps: [String] = []
+        for each in folder.apps {
+            if each != app { apps.append(copy each) }
+        }
+        var ordered: [String] = []
+        let at = min(max(index, 0), apps.count)
+        for position in 0..apps.count {
+            if position == at { ordered.append(copy app) }
+            ordered.append(copy apps[position])
+        }
+        if at == apps.count { ordered.append(copy app) }
+        self.pages[slot.page].items[slot.index] = .Folder(
+            HomeFolder { name: copy folder.name, apps: ordered }
+        )
+    }
+
+    function renameFolder(borrow mut self, slot: borrow HomeSlot, name: borrow String) {
+        let item = try self.itemAt(slot) otherwise return
+        match item {
+            Folder(folder) -> self.pages[slot.page].items[slot.index] = .Folder(
+                HomeFolder {
+                    name: name.count == 0 ? HomeFolderName.made : copy name,
+                    apps: copy folder.apps
+                }
+            )
+            // Only a folder has a name of its own.
+            App -> {}
+        }
+    }
+
+    // Moves the page at `from` to `to`.
+    function movePage(borrow mut self, from: Number, to: Number) {
+        if from < 0 || from >= self.pages.count || to < 0 || to >= self.pages.count { return }
+        let page = copy self.pages[from]
+        var rest: [HomePage] = []
+        for index in 0..self.pages.count {
+            if index != from { rest.append(copy self.pages[index]) }
+        }
+        var ordered: [HomePage] = []
+        for index in 0..rest.count {
+            if index == to { ordered.append(copy page) }
+            ordered.append(copy rest[index])
+        }
+        if to == rest.count { ordered.append(move page) }
+        self.pages = move ordered
+    }
+
+    // Hides the page at `page`, or shows it again; one page stays shown.
+    function toggleHidden(borrow mut self, page: Number) {
+        if page < 0 || page >= self.pages.count { return }
+        if !self.pages[page].hidden && self.shownPages().count <= 1 { return }
+        self.pages[page].hidden = !self.pages[page].hidden
+    }
+
+    // The pages that are not hidden, by their place among all of them.
+    function shownPages(borrow self) -> [Number] {
+        var shown: [Number] = []
+        for page in 0..self.pages.count {
+            if !self.pages[page].hidden { shown.append(page) }
+        }
+        return shown
+    }
+
+    // The arrangement as an edit leaves it: an empty page goes, unless it is
+    // the only one. The reset it follows stays, or the next draw would take
+    // Settings' last reset as new and throw the edit away.
+    function settled(borrow self) -> HomeArrangement {
+        var kept = HomeArrangement { removed: copy self.removed, reset: copy self.reset }
+        for page in self.pages {
+            if page.items.count > 0 || page.widgets.count > 0 { kept.pages.append(copy page) }
+        }
+        if kept.pages.count == 0 { kept.pages.append(HomePage {}) }
+        return kept
+    }
+}
+
+extend HomeArrangement {
+    // Puts `widget` along the top of `page` when there is room beside the
+    // widgets there; the icons it displaces move on to the next page.
+    function addWidget(borrow mut self, page: Number, widget: HomeWidget, space: borrow HomeSpace) {
+        if page < 0 || page >= self.pages.count { return }
+        if !homeWidgetFits(self.pages[page].widgets, widget.size, space.columns) { return }
+        self.pages[page].widgets.append(move widget)
+        self.spill(page, space)
+    }
+
+    // Takes the `index`th widget off `page`.
+    function removeWidget(borrow mut self, page: Number, index: Number) {
+        if page < 0 || page >= self.pages.count { return }
+        var kept: [HomeWidget] = []
+        for at in 0..self.pages[page].widgets.count {
+            if at != index { kept.append(copy self.pages[page].widgets[at]) }
+        }
+        self.pages[page].widgets = move kept
+    }
+
+    // The `index`th widget on `page` at its next size, when that fits.
+    function resizeWidget(borrow mut self, page: Number, index: Number, space: borrow HomeSpace) {
+        if page < 0 || page >= self.pages.count || index >= self.pages[page].widgets.count {
+            return
+        }
+        let widget = copy self.pages[page].widgets[index]
+        let grown = widget.size.next()
+        let others = homeWidgetColumns(self.pages[page].widgets) - widget.size.columns()
+        if others + grown.columns() > space.columns { return }
+        self.pages[page].widgets[index].size = grown
+    }
+
+    // Moves the `index`th widget on `page` to the page `side` either way,
+    // when it fits there.
+    function shiftWidget(
+        borrow mut self,
+        page: Number,
+        index: Number,
+        side: Number,
+        space: borrow HomeSpace
+    ) {
+        let target = page + side
+        if page < 0 || page >= self.pages.count || index >= self.pages[page].widgets.count {
+            return
+        }
+        if target < 0 || target >= self.pages.count { return }
+        let widget = copy self.pages[page].widgets[index]
+        if !homeWidgetFits(self.pages[target].widgets, widget.size, space.columns) { return }
+        self.removeWidget(page, index)
+        self.addWidget(target, move widget, space)
+    }
+
+    // Takes the folder at `slot` off Home; its applications stay in App
+    // Library.
+    function removeFolder(borrow mut self, slot: borrow HomeSlot) {
+        let item = try self.itemAt(slot) otherwise return
+        match item {
+            Folder(folder) -> {
+                for app in folder.apps {
+                    if !self.removed.contains(app) { self.removed.append(copy app) }
+                }
+                self.remove(slot)
+            }
+            App -> {}
+        }
+    }
+}
+
+public namespace HomeFolderName {
+    // What a folder made by dropping one application on another is called
+    // until it is renamed.
+    let made: String = "Folder"
+}

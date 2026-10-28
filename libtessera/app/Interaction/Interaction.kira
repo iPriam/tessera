@@ -1,0 +1,24 @@
+import Foundation
+
+// The interaction token of the input event being handled (roadmap/16 §14.1).
+//
+// The platform sets the token around each key press and pointer button press
+// it hands an application, and clears it when the event is handled. An
+// application reads it while it handles that event, to ask for something the
+// person just did: a paste, a grant, a picker. Outside an event there is none.
+//
+// A token is not a permission by being read. The Presence service verifies it
+// with MosaicDisplay before it acts (§14), and an id that was not minted for
+// a hardware event fails that check.
+
+// Sets the token of the event now being handled, or clears it with none. Only
+// the platform calls this; an application that calls it gains nothing, since
+// its token must still verify.
+public function interactionDispatch(token: InteractionToken?) {
+    library.interaction = token
+}
+
+// The token of the event now being handled, or none outside an event.
+public function interactionCurrent() -> InteractionToken? {
+    return library.interaction
+}

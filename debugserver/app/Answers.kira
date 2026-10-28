@@ -1,0 +1,289 @@
+import Foundation
+import LibTessera
+
+// Each request's answer. A failure the protocol has no word for is `E01`.
+
+enum Reply {
+    Text(String)
+    // `qXfer` data, which can be any bytes.
+    Binary([UN8])
+}
+
+namespace Answer {
+    let ok: String = "OK"
+    let failed: String = "E01"
+    let noProcess: String = "E02"
+    let unreadable: String = "E08"
+    let supported: String = "PacketSize=4000;QStartNoAckMode+;qXfer:auxv:read+;vContSupported+;QEnableErrorStrings+"
+}
+
+function answer(session: borrow mut Session, request: Request) -> Result<Reply, TesseraError> {
+    let text: String = match request {
+        Supported -> Answer.supported
+        StartNoAck -> Answer.ok
+        HostInfo -> "triple:\(hexText(targetTriple(session.architecture)));ptrsize:8;endian:little;ostype:linux;vendor:unknown;"
+        ProcessInfo -> processInfo(session)
+        RegisterInfo(number) -> registerInfo(session.table, number)
+        FirstThreads -> threadList(session)
+        MoreThreads -> "l"
+        CurrentThread -> session.process.isNone()
+        ? Answer.noProcess
+        : "QC\(hexNumber(U64(session.selected)))"
+        StopReason -> stopReason(session)
+        SelectThread(thread) -> {
+            session.selected = thread
+            Answer.ok
+        }
+        ThreadAlive(thread) -> threadIndex(session, thread).isSome() ? Answer.ok : Answer.failed
+        ReadRegisters -> {
+            let words = try debugRegisters(session.selected)
+            allRegistersHex(session.table, words)
+        }
+        WriteRegisters(values) -> try writeRegisters(session, values)
+        ReadRegister(number) -> try readRegister(session, number)
+        WriteRegister(write) -> try writeRegister(session, write)
+        ReadMemory(range) -> readMemory(session, range)
+        WriteMemory(write) -> writeMemory(session, write)
+        InsertBreakpoint(at) -> try insertBreakpoint(session, at)
+        RemoveBreakpoint(at) -> try removeBreakpoint(session, at)
+        MemoryRegion(address) -> try memoryRegion(session, address)
+        AuxiliaryVector(range) -> return auxiliaryVector(session, range)
+        Continue(signal) -> {
+            if session.process.isNone() { return .Ok(.Text(Answer.noProcess)) }
+            try runUntilStop(session, signal)
+        }
+        Step(step) -> {
+            if session.process.isNone() { return .Ok(.Text(Answer.noProcess)) }
+            try stepThread(session, step.thread.or(session.selected), step.signal)
+        }
+        ContinueActions -> "vCont;c;C;s;S"
+        Attach(pid) -> try attach(session, pid)
+        AttachName(name) -> {
+            let found = match processNamed(name) {
+                Ok(value) -> value
+                Error(reason) -> {
+                    log warn("/proc could not be listed", reason)
+                    return .Ok(.Text(Answer.failed))
+                }
+            }
+            let pid = try found otherwise return .Ok(.Text(Answer.failed))
+            try attach(session, pid)
+        }
+        Kill -> try killProcess(session)
+        Detach -> try detachProcess(session)
+        Accepted -> Answer.ok
+        Unsupported -> ""
+    }
+    return .Ok(.Text(text))
+}
+
+function targetTriple(architecture: Architecture) -> String {
+    return match architecture {
+        Arm64 -> "aarch64-unknown-linux-gnu"
+        X64 -> "x86_64-unknown-linux-gnu"
+        RiscV64 -> "riscv64-unknown-linux-gnu"
+    }
+}
+
+function processInfo(session: borrow Session) -> String {
+    let pid = try session.process otherwise return Answer.noProcess
+    let triple = hexText(targetTriple(session.architecture))
+    return "pid:\(hexNumber(U64(pid)));real-uid:0;real-gid:0;effective-uid:0;effective-gid:0;triple:\(triple);ostype:linux;endian:little;ptrsize:8;"
+}
+
+// The traced threads. With no process attached there are none to list, and
+// an empty list would have lldb take a process with one thread to be there.
+function threadList(session: borrow Session) -> String {
+    if session.process.isNone() { return Answer.noProcess }
+    if session.threads.count == 0 { return "l" }
+    var ids: [String] = []
+    for traced in session.threads { ids.append(hexNumber(U64(traced.id))) }
+    return "m" + joined(ids, ",")
+}
+
+// Why the process last stopped: each thread stopped with `SIGSTOP`, or the
+// stop lldb was told of. With none attached there is no stop to tell, as
+// lldb-server answers: an exit here would have lldb wait on a process that
+// never was.
+function stopReason(session: borrow Session) -> String {
+    if session.process.isNone() { return Answer.noProcess }
+    return "T\(hexByte(LinuxSignal.stop))thread:\(hexNumber(U64(session.reported)));"
+}
+
+function writeRegisters(
+    session: borrow Session,
+    values: borrow String
+) -> Result<String, TesseraError> {
+    var words = try debugRegisters(session.selected)
+    try setAllRegisters(session.table, words, values) otherwise return .Ok(Answer.failed)
+    try debugSetRegisters(session.selected, words)
+    return .Ok(Answer.ok)
+}
+
+function readRegister(session: borrow Session, number: Number) -> Result<String, TesseraError> {
+    if number < 0 || number >= session.table.count { return .Ok(Answer.failed) }
+    let words = try debugRegisters(session.selected)
+    return .Ok(registerHex(session.table[number], words))
+}
+
+function writeRegister(
+    session: borrow Session,
+    write: borrow RegisterWrite
+) -> Result<String, TesseraError> {
+    if write.number < 0 || write.number >= session.table.count { return .Ok(Answer.failed) }
+    var words = try debugRegisters(session.selected)
+    setRegisterWord(session.table[write.number], words, write.value)
+    try debugSetRegisters(session.selected, words)
+    return .Ok(Answer.ok)
+}
+
+function readMemory(session: borrow Session, range: borrow MemoryRange) -> String {
+    let pid = try session.process otherwise return Answer.noProcess
+    return match debugReadMemory(pid, range.address, range.count) {
+        Ok(bytes) -> bytes.count == 0 ? Answer.unreadable : hexBytes(bytes)
+        Error(failed) -> {
+            // An address the process has not mapped, which lldb probes for.
+            absorb failed
+            Answer.unreadable
+        }
+    }
+}
+
+function writeMemory(session: borrow Session, write: borrow MemoryWrite) -> String {
+    let pid = try session.process otherwise return Answer.noProcess
+    return match debugWriteMemory(pid, write.address, write.bytes) {
+        Ok -> Answer.ok
+        Error(failed) -> {
+            log warn("memory could not be written", address: write.address, failed)
+            Answer.unreadable
+        }
+    }
+}
+
+function insertBreakpoint(
+    session: borrow mut Session,
+    at: borrow BreakpointAt
+) -> Result<String, TesseraError> {
+    let pid = try session.process otherwise return .Ok(Answer.noProcess)
+    if session.breakpoints.contains(at.address) { return .Ok(Answer.ok) }
+    let trap = breakpointTrap(session.architecture)
+    if trap.count != at.length { return .Ok(Answer.failed) }
+    let original = try debugReadMemory(pid, at.address, trap.count)
+    if original.count != trap.count { return .Ok(Answer.unreadable) }
+    try debugWriteMemory(pid, at.address, trap)
+    session.breakpoints.set(at.address, move original)
+    return .Ok(Answer.ok)
+}
+
+function removeBreakpoint(
+    session: borrow mut Session,
+    at: borrow BreakpointAt
+) -> Result<String, TesseraError> {
+    let pid = try session.process otherwise return .Ok(Answer.noProcess)
+    let original = try session.breakpoints.remove(at.address) otherwise return .Ok(Answer.ok)
+    try debugWriteMemory(pid, at.address, original)
+    return .Ok(Answer.ok)
+}
+
+// The mapping `address` lies in, or the gap up to the next one, as
+// `qMemoryRegionInfo` answers.
+function memoryRegion(session: borrow Session, address: U64) -> Result<String, TesseraError> {
+    let pid = try session.process otherwise return .Ok(Answer.noProcess)
+    let regions = try debugRegions(pid)
+    for region in regions {
+        if address >= region.start && address < region.end {
+            var text = "start:\(hexNumber(region.start));size:\(hexNumber(region.end - region.start));"
+            text += "permissions:\(regionPermissions(region.permissions));"
+            if !region.path.isEmpty() { text += "name:\(hexText(region.path));" }
+            return .Ok(text)
+        }
+        if region.start > address {
+            return .Ok("start:\(hexNumber(address));size:\(hexNumber(region.start - address));")
+        }
+    }
+    return .Ok("start:\(hexNumber(address));size:\(hexNumber(U64(0) - address));")
+}
+
+// `r-xp` as lldb writes it, `rx`.
+function regionPermissions(permissions: borrow String) -> String {
+    var letters: [String] = []
+    for index in 0..min(permissions.count, 3) {
+        let letter = permissions.substring(index, index + 1)
+        if letter != "-" { letters.append(letter) }
+    }
+    return joined(letters, "")
+}
+
+// `offset,count` of the auxiliary vector: `m` and the bytes when more
+// follow, `l` and them when they are the last.
+function auxiliaryVector(
+    session: borrow Session,
+    range: borrow TransferRange
+) -> Result<Reply, TesseraError> {
+    let pid = try session.process otherwise return .Ok(.Text(Answer.noProcess))
+    let vector = try debugAuxiliaryVector(pid)
+    let end = min(vector.count, range.offset + range.count)
+    var part: [UN8] = [UN8(end < vector.count ? 109 : 108)]
+    for index in range.offset..end { part.append(vector[index]) }
+    return .Ok(.Binary(part))
+}
+
+function attach(session: borrow mut Session, pid: Number) -> Result<String, TesseraError> {
+    if session.process.isSome() { return .Ok(Answer.failed) }
+    let threads = try debugAttach(pid)
+    var traced: [TracedThread] = []
+    for thread in threads { traced.append(TracedThread { id: thread }) }
+    session.threads = traced
+    session.process = .Some(pid)
+    session.selected = pid
+    session.reported = pid
+    return .Ok(stopReason(session))
+}
+
+// No matching process is absence; failure to read the listing is not.
+enum ProcessLookupFailure {
+    Directory(FileFailure)
+    Process(TesseraError)
+}
+
+function processNamed(name: borrow String) -> Result<Number?, ProcessLookupFailure> {
+    let listing = match listDirectory("/proc") {
+        Ok(value) -> value
+        Error(failed) -> return .Error(ProcessLookupFailure.Directory(failed))
+    }
+    for index in 0..listing.count() {
+        let pid = listing.entry(index).or("").toNumber()
+        match pid {
+            Some(value) -> {
+                match crashProcessName(value) {
+                    Ok(found) -> {
+                        if found == .Some(name) { return .Ok(.Some(value)) }
+                    }
+                    Error(failed) -> return .Error(ProcessLookupFailure.Process(failed))
+                }
+            }
+            // Not a process's directory.
+            None -> {}
+        }
+    }
+    return .Ok(.None)
+}
+
+function killProcess(session: borrow mut Session) -> Result<String, TesseraError> {
+    for traced in session.threads { try debugKill(traced.id) }
+    session.process = .None
+    session.threads = []
+    session.breakpoints = Map {}
+    return .Ok("X\(hexByte(LinuxSignal.kill))")
+}
+
+// Takes every breakpoint out and lets each thread go, with a signal it holds.
+function detachProcess(session: borrow mut Session) -> Result<String, TesseraError> {
+    let pid = try session.process otherwise return .Ok(Answer.ok)
+    for entry in session.breakpoints.entries() { try debugWriteMemory(pid, entry.key, entry.value) }
+    for traced in session.threads { try debugDetach(traced.id, traced.held) }
+    session.process = .None
+    session.threads = []
+    session.breakpoints = Map {}
+    return .Ok(Answer.ok)
+}

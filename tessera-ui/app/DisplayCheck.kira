@@ -1,0 +1,297 @@
+//! The toolkit's display check, run by the boot tests: it declares a badge and
+//! posts a notification, draws its two frames, asks for focus it must not get,
+//! then logs its keys and takes its link to the platform (DisplayCheckWaits.kira).
+
+import Foundation
+import KiraUI
+import KCoreAnimation
+import Ember
+import LibTessera
+import TesseraDisplayClient
+import AppKit
+
+/// The values the check declares and posts, which the boot tests read.
+namespace DisplayCheck {
+    let badge: Number = 7
+    let notification: Number = 1
+    let priority: Number = 2
+    let frames: Number = 2
+}
+
+/// The two frames' backgrounds, a shade apart, so a frame the display shows
+/// twice is told from the next.
+namespace CheckColor {
+    let first: RGBAColor = RGBAColor { r: 0.1, g: 0.1, b: 0.11, a: 1.0 }
+    let second: RGBAColor = RGBAColor { r: 0.11, g: 0.1, b: 0.1, a: 1.0 }
+}
+
+/// What the check draws.
+construct CheckView() extends Widget {
+    body {
+        VStack(spacing = .Medium) {
+            Text("Tessera")
+            Text("Kira UI, on the machine")
+        }
+    }
+}
+
+/// The check's drawing: its view's retained tree, laid out at the size its
+/// surface was configured at, in points, and drawn at its output's scale.
+struct CheckScene {
+    var compositor: Compositor
+    var size: Size
+    var scale: Number
+}
+
+/// The scene the display check draws: a compositor and the size and scale of the output it fills.
+function makeCheckScene(size: borrow Size, scale: Number) -> CheckScene {
+    var scene = CheckScene { compositor: Compositor {}, size: copy size, scale: scale }
+    let tree = lowerWidgetForTest(CheckView())
+    var described = tree.view
+    layOutLayerTree(described, size.width, size.height)
+    scene.compositor.tree.reconcileImmediate(described)
+    return scene
+}
+
+/// Draws frame `serial` and puts it on the display.
+function showCheckFrame(
+    session: borrow Session,
+    drawing: borrow mut Drawing,
+    scene: borrow mut CheckScene,
+    serial: FrameSerial
+) -> Result<Void, SessionEnd> {
+    try session.requestFrame(serial)
+    try awaitCheckAnswer(session, .FrameGrant, serial)
+    log info("a frame was granted", frame: serial.raw)
+    let pixels = Size {
+        width: scene.size.width * scene.scale,
+        height: scene.size.height * scene.scale
+    }
+    let textures = match drawing.renderer.fit(pixels, pixels) {
+        Ok(value) -> value
+        Error(failure) -> return .Error(.NoTextures(failure))
+    }
+    var frame = match drawing.renderer.device.frame() {
+        Ok(value) -> value
+        Error(failure) -> return .Error(.NotDrawn(failure))
+    }
+    let viewport = Size {
+        width: textures.size.width / scene.scale,
+        height: textures.size.height / scene.scale
+    }
+    let drawn = drawing.renderer.encode(scene.compositor, frame, viewport, scene.scale)
+    log info("drew the widget tree", frame: serial.raw, commands: drawn)
+    let clear = serial.raw % 2 == 1 ? CheckColor.first : CheckColor.second
+    drawing.renderer.present(frame, textures.textureFor(serial), clear)
+    try session.commitFrame(drawing.exporter, textures.memoryFor(serial), textures.drawn, serial)
+    try awaitCheckAnswer(session, .FrameCompletion, serial)
+    log info("a frame is on the display", frame: serial.raw)
+    return .Ok
+}
+
+/// Waits for the `awaited` answer to frame `serial`. A key that arrives first
+/// is reported as one arriving later would be; the pointer and anything else
+/// the session does not act on is let go, since the check draws no interface
+/// to take it.
+function awaitCheckAnswer(
+    session: borrow Session,
+    awaited: Awaited,
+    serial: FrameSerial
+) -> Result<Void, SessionEnd> {
+    while true {
+        let message = try session.awaitMoving()
+        if answers(message, copy awaited, serial) { return .Ok }
+        match keyIn(message) {
+            Some(key) -> try reportKey(session, key)
+            None -> log debug(
+                "let go of a message while a frame was awaited",
+                client: session.client
+            )
+        }
+    }
+    return .Ok
+}
+
+/// The display check, run on each link PID 1 hands over until there is no
+/// next one.
+public function RunDisplayCheck() {
+    let bridge = makeBridgeHandle()
+    var drawing = match openDrawing(LaunchTimeline {}) {
+        Ok(value) -> value
+        Error(failure) -> {
+            log fault("there is nothing to draw with", failure: failure)
+            return
+        }
+    }
+    var link = match initialLink(bridge) {
+        Some(value) -> value
+        None -> {
+            drawing.close()
+            return
+        }
+    }
+    // The display link PID 1 handed over while a session ran, which the next
+    // runs on.
+    var replacement: DisplayLink? = .None
+    while true {
+        match checkDisplay(link, drawing, replacement, bridge) {
+            Ok -> {}
+            Error(end) -> end.report(link.clientIndex)
+        }
+        closeDisplayLink(link)
+        let handed = replacement
+        replacement = .None
+        link = match handed {
+            Some(value) -> value
+            None -> match nextDisplayLink(bridge) {
+                Some(value) -> value
+                None -> break
+            }
+        }
+    }
+    drawing.close()
+}
+
+/// One complete relationship with one MosaicDisplay process, and how it ended.
+function checkDisplay(
+    link: borrow DisplayLink,
+    drawing: borrow mut Drawing,
+    replacement: borrow mut DisplayLink?,
+    bridge: borrow BridgeHandle
+) -> Result<Void, SessionEnd> {
+    let session = try openSession(link)
+    let watches: [ApplicationWatch] = []
+    var waits = match makeWaits(watches) {
+        Ok(value) -> value
+        Error(failure) -> return .Error(.Broken(failure))
+    }
+    let ended = runCheck(session, drawing, waits, replacement, bridge)
+    waits.close()
+    return ended
+}
+
+/// The check on an opened session: the channels declared, the frames shown,
+/// focus asked for, then each key logged until the session ends.
+function runCheck(
+    session: borrow Opened,
+    drawing: borrow mut Drawing,
+    waits: borrow mut Waits,
+    replacement: borrow mut DisplayLink?,
+    bridge: borrow BridgeHandle
+) -> Result<Void, SessionEnd> {
+    let opened = session.session
+    var scene = makeCheckScene(session.size, session.scale)
+    try declareChannels(opened, bridge)
+    for index in 0..DisplayCheck.frames {
+        try showCheckFrame(opened, drawing, scene, FrameSerial(index + 1))
+    }
+    try askForFocus(opened)
+    while true {
+        let message = try awaitCheckMessage(opened, waits, replacement, bridge)
+        match message {
+            Key(key) -> try reportKey(opened, key)
+            // Only keys are logged once the frames are shown.
+            Hello, Welcome, Attach, Commit, FrameDone, FrameRequest, FrameReady, FocusIn, FocusOut, Configure, AckConfigure, SetMode, ModeChanged, InputCapability, SurfaceCreated, SurfaceDestroyed, GrantFocus, InstallGrab, GrabFired, SetChannel, ChannelChanged, PresentSystem, Verify, VerifyResult, InjectInput, Notify, Notification, ActivateRequested, SetBar, PointerMotion, PointerButton, PointerAxis, PointerEnter, PointerLeave, SetDock, SurfacePressed, RequestWindow, WindowRequested, GrantMove, GrantResize, HoldInput, SetOverlay, SetIdle, IdleChanged, BarBackdrop, SetGlass, SetLaunchOrigin, SetStageBadge, PlaceSurface, SurfacePlaced, SetHidden, SetMargin, Insets, Output -> {}
+        }
+    }
+}
+
+/// Declares a badge the platform can read without seeing the widget tree, and
+/// posts a notification. Sent before the first frame request, which the
+/// compositor absorbs and forwards to the platform.
+function declareChannels(
+    session: borrow Session,
+    bridge: borrow BridgeHandle
+) -> Result<Void, SessionEnd> {
+    try session.sendMessage(
+        .SetChannel(
+            DisplayChannelValue {
+                surface: session.surface,
+                channel: .Badge,
+                value: DisplayCheck.badge
+            }
+        )
+    )
+    log info("declared a badge", client: session.client, badge: DisplayCheck.badge)
+    try session.sendMessage(
+        .Notify(
+            DisplayNotification {
+                surface: session.surface,
+                id: DisplayCheck.notification,
+                priority: DisplayCheck.priority
+            }
+        )
+    )
+    log info(
+        "posted a notification",
+        client: session.client,
+        notification: DisplayCheck.notification
+    )
+    // What it says goes to the platform as an application's notification
+    // does, which shows it as a banner.
+    addNotificationVia(
+        bridge,
+        NotificationContent {
+            title: "Display Check",
+            body: "Client \(session.client) is on the display",
+        }
+    )
+    return .Ok
+}
+
+/// Asks for focus as the platform grants it, which an application may not do:
+/// the display server refuses it and the session goes on unchanged.
+function askForFocus(session: borrow Session) -> Result<Void, SessionEnd> {
+    try session.sendMessage(.GrantFocus(session.surface))
+    log info("asked for focus", client: session.client)
+    return .Ok
+}
+
+/// Logs a key; `A` going down sends a malformed packet, which must end only
+/// this session.
+function reportKey(session: borrow Session, key: borrow DisplayKey) -> Result<Void, SessionEnd> {
+    // Repeats come many to a press, more than the log keeps of one site, so
+    // they are logged apart and leave the presses and releases readable.
+    if key.state == .Repeated {
+        log info("a key repeated", client: session.client, key: key.key)
+        return .Ok
+    }
+    // A key with a modifier held is logged apart as well, with every
+    // modifier, so a test of what Shift or Command does finds its line.
+    let held = key.modifiers
+    if held.shift || held.control || held.option || held.command || held.capsLock {
+        log info(
+            "a key arrived with a modifier held",
+            client: session.client,
+            key: key.key,
+            state: displayKeyStateName(key.state),
+            text: key.text,
+            shift: held.shift,
+            control: held.control,
+            option: held.option,
+            command: held.command,
+            capsLock: held.capsLock
+        )
+        return .Ok
+    }
+    log info(
+        "a key arrived",
+        client: session.client,
+        key: key.key,
+        state: displayKeyStateName(key.state),
+        provenance: key.provenance,
+        text: key.text,
+        shift: key.modifiers.shift
+    )
+    let usage = fromCode<Usage>(UN32(key.key))
+    let pressed = match key.state {
+        Pressed -> true
+        Released, Repeated -> false
+    }
+    if usage != .A || !pressed { return .Ok }
+    match sendMalformedMessage(copy session.channel) {
+        Ok -> log info("sent a malformed display packet")
+        Error(failure) -> return .Error(endOf(failure))
+    }
+    return .Ok
+}

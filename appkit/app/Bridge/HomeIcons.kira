@@ -1,0 +1,107 @@
+//! The icons the home screen shows, by application.
+//!
+//! As an iPad's home screen holds them: a window going home flies into its icon
+//! there when the page shown has one, and into the Dock's only when it does not.
+//! The home screen says where each icon is over its link, as an application says
+//! its menus, and the platform tells the display (`DisplayStageBadge.home`).
+
+import Foundation
+import LibTessera
+
+/// One icon on the home screen: the application it opens, as PID 1 names it,
+/// and its frame and corner on the screen, in points.
+public struct BridgeHomeIcon {
+    /// The name of the application the icon opens, as PID 1 names it.
+    var application: String = ""
+    /// The icon's left edge on the screen, in points.
+    var x: Number = 0
+    /// The icon's top edge on the screen, in points.
+    var y: Number = 0
+    /// The icon's width, in points.
+    var width: Number = 0
+    /// The icon's height, in points.
+    var height: Number = 0
+    /// The icon's corner radius, in points.
+    var corner: Number = 0
+}
+
+/// How the icons travel: one record a line, its fields separated by a tab.
+///
+///     H <application> <x> <y> <width> <height> <corner>
+namespace HomeIconRecord {
+    /// The kind of an icon record, the letter `H`.
+    let kind: String = "H"
+    /// The number of fields in an icon record, kind included.
+    let fields: Number = 7
+}
+
+/// Returns `icons` as the records the platform reads, one icon a line.
+function encodedHomeIcons(icons: borrow [BridgeHomeIcon]) -> String {
+    var lines: [String] = []
+    for icon in icons {
+        let fields = [
+            HomeIconRecord.kind,
+            recordText(icon.application),
+            String(icon.x),
+            String(icon.y),
+            String(icon.width),
+            String(icon.height),
+            String(icon.corner)
+        ]
+        lines.append(joined(fields, MenuRecord.field))
+    }
+    return joined(lines, MenuRecord.line)
+}
+
+/// The icons `text` holds; none when it is not a list of them.
+function decodedHomeIcons(text: borrow String) -> [BridgeHomeIcon]? {
+    var icons: [BridgeHomeIcon] = []
+    if text.count == 0 { return .Some(icons) }
+    for line in text.split(MenuRecord.line) {
+        let fields = line.split(MenuRecord.field)
+        if fields.count != HomeIconRecord.fields || fields[0] != HomeIconRecord.kind {
+            return .None
+        }
+        icons.append(
+            BridgeHomeIcon {
+                application: copy fields[1],
+                x: try parseNumber(fields[2]) otherwise return .None,
+                y: try parseNumber(fields[3]) otherwise return .None,
+                width: try parseNumber(fields[4]) otherwise return .None,
+                height: try parseNumber(fields[5]) otherwise return .None,
+                corner: try parseNumber(fields[6]) otherwise return .None,
+            }
+        )
+    }
+    return .Some(icons)
+}
+
+// --- The home screen's side ---------------------------------------------------
+
+/// Tells the platform the icons the home screen shows, when they changed since
+/// it was last told, or a new link has not been told them.
+public function publishHomeIcons(
+    handle: BridgeHandle,
+    icons: borrow [BridgeHomeIcon]
+) -> Result<Void, BridgeFailure> {
+    let text = encodedHomeIcons(icons)
+    if text == handle.bridge.homeIconsPublished { return .Ok }
+    for link in handle.bridge.links {
+        match writeLink(link.channel, .HomeIcons, text.utf8().count, text) {
+            Ok -> {}
+            Error(failure) -> return .Error(.Broken(failure))
+        }
+    }
+    if handle.bridge.links.count > 0 {
+        log info("told the platform the home screen's icons", icons: text)
+        handle.bridge.homeIconsPublished = text
+    }
+    return .Ok
+}
+
+// --- The platform's side ---------------------------------------------------------
+
+/// The icons the home screen last said it shows; none until it says.
+public function homeScreenIcons(handle: BridgeHandle) -> [BridgeHomeIcon] {
+    return copy handle.bridge.homeIcons
+}

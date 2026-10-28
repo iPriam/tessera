@@ -1,0 +1,176 @@
+import Foundation
+import Heap
+import LibTessera
+
+// One crash-safe replacement sequence for every mutable file Tessera writes.
+//
+// The temporary is in the target directory, so the rename cannot cross a
+// volume. The file reaches stable storage before the rename, and the volume
+// is flushed after it, which is what puts the rename itself there. An
+// interrupted write therefore leaves either the old target or the new one,
+// never a zero-length target.
+
+// Writes every byte of `bytes` to `file` from its start. A write that
+// takes nothing means the volume is full.
+function writeAll(calls: Handle, file: Handle, bytes: borrow [UN8]) -> Result<Void, TesseraError> {
+    let capacity = fileReadChunkSize
+    let blockBytes = zeroedBlock(count: capacity, alignment: 16)
+    let block = blockBytes.pointer()
+    var consumed = 0
+    while consumed < bytes.count {
+        var amount = bytes.count - consumed
+        if amount > capacity { amount = capacity }
+        for index in 0..amount { heapStore<U8>(block, index, bytes[consumed + index]) }
+        let buffers = [Buffer { address: block, length: amount }]
+        let wrote = try answer(calls, fileWriteAt(file, consumed, buffers, calls, PortKey.call))
+        if wrote.result0 == UNumber(0) { return .Error(initFailure(.NoSpace)) }
+        consumed += wrote.result0
+    }
+    return .Ok
+}
+
+// Writes `bytes` to a new temporary in `directory` and syncs it.
+function writeTemporary(
+    calls: Handle,
+    directory: Handle,
+    temporary: borrow String,
+    bytes: borrow [UN8]
+) -> Result<Void, TesseraError> {
+    let node = try answeredHandle(
+        calls,
+        nodeCreate(
+            directory,
+            temporary,
+            .File,
+            CreateOptions.exclusive,
+            fileRights,
+            calls,
+            PortKey.call
+        )
+    )
+    let file = match openNode(calls, node, OpenMode.write | OpenMode.truncate) {
+        Ok(value) -> value
+        Error(failed) -> {
+            release(node)
+            return .Error(failed)
+        }
+    }
+    release(node)
+    match writeAll(calls, file, bytes) {
+        Ok -> {}
+        Error(failed) -> {
+            release(file)
+            return .Error(failed)
+        }
+    }
+    let synced = answer(calls, fileSync(file, .Data, calls, PortKey.call))
+    release(file)
+    try synced
+    return .Ok
+}
+
+function removeName(
+    calls: Handle,
+    directory: Handle,
+    name: borrow String
+) -> Result<Void, TesseraError> {
+    return match answer(
+        calls,
+        nodeDelete(directory, name, DeleteOptions.permanent, calls, PortKey.call)
+    ) {
+        Ok(_) -> .Ok
+        Error(failed) -> .Error(failed)
+    }
+}
+
+// Removes a temporary that may not be there; its absence is the point.
+function removeTemporary(calls: Handle, directory: Handle, temporary: borrow String) {
+    match removeName(calls, directory, temporary) {
+        Ok -> {}
+        Error(failed) -> {
+            if failed.code != .NotFound {
+                log warn("a temporary could not be removed", temporary, error: errorName(failed))
+            }
+        }
+    }
+}
+
+function replaceTemporary(
+    calls: Handle,
+    directory: Handle,
+    temporary: borrow String,
+    target: borrow String,
+    bytes: borrow [UN8]
+) -> Result<Void, TesseraError> {
+    try writeTemporary(calls, directory, temporary, bytes)
+    let renamed = try answer(
+        calls,
+        nodeRename(
+            directory,
+            temporary,
+            directory,
+            target,
+            RenameOptions.replace,
+            calls,
+            PortKey.call
+        )
+    )
+    return .Ok
+}
+
+function atomicWriteFile(
+    calls: Handle,
+    path: borrow String,
+    target: borrow String,
+    bytes: borrow [UN8]
+) -> Result<Void, TesseraError> {
+    let directory = try lookup(calls, path, directoryRights())
+    // There is no other writer; remove a temporary left by an interrupted write.
+    let temporary = "." + target + ".tmp"
+    removeTemporary(calls, directory, temporary)
+    let replaced = replaceTemporary(calls, directory, temporary, target, bytes)
+    match replaced {
+        Ok -> {}
+        Error(failed) -> {
+            removeTemporary(calls, directory, temporary)
+            release(directory)
+            return .Error(failed)
+        }
+    }
+    release(directory)
+    return machineFlush()
+}
+
+// Writes a file atomically and reads it back, logging whether it held.
+function verifyAtomicWrite(calls: Handle) {
+    let expected: [UN8] = [84, 101, 115, 115, 101, 114, 97, 10]
+    let target = "tessera-atomic-check"
+    match atomicWriteFile(calls, "/" + SystemDirectory.data, target, expected) {
+        Ok -> {}
+        Error(failed) -> {
+            log warn("could not write the atomic replacement check", error: errorName(failed))
+            return
+        }
+    }
+
+    let observed = match readWholeFile(
+        calls,
+        "/" + SystemDirectory.data + "/tessera-atomic-check"
+    ) {
+        Ok(value) -> value
+        Error(failed) -> {
+            log warn("could not read the atomic replacement check", error: errorName(failed))
+            return
+        }
+    }
+    let equal = observed == expected
+    match lookup(calls, "/" + SystemDirectory.data, directoryRights()) {
+        Ok(directory) -> {
+            removeTemporary(calls, directory, target)
+            release(directory)
+        }
+        Error(failed) -> log warn("the check's file could not be removed", error: errorName(failed))
+    }
+    if equal { log info("verified an atomic file replacement") }
+    else { log warn("an atomic file replacement did not verify") }
+}

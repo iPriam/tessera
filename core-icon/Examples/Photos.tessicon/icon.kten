@@ -1,0 +1,38 @@
+TessIcon {
+    fill: .Solid(Color { space: .Srgb, red: 1, green: 1, blue: 1, alpha: 1 }),
+    groups: [
+        Group {
+            name: "Group",
+            layers: [Layer { name: "orange", image: "orange.svg" }, Layer { name: "blue", image: "blue.svg" }],
+            blend: .Multiply,
+            lighting: .Individual,
+            specular: .Inside,
+            blur: Blur { enabled: false, amount: 0.5 },
+            refraction: Refraction { enabled: true, depth: 0.23, spread: 0.14 },
+            translucency: Translucency { enabled: false, amount: 0.5 },
+            shadow: Shadow { kind: .Chromatic, opacity: 0.05 }
+        },
+        Group {
+            name: "Group",
+            layers: [Layer { name: "red", image: "red.svg" }, Layer { name: "mint", image: "mint.svg" }, Layer { name: "yellow", image: "yellow.svg" }, Layer { name: "purple", image: "purple.svg" }],
+            blend: .Multiply,
+            lighting: .Individual,
+            specular: .Inside,
+            blur: Blur { enabled: false, amount: 0.5 },
+            refraction: Refraction { enabled: true, depth: 0.23, spread: 0.14 },
+            translucency: Translucency { enabled: false, amount: 0.5 },
+            shadow: Shadow { kind: .Chromatic, opacity: 0.05 }
+        },
+        Group {
+            name: "Group",
+            layers: [Layer { name: "pink", image: "pink.svg" }, Layer { name: "green", image: "green.svg" }],
+            blend: .Multiply,
+            lighting: .Individual,
+            specular: .Inside,
+            blur: Blur { enabled: false, amount: 0.5 },
+            refraction: Refraction { enabled: true, depth: 0.23, spread: 0.14 },
+            translucency: Translucency { enabled: false, amount: 0.5 },
+            shadow: Shadow { kind: .Chromatic, opacity: 0.05 }
+        }
+    ]
+}

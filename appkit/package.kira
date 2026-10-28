@@ -1,0 +1,20 @@
+//! AppKit: the bridge between an application and the platform.
+//!
+//! There are four Dynamic Platforms, and an application cannot know
+//! which one it runs under, so it never speaks to one. It speaks to AppKit,
+//! and AppKit to whichever platform is running: over the link PID 1 makes between
+//! them, the application hands over what its menu bar holds, and the platform
+//! hands back what the person chose from it.
+//!
+//! It is a private framework, installed in /System/Library/PrivateFrameworks:
+//! Kira UI calls it on Tessera, and the platforms do; an application never
+//! imports it. It knows nothing of any toolkit -- menus cross it as plain
+//! values -- so it depends on LibTessera alone.
+construct AppKit extends Package {
+    let version: String = "0.1.0"
+    let kind: PackageKind = .Library
+    let moduleRoot: String = "AppKit"
+    let dependencies: [Dependency] = [
+        Dependency { name: "LibTessera", path: "../libtessera" }
+    ]
+}

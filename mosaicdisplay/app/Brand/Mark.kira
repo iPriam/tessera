@@ -1,0 +1,17 @@
+import Foundation
+
+// The stroke across the tile: the long path down it, and the bar that leaves
+// it to the right.
+//
+// The numbers are the artwork's own -- the path in Frame 4.svg, whose square is
+// 500 units -- scaled when the splash is drawn rather than baked in, so a
+// display of any size gets the same drawing rather than the same pixels. Each
+// segment is `(ax, ay, bx, by)`.
+let markSegments: [(Number, Number, Number, Number)] = [
+    (272.0, -7.0, 214.0, 165.0),
+    (214.0, 165.0, 169.0, 295.0),
+    (169.0, 295.0, 162.0, 315.0),
+    (162.0, 315.0, 155.0, 336.0),
+    (155.0, 336.0, 96.0, 507.0),
+    (162.0, 315.0, 558.0, 206.0),
+]

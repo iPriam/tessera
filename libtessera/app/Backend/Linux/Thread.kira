@@ -1,0 +1,120 @@
+import Foundation
+import Heap
+
+// Threads and address waits on Linux: thread and process ids, the
+// scheduler (`sched_setattr`) and `futex`.
+
+function kernelThreadId() -> U64 { return U64(gettid()) }
+
+function kernelProcessId() -> U64 { return U64(getpid()) }
+
+// Ends the calling thread; the last thread's exit ends the process.
+function kernelThreadExit(code: Number) {
+    exitThread(code)
+}
+
+// Ends the whole process at once.
+function kernelProcessExit(code: Number) {
+    exitGroup(code)
+}
+
+// `sched_yield` always succeeds on Linux.
+function kernelYield() {
+    match answerStatus(schedYield()) {
+        Ok -> {}
+        Error(failed) -> absorb failed
+    }
+}
+
+// `struct sched_attr`, 48 bytes, for `sched_setattr`.
+function setScheduler(
+    tid: U64,
+    policy: U32,
+    nice: Number,
+    priority: U32,
+    runtime: U64,
+    deadline: U64,
+    period: U64
+) -> Result<Void, TesseraError> {
+    let blockBytes = zeroedBlock(count: 48, alignment: 16)
+    let block = blockBytes.pointer()
+    heapStore<U32>(block, 0, U32(48))
+    heapStore<U32>(block, 4, policy)
+    heapStore<U32>(block, 16, U32(nice & 0xFFFFFFFF))
+    heapStore<U32>(block, 20, priority)
+    heapStore<U64>(block, 24, runtime)
+    heapStore<U64>(block, 32, deadline)
+    heapStore<U64>(block, 40, period)
+    return answerStatus(schedSetattr(tid, block, U32(0)))
+}
+
+// QoS as Linux scheduling: `SCHED_IDLE` for background, nice levels for the
+// classes between, `SCHED_FIFO` for realtime.
+function kernelSetQos(thread: U64, qos: borrow Qos) -> Result<Void, TesseraError> {
+    if qos == .Realtime { return setScheduler(thread, U32(1), 0, U32(10), U64(0), U64(0), U64(0)) }
+    if qos == .Background {
+        return setScheduler(thread, U32(5), 19, U32(0), U64(0), U64(0), U64(0))
+    }
+    var nice = 0
+    if qos == .Utility { nice = 5 }
+    if qos == .UserInitiated { nice = -5 }
+    if qos == .UserInteractive { nice = -10 }
+    return setScheduler(thread, U32(0), nice, U32(0), U64(0), U64(0), U64(0))
+}
+
+// `SCHED_DEADLINE` with the computation, constraint and period.
+function kernelSetRealtime(
+    thread: U64,
+    computation: U64,
+    constraint: U64,
+    period: U64
+) -> Result<Void, TesseraError> {
+    return setScheduler(thread, U32(6), 0, U32(0), computation, constraint, period)
+}
+
+// `futex`, without `FUTEX_PRIVATE_FLAG` so a word in shared memory works
+// across processes: `FUTEX_WAIT_BITSET` (9) on the monotonic clock,
+// `FUTEX_WAKE` (1) and `FUTEX_REQUEUE` (3).
+function kernelAddressWait(
+    address: RawPtr,
+    expected: U32,
+    deadline: U64
+) -> Result<Void, TesseraError> {
+    var timeout = nullPointer()
+    let blockBytes = zeroedBlock(count: 16, alignment: 16)
+    let block = blockBytes.pointer()
+    if deadline != Deadline.infinite {
+        storeTimespec(block, U64(0), deadline)
+        timeout = block
+    }
+    let answer = futex(
+        address,
+        FutexOp.waitBitset,
+        expected,
+        timeout,
+        nullPointer(),
+        FutexOp.anyBit
+    )
+    if !answerFailed(answer) { return .Ok }
+    if failedWith(answer, .Again) { return .Error(failure(.BadState)) }
+    if failedWith(answer, .TimedOut) { return .Error(failure(.Timeout)) }
+    if failedWith(answer, .Interrupted) { return .Ok }
+    return .Error(errnoFailure(answerErrno(answer)))
+}
+
+function kernelAddressWake(address: RawPtr, count: U32) -> Result<U32, TesseraError> {
+    let answer = futex(address, FutexOp.wake, count, nullPointer(), nullPointer(), U32(0))
+    if answerFailed(answer) { return .Error(errnoFailure(answerErrno(answer))) }
+    return .Ok(U32(answer))
+}
+
+function kernelAddressRequeue(
+    address: RawPtr,
+    wakeCount: U32,
+    target: RawPtr,
+    requeueCount: U32
+) -> Result<U32, TesseraError> {
+    let answer = futex(address, FutexOp.requeue, wakeCount, RawPtr(requeueCount), target, U32(0))
+    if answerFailed(answer) { return .Error(errnoFailure(answerErrno(answer))) }
+    return .Ok(U32(answer))
+}

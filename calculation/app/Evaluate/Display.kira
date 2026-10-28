@@ -1,0 +1,102 @@
+//! Turns values and expressions into the text the display draws.
+//!
+//! A value is shown rounded to 15 significant digits. An expression is shown
+//! with the keypad's operator signs in place of the ASCII ones.
+
+import Foundation
+
+/// The text the display shows for a value, rounded to 15 significant digits.
+///
+/// Rounding is half-to-even and never goes past 18 decimal places. The sign is
+/// kept in front, and zero is always `"0"`. History keeps `String(value)`
+/// instead, which is exact.
+///
+/// # Examples
+///
+/// ```kira
+/// let text = displayText(2.5)
+/// ```
+public function displayText(value: Number) -> String {
+    if value == 0 {
+        return "0"
+    }
+    let text = String(roundToSignificant(absolute(value)))
+    if value < 0 {
+        return "-" + text
+    }
+    return text
+}
+
+/// Rounds a magnitude to `CalcLimit.significantDigits` significant digits, half-to-even.
+function roundToSignificant(magnitude: Number) -> Number {
+    let places = decimalPlacesFor(magnitude)
+    let factor = powerOfTen(absolute(places))
+    let scaled = places >= 0 ? magnitude * factor : magnitude / factor
+    let fraction = scaled % 1
+    var whole = scaled - fraction
+    if fraction > 0.5 || (fraction == 0.5 && whole % 2 == 1) {
+        whole = whole + 1
+    }
+    if places >= 0 {
+        return whole / factor
+    }
+    return whole * factor
+}
+
+/// The decimal places that keep `CalcLimit.significantDigits` digits of a magnitude.
+///
+/// The leading zeros of a value below one count toward the digits. The result
+/// is capped at the decimal places a `Number` keeps.
+function decimalPlacesFor(magnitude: Number) -> Number {
+    let parts = String(magnitude).split(".")
+    if parts[0] != "0" {
+        return CalcLimit.significantDigits - parts[0].count
+    }
+    let places = CalcLimit.significantDigits + leadingZeros(parts[1])
+    return places > CalcLimit.decimalPlaces ? CalcLimit.decimalPlaces : places
+}
+
+/// The number of leading `"0"` characters in `digits`.
+function leadingZeros(digits: borrow String) -> Number {
+    var zeros: Number = 0
+    while true {
+        if zeros >= digits.count { break }
+        if slice(digits, zeros, zeros + 1) != "0" { break }
+        zeros = zeros + 1
+    }
+    return zeros
+}
+
+/// Ten raised to a whole `exponent`, computed by repeated multiplication.
+function powerOfTen(exponent: Number) -> Number {
+    var result: Number = 1
+    for step in 0..exponent {
+        result = result * 10
+    }
+    return result
+}
+
+/// The expression as the display draws it, with the keypad's operator signs.
+///
+/// `*` becomes `×`, `/` becomes `÷` and `-` becomes `−`, a true minus sign.
+/// Every other character is kept as it is. The text is not checked for
+/// validity, so an invalid expression is shown as typed.
+///
+/// # Examples
+///
+/// ```kira
+/// let shown = shownExpression("6*7-2")
+/// ```
+public function shownExpression(expression: borrow String) -> String {
+    var shown = ""
+    for index in 0..expression.count {
+        let character = slice(expression, index, index + 1)
+        match character {
+            "*" -> { shown.append("×") }
+            "/" -> { shown.append("÷") }
+            "-" -> { shown.append("−") }
+            else -> { shown.append(character) }
+        }
+    }
+    return shown
+}

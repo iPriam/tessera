@@ -1,0 +1,79 @@
+Back optimal images on imported host memory with a linear Metal texture.
+
+KosmicKrisp places an optimal (tiled) image only in a MTLHeap, and asserts in
+kk_image_plane_bind that memory has one. Memory imported through
+VK_EXT_external_memory_host is a plain MTLBuffer with no heap, and Metal cannot
+place a tiled texture on a buffer -- only a linear one. MoltenVK handled this by
+backing such textures linearly; KosmicKrisp did not, so an optimal image bound
+to imported host memory aborted.
+
+This matters under venus (virglrenderer): venus gives the guest memory by
+importing a host pointer, and this device exposes a single host-visible memory
+type, so every guest allocation is imported host memory with no heap. Without
+this, no optimal image can bind, and the first one a guest creates aborts the
+renderer -- which is what vk_smoke hit on the first clear-image.
+
+The fix converts the plane to a linear layout when the memory has no heap, and
+takes the existing buffer-backed texture path. It is invisible to the guest: an
+optimal image has an opaque layout the guest may not inspect, so a linear
+backing is a valid choice. It covers the 2D single-level case a buffer-backed
+Metal texture and calc_linear both require, which is what a shared render target
+or a transfer image is; a mip/array/3D image on imported memory is not handled
+and would still assert, but venus does not put those on host-visible memory.
+
+Reported upstream territory -- KosmicKrisp is alpha and this is MoltenVK parity
+it has not reached yet.
+
+diff --git a/src/kosmickrisp/vulkan/kk_image.c b/src/kosmickrisp/vulkan/kk_image.c
+index de27a6d..d328a06 100644
+--- a/src/kosmickrisp/vulkan/kk_image.c
++++ b/src/kosmickrisp/vulkan/kk_image.c
+@@ -852,6 +852,20 @@ kk_image_plane_bind(struct kk_device *dev, struct kk_image *image,
+                                &plane_align_B);
+    *offset_B = align64(*offset_B, plane_align_B);
+ 
++   /* Memory with no Metal heap is imported host memory (VK_EXT_external_memory_host),
++    * which is a plain MTLBuffer. Metal cannot place an optimal (tiled) texture on
++    * a buffer, only a linear one, so an optimal image bound here is backed
++    * linearly instead -- the same thing MoltenVK does. The guest never inspects
++    * an optimal image's opaque layout, so a linear backing is invisible to it;
++    * it only works for a 2D single-level image, which is what calc_linear and a
++    * buffer-backed Metal texture both require, and what a shared render target is.
++    * Every venus allocation lands here because this device exposes one
++    * host-visible memory type, so without this no optimal image could bind. */
++   if (!mem->bo->mtl_handle && !plane->layout.linear) {
++      plane->layout.linear = true;
++      kk_image_layout_calc_linear(dev, &plane->layout);
++   }
++
+    assert(plane->layout.linear || mem->bo->mtl_handle);
+ 
+    /* Linear textures in Metal need to be allocated through a buffer... */
+diff --git a/src/kosmickrisp/vulkan/kk_image_layout.c b/src/kosmickrisp/vulkan/kk_image_layout.c
+index f91bfa8..bf87d56 100644
+--- a/src/kosmickrisp/vulkan/kk_image_layout.c
++++ b/src/kosmickrisp/vulkan/kk_image_layout.c
+@@ -119,7 +119,7 @@ kk_image_layout_can_optimize(const struct kk_physical_device *pdev,
+    return true;
+ }
+ 
+-static void
++void
+ kk_image_layout_calc_linear(const struct kk_device *dev,
+                             struct kk_image_layout *layout)
+ {
+diff --git a/src/kosmickrisp/vulkan/kk_image_layout.h b/src/kosmickrisp/vulkan/kk_image_layout.h
+index 0e2a054..17c044d 100644
+--- a/src/kosmickrisp/vulkan/kk_image_layout.h
++++ b/src/kosmickrisp/vulkan/kk_image_layout.h
+@@ -221,4 +221,10 @@ void kk_image_layout_init(const struct kk_device *dev,
+                           const uint8_t width_scale, const uint8_t height_scale,
+                           struct kk_image_layout *layout);
+ 
++/* Recompute a layout as linear (2D, single level). Used when an image is bound
++ * to memory with no Metal heap -- imported host memory -- where an optimal
++ * texture cannot be placed and a buffer-backed linear one is the only option. */
++void kk_image_layout_calc_linear(const struct kk_device *dev,
++                                 struct kk_image_layout *layout);
++
+ #endif /* KK_IMAGE_LAYOUT_H */

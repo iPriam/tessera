@@ -1,0 +1,66 @@
+Keep compiled shaders on disk.
+
+KosmicKrisp never makes a Mesa disk cache or a device memory cache, so a
+pipeline created without a VkPipelineCache is compiled from SPIR-V through NIR
+to MSL every time. Under venus every guest program opens its own device and
+passes no cache, which made each launch recompile all of its pipelines on the
+host. With both caches, vk_pipeline finds the serialized MSL by its SPIR-V and
+state hash and skips NIR, across devices and across runs.
+
+--- a/src/kosmickrisp/vulkan/kk_device.c	2026-10-19 05:13:14
++++ b/src/kosmickrisp/vulkan/kk_device.c	2026-10-19 05:13:14
+@@ -312,6 +312,15 @@
+       if (result != VK_SUCCESS)
+          goto fail_vab_memory;
+       dev->has_queue = true;
++   }
++
++   struct vk_pipeline_cache_create_info cache_info = {
++      .weak_ref = true,
++   };
++   dev->vk.mem_cache = vk_pipeline_cache_create(&dev->vk, &cache_info, NULL);
++   if (dev->vk.mem_cache == NULL) {
++      result = VK_ERROR_OUT_OF_HOST_MEMORY;
++      goto fail_queue;
+    }
+ 
+    result = kk_device_init_meta(dev);
+@@ -348,6 +357,8 @@
+ fail_meta:
+    kk_device_finish_meta(dev);
+ fail_mem_cache:
++   vk_pipeline_cache_destroy(dev->vk.mem_cache, NULL);
++fail_queue:
+    if (dev->has_queue) {
+       kk_queue_finish(dev, &dev->queue);
+       dev->has_queue = false;
+@@ -384,6 +395,7 @@
+    kk_device_finish_lib(dev);
+    kk_query_table_finish(dev, &dev->occlusion_queries);
+    kk_destroy_sampler_heap(dev, &dev->samplers);
++   vk_pipeline_cache_destroy(dev->vk.mem_cache, NULL);
+ 
+    /* Geometry heap */
+    if (dev->heap)
+--- a/src/kosmickrisp/vulkan/kk_physical_device.c	2026-10-19 05:07:17
++++ b/src/kosmickrisp/vulkan/kk_physical_device.c	2026-10-19 05:07:17
+@@ -975,6 +975,19 @@
+    STATIC_ASSERT(BLAKE3_KEY_LEN >= VK_UUID_SIZE);
+    memcpy(pdev->vk.properties.pipelineCacheUUID, blake3, VK_UUID_SIZE);
+    memcpy(pdev->vk.properties.shaderBinaryUUID, blake3, VK_UUID_SIZE);
++
++#ifdef ENABLE_SHADER_CACHE
++   char timestamp[BLAKE3_HEX_LEN];
++   _mesa_blake3_format(timestamp, instance->driver_build_sha);
++
++   pdev->vk.disk_cache = disk_cache_create("kosmickrisp", timestamp, 0);
++   if (pdev->vk.disk_cache != NULL) {
++      pdev->vk.properties.pipelineBinaryInternalCache = true;
++      pdev->vk.properties.pipelineBinaryInternalCacheControl = true;
++      pdev->vk.properties.pipelineBinaryPrefersInternalCache = true;
++      pdev->vk.properties.pipelineBinaryPrecompiledInternalCache = true;
++   }
++#endif
+ }
+ 
+ static void

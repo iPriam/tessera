@@ -1,0 +1,138 @@
+//! What is installed decides what Home holds, and the output decides how its
+//! pages are shown.
+
+import Foundation
+
+// `arrangement` without what is not in `names`: an uninstalled application
+// leaves its page, its folder and App Library's removed list, and a folder
+// left empty goes.
+public function installedOnly(
+    arrangement: borrow HomeArrangement,
+    names: borrow [String]
+) -> HomeArrangement {
+    var kept = HomeArrangement {}
+    for page in arrangement.pages {
+        var items: [HomeItem] = []
+        for item in page.items {
+            match item {
+                App(app) -> if names.contains(app) { items.append(.App(copy app)) }
+                Folder(folder) -> {
+                    var apps: [String] = []
+                    for app in folder.apps {
+                        if names.contains(app) { apps.append(copy app) }
+                    }
+                    if apps.count > 0 {
+                        items.append(.Folder(HomeFolder { name: copy folder.name, apps: apps }))
+                    }
+                }
+            }
+        }
+        kept.pages.append(
+            HomePage { items: items, hidden: page.hidden, widgets: copy page.widgets }
+        )
+    }
+    for app in arrangement.removed {
+        if names.contains(app) { kept.removed.append(copy app) }
+    }
+    return kept
+}
+
+// `saved` brought up to the applications `names` installed: one that is gone
+// leaves every page and folder, and one new goes on the last page with room,
+// or into App Library only when `toLibrary` says so. A first arrangement
+// holds everything.
+public function withInstalled(
+    saved: borrow HomeArrangement,
+    names: borrow [String],
+    toLibrary: Bool,
+    space: borrow HomeSpace
+) -> HomeArrangement {
+    var arrangement = installedOnly(saved, names)
+    arrangement.reset = copy saved.reset
+    let first = saved.pages.count == 0
+    for name in names {
+        if !arrangement.removed.contains(name) && arrangement.slotOf(name).isNone() {
+            if toLibrary && !first {
+                arrangement.removed.append(copy name)
+            } else {
+                arrangement.place(.App(copy name), space)
+            }
+        }
+    }
+    if arrangement.pages.count == 0 { arrangement.pages.append(HomePage {}) }
+    return arrangement
+}
+
+// A page as the screen shows it: the saved page `page` from its item `first`,
+// `count` items. A page holding more than the output has room for, as after
+// the output turned or got smaller, goes on over the screens after it, so
+// every item stays reachable, and the saved arrangement is unchanged for when
+// the output is restored.
+public struct HomeScreenPage {
+    let page: Number
+    let first: Number
+    let count: Number
+}
+
+extend HomeArrangement {
+    // The screens the shown pages take with `perPage` items on a full page.
+    function screenPages(borrow self, space: borrow HomeSpace) -> [HomeScreenPage] {
+        var screens: [HomeScreenPage] = []
+        for page in self.shownPages() {
+            let items = self.pages[page].items.count
+            let room = self.room(page, space)
+            screens.append(HomeScreenPage { page: page, first: 0, count: min(items, room) })
+            let more = items > room ? ceil((items - room) / space.perPage) : 0
+            for screen in 0..more {
+                let first = room + screen * space.perPage
+                screens.append(
+                    HomeScreenPage {
+                        page: page,
+                        first: first,
+                        count: min(items - first, space.perPage)
+                    }
+                )
+            }
+        }
+        return screens
+    }
+
+    // What `screen` shows of its page: its items, and the page's widgets on
+    // its first screen only.
+    function screenPage(borrow self, screen: borrow HomeScreenPage) -> HomePage {
+        let page = self.pages[screen.page]
+        var items: [HomeItem] = []
+        for index in screen.first..screen.first + screen.count {
+            items.append(copy page.items[index])
+        }
+        return HomePage { items: items, widgets: screen.first == 0 ? copy page.widgets : [] }
+    }
+}
+
+// The applications of the folder at `slot`, or none when no folder is there.
+public function folderApps(arrangement: borrow HomeArrangement, slot: borrow HomeSlot) -> [String] {
+    return match arrangement.itemAt(slot) {
+        Some(item) -> match item {
+            Folder(folder) -> copy folder.apps
+            App -> []
+        }
+        None -> []
+    }
+}
+
+// Where the ring goes from `index` on screen `current` of `screens` a `step`
+// along: a step of one past either end of the screen goes on to the next or
+// the last screen; any other step stops at the screen's items.
+public function steppedFocus(
+    screens: borrow [HomeScreenPage],
+    current: Number,
+    index: Number,
+    step: Number
+) -> (Number, Number) {
+    let count = screens[current].count
+    let next = index + step
+    if next >= 0 && next < count { return (current, next) }
+    if step == 1 && current + 1 < screens.count { return (current + 1, 0) }
+    if step == -1 && current > 0 { return (current - 1, max(screens[current - 1].count - 1, 0)) }
+    return (current, min(max(next, 0), max(count - 1, 0)))
+}

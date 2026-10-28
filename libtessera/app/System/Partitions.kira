@@ -1,0 +1,73 @@
+import Foundation
+
+// A disk's partitions, as a Mac's Disk Utility lays them out: a GUID
+// partition table (UEFI 2.10 §5.3), each partition on a whole mebibyte, the
+// table's backup at the disk's end and a protective MBR before it, so a tool
+// that knows only MBR sees one partition it does not know and leaves alone.
+//
+// Only the installer media's own tools write one: a running system has no
+// code path that creates a volume (roadmap/05-storage-and-state.md), and the
+// call needs the machine entitlement.
+
+// What a partition holds, by its type GUID.
+@Derive(Copy)
+public enum VolumePartitionKind: U32 {
+    // A Tessera volume: the btrfs that holds `boot/`, the systems and the
+    // data, as an APFS container holds a Mac's volumes.
+    Tessera = 1
+}
+
+// A partition to lay out: its name, at most 36 characters, and its size in
+// bytes, or 0 for the rest of the disk, which only the last may ask for.
+public struct VolumePartition {
+    let name: String
+    let bytes: Number
+    let kind: VolumePartitionKind
+}
+
+// How large the disk `disk`, a name from `volumeDisks`, is, in bytes. Anyone
+// may ask.
+public function volumeDiskBytes(disk: borrow String) -> Result<Number, TesseraError> {
+    if !isDiskName(disk) { return .Error(failure(.InvalidArgument)) }
+    return kernelDiskBytes(disk)
+}
+
+// Writes a new partition table to the disk `disk`, a name from
+// `volumeDisks`, holding `partitions` in order from its start, and has the
+// kernel read it, so each partition is a disk of its own, `vda1` and on,
+// when this returns. Everything the disk held is lost. A disk with a volume
+// mounted from it is refused, `Busy`, and one too small for the partitions,
+// `InvalidArgument`.
+public function volumeWritePartitions(
+    disk: borrow String,
+    partitions: borrow [VolumePartition]
+) -> Result<Void, TesseraError> {
+    if !isDiskName(disk) || partitions.count == 0 || partitions.count > PartitionTable.entries {
+        return .Error(failure(.InvalidArgument))
+    }
+    for index in 0..partitions.count {
+        let partition = partitions[index]
+        let last = index == partitions.count - 1
+        if partition.bytes < 0 || (partition.bytes == 0 && !last) || partition.name.count > 36 {
+            return .Error(failure(.InvalidArgument))
+        }
+    }
+    if !machineEntitled() { return .Error(failure(.NotEntitled)) }
+    return kernelWritePartitions(disk, partitions)
+}
+
+// The partitions the kernel found on the disk `disk`, one name per line in
+// the order they lie on it: `vdb1`, `vdb2`. A disk with no partition table
+// has none. Anyone may ask.
+public function volumePartitionNames(disk: borrow String) -> Result<String, TesseraError> {
+    if !isDiskName(disk) { return .Error(failure(.InvalidArgument)) }
+    let names = try kernelPartitionNames(disk)
+    var text = ""
+    for index in 0..names.count { text = text + names[index] + "\n" }
+    return .Ok(text)
+}
+
+// A disk's name is one entry of `/sys/block`: no path, nothing hidden.
+function isDiskName(disk: borrow String) -> Bool {
+    return disk.count > 0 && !disk.contains("/") && !disk.startsWith(".")
+}

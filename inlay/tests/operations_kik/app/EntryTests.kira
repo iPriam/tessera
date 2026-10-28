@@ -1,0 +1,64 @@
+import Foundation
+import FileOperations
+
+@Test
+function entriesAreSortedByNameWithoutCase() {
+    let folder = freshFolder("sorted")
+    writeText(childPath(folder, "beta.txt"), "b")
+    writeText(childPath(folder, "Alpha.txt"), "a")
+    expect!(made(makeDirectory(childPath(folder, "charlie"))))
+    let order = listed(folder) == ["Alpha.txt", "beta.txt", "charlie"]
+    expect!(order)
+    let entries = match entriesIn(folder) {
+        Ok(found) -> found
+        Error(failure) -> {
+            absorb failure
+            []
+        }
+    }
+    expect!(entries.count == 3)
+    let folderLast = match entries[2].kind {
+        Folder -> true
+        File, Other -> false
+    }
+    expect!(folderLast)
+    let sized = entries[0].size == 1
+    expect!(sized)
+    expect!(removed(removeTree(folder)))
+}
+
+@Test
+function aMissingFolderIsReported() {
+    let failed = match entriesIn(".operations-scratch-none") {
+        Ok -> false
+        Error(failure) -> match failure {
+            Missing -> true
+            NotFolder -> false
+        }
+    }
+    expect!(failed)
+}
+
+@Test
+function pathPartsAreSplit() {
+    expect!(lastPathPart("/Documents/Notes/a.txt") == "a.txt")
+    expect!(parentPath("/Documents/Notes/a.txt") == "/Documents/Notes")
+    expect!(parentPath("/Documents") == "/")
+    let (stem, extension) = nameParts("report.final.txt")
+    expect!(stem == "report.final")
+    expect!(extension == ".txt")
+    let (hidden, none) = nameParts(".profile")
+    expect!(hidden == ".profile")
+    expect!(none == "")
+}
+
+@Test
+function freeNamesAreNumberedBeforeTheExtension() {
+    let folder = freshFolder("free")
+    expect!(freeName(folder, "a.txt") == "a.txt")
+    writeText(childPath(folder, "a.txt"), "1")
+    expect!(freeName(folder, "a.txt") == "a 2.txt")
+    writeText(childPath(folder, "a 2.txt"), "2")
+    expect!(freeName(folder, "a.txt") == "a 3.txt")
+    expect!(removed(removeTree(folder)))
+}

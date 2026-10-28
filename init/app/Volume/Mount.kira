@@ -1,0 +1,111 @@
+import Foundation
+import LibTessera
+
+// Mounting the system and data volumes.
+
+namespace System {
+    let mountPoint: String = "/sysroot"
+    let init: String = "/init"
+    // Where the initramfs's init mounts the volume's top while it picks the
+    // system to boot.
+    let volumeTop: String = "/volume"
+    // Where a sealed system's snapshot and its composefs image are mounted,
+    // the layers the system's mount is made of.
+    let sealedLayers: String = "/sealed"
+    let sealedData: String = "/sealed/data"
+    let sealedImage: String = "/sealed/image"
+}
+
+// Whether a volume is mounted at `target` and cannot be written. A volume
+// that cannot be asked about is not known to be read-only, so the failure
+// is returned as it is, for the caller to act on.
+function readOnlyVolumeAt(target: borrow String) -> Result<Bool, TesseraError> {
+    return volumeReadOnlyAt(target)
+}
+
+// The machine's disks, in the order it was given them, each followed by
+// its partitions. Fails when the machine cannot list its disks.
+function disks() -> Result<[String], TesseraError> {
+    var names: [String] = []
+    let text = try volumeDisks()
+    let lines = text.split("\n")
+    for index in 0..lines.count {
+        if lines[index].count > 0 {
+            names.append(copy lines[index])
+            let partitions = try partitionsOf(lines[index])
+            for partition in partitions { names.append(partition) }
+        }
+    }
+    return .Ok(names)
+}
+
+// The partitions on `disk`, as an installed disk has its volume on one.
+function partitionsOf(disk: borrow String) -> Result<[String], TesseraError> {
+    var names: [String] = []
+    let text = try volumePartitionNames(disk)
+    for line in text.split("\n") {
+        if line.count > 0 { names.append(copy line) }
+    }
+    return .Ok(names)
+}
+
+// Why the data subvolume is not mounted.
+enum DataVolumeFailure {
+    // The machine could not list its disks.
+    DiskListFailed(TesseraError)
+    // No disk holds a data subvolume.
+    NoDisk
+    // A disk holds a data subvolume, and it would not mount.
+    MountFailed(TesseraError)
+}
+
+// Mounts the volume's `data` subvolume at `/data`.
+//
+// It is btrfs because an agent's state is a copy-on-write subvolume — a
+// snapshot shares every unchanged block with its parent, so forking an
+// agent's world and rolling it back are metadata operations rather than
+// copies of everything the agent ever wrote.
+//
+// Not executable, without devices and without set-identity programs, so
+// that being data rather than code is a property of the mount and not of a
+// path: nothing on it is ever executed, which is what keeps an installed
+// application an image the launcher mounts read-only rather than a binary a
+// stray launch could reach. Read-write, because this is the one subvolume
+// that is allowed to change.
+//
+// The volume is the first disk whose `data` subvolume mounts, as PID 1 found
+// it before handing over.
+//
+// A failure here does not refuse to boot: a machine whose data did not come
+// up has forgotten everything a person did, which is a fault worth saying on
+// the console, but the machine can still be told what is wrong with it, which
+// a refusal to boot would deny. The caller says so and carries on.
+function mountDataVolume() -> Result<Void, DataVolumeFailure> {
+    let options = VolumeOptions.noExecute | VolumeOptions.noDevices | VolumeOptions.noSetIdentity
+    let target = "/" + SystemDirectory.data
+    let names = match disks() {
+        Ok(value) -> value
+        Error(failed) -> return .Error(.DiskListFailed(failed))
+    }
+    // The last real failure, kept for the caller. A disk that is not btrfs,
+    // or has no data subvolume, is not a failure: the next disk is tried.
+    var failure: TesseraError? = .None
+    for disk in names {
+        match volumeMountSubvolume(disk, target, VolumeLayout.data, options) {
+            Ok -> {
+                log info("mounted the data subvolume read-write", path: target, disk)
+                return .Ok
+            }
+            Error(failed) -> {
+                if failed.code != .InvalidArgument && failed.code != .NotFound {
+                    log warn("a disk's data would not mount", disk, error: errorName(failed))
+                    failure = .Some(failed)
+                }
+            }
+        }
+    }
+    match failure {
+        Some(failed) -> return .Error(.MountFailed(failed))
+        None -> return .Error(.NoDisk)
+    }
+}

@@ -1,0 +1,65 @@
+//! A Dynamic Platform, hosted as an application is (roadmap/11-adaptive-desktop.md). The
+//! platform is a Kira UI client of MosaicDisplay like any application, and Kira
+//! UI runs its session: the frames, the keys, and the links PID 1 makes
+//! between the platform and each application. What only a platform does -- placing
+//! and focusing surfaces, its grabbed keys, its own waits -- it does in the
+//! hooks it hands `RunDynamicPlatform`.
+//!
+//! A platform's surface is the whole output, stacked above every other, and
+//! drawn on nothing, so what is under it shows through everywhere but where it
+//! draws: its bar, and the menus that come down from it.
+
+import Foundation
+import KiraUI
+import LibTessera
+import TesseraDisplayClient
+
+/// The session a platform's hooks act on: the channel to MosaicDisplay, the
+/// platform's surface, and the size it was configured at.
+public struct DynamicPlatformSession {
+    /// The channel to MosaicDisplay: the session's connection to the display.
+    var channel: Handle
+    /// The platform's surface, the whole output, stacked above every other.
+    var surface: DisplaySurfaceId
+    /// The size the platform was configured at.
+    var size: Size
+}
+
+/// The keys a platform's own waits carry on the session's port: `base` and up.
+public namespace DynamicPlatformWaitKey {
+    /// The first key a platform's own wait carries; keys from here up belong to the platform.
+    let base: Number = 1024
+}
+
+/// Artwork for a live window; the display attaches it to the window.
+public struct DynamicPlatformBadge {
+    /// The surface the badge's artwork is attached to.
+    let surface: DisplaySurfaceId
+    /// The artwork a live window shows.
+    let icon: Any Widget
+    /// Where the application's icon stands on the platform's surface, which its window flies into going home.
+    let home: StageFrame = StageFrame { x: 0, y: 0, width: 0, height: 0 }
+    /// The corner of the application's icon at home.
+    let homeCorner: Number = 0
+    /// Whether `home` is the icon on the home screen's page rather than the Dock's.
+    let homeScreen: Bool = false
+}
+
+/// What a platform adds to the session Kira UI runs for it. Whatever a hook
+/// changes is drawn: the interface is built again after each.
+public struct DynamicPlatformHooks {
+    /// The badges the platform draws, one per live window.
+    let badges: () -> [DynamicPlatformBadge]
+    /// Called when a session opens, with the session's channel, surface and size.
+    let began: (DynamicPlatformSession) -> Void
+    /// Called with each message the display sends that the session does not read itself.
+    let message: (DisplayMessage) -> Void
+    /// Called with a key that came to the platform's surface; answers whether the platform took it.
+    let key: (DisplayKey) -> Bool
+    /// Called with a pointer button on the platform's surface; answers whether the platform took it.
+    let press: (DisplayPointerButton) -> Bool
+    /// Arms the platform's own waits on the port.
+    let arm: (Handle) -> Void
+    /// Called when one of the platform's own waits completes, with its key.
+    let woke: (Number) -> Void
+}

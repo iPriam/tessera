@@ -1,0 +1,260 @@
+import Foundation
+import LibTessera
+import TesseraDisplayClient
+import KiraUI
+import TesseraUI
+
+// Recovery is the installer media's platform: it draws the whole screen,
+// menu bar and all, and keeps no applications of its own.
+
+enum RecoveryModelFailure {
+    Port(TesseraError)
+    Volumes(TesseraError)
+    ReleaseFile(FileFailure)
+    MissingVersion
+}
+
+function machineModel() -> Result<RecoveryModel, RecoveryModelFailure> {
+    let port = match portCreate(.None) {
+        Ok(value) -> value
+        Error(failed) -> return .Error(.Port(failed))
+    }
+    let volumes = match listVolumes(port) {
+        Ok(value) -> value
+        Error(failed) -> return .Error(.Volumes(failed))
+    }
+    let disks = recoveryDisks(volumes, try runningDisks())
+    log info("listed the disks", count: disks.count)
+    return .Ok(RecoveryModel { version: try tesseraVersion(), disks: disks })
+}
+
+// The version the media installs: its own, from the release file, where
+// the line is `VERSION="0.1.0"`.
+function tesseraVersion() -> Result<String, RecoveryModelFailure> {
+    let text = match readFile("/" + SystemFile.release) {
+        Ok(contents) -> contents.text
+        Error(failed) -> return .Error(.ReleaseFile(failed))
+    }
+    for line in text.split("\n") {
+        if line.startsWith("VERSION=") {
+            let value = line.substring(8, line.count)
+            if value.count >= 2 && value.startsWith("\"") && value.endsWith("\"") {
+                return .Ok(value.substring(1, value.count - 1))
+            }
+            return .Ok(value)
+        }
+    }
+    return .Error(.MissingVersion)
+}
+
+// What Recovery holds while it runs: the disks, the install the person
+// started and the connection it is heard on, and the session's port, which
+// the install's progress is waited for on.
+struct RecoverySession {
+    var model: RecoveryModel
+    var install: RecoveryInstall
+    var channel: Handle?
+    var port: Handle?
+    var armed: Bool
+}
+
+namespace RecoveryWaitKey {
+    let install: Number = DynamicPlatformWaitKey.base
+}
+
+// What the volume an install makes is called, as a Mac's is "Macintosh HD".
+namespace InstalledVolume {
+    let name: String = "Tessera HD"
+}
+
+// Lays `disk` out, puts a volume on it and starts the install, as the
+// Install pane's Install button asks. Making the table and the volume takes
+// a second or two; the copy's progress comes in on the port.
+function beginInstall(session: borrow mut RecoverySession, disk: borrow String) {
+    if disk.count == 0 || session.channel.isSome() { return }
+    session.install = RecoveryInstall { phase: InstallPhase.copying }
+    let channel = match installConnect() {
+        Ok(value) -> value
+        Error(failed) -> return failInstall(session, "The installer is not running", failed)
+    }
+    let partition = match installPartition(channel, disk) {
+        Ok(value) -> value
+        Error(failed) -> return failInstallClosing(
+            session,
+            channel,
+            "The disk could not be partitioned",
+            failed
+        )
+    }
+    match installErase(channel, partition, InstalledVolume.name) {
+        Ok -> {}
+        Error(failed) -> return failInstallClosing(
+            session,
+            channel,
+            "The disk could not be erased",
+            failed
+        )
+    }
+    match installBegin(channel, partition) {
+        Ok -> {}
+        Error(failed) -> return failInstallClosing(
+            session,
+            channel,
+            "The install did not start",
+            failed
+        )
+    }
+    log info("installing", disk, partition)
+    session.channel = .Some(channel)
+    armInstall(session)
+}
+
+function failInstallClosing(
+    session: borrow mut RecoverySession,
+    channel: Handle,
+    problem: borrow String,
+    failed: borrow TesseraError
+) {
+    closeInstallChannel(channel)
+    failInstall(session, problem, failed)
+}
+
+function failInstall(
+    session: borrow mut RecoverySession,
+    problem: borrow String,
+    failed: borrow TesseraError
+) {
+    log warn("the install failed", problem, error: errorName(failed))
+    session.install = RecoveryInstall { phase: InstallPhase.failed, problem: problem + "." }
+    redrawAfter(0)
+}
+
+function closeInstallChannel(channel: Handle) {
+    match handleClose(channel) {
+        Ok -> {}
+        Error(failed) -> absorb failed
+    }
+}
+
+// Waits once for the install's next answer, when there is an install and a
+// port and no wait is out.
+function armInstall(session: borrow mut RecoverySession) {
+    if session.armed { return }
+    let channel = match session.channel {
+        Some(value) -> value
+        None -> return
+    }
+    let port = match session.port {
+        Some(value) -> value
+        None -> return
+    }
+    match objectWaitAsync(
+        channel,
+        Signals.readable | Signals.peerClosed,
+        .Once,
+        port,
+        RecoveryWaitKey.install
+    ) {
+        Ok -> session.armed = true
+        Error(failed) -> log warn("cannot wait for the install", error: errorName(failed))
+    }
+}
+
+// The install said where it is.
+function installWoke(session: borrow mut RecoverySession, key: Number) {
+    if key != RecoveryWaitKey.install { return }
+    session.armed = false
+    let channel = match session.channel {
+        Some(value) -> value
+        None -> return
+    }
+    match installRead(channel) {
+        Ok(progress) -> {
+            if progress.finished {
+                closeInstallChannel(channel)
+                session.channel = .None
+                if progress.installed {
+                    log info("installed", files: progress.total)
+                    session.install = RecoveryInstall {
+                        phase: InstallPhase.installed,
+                        done: progress.done,
+                        total: progress.total
+                    }
+                } else {
+                    log warn("the install failed", problem: progress.problem)
+                    session.install = RecoveryInstall {
+                        phase: InstallPhase.failed,
+                        problem: copy progress.problem
+                    }
+                }
+            } else {
+                session.install = RecoveryInstall {
+                    phase: InstallPhase.copying,
+                    done: progress.done,
+                    total: progress.total
+                }
+            }
+        }
+        Error(failed) -> {
+            if failed.code != .ShouldWait {
+                closeInstallChannel(channel)
+                session.channel = .None
+                failInstall(session, "The installer stopped", failed)
+            }
+        }
+    }
+    armInstall(session)
+    redrawAfter(0)
+}
+
+function restartMachine() {
+    match machineStop(.Restart) {
+        Ok -> {}
+        Error(failed) -> log warn("the machine would not restart", error: errorName(failed))
+    }
+}
+
+@Main
+function main() {
+    let model = match machineModel() {
+        Ok(value) -> value
+        Error(failure) -> {
+            log fault("Recovery could not read the machine", failure)
+            RecoveryModel { version: "Unavailable", disks: [] }
+        }
+    }
+    var session = RecoverySession {
+        model: model,
+        install: RecoveryInstall {},
+        channel: .None,
+        port: .None,
+        armed: false
+    }
+    RunDynamicPlatform(
+        "Recovery",
+        { in
+            return RecoveryView(
+                model = copy session.model,
+                install = copy session.install,
+                actions = RecoveryActions {
+                    install: { disk in beginInstall(session, disk) },
+                    restart: { in restartMachine() }
+                }
+            )
+        },
+        ApplicationOptions {},
+        DynamicPlatformHooks {
+            badges: { in return [] },
+            began: { opened in return },
+            message: { arrived in return },
+            key: { pressed in return false },
+            press: { button in return false },
+            arm: { port in
+                session.port = .Some(port)
+                armInstall(session)
+            },
+            woke: { waited in installWoke(session, waited) },
+        },
+        platformBridge()
+    )
+}

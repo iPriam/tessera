@@ -1,0 +1,7 @@
+//! The pasteboard package: the service that holds the clipboard for the platforms.
+/// The Tessera pasteboard package: the clipboard service.
+construct TesseraPasteboard extends Package {
+    let version: String = "0.1.0"
+    let kind: PackageKind = .App
+    let moduleRoot: String = "TesseraPasteboard"
+}

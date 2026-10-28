@@ -1,0 +1,98 @@
+import Foundation
+import Heap
+import LibTessera
+
+// Listing and making directories.
+
+let directoryBufferSize: Number = 8192
+
+enum DirectoryFailure {
+    Kernel(TesseraError)
+    MalformedRecord
+}
+
+// The names in the directory at `path`. A `DirEntry` record is its size at
+// 0, its name's length at 4 and the name at 32.
+function readDirectory(calls: Handle, path: borrow String) -> Result<[String], DirectoryFailure> {
+    var names: [String] = []
+    let directory = match lookup(calls, path, Rights.enumerate | Rights.inspect) {
+        Ok(value) -> value
+        Error(failed) -> return .Error(.Kernel(failed))
+    }
+    let blockBytes = zeroedBlock(count: directoryBufferSize, alignment: 16)
+    let block = blockBytes.pointer()
+    var cursor: Number = 0
+    while true {
+        let out = Buffer { address: block, length: directoryBufferSize }
+        match answer(calls, nodeList(directory, cursor, out, calls, PortKey.call)) {
+            Error(failed) -> {
+                release(directory)
+                return .Error(.Kernel(failed))
+            }
+            Ok(listed) -> {
+                var at = 0
+                while at < listed.result0 {
+                    let size = heapLoad<U16>(block, at)
+                    let length = heapLoad<U16>(block, at + 4)
+                    if size < 32 || at + size > listed.result0 {
+                        release(directory)
+                        return .Error(.MalformedRecord)
+                    }
+                    names.append(textOf(heapOffset(block, at + 32), length))
+                    at += size
+                }
+                cursor = Number(listed.result1)
+                if cursor == 0 { break }
+            }
+        }
+    }
+    release(directory)
+    return .Ok(names)
+}
+
+function announceDirectory(calls: Handle, path: borrow String) {
+    let names = match readDirectory(calls, path) {
+        Ok(value) -> value
+        Error(failed) -> {
+            match failed {
+                Kernel(reason) -> log warn(
+                    "could not list a directory",
+                    path,
+                    error: errorName(reason)
+                )
+                MalformedRecord -> log warn("a directory holds a malformed entry", path)
+            }
+            return
+        }
+    }
+    for index in 0..names.count {
+        log info("a directory holds an entry", path, name: names[index])
+    }
+    log info("listed a directory", path, entries: names.count)
+}
+
+// Makes the directory at `path` unless it is there already.
+function ensureDirectory(calls: Handle, path: borrow String) -> Result<Void, TesseraError> {
+    let parent = try lookup(calls, directoryOf(path), directoryRights())
+    let created = answeredHandle(
+        calls,
+        nodeCreate(
+            parent,
+            nameOf(path),
+            .Directory,
+            CreateOptions.openExisting,
+            directoryRights(),
+            calls,
+            PortKey.call
+        )
+    )
+    release(parent)
+    let node = try created
+    release(node)
+    return .Ok
+}
+
+function ensureDirectories(calls: Handle, paths: borrow [String]) -> Result<Void, TesseraError> {
+    for path in paths { try ensureDirectory(calls, path) }
+    return .Ok
+}

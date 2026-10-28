@@ -1,0 +1,95 @@
+//! Which surface has focus: the order of surfaces in front of one another, and the focus choice among them.
+import Foundation
+
+/// Whether `surface` is in front of `best`, or level with it; anything is
+/// in front of nothing.
+function isAtOrAbove(surface: borrow PlatformSurface, best: borrow PlatformSurface?) -> Bool {
+    return match best {
+        Some(other) -> surface.zOrder >= other.zOrder
+        None -> true
+    }
+}
+
+/// The surface id of `surface`, if there is one.
+function idOf(surface: borrow PlatformSurface?) -> PlatformSurfaceId? {
+    return match surface {
+        Some(found) -> .Some(found.id)
+        None -> .None
+    }
+}
+
+/// Whether application `id` is a running platform, not an ordinary application.
+function isRunningPlatform(state: borrow PlatformState, id: PlatformApplicationId) -> Bool {
+    for application in state.applications {
+        if application.id == id && application.running && application.kind == .Platform {
+            return true
+        }
+    }
+    return false
+}
+
+extend PlatformState {
+    /// The focused surface in front, if any surface has focus.
+    function focusedSurface(borrow self) -> PlatformSurfaceId? {
+        var focused: PlatformSurface? = .None
+        for surface in surfaces {
+            if surface.visible == .Visible && surface.focused && isAtOrAbove(surface, focused) {
+                focused = .Some(surface)
+            }
+        }
+        return idOf(focused)
+    }
+
+    /// The application whose surface has focus, if any.
+    function focusedApplication(borrow self) -> PlatformApplicationId? {
+        let focused = try focusedSurface() otherwise return .None
+        for surface in surfaces {
+            if surface.id == focused { return .Some(surface.application) }
+        }
+        return .None
+    }
+
+    /// The visible surface of the running platform that is furthest in front,
+    /// if any.
+    function topmostPlatformSurface(borrow self) -> PlatformSurfaceId? {
+        var target: PlatformSurface? = .None
+        for surface in surfaces {
+            if surface.visible == .Visible && isAtOrAbove(surface, target)
+                && isRunningPlatform(self, surface.application) { target = .Some(surface) }
+        }
+        return idOf(target)
+    }
+
+    /// Gives focus to `target` alone, if it is visible; a hidden target leaves
+    /// nothing focused.
+    function setFocus(borrow mut self, target: PlatformSurfaceId) {
+        var used: PlatformApplicationId? = .None
+        for index in 0..surfaces.count {
+            surfaces[index].focused = surfaces[index].id == target
+                && surfaces[index].visible == .Visible
+            if surfaces[index].focused { used = .Some(surfaces[index].application) }
+        }
+        // The application given focus is the one used last.
+        let application = match used {
+            Some(value) -> value
+            // No visible surface took focus, so no application was used.
+            None -> return
+        }
+        let at = match applicationIndex(self, application) {
+            Some(value) -> value
+            // The application has not been registered yet.
+            None -> return
+        }
+        if applications[at].kind == .Application { noteUsed(copy applications[at].name) }
+    }
+
+    /// Gives focus to the platform's surface in front. Without one, focus stays
+    /// where it is.
+    function returnFocusToPlatform(borrow mut self) {
+        match topmostPlatformSurface() {
+            Some(target) -> setFocus(target)
+            // The platform has no surface yet, so nothing can take focus back.
+            None -> {}
+        }
+    }
+}

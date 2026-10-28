@@ -1,0 +1,445 @@
+import Foundation
+import Heap
+
+// The address space (§6.3): mappings and reservations, by address.
+//
+// The kernel does not say which object a range maps, so the library keeps its
+// own list of what it mapped and reserved. A partial unmap or protect splits
+// an entry the way the kernel splits the VMA.
+
+struct MappingEntry {
+    var live: Bool
+    var base: U64
+    var length: U64
+    var protection: Protection
+    var options: MapOptions
+    var objectId: U64
+    var objectOffset: U64
+    var rights: Rights
+}
+
+// `Memory.query`.
+@Derive(Copy)
+public struct MappingInfo {
+    var base: RawPtr
+    var length: UNumber
+    var protection: Protection
+    var options: MapOptions
+    var objectId: UNumber
+    var objectOffset: UNumber
+    var committed: UNumber
+}
+
+@Derive(Copy)
+public distinct Protection = UNumber
+
+public namespace Protection {
+    let none: Protection = Protection(0)
+    let read: Protection = Protection(1)
+    let write: Protection = Protection(2)
+    let execute: Protection = Protection(4)
+}
+
+@Derive(Copy)
+public distinct MapOptions = UNumber
+
+public namespace MapOptions {
+    let none: MapOptions = MapOptions(0)
+    let fixed: MapOptions = MapOptions(1)
+    let private: MapOptions = MapOptions(2)
+    let guardBelow: MapOptions = MapOptions(4)
+    let guardAbove: MapOptions = MapOptions(8)
+    let hugePages: MapOptions = MapOptions(16)
+}
+
+function mappingAdd(entry: borrow MappingEntry) {
+    for index in 0..library.mappings.count {
+        if !library.mappings[index].live {
+            library.mappings[index] = entry
+            return
+        }
+    }
+    library.mappings.append(entry)
+}
+
+function mappingOverlaps(index: Number, base: U64, end: U64) -> Bool {
+    if !library.mappings[index].live { return false }
+    return library.mappings[index].base < end && library.mappings[index].base + library.mappings[index].length > base
+}
+
+// Forgets `[base, base + length)`, keeping the parts of entries outside it.
+function mappingsCut(base: U64, length: U64) {
+    let end = base + length
+    let count = library.mappings.count
+    for index in 0..count {
+        if mappingOverlaps(index, base, end) {
+            let entry = library.mappings[index]
+            library.mappings[index].live = false
+            let entryEnd = entry.base + entry.length
+            if entry.base < base {
+                var left = entry
+                left.length = base - entry.base
+                mappingAdd(left)
+            }
+            if entryEnd > end {
+                var right = entry
+                right.base = end
+                right.length = entryEnd - end
+                right.objectOffset = entry.objectOffset + (end - entry.base)
+                mappingAdd(right)
+            }
+        }
+    }
+}
+
+// Whether `[base, base + length)` lies wholly in ranges this process reserved.
+function mappingsReserved(base: U64, length: U64) -> Bool {
+    var covered = U64(0)
+    let end = base + length
+    for index in 0..library.mappings.count {
+        if mappingOverlaps(index, base, end) {
+            if library.mappings[index].objectId != U64(
+                0
+            ) || library.mappings[index].protection != Protection.none { return false }
+            var from = library.mappings[index].base
+            if from < base { from = base }
+            var to = library.mappings[index].base + library.mappings[index].length
+            if to > end { to = end }
+            covered += to - from
+        }
+    }
+    return covered == length
+}
+
+// Whether a mapping of the object reaches past `size`.
+function mappingsCover(objectId: U64, size: U64) -> Bool {
+    for index in 0..library.mappings.count {
+        if library.mappings[index].live && library.mappings[index].objectId == objectId {
+            if library.mappings[index].objectOffset + library.mappings[index].length > size {
+                return true
+            }
+        }
+    }
+    return false
+}
+
+function objectById(id: U64) -> Number? {
+    for index in 0..library.objects.count {
+        if library.objects[index].live && library.objects[index].id == id { return .Some(index) }
+    }
+    return .None
+}
+
+// The rights a protection needs on the object mapped.
+function protectionRights(protection: Protection, options: MapOptions) -> Rights {
+    var wanted = Rights.map
+    if protection.has(Protection.read) { wanted = wanted | Rights.read }
+    if protection.has(Protection.write) && !options.has(MapOptions.private) {
+        wanted = wanted | Rights.write
+    }
+    if protection.has(Protection.execute) { wanted = wanted | Rights.execute }
+    return wanted
+}
+
+function protectionAllowed(protection: Protection) -> Result<Void, TesseraError> {
+    if protection.raw > U32(7) { return .Error(failure(.InvalidArgument)) }
+    let writeExecute = Protection.write | Protection.execute
+    if (protection & writeExecute) == writeExecute && !entitlementHeld("tessera.jit") {
+        return .Error(failure(.NotEntitled))
+    }
+    return .Ok
+}
+
+public function memoryMap(
+    source: Handle,
+    offset: UNumber,
+    length: UNumber,
+    protection: Protection,
+    options: MapOptions,
+    hint: RawPtr
+) -> Result<RawPtr, TesseraError> {
+    try protectionAllowed(protection)
+    if options.raw > U32(31) || length == U64(0) || !pageAligned(length) || !pageAligned(offset) {
+        return .Error(failure(.InvalidArgument))
+    }
+    let slot = try resolve(source, .None, protectionRights(protection, options))
+    let object = objectOfSlot(slot)
+    var memory: MemoryObject? = .None
+    match library.objects[object].state {
+        Memory(held) -> memory = .Some(held)
+        File -> {}
+        None, Port, Event, EventPair, Timer, Channel, Thread, Process, Job, Node, Watch, Endpoint, Stream, WakeLock, Presence -> return .Error(
+            failure(.WrongType)
+        )
+    }
+    var fileOffset = offset
+    match memory {
+        Some(held) -> {
+            if !memoryHolds(held, offset, length) { return .Error(failure(.OutOfRange)) }
+            fileOffset = held.offset + offset
+        }
+        None -> {}
+    }
+    let page = kernelPageSize()
+    var below = U64(0)
+    var above = U64(0)
+    if options.has(MapOptions.guardBelow) { below = page }
+    if options.has(MapOptions.guardAbove) { above = page }
+    let total = below + length + above
+    var start = U64(0)
+    let shared = !options.has(MapOptions.private)
+    if options.has(MapOptions.fixed) {
+        let at = U64(pointerAddress(hint))
+        if at == U64(0) || !pageAligned(at) || at < below {
+            return .Error(failure(.InvalidArgument))
+        }
+        start = at - below
+        let placement: Place = mappingsReserved(start, total) ? .Over : .Free
+        let objectBacking = try backingOf(object)
+        try kernelMapBacking(at, length, protection, shared, placement, objectBacking, fileOffset)
+        if below > U64(0) {
+            try kernelReserve(start, below, placement)
+        }
+        if above > U64(0) {
+            try kernelReserve(at + length, above, placement)
+        }
+    } else {
+        let reserved = try kernelReserve(U64(pointerAddress(hint)), total, .Anywhere)
+        start = reserved
+        let backing = try backingOf(object)
+        match kernelMapBacking(
+            start + below,
+            length,
+            protection,
+            shared,
+            .Over,
+            backing,
+            fileOffset
+        ) {
+            Ok -> {}
+            Error(failed) -> {
+                // The mapping already failed, and that failure is the one to
+                // report; releasing the reservation is best effort.
+                let released = kernelUnmap(start, total)
+                absorb released
+                return .Error(failed)
+            }
+        }
+    }
+    let base = start + below
+    if options.has(MapOptions.hugePages) { kernelPreferHugePages(base, length) }
+    mappingsCut(start, total)
+    if below > U64(0) {
+        mappingAdd(
+            MappingEntry {
+                live: true,
+                base: start,
+                length: below,
+                protection: Protection.none,
+                options: MapOptions.none,
+                objectId: U64(0),
+                objectOffset: U64(0),
+                rights: Rights.none
+            }
+        )
+    }
+    if above > U64(0) {
+        mappingAdd(
+            MappingEntry {
+                live: true,
+                base: base + length,
+                length: above,
+                protection: Protection.none,
+                options: MapOptions.none,
+                objectId: U64(0),
+                objectOffset: U64(0),
+                rights: Rights.none
+            }
+        )
+    }
+    mappingAdd(
+        MappingEntry {
+            live: true,
+            base: base,
+            length: length,
+            protection: protection,
+            options: options,
+            objectId: library.objects[object].id,
+            objectOffset: offset,
+            rights: library.handles[slot].rights,
+        }
+    )
+    match memory {
+        Some(held) -> {
+            var marked = move held
+            marked.mapped = true
+            setMemory(object, move marked)
+        }
+        None -> {}
+    }
+    return .Ok(RawPtr(base))
+}
+
+public function memoryUnmap(base: RawPtr, length: UNumber) -> Result<Void, TesseraError> {
+    let at = U64(pointerAddress(base))
+    if length == U64(0) || !pageAligned(at) || !pageAligned(length) {
+        return .Error(failure(.InvalidArgument))
+    }
+    try kernelUnmap(at, length)
+    mappingsCut(at, length)
+    return .Ok
+}
+
+public function memoryProtect(
+    base: RawPtr,
+    length: UNumber,
+    protection: Protection
+) -> Result<Void, TesseraError> {
+    try protectionAllowed(protection)
+    let at = U64(pointerAddress(base))
+    if length == U64(0) || !pageAligned(at) || !pageAligned(length) {
+        return .Error(failure(.InvalidArgument))
+    }
+    let end = at + length
+    var pieces: [MappingEntry] = []
+    for index in 0..library.mappings.count {
+        if mappingOverlaps(index, at, end) {
+            var piece = library.mappings[index]
+            if piece.objectId == U64(0) && protection != Protection.none {
+                return .Error(failure(.AccessDenied))
+            }
+            let wanted = protectionRights(protection, piece.options)
+            if piece.objectId != U64(0) && !piece.rights.has(wanted) {
+                return .Error(failure(.AccessDenied))
+            }
+            if piece.base < at {
+                piece.objectOffset += at - piece.base
+                piece.length -= at - piece.base
+                piece.base = at
+            }
+            if piece.base + piece.length > end { piece.length = end - piece.base }
+            piece.protection = protection
+            pieces.append(piece)
+        }
+    }
+    if pieces.count == 0 { return .Error(failure(.NotFound)) }
+    try kernelProtect(at, length, protection)
+    mappingsCut(at, length)
+    for index in 0..pieces.count { mappingAdd(pieces[index]) }
+    return .Ok
+}
+
+// Backs the range with pages now.
+public function memoryCommit(base: RawPtr, length: UNumber) -> Result<Void, TesseraError> {
+    if length == U64(0) || !pageAligned(U64(pointerAddress(base))) || !pageAligned(length) {
+        return .Error(failure(.InvalidArgument))
+    }
+    return kernelCommit(U64(pointerAddress(base)), length)
+}
+
+// Releases the range's pages; a shared mapping's object loses them too, so
+// they read as zero.
+public function memoryDecommit(base: RawPtr, length: UNumber) -> Result<Void, TesseraError> {
+    let at = U64(pointerAddress(base))
+    if length == U64(0) || !pageAligned(at) || !pageAligned(length) {
+        return .Error(failure(.InvalidArgument))
+    }
+    let end = at + length
+    for index in 0..library.mappings.count {
+        if mappingOverlaps(index, at, end) && library.mappings[index].objectId != U64(
+            0
+        ) && !library.mappings[index].options.has(MapOptions.private) {
+            match objectById(library.mappings[index].objectId) {
+                Some(object) -> {
+                    let memory = match library.objects[object].state {
+                        Memory(held) -> held
+                        None, Port, Event, EventPair, Timer, Channel, Thread, Process, Job, Node, File, Watch, Endpoint, Stream, WakeLock, Presence -> continue
+                    }
+                    var from = library.mappings[index].base
+                    if from < at { from = at }
+                    var to = library.mappings[index].base + library.mappings[index].length
+                    if to > end { to = end }
+                    let within = memory.offset + library.mappings[index].objectOffset + (
+                        from - library.mappings[index].base
+                    )
+                    let backing = try backingOf(object)
+                    try kernelDiscardBacking(backing, within, to - from)
+                }
+                None -> {}
+            }
+        }
+    }
+    return kernelDecommit(at, length)
+}
+
+// An inaccessible range, aligned to `alignment` (0 for the page size), for
+// `Memory.map(.Fixed)` to fill later.
+public function memoryReserve(
+    length: UNumber,
+    alignment: UNumber,
+    hint: RawPtr
+) -> Result<RawPtr, TesseraError> {
+    let page = kernelPageSize()
+    var align = alignment
+    if align == U64(0) { align = page }
+    if length == U64(0) || !pageAligned(length) || !pageAligned(align) || (
+        align & (align - U64(1))
+    ) != U64(0) {
+        return .Error(failure(.InvalidArgument))
+    }
+    var extra = U64(0)
+    if align > page { extra = align }
+    let start = try kernelReserve(U64(pointerAddress(hint)), length + extra, .Anywhere)
+    var base = start
+    if extra > U64(0) {
+        base = (start + align - U64(1)) & ~(align - U64(1))
+        if base > start { trimReservation(start, base - start) }
+        let tail = start + length + extra - (base + length)
+        if tail > U64(0) { trimReservation(base + length, tail) }
+    }
+    mappingAdd(
+        MappingEntry {
+            live: true,
+            base: base,
+            length: length,
+            protection: Protection.none,
+            options: MapOptions.none,
+            objectId: U64(0),
+            objectOffset: U64(0),
+            rights: Rights.none
+        }
+    )
+    return .Ok(RawPtr(base))
+}
+
+// Gives back the slack around an aligned reservation. A trim that fails
+// leaves the slack reserved and unused; the aligned range is the caller's
+// either way.
+function trimReservation(at: U64, length: U64) {
+    match kernelUnmap(at, length) {
+        Ok -> {}
+        Error(failed) -> absorb failed
+    }
+}
+
+public function memoryQuery(address: RawPtr) -> Result<MappingInfo, TesseraError> {
+    let at = U64(pointerAddress(address))
+    for index in 0..library.mappings.count {
+        if mappingOverlaps(index, at, at + U64(1)) {
+            let entry = library.mappings[index]
+            let committed = try kernelResidentBytes(entry.base, entry.length)
+            return .Ok(
+                MappingInfo {
+                    base: RawPtr(entry.base),
+                    length: entry.length,
+                    protection: entry.protection,
+                    options: entry.options,
+                    objectId: entry.objectId,
+                    objectOffset: entry.objectOffset,
+                    committed: committed,
+                }
+            )
+        }
+    }
+    return .Error(failure(.NotFound))
+}

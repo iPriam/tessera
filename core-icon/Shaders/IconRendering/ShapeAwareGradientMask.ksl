@@ -1,0 +1,70 @@
+// shapeAwareGradientMask: opacity across the shape. The gradient along
+// `lightDirection`, opaque at `opaqueEnd` and clear `length` points before
+// it, blended to its reverse over the first `borderWidth` points in from the
+// edge, then lifted to at least `minOpacity`.
+import Stitch
+
+type ShapeAwareGradientMaskArguments {
+    let toUser: Float4
+    let toUserTranslation: Float2
+    let borderWidth: Float
+    let minOpacity: Float
+    let opaqueEnd: Float2
+    let length: Float
+    let lightDirection: Float3
+    let sdfScale: Float
+    let sdfZero: Float
+    let fieldInverseSize: Float2
+}
+
+type FullscreenIn {
+    @builtin(vertex_index)
+    let vid: UInt
+}
+
+type FullscreenOut {
+    @builtin(position)
+    let clip_position: Float4
+}
+
+type StitchOut {
+    let color: Float4
+}
+
+shader ShapeAwareGradientMask {
+    group Draw {
+        uniform arguments: ShapeAwareGradientMaskArguments
+        texture field: Texture2d
+        sampler fieldSampler: Sampler
+    }
+
+    vertex {
+        input FullscreenIn
+        output FullscreenOut
+
+        function entry(input: FullscreenIn) -> FullscreenOut {
+            let out: FullscreenOut
+            out.clip_position = Stitch.fullscreen(input.vid)
+            return out
+        }
+    }
+
+    fragment {
+        input FullscreenOut
+        output StitchOut
+
+        function entry(input: FullscreenOut) -> StitchOut {
+            let a = arguments
+            let position = Stitch.userPoint(input.clip_position.xy, a.toUser, a.toUserTranslation)
+            let texel = sample(field, fieldSampler, position * a.fieldInverseSize)
+            let d = Stitch.insideDistance(texel, a.sdfScale, a.sdfZero)
+            let inward = Stitch.saturate(d / a.borderWidth)
+            let along = Stitch.saturate(dot(a.lightDirection.xy, a.opaqueEnd - position) / a.length)
+            let shaded = mix(1.0 - along, along, inward)
+            let opacity = Stitch.smooth01(mix(1.0, a.minOpacity, shaded))
+            let result: StitchOut
+            result.color = Float4(opacity, opacity, opacity, opacity)
+            return result
+        }
+    }
+}

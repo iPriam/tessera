@@ -1,0 +1,167 @@
+import Foundation
+import LibTessera
+
+// Connections, and what each may use.
+//
+// A connection's program is where its process was started from. What it
+// may use follows from that, as devicekitd decides it (17 §20.3): a program
+// under `/bin` is part of the system and holds every entitlement; anything
+// else holds the defaults, audio playback and haptics. LibTessera checks
+// the caller's own entitlements before it asks; this is the check the
+// caller cannot skip.
+
+struct Client {
+    var id: Number
+    var channel: Handle
+    // None when the connection's program is unknown; it holds the defaults.
+    var program: String?
+}
+
+namespace Entitlement {
+    let audioCapture: String = "tessera.audio.capture"
+    let audioPlayback: String = "tessera.audio.playback"
+    let camera: String = "tessera.camera"
+    let haptics: String = "tessera.haptics"
+    let motion: String = "tessera.sensors.motion"
+    let environment: String = "tessera.sensors.environment"
+    // Where the system's own programs live.
+    let systemPrograms: String = "/" + SystemDirectory.programs + "/"
+}
+
+let defaultEntitlements: [String] = [Entitlement.audioPlayback, Entitlement.haptics]
+
+let motionSensors: [SensorKind] = [SensorKind.Accelerometer, SensorKind.Gyroscope, SensorKind.Gravity, SensorKind.LinearAcceleration, SensorKind.RotationVector, SensorKind.StepCounter, SensorKind.StepDetector, SensorKind.Significant,]
+
+function entitled(client: borrow Client, name: borrow String) -> Bool {
+    match client.program {
+        Some(program) -> if program.startsWith(Entitlement.systemPrograms) { return true }
+        None -> {}
+    }
+    return arrayContains(defaultEntitlements, name)
+}
+
+// What opening a device of the class (and, for a sensor, of the kind)
+// needs held: LibTessera's own table.
+function entitlementFor(deviceClass: borrow DeviceClass, kind: borrow SensorKind?) -> String {
+    return match deviceClass {
+        AudioInput -> Entitlement.audioCapture
+        AudioOutput -> Entitlement.audioPlayback
+        Camera -> Entitlement.camera
+        Haptic -> Entitlement.haptics
+        Sensor -> match kind {
+            Some(sensor) -> arrayContains(
+                motionSensors,
+                sensor
+            ) ? Entitlement.motion : Entitlement.environment
+            None -> Entitlement.environment
+        }
+    }
+}
+
+// Whether the client may use some device of the class.
+function classEntitled(client: borrow Client, deviceClass: borrow DeviceClass) -> Bool {
+    if deviceClass == .Sensor {
+        return entitled(client, Entitlement.motion) || entitled(client, Entitlement.environment)
+    }
+    return entitled(client, entitlementFor(deviceClass, .None))
+}
+
+function clientIndex(service: borrow Service, id: Number) -> Number? {
+    for (index, client) in service.clients.enumerated() {
+        if client.id == id { return .Some(index) }
+    }
+    return .None
+}
+
+function acceptChannel(listener: Handle) -> Handle? {
+    match serviceAccept(listener) {
+        Ok(value) -> return .Some(value)
+        Error(reason) -> reportAccept(reason)
+    }
+    return .None
+}
+
+function reportAccept(reason: borrow TesseraError) {
+    if reason.code != .ShouldWait { log warn("a connection could not be taken", error: errorName(reason)) }
+}
+
+function unknownProgram(reason: borrow TesseraError) -> String? {
+    log warn("a connection's program is unknown; it holds the defaults", error: errorName(reason))
+    return .None
+}
+
+function unwatchedConnection(channel: Handle, reason: borrow TesseraError) {
+    log warn("a connection could not be waited on", error: errorName(reason))
+    closeHandle(channel)
+}
+
+// Takes every connection waiting on the listener.
+function accept(service: borrow mut Service) {
+    while true {
+        let channel = match acceptChannel(service.listener) {
+            Some(value) -> value
+            None -> return
+        }
+        // A program the manager cannot name leaves the connection on the defaults.
+        let program: String? = match servicePeerProgram(channel) {
+            Ok(value) -> .Some(value)
+            Error(failed) -> unknownProgram(failed)
+        }
+        let id = service.nextClient
+        service.nextClient += 1
+        match objectWaitAsync(
+            channel,
+            Signals.readable | Signals.peerClosed,
+            .Repeat,
+            service.port,
+            channelKey(id)
+        ) {
+            Ok -> service.clients.append(Client { id: id, channel: channel, program: program })
+            Error(failed) -> unwatchedConnection(channel, failed)
+        }
+    }
+}
+
+// Closes a connection and its stream.
+function closeClient(service: borrow mut Service, id: Number) {
+    match streamIndex(service, id) {
+        Some(stream) -> closeStream(service, stream)
+        None -> {}
+    }
+    cancelWaits(service.port, channelKey(id))
+    var kept: [Client] = []
+    for client in service.clients {
+        if client.id == id {
+            closeHandle(client.channel)
+        } else {
+            kept.append(client)
+        }
+    }
+    service.clients = kept
+}
+
+// Answers everything a connection has sent; closes it once its peer has
+// gone.
+function serveClient(service: borrow mut Service, id: Number) {
+    while true {
+        let client = match clientIndex(service, id) {
+            Some(value) -> value
+            None -> return
+        }
+        let channel = service.clients[client].channel
+        match receive(channel) {
+            Ok(request) -> serveRequest(service, client, request)
+            Error(fault) -> match fault {
+                Channel(failed) -> {
+                    if failed.code != .ShouldWait { closeClient(service, id) }
+                    return
+                }
+                UnknownOperation(op) -> log warn(
+                    "a client sent an operation clients do not send",
+                    op
+                )
+                Refused(refusal) -> answer(channel, refusal.op, refusal.reason)
+            }
+        }
+    }
+}

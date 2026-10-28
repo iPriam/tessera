@@ -1,0 +1,126 @@
+//! The pointer, from MosaicDisplay (roadmap/08-display-server.md, "Input"):
+//! motion, buttons and scroll come to the focused surface in its buffer's
+//! pixels, where a window with a margin starts at it,
+//! and go to the interface as a window's pointer events would, through Kira
+//! UI's own pointer dispatch. A platform hears of a button first, as it does
+//! of a key.
+
+import Foundation
+import KiraUI
+import Ember
+import LibTessera
+import TesseraDisplayClient
+
+/// The pointer's button page: which button presses, and how close two presses must be to count as a double press.
+namespace HostedPointer {
+    // The button page's first button: the primary one, which presses.
+    let primary: Number = 1
+    // How soon a second press, in the display's milliseconds, makes a double
+    // click: a Mac's default.
+    let doubleClick: Number = 500
+}
+
+/// Takes `message` when it is the pointer's; whether it was.
+function takePointer(
+    session: borrow Session,
+    hosting: borrow mut Hosting,
+    message: borrow DisplayMessage
+) -> Result<Bool, SessionEnd> {
+    match message {
+        PointerMotion(motion) -> {
+            hosting.host.pointerX = motion.x
+            hosting.host.pointerY = motion.y
+            hosting.host.pointerInside = true
+            let events = hosting.host.state.ui.eventCount
+            kiraLayerDispatch(hosting.host.state, motion.x, motion.y, .PointerMoved)
+            // Dispatch still updates the pointer snapshot. An unchanged hover
+            // with no held press leaves the drawn interface unchanged too.
+            if hosting.host.state.ui.eventCount == events { return .Ok(true) }
+        }
+        PointerButton(button) -> try takePointerButton(session, hosting, button)
+        PointerAxis(axis) -> kiraLayerDispatchScroll(
+            hosting.host.state,
+            AppEvent {
+                kind: .Scroll,
+                pointerX: hosting.host.pointerX,
+                pointerY: hosting.host.pointerY,
+                // The display's positive scroll is toward the person, and a
+                // window's toward the top.
+                scrollX: axis.axis == .Horizontal ? -axis.value : 0,
+                scrollY: axis.axis == .Vertical ? -axis.value : 0,
+                scrollPrecise: false,
+                timestamp: Number(axis.time)
+            }
+        )
+        PointerEnter -> {
+            hosting.host.pointerInside = true
+            kiraLayerDispatch(
+                hosting.host.state,
+                hosting.host.pointerX,
+                hosting.host.pointerY,
+                .PointerEntered
+            )
+        }
+        PointerLeave -> {
+            hosting.host.pointerInside = false
+            kiraLayerDispatch(
+                hosting.host.state,
+                hosting.host.pointerX,
+                hosting.host.pointerY,
+                .PointerExited
+            )
+        }
+        Hello, Welcome, Attach, Commit, FrameDone, FrameRequest, FrameReady, FocusIn, FocusOut, Configure, AckConfigure, SetMode, ModeChanged, InputCapability, SurfaceCreated, SurfaceDestroyed, GrantFocus, InstallGrab, GrabFired, SetChannel, ChannelChanged, PresentSystem, Verify, VerifyResult, InjectInput, Notify, Notification, ActivateRequested, SetBar, Key, SetDock, SurfacePressed, RequestWindow, WindowRequested, GrantMove, GrantResize, HoldInput, SetOverlay, SetIdle, IdleChanged, BarBackdrop, SetGlass, SetLaunchOrigin, SetStageBadge, PlaceSurface, SurfacePlaced, SetHidden, SetMargin, Insets, Output -> return .Ok(
+            false
+        )
+    }
+    hosting.host.stale = true
+    return .Ok(true)
+}
+
+/// A button: the platform's first, when this is the platform, else the
+/// interface's. Only the primary button presses. A press on the bar of a window
+/// that draws its own frame, on none of its controls, asks the display to move
+/// the window, and a second one soon after zooms it, as on a Mac.
+function takePointerButton(
+    session: borrow Session,
+    hosting: borrow mut Hosting,
+    button: borrow DisplayPointerButton
+) -> Result<Void, SessionEnd> {
+    interactionDispatch(interactionTokenOf(button.token, button.surface, button.time))
+    let outcome = handlePointerButton(session, hosting, button)
+    interactionDispatch(.None)
+    return outcome
+}
+
+/// The button as the pointer handles it, with the token already set.
+function handlePointerButton(
+    session: borrow Session,
+    hosting: borrow mut Hosting,
+    button: borrow DisplayPointerButton
+) -> Result<Void, SessionEnd> {
+    match hosting.hooks {
+        Some(hooks) -> if hooks.press(copy button) { return .Ok }
+        None -> {}
+    }
+    if button.button != HostedPointer.primary { return .Ok }
+    let down = isDown(button.state)
+    if down && windowDecorated()
+        && kiraLayerWindowDragRegion(
+            hosting.host.state,
+            hosting.host.pointerX,
+            hosting.host.pointerY,
+            hosting.host.margin
+        ) {
+        let time = Number(button.time)
+        if hosting.host.barPressed > 0 && time - hosting.host.barPressed <= HostedPointer.doubleClick {
+            hosting.host.barPressed = 0
+            return askWindow(session, .Zoom)
+        }
+        hosting.host.barPressed = time
+        return askWindow(session, .Move)
+    }
+    let kind: AppEventKind = down ? .PointerDown : .PointerUp
+    kiraLayerDispatch(hosting.host.state, hosting.host.pointerX, hosting.host.pointerY, move kind)
+    return .Ok
+}

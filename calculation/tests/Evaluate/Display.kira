@@ -1,0 +1,16 @@
+import Foundation
+
+// The shown form of a value: rounded to fifteen significant digits, with no
+// trailing zeros.
+
+@Test
+function longValuesRoundToFifteenSignificantDigits() {
+    expect!(displayText(Number("0.666666666666666667")) == "0.666666666666667")
+}
+
+@Test
+function shortValuesShowAsTheyAre() {
+    expect!(displayText(Number("-2.5")) == "-2.5")
+    expect!(displayText(Number("0.1")) == "0.1")
+    expect!(displayText(Number("0")) == "0")
+}

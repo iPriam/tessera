@@ -1,0 +1,161 @@
+import Foundation
+import HomeLayout
+import LibTessera
+import KiraUI
+import TesseraUI
+import PlatformUI
+
+// Home from the keyboard (roadmap/24-home-and-personalisation.md): every
+// touch edit has a key. Command-E starts and ends the edit, Return opens,
+// Escape closes or cancels, Delete takes off Home, Command-G makes a folder.
+
+extend HomeScreen {
+    // The keyboard: the arrows move the ring over the screen's items, on to
+    // the next or the last screen past its ends; held with Shift while Home
+    // is edited they move the ringed item with it. In an open folder they
+    // walk its applications, and Shift reorders them.
+    function keyStep(step: Number, shifted: Bool) {
+        let arrangement = loadArrangement()
+        let space = homeSpace(launcherMetrics())
+        let screens = arrangement.screenPages(space)
+        let current = min(page, screens.count)
+        if folderOpen {
+            self.folderStep(arrangement, step, shifted)
+            return
+        }
+        // App Library's own field takes the keys.
+        if current >= screens.count { return }
+        if !keyed {
+            keyed = true
+            focusIndex = min(focusIndex, max(screens[current].count - 1, 0))
+            return
+        }
+        let (screen, index) = steppedFocus(screens, current, focusIndex, step)
+        if shifted && editing {
+            let from = HomeSlot {
+                page: screens[current].page,
+                index: screens[current].first + focusIndex
+            }
+            let to = HomeSlot { page: screens[screen].page, index: screens[screen].first + index }
+            var changed = arrangement
+            changed.moveItem(from, to, space)
+            commitHome(changed)
+        }
+        page = screen
+        focusIndex = index
+    }
+
+    function folderStep(arrangement: borrow HomeArrangement, step: Number, shifted: Bool) {
+        let slot = HomeSlot { page: folderPage, index: folderIndex }
+        let apps = folderApps(arrangement, slot)
+        if apps.count == 0 { return }
+        keyed = true
+        let next = min(max(folderFocus + step, 0), apps.count - 1)
+        if shifted && editing && folderFocus < apps.count {
+            var changed = copy arrangement
+            changed.reorderFolder(slot, apps[folderFocus], next)
+            commitHome(changed)
+        }
+        folderFocus = next
+    }
+
+    // Return opens the ringed item: an application, or a folder, or the
+    // ringed application of the open folder.
+    function keyOpen() {
+        if !keyed { return }
+        let arrangement = loadArrangement()
+        if folderOpen {
+            let apps = folderApps(arrangement, HomeSlot { page: folderPage, index: folderIndex })
+            if folderFocus < apps.count { self.openNamed(apps[folderFocus]) }
+            return
+        }
+        let slot = try self.focusedSlot(arrangement) otherwise return
+        match arrangement.itemAt(slot) {
+            Some(item) -> match item {
+                App(name) -> self.openNamed(name)
+                Folder(folder) -> {
+                    folderPage = slot.page
+                    folderIndex = slot.index
+                    folderName = copy folder.name
+                    folderFocus = 0
+                    folderOpen = true
+                }
+            }
+            // Nothing is at the ring, as on an empty page.
+            None -> {}
+        }
+    }
+
+    function openNamed(name: borrow String) {
+        if editing { return }
+        match applicationNamed(applications, name) {
+            Some(application) -> openApplication(application)
+            None -> log warn("a Home item names no installed application")
+        }
+    }
+
+    // Escape closes what is open over Home, or else cancels the edit.
+    function keyEscape() {
+        if askOpen || folderOpen || overview || gallery || editMenu {
+            askOpen = false
+            folderOpen = false
+            overview = false
+            gallery = false
+            editMenu = false
+            return
+        }
+        if editing { self.endEdit(false) }
+    }
+
+    // Delete asks to take the ringed item off Home while it is edited, or
+    // moves the ringed application out of the open folder.
+    function keyRemove() {
+        if !keyed || !editing { return }
+        let arrangement = loadArrangement()
+        let space = homeSpace(launcherMetrics())
+        if folderOpen {
+            let apps = folderApps(arrangement, HomeSlot { page: folderPage, index: folderIndex })
+            if folderFocus >= apps.count { return }
+            var changed = copy arrangement
+            changed.moveOut(apps[folderFocus], folderPage, space)
+            if apps.count == 1 { folderOpen = false }
+            folderFocus = max(folderFocus - 1, 0)
+            commitHome(changed)
+            return
+        }
+        let slot = try self.focusedSlot(arrangement) otherwise return
+        askPage = slot.page
+        askIndex = slot.index
+        askOpen = true
+    }
+
+    // Command-E starts editing Home, or ends it as Done does.
+    function keyEdit() {
+        if editing {
+            self.endEdit(true)
+            return
+        }
+        editing = true
+        beginHomeEdit()
+    }
+
+    // Command-G, while Home is edited, puts the ringed item and the one after
+    // it in one folder, as dropping one on the other does.
+    function keyGroup() {
+        if !keyed || !editing || folderOpen { return }
+        let arrangement = loadArrangement()
+        let slot = try self.focusedSlot(arrangement) otherwise return
+        let after = HomeSlot { page: slot.page, index: slot.index + 1 }
+        if arrangement.itemAt(after).isNone() { return }
+        var changed = copy arrangement
+        changed.dropItem(slot, after, homeSpace(launcherMetrics()))
+        commitHome(changed)
+    }
+
+    // Where the ring is on its saved page, when it is on a page.
+    function focusedSlot(arrangement: borrow HomeArrangement) -> HomeSlot? {
+        let screens = arrangement.screenPages(homeSpace(launcherMetrics()))
+        if page >= screens.count || focusIndex >= screens[page].count { return .None }
+        return .Some(HomeSlot { page: screens[page].page, index: screens[page].first + focusIndex })
+    }
+}

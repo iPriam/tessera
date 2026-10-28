@@ -1,0 +1,321 @@
+import Foundation
+import Build
+
+// Every component built for one architecture, and the release assembled from
+// their install roots.
+
+// A component as the graph describes it.
+struct DescribedComponent {
+    let component: Component
+    let facts: PackageFacts
+    let roots: ComponentRoots
+    // The library components it links, directly or through another library,
+    // by their index in the described components.
+    let libraries: [Number]
+}
+
+struct DescribedRelease {
+    let components: [DescribedComponent]
+    // The initramfs's root: PID 1, LibTessera and the C runtime.
+    let initramfsRoot: Artifact
+    // The union of every component's symbols root.
+    let symbols: Artifact
+    // The SDK holding every library's contract.
+    let sdk: Artifact
+    // The system volume's root: every component, the C runtime and the
+    // guest GPU stack.
+    let systemRoot: Artifact
+    // The C library and its loader, which every image carries.
+    let runtime: Artifact
+}
+
+// Describes every component for `context`'s architecture, libraries first,
+// each against an SDK of the contracts it links.
+function describeComponents(
+    graph: borrow mut Graph,
+    context: borrow BuildContext,
+    settings: Artifact
+) -> Result<[DescribedComponent], String> {
+    let root = graph.root
+    var described: [DescribedComponent] = []
+    let browser = webkitBrowserAvailable(graph, context.architecture)
+    for component in tesseraComponents() {
+        if component.name == "tessera-browser" && !browser { continue }
+        let facts = match readPackage(root, component.location) {
+            Ok(read) -> read
+            Error(problem) -> return .Error(problem)
+        }
+        var libraries: [Number] = []
+        for (index, known) in described.enumerated() {
+            if known.component.kind == .Library && facts.imports.contains(known.facts.module) {
+                if !libraries.contains(index) { libraries.append(index) }
+                for linked in known.libraries {
+                    if !libraries.contains(linked) { libraries.append(linked) }
+                }
+            }
+        }
+        var contracts: [Artifact] = []
+        for index in libraries {
+            match described[index].roots.contracts {
+                Some(contract) -> contracts.append(contract)
+                None -> {}
+            }
+        }
+        let sdk = componentSdk(graph, context, component.name, copy settings, contracts)
+        let roots = buildComponent(graph, context, component, facts, move sdk)
+        described.append(
+            DescribedComponent {
+                component: copy component,
+                facts: facts,
+                roots: roots,
+                libraries: libraries
+            }
+        )
+    }
+    return .Ok(described)
+}
+
+// The components, the initramfs root, the symbols and the SDK.
+function describeRelease(
+    graph: borrow mut Graph,
+    context: borrow BuildContext
+) -> Result<DescribedRelease, String> {
+    let architecture = context.architecture.name()
+    let settings = sdkSettingsTree(graph, context)
+    let components = match describeComponents(graph, context, copy settings) {
+        Ok(described) -> described
+        Error(problem) -> return .Error(problem)
+    }
+    let runtime = platformRuntime(graph, context)
+    // The initramfs carries PID 1 and nothing else (roadmap/05-storage-and-state.md): init,
+    // LibTessera, which it links, the C library and its loader until PID 1 is
+    // freestanding, and the mount points it mounts onto before it hands the
+    // machine to the system volume, which it mounts at `sysroot`.
+    let initramfsBase = platformBase(
+        graph,
+        context,
+        "base",
+        ["proc", "sys", "dev", "tmp", "run", "sysroot", "volume"]
+    )
+    // The public half of the key the system's seal is signed with, beside
+    // PID 1, which checks the seal before it mounts the system.
+    let sealKey = graph.writeBytes(
+        "\(architecture)/seal-key",
+        copy context.sealKey.publicKey,
+        FileMode.data
+    )
+    let sealKeyTree = graph.tree(
+        "\(architecture)/seal-key-tree",
+        [.Place(TreePlace { path: SealedSystem.key, artifact: sealKey })]
+    )
+    var initramfsTrees = [initramfsBase, copy runtime, sealKeyTree]
+    // The system: everything else. The mount points the system's init
+    // mounts onto, `Volumes` where the Volume service mounts disks, and
+    // /Applications, /Cache and /BuildCache, which PID 1 binds from the data
+    // volume: a root mounted read-only cannot grow them at boot.
+    // `volume` is where it mounts the volume's top to keep an update.
+    let systemBase = platformBase(
+        graph,
+        context,
+        "system-base",
+        [
+            "proc", "sys", "dev", "tmp", "bin", "etc", "run", "Volumes", "data",
+            "Applications", "Cache", "BuildCache", "volume"
+        ]
+    )
+    var systemTrees = [systemBase, copy runtime, platformGraphics(graph, context), platformZoneInfo(
+        graph,
+        context
+    ), platformWebKit(graph, context)]
+    if context.valgrind != "none" {
+        var program = ""
+        for described in components {
+            if described.component.name == context.valgrind {
+                program = installedPath(described.component, described.facts)
+            }
+        }
+        match platformValgrind(graph, context, program) {
+            Ok(made) -> systemTrees.append(made)
+            Error(problem) -> return .Error(problem)
+        }
+    }
+    var symbolTrees: [Artifact] = []
+    var contractTrees: [Artifact] = []
+    for described in components {
+        let name = described.component.name
+        if name == "init" || name == "libtessera" {
+            initramfsTrees.append(copy described.roots.install)
+        }
+        // The installer's formatter is the /init of its own image.
+        if name != "installer" { systemTrees.append(copy described.roots.install) }
+        symbolTrees.append(described.roots.symbols)
+        match described.roots.contracts {
+            Some(contract) -> contractTrees.append(contract)
+            None -> {}
+        }
+    }
+    let symbols = graph.union("\(architecture)/symbols", symbolTrees)
+    match developerTrees(graph, context, symbols) {
+        Ok(trees) -> {
+            for tree in trees { systemTrees.append(tree) }
+        }
+        Error(problem) -> return .Error(problem)
+    }
+    return .Ok(
+        DescribedRelease {
+            systemRoot: graph.union("\(architecture)/system-root", systemTrees),
+            runtime: runtime,
+            components: components,
+            initramfsRoot: graph.union("\(architecture)/initramfs-root", initramfsTrees),
+            symbols: symbols,
+            sdk: componentSdk(graph, context, "release", move settings, contractTrees)
+        }
+    )
+}
+
+// What a dev OS carries beyond a shipped one: every component's dSYM bundle,
+// where the crash reporter looks for it to name a dying process's frames (a
+// dev root brings its own over it), and LLVM's debugger with `-lldb on`. A
+// shipped system carries no debug information.
+function developerTrees(
+    graph: borrow mut Graph,
+    context: borrow BuildContext,
+    symbols: borrow Artifact
+) -> Result<[Artifact], String> {
+    let architecture = context.architecture.name()
+    match context.symbols {
+        Developer -> {}
+        Omitted -> return .Ok([])
+    }
+    let placed = graph.tree(
+        "\(architecture)/developer-symbols",
+        [.Place(TreePlace { path: DeveloperSymbols.directory, artifact: copy symbols })]
+    )
+    if !context.lldb { return .Ok([placed]) }
+    return match platformLldb(graph, context) {
+        Ok(lldb) -> .Ok([placed, lldb])
+        Error(problem) -> .Error(problem)
+    }
+}
+
+// The initramfs: a newc cpio archive of `root`, owned by 0:0 and in byte order
+// of its paths so two builds of one tree make one archive, compressed with
+// zstd, which the kernel unpacks (CONFIG_RD_ZSTD).
+function initramfsImage(
+    graph: borrow mut Graph,
+    context: borrow BuildContext,
+    root: Artifact
+) -> Artifact {
+    let architecture = context.architecture.name()
+    let archive = graph.cpio("\(architecture)/initramfs.cpio", root)
+    return graph.zstd("\(architecture)/initramfs.cpio.zst", archive, 3)
+}
+
+// The system volume: a squashfs image of `root` with its composefs image
+// beside the tree, read-only by construction, with every entry owned by root
+// and dated 0, so two builds of one tree make one image. Stored
+// uncompressed: the image is rebuilt on every change to the system and only
+// carries it to the installer, which copies it onto the volume, so packing it
+// fast matters and its size does not.
+//
+// The composefs image is how the system is sealed (roadmap/13): an EROFS
+// image of the tree recording each file's fs-verity digest, which PID 1
+// mounts the system through with `verity=require`. Its own fs-verity digest
+// is the system's digest, which the build signs with the seal key. The image
+// lies at `SealedSystem.image` in the system and the signature at
+// `SealedSystem.signature`, outside the tree they describe.
+function systemImage(
+    graph: borrow mut Graph,
+    context: borrow BuildContext,
+    name: borrow String,
+    root: Artifact
+) -> Artifact {
+    let architecture = context.architecture.name()
+    let sealed = graph.composefs("\(architecture)/\(name).cfs", root)
+    return sealedVolume(graph, context, name, copy sealed, move sealed, move root)
+}
+
+// The system with one file the seal does not cover, for the tamper test
+// (`boot -tampered`): the signature is over the system's composefs image, and
+// the image beside it is of the system and that file, so PID 1 has to refuse
+// to boot it.
+function tamperedSystemImage(
+    graph: borrow mut Graph,
+    context: borrow BuildContext,
+    root: Artifact
+) -> Artifact {
+    let architecture = context.architecture.name()
+    let signed = graph.composefs("\(architecture)/tampered-signed.cfs", root)
+    let file = graph.write("\(architecture)/tampered", "a file the seal does not cover\n", 420)
+    let added = graph.tree(
+        "\(architecture)/tampered-file",
+        [.Place(TreePlace { path: "tampered", artifact: file, mode: 420 })]
+    )
+    let shipped = graph.union("\(architecture)/tampered-root", [root, added])
+    let image = graph.composefs("\(architecture)/tampered.cfs", shipped)
+    return sealedVolume(graph, context, "tampered", move signed, move image, move shipped)
+}
+
+// The system with one file more, sealed as a system is, for the update test
+// (`boot -update`): a second good system to update to.
+function updatedSystemImage(
+    graph: borrow mut Graph,
+    context: borrow BuildContext,
+    root: Artifact
+) -> Artifact {
+    let architecture = context.architecture.name()
+    let file = graph.write("\(architecture)/updated", "the update test's second system\n", 420)
+    let added = graph.tree(
+        "\(architecture)/updated-file",
+        [.Place(TreePlace { path: "updated", artifact: file, mode: 420 })]
+    )
+    return systemImage(
+        graph,
+        context,
+        "updated",
+        graph.union("\(architecture)/updated-root", [root, added])
+    )
+}
+
+// The squashfs image of `root` with `image` beside it as its composefs image
+// and a signature over `signed`'s digest; `systemImage` passes one image as
+// both.
+function sealedVolume(
+    graph: borrow mut Graph,
+    context: borrow BuildContext,
+    name: borrow String,
+    signed: Artifact,
+    image: Artifact,
+    root: Artifact
+) -> Artifact {
+    let architecture = context.architecture.name()
+    let digest = graph.verityDigest("\(architecture)/\(name).digest", signed)
+    let signature = graph.sign("\(architecture)/\(name).sig", digest, context.sealKey)
+    let beside = graph.tree(
+        "\(architecture)/\(name)-seal",
+        [
+            .Place(TreePlace { path: SealedSystem.image, artifact: image, mode: 420 }),
+            .Place(TreePlace { path: SealedSystem.signature, artifact: signature, mode: 420 })
+        ]
+    )
+    let volume = graph.union("\(architecture)/\(name)-volume", [root, beside])
+    return graph.squashfs("\(architecture)/\(name).img", volume, 0)
+}
+
+namespace SealedSystem {
+    // Where the system's composefs image lies in it; LibTessera's
+    // `VolumeLayout.sealedImage` names the same.
+    let image: String = "composefs.img"
+    // Where the signature over the image's digest lies beside it;
+    // `VolumeLayout.sealedSignature`.
+    let signature: String = "composefs.sig"
+    // Where the seal key's public half lies in the initramfs;
+    // `VolumeLayout.sealKey`.
+    let key: String = "seal.pub"
+}
+
+// Where the build host keeps the seal key: under the build root, outside
+// every repository, made the first time a build needs it.
+function sealKeyPath(host: borrow Host) -> String {
+    return "\(host.buildRoot)/keys/system-seal.pem"
+}

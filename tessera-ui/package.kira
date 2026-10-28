@@ -1,0 +1,21 @@
+//! TesseraUI: how a Kira UI program runs on Tessera's display
+//! (roadmap/10-toolkit.md). It connects to MosaicDisplay, draws the program's
+//! interface into the surface it is given, delivers its input, follows PID 1's
+//! links and reconnects when the display server starts again. An application
+//! starts with `RunTesseraApplication`, a Dynamic Platform with
+//! `RunDynamicPlatform`. A public framework: every application links it.
+/// The Tessera UI library: the home screen, the session and the host that Tessera's applications and platforms share.
+construct TesseraUI extends Package {
+    let version: String = "0.1.0"
+    let kind: PackageKind = .Library
+    let moduleRoot: String = "TesseraUI"
+    let dependencies: [Dependency] = [
+        Dependency { name: "KiraUI", path: "../kira-ui" },
+        Dependency { name: "LibTessera", path: "../libtessera" },
+        Dependency { name: "Ember", path: "../ember" },
+        Dependency { name: "KCoreAnimation", path: "../kcoreanimation" },
+        Dependency { name: "KiraLayout", path: "../kira-layout" },
+        Dependency { name: "TesseraDisplayClient", path: "../display-client" },
+        Dependency { name: "AppKit", path: "../appkit" }
+    ]
+}

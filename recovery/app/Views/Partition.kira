@@ -1,0 +1,265 @@
+import Foundation
+import KiraUI
+
+// Partition and Erase, the two ways Disk Utility changes a disk. Each edits a
+// plan here; nothing is written until Apply or Erase is pressed.
+
+// The plan for a disk's partitions: one entry per partition, in order. A
+// disk with no map yet starts with one partition across all of it.
+function startingPlan(disk: borrow RecoveryDisk) -> [RecoveryPartition] {
+    if disk.partitions.count > 0 { return copy disk.partitions }
+    return [
+        RecoveryPartition {
+            name: "Untitled",
+            format: "btrfs",
+            bytes: disk.bytes,
+            usedBytes: 0.0,
+            mountPoint: ""
+        },
+    ]
+}
+
+function planBytes(plan: borrow [RecoveryPartition]) -> Number {
+    var total = 0.0
+    for partition in plan { total = total + partition.bytes }
+    return total
+}
+
+// Plus halves the chosen partition, as a Mac's does: the new one takes the
+// second half.
+function splitPartition(plan: borrow [RecoveryPartition], at: Number) -> [RecoveryPartition] {
+    var next: [RecoveryPartition] = []
+    for index in 0..plan.count {
+        if index != at {
+            next.append(copy plan[index])
+            continue
+        }
+        let half = floor(plan[index].bytes / 2.0)
+        next.append(
+            RecoveryPartition {
+                name: copy plan[index].name,
+                format: copy plan[index].format,
+                bytes: plan[index].bytes - half,
+                usedBytes: plan[index].usedBytes,
+                mountPoint: copy plan[index].mountPoint
+            }
+        )
+        next.append(
+            RecoveryPartition {
+                name: "Untitled " + String(plan.count + 1),
+                format: "btrfs",
+                bytes: half,
+                usedBytes: 0.0,
+                mountPoint: ""
+            }
+        )
+    }
+    return next
+}
+
+// Minus gives the chosen partition's room to the one before it, or after it
+// when it is the first.
+function removePartition(plan: borrow [RecoveryPartition], at: Number) -> [RecoveryPartition] {
+    if plan.count < 2 { return copy plan }
+    let heir = at == 0 ? 1 : at - 1
+    var next: [RecoveryPartition] = []
+    for index in 0..plan.count {
+        if index == at { continue }
+        if index != heir {
+            next.append(copy plan[index])
+            continue
+        }
+        next.append(
+            RecoveryPartition {
+                name: copy plan[index].name,
+                format: copy plan[index].format,
+                bytes: plan[index].bytes + plan[at].bytes,
+                usedBytes: plan[index].usedBytes,
+                mountPoint: copy plan[index].mountPoint
+            }
+        )
+    }
+    return next
+}
+
+function planRows(
+    plan: borrow [RecoveryPartition],
+    chosen: Number,
+    choice: Binding<Number>
+) -> [Any Widget] {
+    var rows: [Any Widget] = []
+    for index in 0..plan.count {
+        let at = index
+        let target = copy choice
+        rows.append(
+            ListRow(selected = chosen == index) {
+                Circle().fill(partitionColor(index)).frame(width = 10.0, height = 10.0)
+                Text(copy plan[index].name)
+                Spacer()
+                Text(copy plan[index].format).foregroundColor(.Secondary)
+                Text(byteText(plan[index].bytes))
+            }.onClick(
+                { in
+                    target.set(at)
+                    return
+                }
+            )
+        )
+    }
+    return rows
+}
+
+public construct PartitionEditor(
+    head: Any Widget,
+    disk: RecoveryDisk,
+    done: () -> Void
+) extends Widget {
+    // The plan, as `planText` writes it: a State holds a string, not a list.
+    @State var planned: String = planText(startingPlan(disk))
+    @State var chosen: Number = 0
+
+    body {
+        let plan = planFrom(planned)
+        let shown = RecoveryDisk {
+            name: copy disk.name,
+            model: copy disk.model,
+            bytes: disk.bytes,
+            external: disk.external,
+            scheme: "GUID Partition Map",
+            partitions: copy plan
+        }
+        VStack(spacing = .None, alignment = .Leading) {
+            VStack(spacing = .Large, alignment = .Leading) {
+                copy head
+                VStack(spacing = .Small, alignment = .Leading) {
+                    Text("Partition “" + disk.model + "”")
+                    .font(size = resolvedLength(15.0), weight = .Bold)
+                    Text(
+                        "Plus splits the chosen partition in two; minus gives its room to its neighbour."
+                    )
+                    .font(size = resolvedLength(12.0))
+                    .foregroundColor(.Secondary)
+                }
+                mapBar(shown, 640.0)
+            }
+            .scenePadding()
+            List(children: [Section(children: planRows(plan, chosen, $chosen))])
+            HStack(spacing = .Small, alignment = .Center) {
+                Button(
+                    action = { in
+                        planned = planText(splitPartition(plan, chosen))
+                        return
+                    }
+                ) {
+                    Icon(symbol: .Plus)
+                }
+                Button(
+                    action = { in
+                        planned = planText(removePartition(plan, chosen))
+                        chosen = 0
+                        return
+                    }
+                ) {
+                    Icon(symbol: .Minus)
+                }
+                .disabled(plan.count < 2)
+                Spacer()
+                Button(
+                    action = { in
+                        planned = planText(startingPlan(disk))
+                        chosen = 0
+                        return
+                    }
+                ) {
+                    Text("Revert")
+                }
+                Button(action = done) {
+                    Text("Apply")
+                }
+                .buttonStyle(.BorderedProminent)
+            }
+            .scenePadding()
+        }
+    }
+}
+
+public construct EraseForm(head: Any Widget, disk: RecoveryDisk, done: () -> Void) extends Widget {
+    @State var name: String = "Tessera HD"
+    @State var format: String = "btrfs"
+    @State var scheme: String = "gpt"
+
+    body {
+        VStack(spacing = .None, alignment = .Leading) {
+            copy head
+            .scenePadding()
+            Form {
+                Section {
+                    LabeledContent(label = "Name") {
+                        TextField(title = "Name", text = $name)
+                    }
+                    Picker(title = "Format", selection = $format) {
+                        Text("btrfs").tag("btrfs")
+                        Text("FAT32").tag("fat32")
+                    }
+                    Picker(title = "Scheme", selection = $scheme) {
+                        Text("GUID Partition Map").tag("gpt")
+                    }
+                } header: {
+                    VStack(spacing = .Small, alignment = .Leading) {
+                        Text("Erase “" + disk.model + "”?")
+                        .font(size = resolvedLength(15.0), weight = .Bold)
+                        Text(
+                            "Erasing deletes everything on the disk. Enter a name, choose a format and a map."
+                        )
+                        .font(size = resolvedLength(12.0))
+                        .foregroundColor(.Secondary)
+                    }
+                }
+            }
+            HStack(spacing = .Small, alignment = .Center) {
+                Spacer()
+                Button(action = done) {
+                    Text("Cancel")
+                }
+                Button(role = .Destructive, action = done) {
+                    Text("Erase")
+                }
+                .buttonStyle(.BorderedProminent)
+            }
+            .scenePadding()
+        }
+    }
+}
+
+// A plan as one string: a line per partition, its name, format and size in
+// bytes apart by tabs.
+function planText(plan: borrow [RecoveryPartition]) -> String {
+    var text = ""
+    for partition in plan {
+        text = text + partition.name + "\t" + partition.format + "\t" + String(
+            partition.bytes
+        ) + "\n"
+    }
+    return text
+}
+
+function planFrom(text: borrow String) -> [RecoveryPartition] {
+    var plan: [RecoveryPartition] = []
+    for line in text.split("\n") {
+        let fields = line.split("\t")
+        if fields.count != 3 { continue }
+        plan.append(
+            RecoveryPartition {
+                name: copy fields[0],
+                format: copy fields[1],
+                bytes: match fields[2].toNumber() {
+                    Some(value) -> value
+                    None -> 0.0
+                },
+                usedBytes: 0.0,
+                mountPoint: ""
+            }
+        )
+    }
+    return plan
+}

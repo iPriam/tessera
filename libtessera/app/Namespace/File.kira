@@ -1,0 +1,379 @@
+import Foundation
+import Heap
+
+// Files (§13.5): a backing opened from the Node for what the mode asks,
+// so Read and Write are the kernel's to enforce. The state keeps the mode. I/O
+// is positional and completes as `Io` packets.
+
+@Derive(Copy)
+public struct FileInfo {
+    var size: UNumber
+    var allocated: UNumber
+    var modified: UNumber
+    var blockSize: UNumber
+    var mode: OpenMode
+    var nodeId: UNumber
+    var volumeId: UNumber
+}
+
+@Derive(Copy)
+public distinct OpenMode = UNumber
+
+public namespace OpenMode {
+    let none: OpenMode = OpenMode(0)
+    let read: OpenMode = OpenMode(1)
+    let write: OpenMode = OpenMode(2)
+    let append: OpenMode = OpenMode(4)
+    let truncate: OpenMode = OpenMode(8)
+    let noCache: OpenMode = OpenMode(16)
+    let sync: OpenMode = OpenMode(32)
+}
+// What `File.sync` makes durable: the data and size, or all metadata too.
+@Derive(Copy)
+public enum SyncOptions: U32 {
+    Data = 0
+    All = 1
+}
+@Derive(Copy)
+public distinct AllocateOptions = UNumber
+
+public namespace AllocateOptions {
+    let none: AllocateOptions = AllocateOptions(0)
+    let punchHole: AllocateOptions = AllocateOptions(1)
+    let zeroRange: AllocateOptions = AllocateOptions(2)
+}
+@Derive(Copy)
+public enum LockMode: U32 {
+    Shared = 0
+    Exclusive = 1
+}
+
+public namespace FileOffset {
+    // `File.write`'s offset for "append atomically".
+    let append: UNumber = 0xFFFFFFFFFFFFFFFF
+}
+
+public function fileOpen(
+    node: Handle,
+    mode: OpenMode,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    if mode.raw == U32(0) || mode.raw > U32(63) { return .Error(failure(.InvalidArgument)) }
+    let writes = (mode & (OpenMode.write | OpenMode.append | OpenMode.truncate)).raw != U32(0)
+    var needed = Rights.none
+    if mode.has(OpenMode.read) { needed = needed | Rights.read }
+    if writes { needed = needed | Rights.write }
+    let object = try resolveObject(node, .Node, needed)
+    let target = try portTarget(port)
+    let backing = try backingOf(object)
+    let kind = match kernelNodeStat(backing) {
+        Ok(stat) -> stat.kind
+        Error(failed) -> {
+            portComplete(target, key, .Error(failed), .Namespace, U64(0), U64(0), U64(0))
+            return .Ok
+        }
+    }
+    if kind == .Directory {
+        portComplete(target, key, .Error(failure(.IsDirectory)), .Namespace, U64(0), U64(0), U64(0))
+        return .Ok
+    }
+    let backing = try backingOf(object)
+    let opened = match kernelFileOpen(backing, mode) {
+        Ok(value) -> value
+        Error(failed) -> {
+            portComplete(target, key, .Error(failed), .Namespace, U64(0), U64(0), U64(0))
+            return .Ok
+        }
+    }
+    let file = objectCreate(.File(FileObject { mode: mode }), opened)
+    var rights = Rights.map | Rights.duplicate | Rights.transfer | Rights.wait | Rights.inspect
+    if mode.has(OpenMode.read) { rights = rights | Rights.read }
+    if writes { rights = rights | Rights.write }
+    let handle = match handleMint(file, rights) {
+        Ok(value) -> value
+        Error(failed) -> {
+            objectDestroy(file)
+            portComplete(target, key, .Error(failed), .Namespace, U64(0), U64(0), U64(0))
+            return .Ok
+        }
+    }
+    portComplete(target, key, .Ok, .Namespace, handle.raw, U64(0), U64(0))
+    return .Ok
+}
+
+// The object a call acts on and the port it completes to.
+struct CallTarget {
+    var object: Number
+    var port: Number
+}
+
+function fileTarget(
+    file: Handle,
+    rights: Rights,
+    port: Handle
+) -> Result<CallTarget, TesseraError> {
+    let object = try resolveObject(file, .File, rights)
+    let target = try portTarget(port)
+    return .Ok(CallTarget { object: object, port: target })
+}
+
+// Positional scatter read; `result0` the bytes read, 0 at the end.
+public function fileReadAt(
+    file: Handle,
+    offset: UNumber,
+    buffers: borrow [Buffer],
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    if buffers.count == 0 || buffers.count > 1024 { return .Error(failure(.InvalidArgument)) }
+    let call = try fileTarget(file, Rights.read, port)
+    let backing = try backingOf(call.object)
+    let got = kernelReadVectored(backing, offset, buffers)
+    fileCompleteTransfer(got, call.port, key)
+    return .Ok
+}
+
+// Positional gather write. `FileOffset.append` appends, in `Append` mode.
+public function fileWriteAt(
+    file: Handle,
+    offset: UNumber,
+    buffers: borrow [Buffer],
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    if buffers.count == 0 || buffers.count > 1024 { return .Error(failure(.InvalidArgument)) }
+    let call = try fileTarget(file, Rights.write, port)
+    let appending = offset == FileOffset.append
+    let opened = try fileOf(call.object)
+    if appending && !opened.mode.has(OpenMode.append) {
+        return .Error(failure(.InvalidArgument))
+    }
+    let backing = try backingOf(call.object)
+    let wrote = kernelWriteVectored(backing, offset, buffers, appending)
+    fileCompleteTransfer(wrote, call.port, key)
+    return .Ok
+}
+
+// A copy between a file and a Memory object: both objects, where in the
+// Memory object it starts, and the port it completes to.
+struct FileMemoryCall {
+    var file: Number
+    var memory: Number
+    var at: U64
+    var port: Number
+}
+
+function fileMemory(
+    file: Handle,
+    fileRights: Rights,
+    memory: Handle,
+    memoryRights: Rights,
+    memoryOffset: U64,
+    length: U64,
+    port: Handle
+) -> Result<FileMemoryCall, TesseraError> {
+    let memoryObject = try resolveObject(memory, .Memory, memoryRights)
+    let held = try memoryOf(memoryObject)
+    if !memoryHolds(held, memoryOffset, length) { return .Error(failure(.OutOfRange)) }
+    let call = try fileTarget(file, fileRights, port)
+    return .Ok(
+        FileMemoryCall {
+            file: call.object,
+            memory: memoryObject,
+            at: held.offset + memoryOffset,
+            port: call.port,
+        }
+    )
+}
+
+// File bytes into a Memory object; `result0` the bytes moved.
+public function fileReadMemory(
+    file: Handle,
+    offset: UNumber,
+    memory: Handle,
+    memoryOffset: UNumber,
+    length: UNumber,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    let call = try fileMemory(file, Rights.read, memory, Rights.write, memoryOffset, length, port)
+    let memoryBacking = try backingOf(call.memory)
+    let fileBacking = try backingOf(call.file)
+    let moved = kernelCopyBetween(fileBacking, offset, memoryBacking, call.at, length)
+    fileCompleteTransfer(moved, call.port, key)
+    return .Ok
+}
+
+public function fileWriteMemory(
+    file: Handle,
+    offset: UNumber,
+    memory: Handle,
+    memoryOffset: UNumber,
+    length: UNumber,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    let call = try fileMemory(file, Rights.write, memory, Rights.read, memoryOffset, length, port)
+    let fileBacking = try backingOf(call.file)
+    let memoryBacking = try backingOf(call.memory)
+    let moved = kernelCopyBetween(memoryBacking, call.at, fileBacking, offset, length)
+    fileCompleteTransfer(moved, call.port, key)
+    return .Ok
+}
+
+function fileCompleteTransfer(moved: borrow Result<U64, TesseraError>, port: Number, key: U64) {
+    match moved {
+        Ok(count) -> portComplete(port, key, .Ok, .Io, count, U64(0), U64(0))
+        Error(failed) -> portComplete(port, key, .Error(failed), .Io, U64(0), U64(0), U64(0))
+    }
+}
+
+public function fileSync(
+    file: Handle,
+    options: SyncOptions,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    let call = try fileTarget(file, Rights.none, port)
+    let backing = try backingOf(call.object)
+    let synced = kernelSync(backing, options)
+    portComplete(call.port, key, synced, .Io, U64(0), U64(0), U64(0))
+    return .Ok
+}
+
+public function fileResize(
+    file: Handle,
+    size: UNumber,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    let call = try fileTarget(file, Rights.write, port)
+    if mappingsCover(library.objects[call.object].id, size) {
+        portComplete(call.port, key, .Error(failure(.Busy)), .Io, U64(0), U64(0), U64(0))
+        return .Ok
+    }
+    let backing = try backingOf(call.object)
+    portComplete(call.port, key, kernelMemoryResize(backing, size), .Io, U64(0), U64(0), U64(0))
+    return .Ok
+}
+
+// Makes the file's contents `source`'s, sharing its blocks rather than
+// copying them (§13). `Unsupported` where the volume cannot, and the caller
+// copies instead.
+public function fileClone(
+    file: Handle,
+    source: Handle,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    let call = try fileTarget(file, Rights.write, port)
+    let from = try resolveObject(source, .File, Rights.read)
+    let backing = try backingOf(call.object)
+    let sourceBacking = try backingOf(from)
+    let cloned = kernelClone(backing, sourceBacking)
+    portComplete(call.port, key, cloned, .Io, U64(0), U64(0), U64(0))
+    return .Ok
+}
+
+// Preallocates, punches a hole, or zeroes a range.
+public function fileAllocate(
+    file: Handle,
+    offset: UNumber,
+    length: UNumber,
+    options: AllocateOptions,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    if options.raw > AllocateOptions.zeroRange.raw || length == U64(0) {
+        return .Error(failure(.InvalidArgument))
+    }
+    let call = try fileTarget(file, Rights.write, port)
+    let backing = try backingOf(call.object)
+    portComplete(
+        call.port,
+        key,
+        kernelAllocate(backing, offset, length, options),
+        .Io,
+        U64(0),
+        U64(0),
+        U64(0)
+    )
+    return .Ok
+}
+
+// Completes when the lock is held; a lock held by someone else is tried
+// again as the port waits, until the caller cancels. The lock belongs to the
+// File and goes with it.
+public function fileLock(
+    file: Handle,
+    offset: UNumber,
+    length: UNumber,
+    mode: LockMode,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    let slot = try resolve(file, .File, Rights.none)
+    let target = try portTarget(port)
+    let lock = LockWork { offset: offset, length: length, mode: mode }
+    let index = pendingAdd(.Lock(lock), .Handle(slot), target, key)
+    fileLockStep(index, lock)
+    return .Ok
+}
+
+function fileLockStep(index: Number, lock: borrow LockWork) {
+    let backing = match backingOf(library.pending[index].object) {
+        Ok(value) -> value
+        Error(failed) -> {
+            pendingFinish(index, .Error(failed), U64(0), U64(0), U64(0))
+            return
+        }
+    }
+    let locked = kernelLockRange(backing, lock.offset, lock.length, lock.mode)
+    if !failedWith(locked, .ShouldWait) { pendingFinish(index, locked, U64(0), U64(0), U64(0)) }
+}
+
+public function fileUnlock(
+    file: Handle,
+    offset: UNumber,
+    length: UNumber
+) -> Result<Void, TesseraError> {
+    let object = try resolveObject(file, .File, Rights.none)
+    let backing = try backingOf(object)
+    return kernelUnlockRange(backing, offset, length)
+}
+
+public function fileInfo(file: Handle) -> Result<FileInfo, TesseraError> {
+    let object = try resolveObject(file, .File, Rights.none)
+    let backing = try backingOf(object)
+    let stat = try kernelNodeStat(backing)
+    let opened = try fileOf(object)
+    let info = FileInfo {
+        size: stat.size,
+        allocated: stat.allocated,
+        modified: stat.modified,
+        blockSize: stat.blockSize,
+        mode: opened.mode,
+        nodeId: stat.identity,
+        volumeId: stat.volume,
+    }
+    return .Ok(info)
+}
+
+// `FileInfo`, 48 bytes.
+function fileInfoWrite(
+    object: Number,
+    opened: borrow FileObject,
+    block: RawPtr
+) -> Result<U64, TesseraError> {
+    let backing = try backingOf(object)
+    let stat = try kernelNodeStat(backing)
+    heapStore<U64>(block, 0, stat.size)
+    heapStore<U64>(block, 8, stat.allocated)
+    heapStore<U64>(block, 16, stat.modified)
+    heapStore<U32>(block, 24, stat.blockSize)
+    heapStore<U32>(block, 28, opened.mode.raw)
+    heapStore<U64>(block, 32, stat.identity)
+    heapStore<U64>(block, 40, stat.volume)
+    return .Ok(48)
+}

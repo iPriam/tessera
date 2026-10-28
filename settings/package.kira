@@ -1,0 +1,17 @@
+// Settings: where a person changes how Tessera looks and behaves, laid out as
+// an iPad's Settings is, a sidebar of panes beside the one open.
+//
+// What it changes it writes to the Settings service, `tessera.settings`,
+// which keeps it on the data volume and tells every process.
+construct SettingsApp extends Package {
+    let version: String = "0.1.0"
+    let kind: PackageKind = .App
+    // Its icon, light and dark, which the platform shows wherever the
+    // application is.
+    let assets: [String] = ["Resources/AppIcon.tessicon"]
+    let moduleRoot: String = "Settings"
+    // Backups copy and restore with Inlay's file rules.
+    let dependencies: [Dependency] = [
+        Dependency { name: "FileOperations", path: "../inlay/operations" }
+    ]
+}

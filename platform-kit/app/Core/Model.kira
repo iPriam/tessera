@@ -1,0 +1,132 @@
+//! The platform's model: the identities of its applications and surfaces, and the values that describe them.
+import Foundation
+
+/// The identity of one application in a platform's state. Distinct from a surface's identity, so the two cannot be mixed up.
+public distinct PlatformApplicationId = UNumber
+/// The identity of one surface (a window) in a platform's state. Distinct from an application's identity.
+public distinct PlatformSurfaceId = UNumber
+
+/// The platform the running program is: one operating system runs four platforms, each its own program.
+///
+/// Adaptive Desktop and Adaptive Mobile are adaptive because each spans many form factors, not because they are one platform.
+public enum DynamicPlatform {
+    /// The platform for desktop computers and convertibles.
+    AdaptiveDesktop
+    /// The platform for tablets and phones.
+    AdaptiveMobile
+    /// The platform for a game console, driven from the couch.
+    Console
+    /// The platform for a television or streaming device, driven from the couch.
+    Media
+}
+
+/// Whether a surface is shown on the output or put away.
+public enum SurfaceVisibility {
+    /// The surface is put away: minimized, or hidden by going home.
+    Hidden
+    /// The surface is shown on the output.
+    Visible
+}
+
+/// What a running program is to the platform, and so whether the Dock and switcher count it.
+public enum ApplicationKind {
+    /// The platform's own surfaces, which draw what is not an application.
+    Platform
+    /// The desktop: the surface under every application. The switcher counts it as one application; the Dock does not show it.
+    Desktop
+    /// An application the user runs.
+    Application
+}
+
+/// A running program or a kept application known to the platform.
+public struct PlatformApplication {
+    /// The application's identity in the platform's state.
+    var id: PlatformApplicationId
+    /// The application's name, as its window's name reached the platform. Empty until it has.
+    var name: String
+    /// Whether the program is an application, the desktop or the platform's own surfaces.
+    var kind: ApplicationKind
+    /// Whether the application has at least one window open.
+    var running: Bool
+}
+
+/// A rectangle on the output, in points.
+public struct SurfaceFrame {
+    /// The left edge, in points.
+    var x: Number
+    /// The top edge, in points.
+    var y: Number
+    /// The width, in points.
+    var width: Number
+    /// The height, in points.
+    var height: Number
+}
+
+/// One surface (a window) of an application, and where it is on the output.
+public struct PlatformSurface {
+    /// The surface's identity in the platform's state.
+    var id: PlatformSurfaceId
+    /// The application the surface is a window of.
+    var application: PlatformApplicationId
+    /// Whether the surface is shown or put away.
+    var visible: SurfaceVisibility
+    /// Whether the surface holds keyboard focus.
+    var focused: Bool
+    /// Where the surface is on the output.
+    var frame: SurfaceFrame
+    /// Its place in the stack: a larger value is nearer the front.
+    var zOrder: Number
+    /// Where the surface was before it was zoomed to fill the room, so zooming again puts it back. `.None` while it is not zoomed.
+    var unzoomed: SurfaceFrame? = .None
+}
+
+/// The whole of a platform's state: its applications, surfaces, the switcher, the launcher and the Dock.
+///
+/// Changes go through the functions in this package, which keep the fields consistent.
+public struct PlatformState {
+    /// Which platform the state is for.
+    var platform: DynamicPlatform
+    /// Every application the platform knows, running or not.
+    var applications: [PlatformApplication]
+    /// Every surface the platform knows, shown or put away.
+    var surfaces: [PlatformSurface]
+    /// Whether the application switcher is open.
+    var switcherOpen: Bool
+    /// The application the switcher has chosen, or `.None` when none is chosen.
+    var switcherSelection: PlatformApplicationId?
+    /// The surface focus goes back to when the switcher closes without a switch, or `.None`.
+    var switcherReturnFocus: PlatformSurfaceId?
+    /// Whether the launcher is open.
+    var launcherOpen: Bool
+    /// The names of the applications the Dock keeps, in its order.
+    var kept: [String] = []
+    /// The names of the applications used last, the latest first, whether open or not.
+    var recent: [String] = []
+}
+
+/// Why a change to the platform's state was refused.
+public enum PlatformStateFailure {
+    /// No application has this identity.
+    UnknownApplication(PlatformApplicationId)
+    /// No surface has this identity.
+    UnknownSurface(PlatformSurfaceId)
+    /// The surface is put away, so the change cannot be made to it.
+    HiddenSurface(PlatformSurfaceId)
+    /// A size of zero or less was given where a size must be positive.
+    EmptySize
+}
+
+/// The state of a platform with no applications, no surfaces and nothing open.
+///
+/// The switcher and launcher are closed, and nothing is selected or focused.
+public function emptyPlatformState(platform: DynamicPlatform) -> PlatformState {
+    return PlatformState {
+        platform: platform,
+        applications: [],
+        surfaces: [],
+        switcherOpen: false,
+        switcherSelection: .None,
+        switcherReturnFocus: .None,
+        launcherOpen: false,
+    }
+}

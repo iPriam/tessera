@@ -1,0 +1,115 @@
+//! The keyboard, from MosaicDisplay to the toolkit.
+//!
+//! MosaicDisplay sends a key as its HID usage on the keyboard page (HID Usage
+//! Tables, section 10), going down, repeating or coming up, with the modifiers
+//! held and the character its keymap resolved. Kira UI reads keys as Ember
+//! numbers them; this is where a usage becomes Ember's key. The character is
+//! never worked out here: a client carries no keymap of its own.
+
+import Foundation
+import KiraUI
+import Ember
+import LibTessera
+
+/// The usages this reads, by name. Open: a keyboard has keys this does not name.
+@Open
+enum Usage: UN32 {
+    A = 4
+    Z = 29
+    Digit1 = 30
+    Digit9 = 38
+    Digit0 = 39
+    Enter = 40
+    Escape = 41
+    Backspace = 42
+    Tab = 43
+    Space = 44
+    CapsLock = 57
+    F1 = 58
+    F12 = 69
+    Insert = 73
+    Home = 74
+    PageUp = 75
+    Delete = 76
+    End = 77
+    PageDown = 78
+    Right = 79
+    Left = 80
+    Down = 81
+    Up = 82
+    LeftControl = 224
+    LeftShift = 225
+    LeftAlt = 226
+    LeftGui = 227
+    RightControl = 228
+    RightShift = 229
+    RightAlt = 230
+    RightGui = 231
+}
+
+/// A run of usages that follow each other as the toolkit's keys from `key` do.
+struct KeyRun {
+    let first: Usage
+    let last: Usage
+    let key: Key
+}
+
+/// The digits run from 1 to 0 in HID and from 0 to 9 in Ember, so 0 is
+/// named on its own in `keyFor`.
+namespace Runs {
+    let keys: [KeyRun] = [KeyRun { first: .A, last: .Z, key: .A }, KeyRun {
+        first: .Digit1,
+        last: .Digit9,
+        key: .Digit1
+    }, KeyRun { first: .F1, last: .F12, key: .F1 }]
+}
+
+/// Whether `usage` is a modifier key, which arrives as the modifiers of the
+/// keys after it rather than as a key.
+function isModifier(usage: borrow Usage) -> Bool {
+    return match usage {
+        LeftControl, LeftShift, LeftAlt, LeftGui, RightControl, RightShift, RightAlt, RightGui,
+            CapsLock -> true
+        else -> false
+    }
+}
+
+/// Where `usage` falls in the run from `first` to `last`, or none outside it.
+function offsetIn(usage: borrow Usage, first: Usage, last: Usage) -> Number? {
+    let raw = Number(code(usage))
+    if raw < Number(code(first)) || raw > Number(code(last)) { return .None }
+    return .Some(raw - Number(code(first)))
+}
+
+/// The toolkit's key for `usage`.
+function keyFor(usage: Usage) -> Key {
+    for run in Runs.keys {
+        match offsetIn(usage, run.first, run.last) {
+            Some(offset) -> return fromCode<Key>(Number(code(run.key)) + offset)
+            None -> continue
+        }
+    }
+    return match usage {
+        Digit0 -> .Digit0
+        Enter -> .Enter
+        Escape -> .Escape
+        Backspace -> .Backspace
+        Tab -> .Tab
+        Space -> .Space
+        Insert -> .Insert
+        Home -> .Home
+        PageUp -> .PageUp
+        Delete -> .Delete
+        End -> .End
+        PageDown -> .PageDown
+        Right -> .Right
+        Left -> .Left
+        Down -> .Down
+        Up -> .Up
+        LeftShift, RightShift -> .LeftShift
+        LeftControl, RightControl -> .LeftControl
+        LeftAlt, RightAlt -> .LeftAlt
+        // The keys the toolkit has no name for.
+        else -> .None
+    }
+}

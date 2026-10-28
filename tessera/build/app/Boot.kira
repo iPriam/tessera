@@ -1,0 +1,680 @@
+import Foundation
+import Build
+
+// The `boot` step: the images the graph built, booted under QEMU.
+//
+//     kira build boot                     interactive, quit with Ctrl-A X
+//     kira build boot -test               boot, check, power off, report
+//     kira build boot -services           the services, without the handover
+//     kira build boot -desktop            the desktop, left running
+//
+// A test boot answers yes or no: it caps the run with a timeout and fails
+// unless the guest's serial line says what that boot has to reach. The
+// services boots run the services PID 1 starts without a system to hand the
+// machine to, and drive them from outside through QEMU's monitor
+// (BootServices.kira, BootScenarios.kira).
+
+// The mode the command line gave after `boot`. Each mode sets the flags it implies.
+struct BootMode {
+    var test: Bool = false
+    // A window on the initramfs, with the 2D device.
+    var display: Bool = false
+    // The services, without the system volume's handover.
+    var services: Bool = false
+    var restart: Bool = false
+    var multi: Bool = false
+    var media: Bool = false
+    // The Browser instead of Display Check, on a page that needs no network.
+    var browser: Bool = false
+    var mobile: Bool = false
+    // Recovery's screen as a test.
+    var recoveryTest: Bool = false
+    var recovery: Bool = false
+    // The desktop from the internal disk the recovery media installed onto.
+    var installed: Bool = false
+    var desktop: Bool = false
+    // The dev root service runs, and the serial line is also written to a
+    // file the `devroot` step reads.
+    var dev: Bool = false
+    var mobilePlatform: Bool = false
+    // The system with a file its seal does not cover, which PID 1 refuses.
+    var tampered: Bool = false
+    // A volume whose install was stopped midway, which PID 1 refuses.
+    var interrupted: Bool = false
+    // An update, kept; an update that fails, rolled back (Update.kira).
+    // `updateStage` is the boot of the three this one is.
+    var update: Bool = false
+    var updateStage: Number = 0
+}
+
+// The mode `arguments` names, or why it names none.
+function bootMode(arguments: borrow [String]) -> Result<BootMode, String> {
+    var mode = BootMode {}
+    if arguments.count == 0 { return .Ok(mode) }
+    if arguments.count > 1 { return .Error("boot takes one mode, not \(arguments.count)") }
+    match arguments[0] {
+        "-test" -> {
+            mode.test = true
+        }
+        "-tampered" -> {
+            mode.test = true
+            mode.tampered = true
+        }
+        "-interrupted" -> {
+            mode.test = true
+            mode.interrupted = true
+        }
+        "-update" -> {
+            mode.test = true
+            mode.update = true
+        }
+        "-display" -> mode.display = true
+        "-services" -> {
+            mode.test = true
+            mode.services = true
+        }
+        "-services-restart" -> {
+            mode.test = true
+            mode.services = true
+            mode.restart = true
+        }
+        "-services-multi" -> {
+            mode.test = true
+            mode.services = true
+            mode.multi = true
+        }
+        "-services-media" -> {
+            mode.test = true
+            mode.services = true
+            mode.media = true
+        }
+        "-services-browser" -> {
+            mode.test = true
+            mode.services = true
+            mode.browser = true
+        }
+        "-services-mobile" -> {
+            mode.test = true
+            mode.services = true
+            mode.mobile = true
+        }
+        "-services-recovery" -> {
+            mode.test = true
+            mode.services = true
+            mode.recoveryTest = true
+            mode.recovery = true
+        }
+        "-desktop" -> {
+            mode.services = true
+            mode.desktop = true
+        }
+        "-dev" -> {
+            mode.services = true
+            mode.desktop = true
+            mode.dev = true
+        }
+        "-dev-mobile" -> {
+            mode.services = true
+            mode.desktop = true
+            mode.dev = true
+            mode.mobilePlatform = true
+        }
+        "-recovery" -> {
+            mode.services = true
+            mode.desktop = true
+            mode.recovery = true
+        }
+        "-installed" -> {
+            mode.services = true
+            mode.desktop = true
+            mode.installed = true
+        }
+        else -> return .Error("no boot mode \(arguments[0])")
+    }
+    return .Ok(mode)
+}
+
+extend BootMode {
+    // The plain services boot: no scenario of its own.
+    function plainServices(borrow self) -> Bool {
+        return !desktop && !restart && !multi && !media && !mobile && !browser && !recovery
+    }
+
+    // Whether the boot is one of the services scenarios that drive the
+    // machine further than the plain one.
+    function scenario(borrow self) -> Bool {
+        return restart || multi || media || mobile || browser || recoveryTest
+    }
+}
+
+// What the command line set for a boot besides its mode.
+struct BootOptions {
+    var train: String = ""
+    // `WIDTHxHEIGHT`: the display pinned to that mode with no EDID; empty
+    // follows the window from 2560x1600, or on a Mac's -dev boot from the
+    // window its screen holds.
+    let outputSize: String
+    // What the services' log events print (`KIRA_LOG`).
+    let kiraLog: String
+    // `KLF_HEAP_REPORT`, which init passes to every program it starts.
+    let heapReport: String
+    // Flags for init a development boot adds.
+    let initFlags: String
+    // QEMU's gdbstub on tcp::1234, with the same addresses every boot.
+    let gdb: Bool
+    // Where a Linux host serves the desktop's screen.
+    let vnc: String
+    // How much longer than on Apple silicon each wait may take; 0 for the
+    // architecture's own.
+    let pollScale: Number
+    // `all` prints every kernel message.
+    let kernelLog: String
+    // The host Vulkan driver venus forwards to.
+    let vulkanIcd: String
+    // Translates the guest instruction by instruction, as a host of another
+    // architecture does, even where it could be virtualised.
+    let emulate: Bool
+}
+
+// The boot options, as graph options.
+function bootOptions(graph: borrow mut Graph) -> BootOptions {
+    let scale = graph.option(
+        textChoice("poll-scale", "how many times longer a boot test's waits may take")
+    )
+    return BootOptions {
+        outputSize: graph.option(
+            textChoice("output-size", "the display's mode, WIDTHxHEIGHT, with no EDID")
+        ),
+        kiraLog: graph.option(
+            textChoice("kira-log", "the KIRA_LOG the services print their events under")
+        ),
+        heapReport: graph.option(
+            textChoice("heap-report", "the KLF_HEAP_REPORT every program is started with")
+        ),
+        initFlags: graph.option(
+            textChoice("init-flags", "boot flags for init on a -dev boot, separated by commas")
+        ),
+        gdb: graph.option(
+            Choice {
+                name: "gdb",
+                summary: "QEMU's gdbstub on tcp::1234, without address randomisation",
+                values: ["no", "yes"],
+                fallback: "no"
+            }
+        ) == "yes",
+        vnc: graph.option(textChoice("vnc", "where a Linux host serves the desktop's screen")),
+        pollScale: match scale.toNumber() {
+            Some(value) -> value
+            None -> 0
+        },
+        kernelLog: graph.option(
+            Choice {
+                name: "kernel-log",
+                summary: "which kernel messages reach the console",
+                values: ["errors", "all"],
+                fallback: "errors"
+            }
+        ),
+        vulkanIcd: graph.option(
+            textChoice("vulkan-icd", "the host Vulkan driver venus forwards to")
+        ),
+        emulate: graph.option(
+            Choice {
+                name: "emulate",
+                summary: "translate the guest as a host of another architecture does",
+                values: ["no", "yes"],
+                fallback: "no"
+            }
+        ) == "yes"
+    }
+}
+
+// A boot option taking any text, empty when not given.
+function textChoice(name: borrow String, summary: borrow String) -> Choice {
+    let none: [String] = []
+    return Choice { name: copy name, summary: copy summary, values: none, fallback: "" }
+}
+
+// The files a boot reads, from the boot step's artifacts; empty for one the
+// graph could not build.
+struct BootImages {
+    var kernel: String = ""
+    var initramfs: String = ""
+    var system: String = ""
+    var systemDigest: String = ""
+    var installer: String = ""
+    var recovery: String = ""
+    var recoveryDigest: String = ""
+    var tampered: String = ""
+    var tamperedDigest: String = ""
+    var updated: String = ""
+    var updatedDigest: String = ""
+    var scratch: String = ""
+    var stick: String = ""
+    var disc: String = ""
+    // The host GPU stack's prefix, and KosmicKrisp's.
+    var emulator: String = ""
+    var vulkan: String = ""
+}
+
+// `run.paths` by the role `roles` names at each index.
+function bootImages(roles: borrow [String], run: borrow StepRun) -> BootImages {
+    var images = BootImages {}
+    for (index, role) in roles.enumerated() {
+        if index >= run.paths.count { continue }
+        let path = copy run.paths[index]
+        match role {
+            "kernel" -> images.kernel = path
+            "initramfs" -> images.initramfs = path
+            "system" -> {
+                images.system = path
+                images.systemDigest = copy run.digests[index]
+            }
+            "installer" -> images.installer = path
+            "recovery" -> {
+                images.recovery = path
+                images.recoveryDigest = copy run.digests[index]
+            }
+            "tampered" -> {
+                images.tampered = path
+                images.tamperedDigest = copy run.digests[index]
+            }
+            "updated" -> {
+                images.updated = path
+                images.updatedDigest = copy run.digests[index]
+            }
+            "scratch" -> images.scratch = path
+            "stick" -> images.stick = path
+            "disc" -> images.disc = path
+            "emulator" -> images.emulator = path
+            "vulkan" -> images.vulkan = path
+            else -> {}
+        }
+    }
+    return images
+}
+
+// The marker PID 1 prints once it runs, and the one a system's init prints
+// after the handover: refusing to boot prints the first too, one step before
+// it stops the machine. Changing either means changing init with it.
+namespace BootBanners {
+    let initramfs: String = "tessera: userland reached, pid 1 is alive"
+    let system: String = "tessera: system volume is the root, pid 1 is the system's own init"
+}
+
+// The `boot` step's run.
+function boot(
+    host: borrow Host,
+    architecture: Architecture,
+    options: borrow BootOptions,
+    roles: borrow [String],
+    run: borrow StepRun,
+    started: (() -> Number)? = .None
+) -> Number {
+    let mode = match bootMode(run.arguments) {
+        Ok(parsed) -> parsed
+        Error(problem) -> {
+            log fault("the boot cannot start", problem)
+            return 2
+        }
+    }
+    let images = bootImages(roles, run)
+    if images.kernel.count == 0 {
+        log fault("the boot cannot start: the graph built no kernel")
+        return 1
+    }
+    if mode.update { return updateBoots(host, architecture, options, images, mode) }
+    return bootWith(host, architecture, options, images, mode, move started)
+}
+
+// One boot of `images` in `mode`.
+function bootWith(
+    host: borrow Host,
+    architecture: Architecture,
+    options: borrow BootOptions,
+    images: borrow BootImages,
+    mode: borrow BootMode,
+    started: (() -> Number)? = .None
+) -> Number {
+    // A window takes the 2D device, whichever emulator runs: the initramfs
+    // splash draws with dumb buffers, which the venus device cannot scan out.
+    let emulator = bootEmulator(host, architecture, options.vulkanIcd, images)
+    let venus = emulator.venus && !mode.display
+    var device = venus ? MachineLayout.venusDevice : MachineLayout.plainDevice
+    var outputSize = "2560x1600"
+    var asked = copy options.outputSize
+    if asked.count == 0 && mode.desktop && !mode.test && host.darwin {
+        match hostWindowOutputSize() {
+            Some(size) -> asked = move size
+            None -> {}
+        }
+    }
+    // Without an EDID the output has no physical size, so MosaicDisplay takes
+    // its scale from the boot: the pixels a point the Mac draws the window at.
+    // QEMU's EDID gives every size 100 pixels an inch, which draws it at one.
+    var width = 2560
+    if asked.count > 0 {
+        let sides = asked.split("x")
+        if sides.count != 2 || sides[0].toNumber() == .None || sides[1].toNumber() == .None {
+            log fault("-output-size is WIDTHxHEIGHT", given: asked)
+            return 2
+        }
+        width = try sides[0].toNumber() otherwise 0
+        let height = try sides[1].toNumber() otherwise 0
+        device = device + ",xres=\(sides[0]),yres=\(sides[1]),edid=off"
+        if venus {
+            device = device + ",hostmem=\(bootHostMemory(host, width, height))G"
+        }
+        outputSize = move asked
+    } else {
+        device = device + ",xres=2560,yres=1600,edid=off"
+        if venus { device = device + ",hostmem=\(bootHostMemory(host, 2560, 1600))G" }
+    }
+    let scale = bootOutputScale(host, width)
+    let logs = host.logDirectory()
+    let machine = host.machineDirectory(architecture)
+    for directory in [logs, machine] {
+        if !isDirectory(directory) {
+            match makeDirectory(directory) {
+                Ok -> {}
+                Error(failure) -> {
+                    log fault("a boot directory cannot be made", traceText(failure))
+                    return 1
+                }
+            }
+        }
+    }
+    var disks: [String] = []
+    var initFlags = ""
+    var kiraLog = copy options.kiraLog
+    if mode.test {
+        kiraLog = kiraLog.count > 0 ? kiraLog + ",TesseraUI=info,PlatformUI=info" : "TesseraUI=info,PlatformUI=info"
+    }
+    if mode.services {
+        match servicesDisks(images, mode, machine) {
+            Ok(attached) -> disks = attached
+            Error(problem) -> {
+                log fault("the boot's disks cannot be made", problem)
+                return 1
+            }
+        }
+        initFlags = servicesFlags(mode, options)
+    }
+    // The machine's volume on every boot, with the system just built
+    // installed onto it; PID 1 finds it as the first disk that
+    // mounts as btrfs, so it goes after the boot's other disks. A recovery
+    // boot runs the recovery media from a volume of its own, with the blank
+    // internal disk after it.
+    let volume = match bootVolume(host, architecture, images, mode, options) {
+        Ok(path) -> path
+        Error(problem) -> {
+            log fault("the boot has no volume", problem)
+            return 1
+        }
+    }
+    // Writes skip the host's flushes: each btrfs commit was an fsync of
+    // the image. A host crash before its page cache is written back can
+    // leave the volume damaged; delete it and boot again.
+    disks.append("-drive")
+    let volumeFormat = options.train.count > 0 && mode.dev ? "qcow2" : "raw"
+    disks.append("file=\(volume),if=virtio,format=\(volumeFormat),cache=unsafe")
+    if mode.recovery && !mode.installed && images.recovery.count > 0 {
+        let internal = "\(machine)/\(VolumeLayout.internalDisk)"
+        if !fileExists(internal) {
+            match setFileLength(internal, VolumeLayout.internalBytes) {
+                Ok -> {}
+                Error(failure) -> {
+                    log fault("the internal disk cannot be made", traceText(failure))
+                    return 1
+                }
+            }
+        }
+        disks.append("-drive")
+        disks.append("file=\(internal),if=virtio,format=raw,cache=unsafe")
+    }
+    initFlags = initFlags + " tessera.system" + timeZoneWord()
+    // Not for the services: autoexit acts the moment the last service is
+    // started, before the display has asked the card what it is. Those
+    // boots are stopped from outside.
+    if mode.test && !mode.services { initFlags = initFlags + " tessera.autoexit" }
+    // Everything before `--` is the kernel's and everything after it init's:
+    // a bare word with a dot reads as `module.parameter` to the kernel, which
+    // would swallow `tessera.autoexit`. The kernel ends init's arguments at a
+    // second `--`, so it is written once.
+    var kernelWords = architecture.console() + " panic=-1 vt.global_cursor_default=0"
+    kernelWords = kernelWords + kernelLogWords(options.kernelLog)
+    if options.heapReport.count > 0 {
+        kernelWords = kernelWords + " KLF_HEAP_REPORT=" + options.heapReport
+    }
+    if kiraLog.count > 0 { kernelWords = kernelWords + " KIRA_LOG=" + kiraLog }
+    kernelWords = kernelWords + " TESSERA_OUTPUT_SCALE=\(scale)"
+    if options.gdb { kernelWords = kernelWords + " norandmaps" }
+    let commandLine = kernelWords + " --" + initFlags
+    var arguments = [
+        // The dynamic UI service expands the initramfs to about 600 MiB,
+        // which the kernel holds beside the compressed image while it unpacks.
+        "-m", "2G",
+        // With one processor the display server, every application and the
+        // GPU's submissions take turns.
+        "-smp", "4",
+        "-kernel", copy images.kernel,
+        "-initrd", copy images.initramfs,
+        "-append", commandLine,
+        "-device", device,
+        // The `virt` board has no PS/2 controller; the tablet is where the
+        // window sends the host pointer.
+        "-device", "virtio-keyboard-pci",
+        "-device", "virtio-mouse-pci",
+        "-device", "virtio-tablet-pci",
+        // q35's default NIC is an e1000e, whose probe is a tenth of a second.
+        "-nic", "user,model=virtio-net-pci",
+        "-no-reboot",
+        // Every device is named here; q35's default CD-ROM probe holds up PID 1.
+        "-nodefaults",
+        // What a device refused of the guest, and why, in QEMU's log.
+        "-d", "guest_errors"
+    ]
+    for word in disks { arguments.append(word) }
+    if options.gdb { arguments.append("-s") }
+    let serialLog = mode.dev ? "\(logs)/serial-\(architecture.name()).log" : ""
+    if serialLog.count > 0 {
+        match writeFile(serialLog, "") {
+            Ok -> {}
+            Error(failure) -> absorb failure
+        }
+    }
+    var vnc = ""
+    if mode.display || (mode.desktop && host.darwin) {
+        arguments.append("-display")
+        arguments.append("cocoa,zoom-to-fit=on")
+    } else if mode.desktop {
+        // The venus frames are GPU memory only a GL-backed display shows:
+        // egl-headless composes them and VNC serves them.
+        vnc = options.vnc.count > 0 ? copy options.vnc : "127.0.0.1:0"
+        for word in ["-display", "egl-headless", "-vnc", vnc] { arguments.append(copy word) }
+    } else {
+        arguments.append("-display")
+        arguments.append("none")
+    }
+    for word in consoleArguments(serialLog) { arguments.append(word) }
+    if mode.dev {
+        for word in debugPortArguments() { arguments.append(word) }
+    }
+    let monitor = Monitor { path: "\(logs)/qemu-\(architecture.name())-services.monitor" }
+    if mode.services {
+        let qmp = "\(logs)/qemu-\(architecture.name())-services.qmp"
+        // A socket the last machine left behind; one that ended cleanly
+        // removed its own.
+        for socket in [copy monitor.path, copy qmp] {
+            if !pathExists(socket) && !linkExists(socket) { continue }
+            match removePath(socket) {
+                Ok -> {}
+                Error(failure) -> {
+                    log fault(
+                        "a stale machine socket cannot be removed",
+                        socket,
+                        traceText(failure)
+                    )
+                    return 1
+                }
+            }
+        }
+        arguments.append("-monitor")
+        arguments.append("unix:\(monitor.path),server,nowait")
+        // QMP presses and releases keys separately, which holding one key
+        // while pressing another needs.
+        arguments.append("-qmp")
+        arguments.append("unix:\(qmp),server,nowait")
+    }
+    for word in machineArguments(host, architecture, options.emulate) { arguments.append(word) }
+    var environment: [EnvironmentEntry] = []
+    if venus && emulator.icd.count > 0 {
+        environment.append(EnvironmentEntry { name: "VK_ICD_FILENAMES", value: copy emulator.icd })
+    }
+    var command = ProcessCommand {
+        program: copy emulator.program,
+        arguments: arguments,
+        environment: environment
+    }
+    if !mode.test {
+        if mode.desktop {
+            let screen = vnc.count > 0 ? "the screen is VNC display \(vnc)" : "in a window"
+            log info("booting the desktop; Ctrl-C quits", screen: screen, monitor: monitor.path)
+        } else {
+            log info("booting interactively; Ctrl-A X quits", device: device)
+        }
+        return runToEnd(command, move started)
+    }
+    let verdict = testBoot(host, architecture, mode, options, outputSize, monitor, command)
+    // The interrupted install's volume is made again at its next boot.
+    if verdict == 0 && mode.interrupted { dropScratch([copy volume]) }
+    return verdict
+}
+
+// Starts `command` and answers its exit status once it ends.
+function runToEnd(command: borrow ProcessCommand, started: (() -> Number)?) -> Number {
+    let child = match command.start() {
+        Ok(started) -> started
+        Error(failure) -> {
+            log fault("QEMU did not start", traceText(failure))
+            return 1
+        }
+    }
+    let startedStatus = match started {
+        Some(work) -> work()
+        None -> 0
+    }
+    let ended = child.wait()
+    match child.release() {
+        Ok -> {}
+        Error(failure) -> log warn("QEMU's process was not released", traceText(failure))
+    }
+    if startedStatus != 0 { return startedStatus }
+    return match ended {
+        Ok(exit) -> exitStatus(exit)
+        Error(failure) -> {
+            log fault("QEMU could not be waited for", traceText(failure))
+            1
+        }
+    }
+}
+
+// The init flags of a services boot.
+function servicesFlags(mode: borrow BootMode, options: borrow BootOptions) -> String {
+    var flags: [String] = []
+    if mode.plainServices() { flags.append("tessera.list-test") }
+    if mode.restart {
+        for flag in [
+            "tessera.restart-test", "tessera.eject-test", "tessera.ioreg-test",
+            "tessera.eject-disc-test", "tessera.crash-loop-test"
+        ] { flags.append(copy flag) }
+    }
+    if mode.multi {
+        for flag in ["tessera.multi-client-test", "tessera.unmount-test", "tessera.date-test"] {
+            flags.append(copy flag)
+        }
+    }
+    if mode.media {
+        for flag in ["tessera.media", "tessera.activity-test", "tessera.pmset-test"] {
+            flags.append(copy flag)
+        }
+    }
+    if mode.browser { flags.append("tessera.browser-test") }
+    if mode.mobile {
+        for flag in [
+            "tessera.adaptive-mobile", "tessera.multi-client-test", "tessera.info-test",
+            "tessera.caffeinate-test", "tessera.idle-test"
+        ] { flags.append(copy flag) }
+    }
+    if mode.recovery { flags.append("tessera.recovery") }
+    // The desktop, from which applications are opened, in place of the
+    // toolkit's boot check.
+    if mode.desktop && !mode.recovery { flags.append("tessera.desktop") }
+    if mode.dev { flags.append("tessera.dev") }
+    if mode.mobilePlatform { flags.append("tessera.adaptive-mobile") }
+    // Such as `-init-flags tessera.idle-test` for twenty seconds of display
+    // sleep.
+    if mode.dev && options.initFlags.count > 0 {
+        for flag in options.initFlags.split(",") { flags.append(flag.trim()) }
+    }
+    var text = ""
+    for flag in flags { text = text + " " + flag }
+    return text
+}
+
+// The disks a services boot attaches before the volume, and the USB host
+// they hang off.
+function servicesDisks(
+    images: borrow BootImages,
+    mode: borrow BootMode,
+    machine: borrow String
+) -> Result<[String], String> {
+    // The Volume service probes the scratch disk, read-only, without the
+    // system volume, whose handover would end the boot.
+    var disks = ["-drive", "file=\(images.scratch),if=virtio,format=raw,readonly=on"]
+    // The stick the media and multi boots plug in and pull out, a fresh
+    // copy every boot: pulling it out mounted leaves its journal dirty.
+    let stick = "\(machine)/\(VolumeLayout.stick)"
+    match freshCopy(images.stick, stick) {
+        Ok -> {}
+        Error(problem) -> return .Error(problem)
+    }
+    // A CCID reader with no card, which devicekitd starts ccid-driver for,
+    // and a USB tablet tablet-driver takes; a window has no tablet, as QEMU
+    // would send the host pointer to it. A silent audio backend for the
+    // speaker the multi boot plugs in.
+    for word in ["-device", "qemu-xhci,id=xhci", "-device", "usb-ccid", "-audiodev", "none,id=silence"] {
+        disks.append(copy word)
+    }
+    if !mode.desktop {
+        disks.append("-device")
+        disks.append("usb-tablet")
+    }
+    // A CD in a SCSI drive, which the restart boot ejects.
+    if mode.restart {
+        for word in [
+            "-device", "virtio-scsi-pci,id=scsi",
+            "-drive", "if=none,id=discmedium,file=\(images.disc),format=raw,media=cdrom,readonly=on",
+            "-device", "scsi-cd,bus=scsi.0,drive=discmedium"
+        ] { disks.append(copy word) }
+    }
+    return .Ok(disks)
+}
+
+// A writable copy of the stored file `from` at `to`, replacing one there.
+function freshCopy(from: borrow String, to: borrow String) -> Result<Void, String> {
+    if pathExists(to) {
+        match removePath(to) {
+            Ok -> {}
+            Error(failure) -> return .Error("\(to) cannot be removed: \(traceText(failure))")
+        }
+    }
+    match copyFile(from, to) {
+        Ok(copied) -> {}
+        Error(failure) -> return .Error("\(from) cannot be copied: \(traceText(failure))")
+    }
+    return match setFileMode(to, 420) {
+        Ok -> .Ok
+        Error(failure) -> .Error("\(to) cannot be made writable: \(traceText(failure))")
+    }
+}

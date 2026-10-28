@@ -1,0 +1,41 @@
+import Foundation
+import HomeLayout
+import LibTessera
+import KiraUI
+
+// What editing Home does to its arrangement: moving an item to another place
+// or page, dropping an application on another to make a folder or into one,
+// taking one out of its folder, taking one off Home and putting it back, and
+// adding, moving and hiding pages. A page given more than it holds passes its
+// last item on to the next. An edit begins by keeping the arrangement it
+// started from, which cancelling puts back.
+
+// Keeps the arrangement as it is now, for cancelling the edit beginning.
+function beginHomeEdit() {
+    match writeFile(HomeStore.before, arrangementText(loadArrangement())) {
+        Ok -> {}
+        Error(failure) -> log warn("could not keep Home from before the edit", failure)
+    }
+}
+
+// Ends the edit: kept as it is, or put back as it was before it.
+function endHomeEdit(keep: Bool) {
+    if keep {
+        saveArrangement(loadArrangement().settled())
+    } else {
+        match readFile(HomeStore.before) {
+            Ok(contents) -> saveArrangement(parsedArrangement(contents.text))
+            Error(failure) -> log warn("could not put Home back as it was", failure)
+        }
+    }
+    match removePath(HomeStore.before) {
+        Ok -> {}
+        Error(failure) -> log info("no Home from before the edit to remove", failure)
+    }
+}
+
+// Saves `arrangement` as an edit left it, and draws Home again.
+function commitHome(arrangement: borrow HomeArrangement) {
+    saveArrangement(arrangement)
+    redrawAfter(0)
+}

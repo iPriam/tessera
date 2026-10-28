@@ -1,0 +1,178 @@
+import Foundation
+import Heap
+import LibTessera
+import DeviceKit
+
+// Devices that come and go (§12 `deviceChanged`, §16.3).
+//
+// Three DeviceKit registry watches, on AudioEndpoint, Camera and
+// HapticDevice entries, wake the service when one of those classes
+// changes. It then lists the classes again and compares them with what it
+// listed before: every device that appeared or went is posted through the
+// broker as `System/deviceChanged`, which reaches every process holding
+// the class's entitlement on its System channel, as Core Audio tells its
+// listeners that the device list changed. Sensors are not watched, since
+// listing them opens every IIO device.
+//
+// The body is §10.3: `class: DeviceClass` (u32) @0, `deviceId: UInt64` @8,
+// `added: Bool` @16, padded to 24 bytes.
+
+enum Change {
+    Added
+    Removed
+}
+
+struct KnownDevice {
+    var deviceClass: DeviceClass
+    var id: Number
+    var name: String
+}
+
+namespace DeviceChange {
+    let method: String = "System/deviceChanged"
+    let bodyBytes: Number = 24
+    // A watch read: a header, then up to `records` changes of `recordBytes`.
+    let readHeaderBytes: Number = 8
+    let records: Number = 64
+    let recordBytes: Number = 24
+}
+
+let watchedClasses: [DeviceClass] = [DeviceClass.AudioInput, DeviceClass.AudioOutput, DeviceClass.Camera, DeviceClass.Haptic]
+let watchedEntries: [EntryClass] = [EntryClass.AudioEndpoint, EntryClass.Camera, EntryClass.HapticDevice]
+
+function className(deviceClass: borrow DeviceClass) -> String {
+    return match deviceClass {
+        AudioInput -> "audio input"
+        AudioOutput -> "audio output"
+        Camera -> "camera"
+        Haptic -> "haptic device"
+        Sensor -> "sensor"
+    }
+}
+
+function currentDevices(service: borrow Service) -> Result<[KnownDevice], TesseraError> {
+    var found: [KnownDevice] = []
+    for deviceClass in watchedClasses {
+        let devices = try devicesOf(service, deviceClass)
+        for device in devices {
+            found.append(KnownDevice { deviceClass: deviceClass, id: device.id, name: device.name })
+        }
+    }
+    return .Ok(found)
+}
+
+function knownIn(list: borrow [KnownDevice], device: borrow KnownDevice) -> Bool {
+    for known in list {
+        if known.deviceClass == device.deviceClass && known.id == device.id { return true }
+    }
+    return false
+}
+
+function postChange(service: borrow Service, device: borrow KnownDevice, change: borrow Change) {
+    let added = change == .Added
+    let body = zeroedBlock(count: DeviceChange.bodyBytes, alignment: 16)
+    heapStore(
+        body.pointer(),
+        DeviceChangedRecord {
+            deviceClass: device.deviceClass.rawValue(),
+            deviceId: UNumber(device.id),
+            added: added ? UN8(1) : UN8(0),
+        }
+    )
+    let entitlement = entitlementFor(device.deviceClass, .None)
+    let kind = className(device.deviceClass)
+    match serviceNotify(
+        service.listener,
+        DeviceChange.method,
+        Buffer { address: body.pointer(), length: DeviceChange.bodyBytes },
+        entitlement
+    ) {
+        Ok -> match change {
+            Added -> log info("a device was added", kind, device: device.name, id: device.id)
+            Removed -> log info("a device was removed", kind, device: device.name, id: device.id)
+        }
+        Error(failed) -> log warn(
+            "cannot post a device change",
+            kind,
+            device: device.name,
+            added,
+            error: errorName(failed)
+        )
+    }
+}
+
+function armWatch(service: borrow Service, index: Number) -> Result<Void, TesseraError> {
+    return refWaitAsync(
+        service.watches[index],
+        DeviceEvents.readable,
+        .Once,
+        service.port,
+        UNumber(watchKey(index))
+    )
+}
+
+// Everything a watch has queued, which says only that its class changed.
+function drainWatch(service: borrow Service, index: Number) -> Result<Void, TesseraError> {
+    let room = DeviceChange.readHeaderBytes + DeviceChange.records * DeviceChange.recordBytes
+    let out = zeroedBlock(count: room, alignment: 16)
+    while true {
+        match registryWatchRead(
+            service.watches[index],
+            Buffer { address: out.pointer(), length: room }
+        ) {
+            Ok(count) -> {
+                if count == 0 { return .Ok }
+            }
+            Error(failed) -> return drainedWatch(failed)
+        }
+    }
+    return .Ok
+}
+
+function drainedWatch(reason: borrow TesseraError) -> Result<Void, TesseraError> {
+    if reason.code == .ShouldWait { return .Ok }
+    return .Error(reason)
+}
+
+// Opens the watches, drains their first reads, which report what is there
+// now, and remembers what the classes hold.
+function watchStart(service: borrow mut Service) -> Result<Void, TesseraError> {
+    for entryClass in watchedEntries {
+        let spec = classSpec(entryClass)
+        let watch = try registryWatch(
+            Buffer { address: spec.pointer(), length: RegistryRecord.specBytes }
+        )
+        service.watches.append(watch)
+    }
+    for index in 0..service.watches.count {
+        try drainWatch(service, index)
+        try armWatch(service, index)
+    }
+    service.known = try currentDevices(service)
+    return .Ok
+}
+
+function watchWoke(service: borrow mut Service, index: Number) {
+    if index >= service.watches.count { return }
+    match updateWatch(service, index) {
+        Ok -> {}
+        Error(failed) -> log warn(
+            "a registry watch could not be updated; no change is posted",
+            error: errorName(failed)
+        )
+    }
+}
+
+function updateWatch(service: borrow mut Service, index: Number) -> Result<Void, TesseraError> {
+    try drainWatch(service, index)
+    try armWatch(service, index)
+    let now = try currentDevices(service)
+    for device in service.known {
+        if !knownIn(now, device) { postChange(service, device, .Removed) }
+    }
+    for device in now {
+        if !knownIn(service.known, device) { postChange(service, device, .Added) }
+    }
+    service.known = now
+    return .Ok
+}

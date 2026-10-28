@@ -1,0 +1,8 @@
+//! The Settings service, `tessera.settings`: the machine's settings, kept on
+//! the data volume, read by anyone and written by the system.
+/// The Settings service package: the machine's settings, kept on the data volume.
+construct TesseraSettingsService extends Package {
+    let version: String = "0.1.0"
+    let kind: PackageKind = .App
+    let moduleRoot: String = "TesseraSettingsService"
+}

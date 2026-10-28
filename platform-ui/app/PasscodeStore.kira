@@ -1,0 +1,116 @@
+import Foundation
+import LibTessera
+import PlatformKit
+
+// The device passcode on disk (roadmap/27-lock-screen.md): PlatformKit's
+// `PasscodeRecord` in a file of the system's own on the data volume, which
+// Settings writes and the platform's lock screen reads. With no file there is
+// no passcode, and the lock screen is the cover it was. Forgetting the
+// passcode is deleting the file, which Settings does once the current one is
+// given. A person who forgot it erases the data volume from Recovery, which
+// takes the passcode with everything else kept there.
+
+namespace PasscodeStore {
+    let path: String = "/" + SystemDirectory.systemData + "/Passcode"
+}
+
+/// Why a passcode could not be kept or forgotten.
+public enum PasscodeStoreFailure {
+    /// It was too short, or cryptography refused.
+    Refused(PasscodeFailure)
+    /// The file could not be written or removed.
+    Unwritable(String)
+}
+
+/// The passcode kept, none when there is none.
+public function passcodeKept() -> PasscodeRecord? {
+    let text = match readFile(PasscodeStore.path) {
+        Ok(contents) -> contents.text
+        Error(failure) -> {
+            // No file is no passcode.
+            absorb failure
+            return .None
+        }
+    }
+    let record = passcodeRecordFrom(text)
+    if record.isNone() {
+        log warn("the passcode file is not in its form; the lock screen opens without one")
+    }
+    return record
+}
+
+/// Whether the lock screen asks for a passcode.
+public function passcodeRequired() -> Bool {
+    return passcodeKept().isSome()
+}
+
+/// Keeps `passcode` as the device passcode, replacing any.
+///
+/// # Errors
+///
+/// [`PasscodeStoreFailure`] when it is refused or cannot be written.
+public function keepPasscode(passcode: borrow String) -> Result<Void, PasscodeStoreFailure> {
+    let record = match passcodeRecord(passcode) {
+        Ok(value) -> value
+        Error(failure) -> return .Error(.Refused(failure))
+    }
+    match writeFile(PasscodeStore.path, passcodeRecordText(record)) {
+        Ok -> {
+            log info("the device passcode was set")
+            return .Ok
+        }
+        Error(failure) -> return .Error(.Unwritable(traceText(failure)))
+    }
+}
+
+/// Forgets the device passcode.
+///
+/// # Errors
+///
+/// [`PasscodeStoreFailure.Unwritable`] when the file cannot be removed.
+public function forgetPasscode() -> Result<Void, PasscodeStoreFailure> {
+    if !pathExists(PasscodeStore.path) { return .Ok }
+    match removePath(PasscodeStore.path) {
+        Ok -> {
+            log info("the device passcode was turned off")
+            return .Ok
+        }
+        Error(failure) -> return .Error(.Unwritable(traceText(failure)))
+    }
+}
+
+/// What the lock screen made of a passcode.
+public enum UnlockAnswer {
+    Opened
+    Wrong
+    /// Too many were wrong: none is taken until this time, in milliseconds
+    /// since 1970.
+    Waiting(Number)
+}
+
+struct UnlockState {
+    var attempts: UnlockAttempts = UnlockAttempts {}
+}
+
+namespace UnlockSlot {
+    let key: PersistentStateKey = PersistentStateKey { name: "platformui.unlock" }
+}
+
+/// Tries `passcode` at `now` against the one kept, counting it when wrong.
+public function tryPasscode(passcode: borrow String, now: Number) -> UnlockAnswer {
+    if !ambientStateHas(UnlockSlot.key) {
+        ambientStatePut(UnlockSlot.key, nativeUserData(nativeState(UnlockState {})))
+    }
+    var state = nativeRecover<UnlockState>(ambientStateGet(UnlockSlot.key))
+    if !state.attempts.allowed(now) { return .Waiting(state.attempts.waitUntil) }
+    let record = try passcodeKept() otherwise return .Opened
+    if record.matches(passcode) {
+        state.attempts = UnlockAttempts {}
+        log info("the lock screen opened with the passcode")
+        return .Opened
+    }
+    state.attempts = state.attempts.failed(now)
+    log info("a wrong passcode was given", failures: state.attempts.failures)
+    if !state.attempts.allowed(now) { return .Waiting(state.attempts.waitUntil) }
+    return .Wrong
+}

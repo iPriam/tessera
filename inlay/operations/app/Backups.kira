@@ -1,0 +1,271 @@
+//! Backups of a folder onto another volume (roadmap/31-backup-and-recovery.md):
+//! each one a dated folder holding the whole tree as it was, a file that did
+//! not change since the last backup linked to that backup's copy rather than
+//! copied again, as Time Machine does. A backup counts once its `.complete`
+//! marker is written, last, so one that was cut short is never restored from
+//! and is removed by the next.
+
+import Foundation
+
+/// One backup on the destination.
+public struct Snapshot {
+    /// Its folder's name: when it was taken, `20261026-142530` in UTC.
+    let name: String
+    let path: String
+}
+
+/// What a backup did.
+public struct BackupSummary {
+    let snapshot: Snapshot
+    /// Files copied, and files linked to the last backup's unchanged copy.
+    let copied: Number
+    let linked: Number
+}
+
+namespace BackupLayout {
+    let marker: String = ".complete"
+}
+
+/// The complete backups under `root`, newest first; one cut short is left
+/// out.
+public function snapshotsIn(root: borrow String) -> [Snapshot] {
+    let entries = match entriesIn(root) {
+        Ok(found) -> found
+        Error(failure) -> {
+            // No backups yet is no failure.
+            absorb failure
+            return []
+        }
+    }
+    var found: [Snapshot] = []
+    for index in 0..entries.count {
+        let entry = entries[entries.count - 1 - index]
+        if entry.kind != .Folder { continue }
+        if !pathExists(childPath(entry.path, BackupLayout.marker)) { continue }
+        found.append(Snapshot { name: copy entry.name, path: copy entry.path })
+    }
+    return found
+}
+
+/// Backs `source` up under `root` as it is at `at`, in milliseconds since
+/// 1970, linking what did not change since the newest backup there. A backup
+/// cut short before is removed first.
+///
+/// # Errors
+///
+/// [`ChangeFailure`] naming the first entry that could not be backed up;
+/// the partial backup is removed.
+public function backUp(
+    source: borrow String,
+    root: borrow String,
+    at: Number
+) -> Result<BackupSummary, ChangeFailure> {
+    if !isDirectory(root) {
+        match makeDirectory(root) {
+            Ok -> {}
+            Error(failure) -> {
+                absorb failure
+                return .Error(.Refused(copy root))
+            }
+        }
+    }
+    try removePartials(root)
+    let earlier = snapshotsIn(root)
+    let previous: String? = earlier.count > 0 ? .Some(copy earlier[0].path) : .None
+    let name = freeName(root, snapshotName(at))
+    let path = childPath(root, name)
+    var counts = BackupCounts {}
+    match backUpTree(source, path, previous, counts) {
+        Ok -> {}
+        Error(failure) -> {
+            match removeTree(path) {
+                Ok -> {}
+                // The partial backup is marked as one and goes next time.
+                Error(left) -> absorb left
+            }
+            return .Error(failure)
+        }
+    }
+    match writeFile(childPath(path, BackupLayout.marker), name) {
+        Ok -> {}
+        Error(failure) -> {
+            absorb failure
+            return .Error(.Refused(copy path))
+        }
+    }
+    return .Ok(
+        BackupSummary {
+            snapshot: Snapshot { name: name, path: path },
+            copied: counts.copied,
+            linked: counts.linked
+        }
+    )
+}
+
+struct BackupCounts {
+    var copied: Number = 0
+    var linked: Number = 0
+}
+
+// Removes the backups under `root` that never got their marker.
+function removePartials(root: borrow String) -> Result<Void, ChangeFailure> {
+    let entries = match entriesIn(root) {
+        Ok(found) -> found
+        Error(failure) -> {
+            absorb failure
+            return .Ok
+        }
+    }
+    for entry in entries {
+        if entry.kind == .Folder && !pathExists(childPath(entry.path, BackupLayout.marker)) {
+            try removeTree(entry.path)
+        }
+    }
+    return .Ok
+}
+
+// Copies the tree at `from` to `to`, linking each file the same in size and
+// time to its copy in the `previous` backup, at the same place.
+function backUpTree(
+    from: borrow String,
+    to: borrow String,
+    previous: borrow String?,
+    counts: borrow mut BackupCounts
+) -> Result<Void, ChangeFailure> {
+    match makeDirectory(to) {
+        Ok -> {}
+        Error(failure) -> {
+            absorb failure
+            return .Error(.Refused(copy to))
+        }
+    }
+    let entries = match entriesIn(from) {
+        Ok(found) -> found
+        Error(failure) -> {
+            absorb failure
+            return .Error(.Missing(copy from))
+        }
+    }
+    for entry in entries {
+        let target = childPath(to, entry.name)
+        let earlier: String? = match previous {
+            Some(folder) -> .Some(childPath(folder, entry.name))
+            None -> .None
+        }
+        match entry.kind {
+            Folder -> try backUpTree(entry.path, target, earlier, counts)
+            File -> try backUpFile(entry, target, earlier, counts)
+            // A link or a device is not backed up.
+            Other -> {}
+        }
+    }
+    return .Ok
+}
+
+function backUpFile(
+    entry: borrow Entry,
+    target: borrow String,
+    earlier: borrow String?,
+    counts: borrow mut BackupCounts
+) -> Result<Void, ChangeFailure> {
+    match earlier {
+        Some(path) -> if unchanged(entry, path) {
+            match makeHardLink(path, target) {
+                Ok -> {
+                    counts.linked += 1
+                    return .Ok
+                }
+                // A volume without links gets a copy instead.
+                Error(failure) -> absorb failure
+            }
+        }
+        None -> {}
+    }
+    match copyFile(entry.path, target) {
+        Ok(bytes) -> {
+            absorb bytes
+            counts.copied += 1
+            return .Ok
+        }
+        Error(failure) -> {
+            absorb failure
+            return .Error(.Refused(copy entry.path))
+        }
+    }
+}
+
+// Whether the backed-up file at `path` is `entry` as it is now: the same
+// size, and not changed since it was copied.
+function unchanged(entry: borrow Entry, path: borrow String) -> Bool {
+    return match fileStatus(path) {
+        Ok(
+            status
+        ) -> status.kind == .File && status.size == entry.size && status.modified >= entry.modified
+        Error(failure) -> {
+            absorb failure
+            false
+        }
+    }
+}
+
+/// Copies `item`, a path inside `snapshot`, back into `folder`, under its
+/// own name or, when that is taken, the next numbered one, and answers
+/// where it went. The backup is not changed.
+///
+/// # Errors
+///
+/// [`ChangeFailure`] when the item is not in the backup or cannot be copied.
+public function restoreItem(
+    item: borrow String,
+    folder: borrow String
+) -> Result<String, ChangeFailure> {
+    if !pathExists(item) { return .Error(.Missing(copy item)) }
+    let target = childPath(folder, freeName(folder, lastPathPart(item)))
+    try copyTree(item, target)
+    return .Ok(target)
+}
+
+/// Removes all but the newest `keep` backups under `root`.
+///
+/// # Errors
+///
+/// [`ChangeFailure`] naming the first backup that could not be removed.
+public function pruneSnapshots(root: borrow String, keep: Number) -> Result<Void, ChangeFailure> {
+    for (index, snapshot) in snapshotsIn(root).enumerated() {
+        if index >= keep { try removeTree(snapshot.path) }
+    }
+    return .Ok
+}
+
+/// When `millis` since 1970 is, in UTC, as a backup's folder is named:
+/// `20261026-142530`.
+public function snapshotName(millis: Number) -> String {
+    let seconds = trunc(millis / 1000)
+    let days = trunc(seconds / 86400)
+    let rest = seconds - days * 86400
+    let (year, month, day) = civilFromDays(days)
+    return "\(year)\(twoDigits(month))\(twoDigits(day))-\(twoDigits(trunc(rest / 3600)))\(twoDigits(trunc(rest % 3600 / 60)))\(twoDigits(rest % 60))"
+}
+
+function twoDigits(value: Number) -> String {
+    return value < 10 ? "0\(value)" : "\(value)"
+}
+
+// The year, month and day `days` after 1970-01-01, by Howard Hinnant's
+// civil_from_days.
+function civilFromDays(days: Number) -> (Number, Number, Number) {
+    let shifted = days + 719468
+    let era = floor(shifted / 146097)
+    let dayOfEra = shifted - era * 146097
+    let yearOfEra = trunc(
+        (
+            dayOfEra - trunc(dayOfEra / 1460) + trunc(dayOfEra / 36524) - trunc(dayOfEra / 146096)
+        ) / 365
+    )
+    let dayOfYear = dayOfEra - (365 * yearOfEra + trunc(yearOfEra / 4) - trunc(yearOfEra / 100))
+    let monthIndex = trunc((5 * dayOfYear + 2) / 153)
+    let day = dayOfYear - trunc((153 * monthIndex + 2) / 5) + 1
+    let month = monthIndex < 10 ? monthIndex + 3 : monthIndex - 9
+    let year = yearOfEra + era * 400 + (month <= 2 ? 1 : 0)
+    return (year, month, day)
+}

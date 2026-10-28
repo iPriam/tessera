@@ -1,0 +1,74 @@
+import Foundation
+import Heap
+import LibTessera
+
+// Being asked to stop (03 shutdown). The request is a completion on the
+// main port, so the manager stops its drivers and leaves through main
+// instead of being killed.
+
+// A port to wait for the drivers' endings on, or none once the reason there is
+// none is logged.
+function stoppingPort() -> Handle? {
+    match portCreate(.None) {
+        Ok(value) -> return .Some(value)
+        Error(failed) -> log warn("the drivers cannot be waited for", error: errorName(failed))
+    }
+    return .None
+}
+
+// The endings that arrived, or none once the reason they cannot be waited for
+// is logged.
+function waitForEndings(port: borrow Handle) -> [Completion]? {
+    match portWait(port, PortKey.batch, Number(Deadline.infinite)) {
+        Ok(value) -> return .Some(value)
+        Error(failed) -> log warn("the drivers cannot be waited for", error: errorName(failed))
+    }
+    return .None
+}
+
+// Asks every driver this manager started to stop, and waits for each. Init's
+// deadline is the bound: a driver that will not go keeps the manager here
+// until init kills both.
+function stopDrivers(manager: borrow mut Manager) {
+    let port = match stoppingPort() {
+        Some(value) -> value
+        None -> return
+    }
+    var waiting = 0
+    for running in manager.running {
+        match processAskToStop(running.process) {
+            // The request is delivered; the driver's end is waited for below.
+            Ok -> {}
+            Error(failed) -> log warn(
+                "a driver cannot be asked to stop",
+                driver: running.name,
+                error: errorName(failed)
+            )
+        }
+        match objectWaitAsync(running.process, Signals.terminated, .Once, port, running.key) {
+            Ok -> waiting += 1
+            Error(failed) -> log warn(
+                "a driver's end cannot be heard",
+                driver: running.name,
+                error: errorName(failed)
+            )
+        }
+    }
+    var waitingForMore = true
+    while waiting > 0 && waitingForMore {
+        match waitForEndings(port) {
+            Some(completions) -> {
+                for completion in completions {
+                    for running in manager.running {
+                        if running.key == Number(completion.key) { logEnding(running) }
+                    }
+                    waiting -= 1
+                }
+            }
+            None -> waitingForMore = false
+        }
+    }
+    for running in manager.running { closeHandle(running.process) }
+    manager.running = []
+    closeHandle(port)
+}

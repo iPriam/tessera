@@ -1,0 +1,8 @@
+//! The Trash app package: the trash service, which moves items to the Trash and back.
+/// The Tessera trash package: the trash service that moves items to the Trash and back.
+construct TesseraTrash extends Package {
+    let version: String = "0.1.0"
+    let kind: PackageKind = .App
+    let moduleRoot: String = "TesseraTrash"
+    let dependencies: [Dependency] = [Dependency { name: "TrashStore", path: "store" }]
+}

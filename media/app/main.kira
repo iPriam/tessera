@@ -1,0 +1,185 @@
+//! The Media platform's entry point: a television-sized platform on the same MosaicDisplay as the desktop.
+import Foundation
+import LibTessera
+import PlatformKit
+import TesseraDisplayClient
+
+// The Media platform: a different form factor against the same MosaicDisplay. It
+// speaks the display protocol the same way Adaptive Desktop does — the display
+// server is not told which platform it is talking to — and asks for the mode its
+// presentation calls for, which for a television is one thing full-screen.
+//
+// It waits on one port for the display and for its System channel, and
+// follows `platform.dynamic` as the other platforms do
+// (roadmap/15-form-factors.md).
+
+/// The keys the Media platform's port tells its two waits apart by: the display channel and the System channel's settings.
+namespace MediaWaitKey {
+    let display: UNumber = 1
+    let settings: UNumber = 2
+}
+
+/// The display channel's next message, once the port says it is readable, or a change of setting followed first; the failure that ended the session otherwise.
+function awaitDisplayMessage(
+    link: borrow DisplayLink,
+    port: Handle,
+    watch: borrow mut PlatformSettingWatch
+) -> Result<DisplayMessage, TesseraError> {
+    try objectWaitAsync(link.channel, Signals.readable | Signals.peerClosed, .Once, port, MediaWaitKey.display)
+    armPlatformSettingWatch(watch, port, MediaWaitKey.settings)
+    // A wait returns at least one completion.
+    var waited = try portWait(port, 1, Deadline.infinite)
+    while waited[0].key != U64(MediaWaitKey.display) {
+        platformSettingWoke(watch, PlatformSetting.media)
+        armPlatformSettingWatch(watch, port, MediaWaitKey.settings)
+        waited = try portWait(port, 1, Deadline.infinite)
+    }
+    return receiveDisplayMessage(link.channel)
+}
+
+/// Runs one Media session on the display link: begins it, then serves the display's messages until the session ends.
+function runMediaSession(
+    link: borrow DisplayLink,
+    port: Handle,
+    watch: borrow mut PlatformSettingWatch
+) -> Result<Void, TesseraError> {
+    log info("the display link is ready")
+    let beginning = try beginDisplaySession(link)
+    let configured = beginning.configured
+    log info(
+        "configured",
+        x: configured.x,
+        y: configured.y,
+        width: configured.width,
+        height: configured.height
+    )
+    var state = emptyPlatformState(.Media)
+    log info("arranged", arrangement: state.platform.arrangement().name())
+    let ownApplication = PlatformApplicationId(1)
+    let ownSurface = PlatformSurfaceId(configured.surface.raw)
+    let frame = SurfaceFrame {
+        x: configured.x,
+        y: configured.y,
+        width: configured.width,
+        height: configured.height,
+    }
+    state.registerApplication(ownApplication, "Media", .Platform)
+    state.registerSurface(ownSurface, ownApplication, move frame, 0)
+    match state.activateSurface(ownSurface) {
+        // The platform's own surface is in front and focused.
+        Ok -> {}
+        Error(failure) -> log warn("the platform could not bring its own surface forward", failure)
+    }
+    var requestedMode = CompositorMode.Exclusive
+    match state.platform.presentationPolicy().windows {
+        Freeform -> {
+            log info("window policy", policy: "freeform")
+            requestedMode = .Freeform
+        }
+        Staged -> {
+            log info("window policy", policy: "staged")
+            requestedMode = .Stage
+        }
+        Stack -> {
+            log info("window policy", policy: "stack")
+            requestedMode = .Stack
+        }
+        Fullscreen -> {
+            log info("window policy", policy: "fullscreen")
+            requestedMode = .Exclusive
+        }
+    }
+    try sendSetMode(link.channel, requestedMode, false)
+    log info("asked the compositor for its mode", mode: requestedMode)
+    log info("running")
+    while true {
+        let message = match awaitDisplayMessage(link, port, watch) {
+            Ok(value) -> value
+            // Peer closure ends this session normally; every other failure
+            // reaches main, which owns the link and closes it.
+            Error(failure) -> return failure.code == .PeerClosed ? .Ok : .Error(failure)
+        }
+        match message {
+            SurfaceCreated(announced) -> {
+                let surface = announced.surface
+                log info("an application surface appeared", surface: surface.raw)
+                try sendGrantFocus(link.channel, surface)
+                log info("granting focus", surface: surface.raw)
+            }
+            SurfaceDestroyed(surface) -> log info(
+                "an application surface went",
+                surface: surface.raw
+            )
+            ChannelChanged(declared) -> match declared.channel {
+                Badge -> log info(
+                    "a surface set its badge",
+                    surface: declared.surface.raw,
+                    badge: declared.value
+                )
+                StatusBarHidden -> {}
+                HomeEditing -> {}
+            }
+            Notification(notification) -> log info(
+                "a notification arrived",
+                notification: notification.id,
+                priority: notification.priority
+            )
+            // Nothing else is the platform's to act on.
+            Hello, Welcome, Attach, Commit, Key, FrameDone, FrameRequest, FrameReady, FocusIn, FocusOut,
+                Configure, AckConfigure, SetMode, ModeChanged, InputCapability, GrantFocus, InstallGrab,
+                GrabFired, SetChannel, PresentSystem, Verify, VerifyResult, InjectInput, Notify,
+                ActivateRequested, SetBar, PointerMotion, PointerButton, PointerAxis, PointerEnter, PointerLeave, SetDock, SurfacePressed, RequestWindow, WindowRequested, GrantMove, GrantResize, HoldInput, SetOverlay, SetIdle, IdleChanged, BarBackdrop, SetGlass, SetLaunchOrigin, SetStageBadge, PlaceSurface, SurfacePlaced, SetHidden, SetMargin, Insets, Output -> {}
+        }
+    }
+    return .Ok
+}
+
+/// Starts the Media platform: waits on its port for the display and its System channel, and runs the sessions the display offers.
+@Main
+function main() {
+    log info("starting", desktop: "Media")
+    let port = match portCreate(.None) {
+        Ok(value) -> value
+        Error(failed) -> {
+            log fault("no port to wait on", error: errorName(failed))
+            return
+        }
+    }
+    var watch = platformSettingWatch()
+    let first = match takeInitialDisplayLink() {
+        Ok(value) -> value
+        Error(failure) -> {
+            log fault("no display-server channel", error: errorName(failure))
+            return
+        }
+    }
+    var active = match first {
+        Some(link) -> link
+        None -> {
+            log fault("no display-server channel")
+            return
+        }
+    }
+    while true {
+        let reached = runMediaSession(active, port, watch)
+        closeDisplayLink(active)
+        match reached {
+            Ok -> log info("the display session closed; waiting for a replacement")
+            Error(failure) -> log warn(
+                "the display session was interrupted; waiting for a replacement",
+                error: errorName(failure)
+            )
+        }
+        let next = match takeReplacementDisplayLink() {
+            Ok(value) -> value
+            Error(failure) -> {
+                log warn("a replacement display link could not be read", error: errorName(failure))
+                break
+            }
+        }
+        match next {
+            Some(replacement) -> active = replacement
+            None -> break
+        }
+    }
+}

@@ -1,0 +1,165 @@
+import Foundation
+import Heap
+
+// Files on Linux (§13.5): a descriptor reopened from the Node's `O_PATH`
+// one through `/proc/self/fd`, with the open flags the `OpenMode` asks for,
+// so Read and Write are the kernel's to enforce. I/O is `preadv` and
+// `pwritev`; locks are open-file-description locks, so a lock belongs to the
+// File and goes with it.
+
+// A file backing for the node, opened for the `OpenMode`.
+function kernelFileOpen(node: Number, mode: OpenMode) -> Result<Number, TesseraError> {
+    let writes = (mode & (OpenMode.write | OpenMode.append | OpenMode.truncate)).raw != U32(0)
+    var flags = LinuxOpen.closeOnExec
+    if writes && mode.has(OpenMode.read) { flags = flags | LinuxOpen.readWrite } else if writes {
+        flags = flags | LinuxOpen.writeOnly
+    }
+    if mode.has(OpenMode.append) { flags = flags | LinuxOpen.append }
+    if mode.has(OpenMode.truncate) { flags = flags | LinuxOpen.truncate }
+    if mode.has(OpenMode.noCache) { flags = flags | openDirectFlag() }
+    if mode.has(OpenMode.sync) { flags = flags | LinuxOpen.sync }
+    let fd = openat(AtDirectory.current, cStringFrom(descriptorPath(node)), flags, 0)
+    if answerFailed(fd) { return .Error(errnoFailure(answerErrno(fd))) }
+    return .Ok(fd)
+}
+
+// `struct iovec`s for the buffers.
+function bufferVectors(buffers: borrow [Buffer]) -> ByteBlock {
+    let blockBytes = zeroedBlock(count: 16 * buffers.count + 16, alignment: 16)
+    let block = blockBytes.pointer()
+    for index in 0..buffers.count {
+        heapStore<RawPtr>(block, (index * 16), buffers[index].address)
+        heapStore<U64>(block, (index * 16 + 8), buffers[index].length)
+    }
+    return move blockBytes
+}
+
+// Scatter read at `offset`; the bytes read, 0 at the end.
+function kernelReadVectored(
+    backing: Number,
+    offset: U64,
+    buffers: borrow [Buffer]
+) -> Result<U64, TesseraError> {
+    let vectorsBytes = bufferVectors(buffers)
+    let got = preadv(backing, vectorsBytes.pointer(), buffers.count, offset, U64(0))
+    if answerFailed(got) { return .Error(errnoFailure(answerErrno(got))) }
+    return .Ok(U64(got))
+}
+
+// Gather write at `offset`, or at the end in one step when `append`; past
+// the largest file the volume allows is `OutOfRange`.
+function kernelWriteVectored(
+    backing: Number,
+    offset: U64,
+    buffers: borrow [Buffer],
+    append: Bool
+) -> Result<U64, TesseraError> {
+    let vectorsBytes = bufferVectors(buffers)
+    let vectors = vectorsBytes.pointer()
+    var wrote = 0
+    if append { wrote = writev(backing, vectors, buffers.count) } else {
+        wrote = pwritev(backing, vectors, buffers.count, offset, U64(0))
+    }
+    if answerFailed(wrote) {
+        if failedWith(wrote, .FileTooBig) { return .Error(failure(.OutOfRange)) }
+        return .Error(errnoFailure(answerErrno(wrote)))
+    }
+    return .Ok(U64(wrote))
+}
+
+// Copies up to `length` bytes between backings; answers how many moved
+// before the source ended.
+function kernelCopyBetween(
+    from: Number,
+    fromOffset: U64,
+    to: Number,
+    toOffset: U64,
+    length: U64
+) -> Result<U64, TesseraError> {
+    let chunk = U64(65536)
+    let blockBytes = zeroedBlock(count: chunk, alignment: 16)
+    let block = blockBytes.pointer()
+    var done = U64(0)
+    while done < length {
+        var step = length - done
+        if step > chunk { step = chunk }
+        let got = pread(from, block, step, fromOffset + done)
+        if answerFailed(got) { return .Error(errnoFailure(answerErrno(got))) }
+        if got == 0 { break }
+        try kernelWriteAt(to, block, U64(got), toOffset + done)
+        done += U64(got)
+    }
+    return .Ok(done)
+}
+
+// Makes `target`'s contents `source`'s, sharing its blocks: `FICLONE`,
+// `_IOW(0x94, 9, int)`. A file system that cannot share blocks, or two
+// volumes, answer `Unsupported`.
+function kernelClone(target: Number, source: Number) -> Result<Void, TesseraError> {
+    return answerStatus(ioctlValue(target, U64(0x40049409), source))
+}
+
+function kernelSync(backing: Number, options: SyncOptions) -> Result<Void, TesseraError> {
+    return match options {
+        Data -> answerStatus(fdatasync(backing))
+        All -> answerStatus(fsync(backing))
+    }
+}
+
+// `fallocate` for the `AllocateOptions`: preallocate, or
+// `FALLOC_FL_PUNCH_HOLE | KEEP_SIZE`, or `FALLOC_FL_ZERO_RANGE`.
+function kernelAllocate(
+    backing: Number,
+    offset: U64,
+    length: U64,
+    options: AllocateOptions
+) -> Result<Void, TesseraError> {
+    var mode = 0
+    if options.has(AllocateOptions.punchHole) {
+        mode = FallocateMode.punchHole | FallocateMode.keepSize
+    }
+    if options.has(AllocateOptions.zeroRange) { mode = FallocateMode.zeroRange }
+    return answerStatus(fallocate(backing, mode, offset, length))
+}
+
+// Takes a byte-range lock, shared or exclusive, or releases
+// with `kernelUnlockRange`. A lock someone else holds is `ShouldWait`.
+// `F_OFD_SETLK` (37) with `F_RDLCK` 0, `F_WRLCK` 1, `F_UNLCK` 2.
+function lockRange(
+    backing: Number,
+    offset: U64,
+    length: U64,
+    lockType: Number
+) -> Result<Void, TesseraError> {
+    let blockBytes = zeroedBlock(count: 32, alignment: 16)
+    let block = blockBytes.pointer()
+    heapStore<U16>(block, 0, U16(lockType))
+    heapStore<U64>(block, 8, offset)
+    heapStore<U64>(block, 16, length)
+    let answer = fcntl(backing, Fcntl.openFileDescriptionLock, block)
+    if !answerFailed(answer) { return .Ok }
+    if failedWith(answer, .Again) || failedWith(answer, .Access) {
+        return .Error(failure(.ShouldWait))
+    }
+    return .Error(errnoFailure(answerErrno(answer)))
+}
+
+function kernelLockRange(
+    backing: Number,
+    offset: U64,
+    length: U64,
+    mode: LockMode
+) -> Result<Void, TesseraError> {
+    match mode {
+        Shared -> return lockRange(backing, offset, length, 0)
+        Exclusive -> return lockRange(backing, offset, length, 1)
+    }
+}
+
+function kernelUnlockRange(
+    backing: Number,
+    offset: U64,
+    length: U64
+) -> Result<Void, TesseraError> {
+    return lockRange(backing, offset, length, 2)
+}

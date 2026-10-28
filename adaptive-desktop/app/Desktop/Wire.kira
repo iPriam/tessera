@@ -1,0 +1,231 @@
+import Foundation
+import Heap
+import LibTessera
+
+// The bytes the platform reads from LibTessera and writes for it: the System
+// channel's events, the device and service lists, and the chime's samples
+// (roadmap/16-libtessera.md §10.3, §12). Everything above this file works
+// with the types it answers.
+
+// A message on the System channel: the §10.3 header, with the method's
+// ordinal @8 and the flags @16, then the body.
+namespace SystemMessage {
+    let ordinalAt: Number = 8
+    let flagsAt: Number = 16
+    // The room a read takes: the longest event the platform follows fits.
+    let bytes: Number = 256
+    let handles: Number = 4
+}
+
+// `deviceChanged`: the class @0, the device @8, whether it came @16.
+namespace DeviceChangedBody {
+    let classAt: Number = 0
+    let deviceAt: Number = 8
+    let addedAt: Number = 16
+    let bytes: Number = 24
+}
+
+// `RealtimeDetails`: Realtime less Monotonic @0.
+namespace TimeChangedBody {
+    let offsetAt: Number = 0
+    let bytes: Number = 32
+}
+
+// `volumeChanged`: mounted @0, then the mount point, its length @8 and its
+// bytes @16.
+namespace VolumeChangedBody {
+    let mountedAt: Number = 0
+    let lengthAt: Number = 8
+    let pathAt: Number = 16
+}
+
+// The System channel events the platform follows.
+@Derive(Copy)
+enum SystemMethod {
+    DeviceChanged
+    TimeChanged
+    VolumeChanged
+}
+
+let systemMethods: [SystemMethod] = [SystemMethod.DeviceChanged, SystemMethod.TimeChanged, SystemMethod.VolumeChanged]
+
+function methodName(method: borrow SystemMethod) -> String {
+    return match method {
+        DeviceChanged -> "System/deviceChanged"
+        TimeChanged -> "System/timeChanged"
+        VolumeChanged -> "System/volumeChanged"
+    }
+}
+
+// A device that came or went; its class is none when the platform does not
+// know it.
+struct DeviceChange {
+    var deviceClass: DeviceClass?
+    var id: Number
+    var added: Bool
+}
+
+struct VolumeChange {
+    var mounted: Bool
+    var path: String
+}
+
+// An event the System channel carried.
+enum SystemNotice {
+    DeviceChanged(DeviceChange)
+    // The clock was set: Realtime less Monotonic.
+    TimeChanged(Number)
+    VolumeChanged(VolumeChange)
+}
+
+let deviceClasses: [DeviceClass] = [DeviceClass.Sensor, DeviceClass.AudioInput, DeviceClass.AudioOutput, DeviceClass.Camera, DeviceClass.Haptic]
+
+// The method an event's ordinal names, when the platform follows it.
+function systemMethodOf(ordinal: Number) -> SystemMethod? {
+    for method in systemMethods {
+        if wireOrdinal(methodName(method)) == ordinal { return .Some(method) }
+    }
+    return .None
+}
+
+// The event in the message `block` holds, `bytes` long; none for a message
+// that is no event the platform follows, or too short for its body.
+function systemNoticeOf(block: RawPtr, bytes: Number) -> SystemNotice? {
+    if bytes < Wire.headerBytes { return .None }
+    if !MessageFlags(heapLoad<U32>(block, SystemMessage.flagsAt)).has(MessageFlags.event) {
+        return .None
+    }
+    let method = try systemMethodOf(
+        heapLoad<U64>(block, SystemMessage.ordinalAt)
+    ) otherwise return .None
+    let body = heapOffset(block, Wire.headerBytes)
+    let length = bytes - Wire.headerBytes
+    return match method {
+        DeviceChanged -> deviceChangedOf(body, length)
+        TimeChanged -> length < TimeChangedBody.bytes ? .None : .Some(
+            .TimeChanged(heapLoad<U64>(body, TimeChangedBody.offsetAt))
+        )
+        VolumeChanged -> volumeChangedOf(body, length)
+    }
+}
+
+function deviceChangedOf(body: RawPtr, length: Number) -> SystemNotice? {
+    if length < DeviceChangedBody.bytes { return .None }
+    return .Some(
+        .DeviceChanged(
+            DeviceChange {
+                deviceClass: caseWithCode(
+                    deviceClasses,
+                    heapLoad<U32>(body, DeviceChangedBody.classAt)
+                ),
+                id: heapLoad<U64>(body, DeviceChangedBody.deviceAt),
+                added: heapLoad<U8>(body, DeviceChangedBody.addedAt) != UN8(0),
+            }
+        )
+    )
+}
+
+function volumeChangedOf(body: RawPtr, length: Number) -> SystemNotice? {
+    if length < VolumeChangedBody.pathAt { return .None }
+    let pathLength = heapLoad<U64>(body, VolumeChangedBody.lengthAt)
+    if pathLength > length - VolumeChangedBody.pathAt { return .None }
+    return .Some(
+        .VolumeChanged(
+            VolumeChange {
+                mounted: heapLoad<U8>(body, VolumeChangedBody.mountedAt) != UN8(0),
+                path: stringFromCBytes(heapOffset(body, VolumeChangedBody.pathAt), pathLength),
+            }
+        )
+    )
+}
+
+// `Vector<DeviceInfo>`: the count, then for each device its id @0, its
+// class and kind @8, its name and vendor as `String`s and its capabilities
+// as `Bytes` from @16 on, each a length and the bytes padded to 8, and its
+// flags, padded to 8.
+namespace DeviceRecord {
+    let countBytes: Number = 8
+    let idAt: Number = 0
+    let nameAt: Number = 16
+    let lengthBytes: Number = 8
+    let flagsBytes: Number = 8
+}
+
+struct ListedDevice {
+    var id: Number
+    var name: String
+}
+
+// `length` rounded up to the 8 bytes a §10.3 field is padded to.
+function padded(length: Number) -> Number { return trunc((length + 7) / 8) * 8 }
+
+// The devices `Device.list` wrote into `block`, `size` long; a record that
+// runs past it ends the list.
+function listedDevicesOf(block: RawPtr, size: Number) -> [ListedDevice] {
+    var devices: [ListedDevice] = []
+    if size < DeviceRecord.countBytes { return devices }
+    let count = heapLoad<U64>(block, 0)
+    var at = DeviceRecord.countBytes
+    for index in 0..count {
+        let nameAt = at + DeviceRecord.nameAt
+        if nameAt + DeviceRecord.lengthBytes > size { break }
+        let nameLength = heapLoad<U64>(block, nameAt)
+        let vendorAt = nameAt + DeviceRecord.lengthBytes + padded(nameLength)
+        if vendorAt + DeviceRecord.lengthBytes > size { break }
+        let vendorLength = heapLoad<U64>(block, vendorAt)
+        let bytesAt = vendorAt + DeviceRecord.lengthBytes + padded(vendorLength)
+        if bytesAt + DeviceRecord.lengthBytes > size { break }
+        devices.append(
+            ListedDevice {
+                id: heapLoad<U64>(block, at + DeviceRecord.idAt),
+                name: stringFromCBytes(
+                    heapOffset(block, nameAt + DeviceRecord.lengthBytes),
+                    nameLength
+                ),
+            }
+        )
+        let bytesLength = heapLoad<U64>(block, bytesAt)
+        at = bytesAt + DeviceRecord.lengthBytes + padded(bytesLength) + DeviceRecord.flagsBytes
+    }
+    return devices
+}
+
+// `serviceList`'s records: one per service, its name first, NUL-padded.
+namespace ServiceRecord {
+    let bytes: Number = 160
+    let nameBytes: Number = 96
+}
+
+// The names of the `count` services `serviceList` wrote into `block`.
+function serviceNamesOf(block: RawPtr, count: Number) -> [String] {
+    var names: [String] = []
+    for index in 0..count {
+        names.append(
+            stringFromCBytes(
+                heapOffset(block, index * ServiceRecord.bytes),
+                ServiceRecord.nameBytes
+            )
+        )
+    }
+    return names
+}
+
+// The number at the start of a list `Device.list` wrote: how many records
+// follow.
+function listedCount(block: RawPtr) -> Number { return heapLoad<U64>(block, 0) }
+
+// Interleaved 16-bit stereo: each frame is the same sample twice.
+namespace StereoFrame {
+    let bytes: Number = 4
+    let sampleBytes: Number = 2
+}
+
+// Writes `frames` frames of `level(frame)` into `block`.
+function writeStereo(block: RawPtr, frames: Number, level: (Number) -> Number) {
+    for frame in 0..frames {
+        let value = level(frame)
+        let sample = value < 0 ? UN16(65536 + value) : UN16(value)
+        heapStore<U16>(block, frame * StereoFrame.bytes, sample)
+        heapStore<U16>(block, frame * StereoFrame.bytes + StereoFrame.sampleBytes, sample)
+    }
+}

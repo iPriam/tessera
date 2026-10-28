@@ -1,0 +1,31 @@
+import Foundation
+import LibTessera
+import PlatformUI
+
+// The settings this application changes, each read from and written to the
+// Settings service. A setting that cannot be written is said in the log, and
+// the pane keeps showing the choice made, which holds until the service
+// answers again.
+
+namespace SettingKeys {
+    // The seconds without input before the display sleeps, 0 for never (the
+    // platforms' `IdleSetting`, in PlatformKit).
+    let displaySleep: String = "display.sleep"
+}
+
+// The value `key` holds, `fallback` when none.
+function storedSetting(key: borrow String, fallback: borrow String) -> String {
+    return settingValue(key, fallback)
+}
+
+// Sets `key` to `value`; none forgets it, so its reader's default holds.
+function changeSetting(key: borrow String, value: String?) {
+    match storeSetting(key, move value) {
+        Ok -> {}
+        Error(failed) -> log warn(
+            "a setting could not be changed",
+            key: key,
+            error: errorName(failed)
+        )
+    }
+}

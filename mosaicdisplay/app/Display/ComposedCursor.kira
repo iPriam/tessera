@@ -1,0 +1,111 @@
+import Foundation
+import Ember
+
+// The cursor on a display without a cursor plane (roadmap/08-display-server.md,
+// "Input": on the cursor plane where there is one, "as a quad otherwise"). Each
+// shape is painted into a texture of the composer's device the first time the
+// cursor takes it, and the one the cursor has is drawn over every surface, its
+// hot spot at the pointer, in each composed picture. A pointer that moves
+// composes the picture again, and no surface is scanned out alone while the
+// cursor is drawn into the picture.
+
+// A shape as the composer samples it: RGBA, premultiplied, row by row.
+function shapePixels(shape: borrow CursorShape, scale: Number) -> [UN8] {
+    let painter = shapePainter(shape, scale)
+    let side = CursorImage.side
+    var pixels: [UN8] = []
+    for row in 0..side {
+        for column in 0..side {
+            let (black, white) = shapeCoverage(painter, row, column)
+            let level = UN8(clamp(round(white * 255.0), 0.0, 255.0))
+            pixels.append(level)
+            pixels.append(level)
+            pixels.append(level)
+            pixels.append(UN8(clamp(round((black + white) * 255.0), 0.0, 255.0)))
+        }
+    }
+    return pixels
+}
+
+// A slot for each of the cursor's shapes, in `cursorShapes` order, for a
+// display that has no cursor plane; none on one that has. A slot is filled
+// when its shape is first drawn (paintComposedCursor): a shape is painted
+// pixel by pixel, and painting every one at start holds up the first picture
+// for shapes a session may never show.
+function makeComposedCursor(display: borrow Display) -> [GraphicsTexture?] {
+    if display.scanout.cursorPlane.isSome() { return [] }
+    var slots: [GraphicsTexture?] = []
+    for _ in cursorShapes { slots.append(.None) }
+    log info("the cursor is drawn into the composed picture", shapes: slots.count)
+    return slots
+}
+
+// Paints the shape the cursor has into a texture of the composer's device,
+// unless it already has one. When the device would not take it, which is said,
+// the composed picture stops drawing the cursor.
+function paintComposedCursor(server: borrow mut Server) {
+    if !cursorComposed(server) { return }
+    let index = code(server.cursorShape)
+    let scale = cursorScale(server.display)
+    // The composer is taken out of the server to fill its slot, and put back.
+    var held: Composer? = .None
+    held = move server.composer
+    match held {
+        Some(composer) -> {
+            var open = move composer
+            if open.cursors[index].isNone() {
+                let side = UN32(CursorImage.side)
+                let descriptor = TextureDescriptor { label: "cursor", width: side, height: side }
+                let pixels = shapePixels(cursorShapes[index], scale)
+                match open.device.graphics().createTextureFromPixels(descriptor, pixels) {
+                    Ok(texture) -> {
+                        open.cursors[index] = .Some(texture)
+                        log info("painted a cursor shape", shape: index)
+                    }
+                    Error(failure) -> {
+                        log warn(
+                            "the cursor could not be made a texture; the pointer is not drawn",
+                            failure
+                        )
+                        open.cursors = []
+                    }
+                }
+            }
+            server.composer = .Some(move open)
+        }
+        None -> {}
+    }
+}
+
+// Whether the composed picture draws the cursor: there is a pointer, and no
+// cursor plane to show it on.
+function cursorComposed(server: borrow Server) -> Bool {
+    if server.pointers.count == 0 { return false }
+    return match server.composer {
+        Some(composer) -> composer.cursors.count > 0
+        None -> false
+    }
+}
+
+// Draws the cursor over the picture, in the shape it has, its hot spot at the
+// pointer, once paintComposedCursor has painted that shape.
+function drawComposedCursor(composer: borrow Composer, server: borrow Server) {
+    if server.pointers.count == 0 || composer.cursors.count == 0 { return }
+    // The image and its hot spot are in pixels, painted at the output's
+    // scale; the picture is laid out in points.
+    let scale = server.display.scanout.scale
+    let spot = shapeHotSpot(server.cursorShape) / scale
+    match composer.cursors[code(server.cursorShape)] {
+        Some(texture) -> drawSurface(
+            composer,
+            texture,
+            Geometry {
+                x: server.pointerX - spot,
+                y: server.pointerY - spot,
+                width: CursorImage.side / scale,
+                height: CursorImage.side / scale,
+            }
+        )
+        None -> {}
+    }
+}

@@ -1,0 +1,111 @@
+//! The wire Presence speaks: the request and answer layouts, and how they are received and sent.
+import Foundation
+import Heap
+import LibTessera
+
+// The wire, as LibTessera `app/Presence/Presence.kira` speaks it: a 32-byte
+// header, `op` @0, `code` @4 (an `ErrorCode` value), `a` @8, `b` @16, `c` @24.
+// A request carries no payload. An answer carries the request's `op`.
+
+/// The wire's sizes: the header's length and how many handles a request may carry.
+namespace PresenceWire {
+    let headerBytes: Number = 32
+    // A client's request carries no handles; a few are taken to close them.
+    let handleCapacity: Number = 4
+}
+
+/// The operations a client may ask of Presence.
+@Derive(Copy)
+@Derive(CaseIterable)
+enum Operation: UN32 {
+    Verify = 1
+}
+
+/// The interaction token's three words, as a verification sends them.
+struct VerifyToken {
+    var idLow: UNumber
+    var idHigh: UNumber
+    var surfaceId: UNumber
+}
+
+/// A request decoded from a message.
+enum Request {
+    Verify(VerifyToken)
+}
+
+/// Why nothing could be taken off a channel as a request.
+enum ReceiveFailure {
+    // The channel had nothing (`ShouldWait`) or failed.
+    Channel(TesseraError)
+    // An operation a client does not send; it is answered `Unsupported`.
+    UnknownOperation(UN32)
+    // A request refused as it was sent, answered with the reason.
+    Refused(Refusal)
+}
+
+/// A request refused as it was sent: the operation, and why.
+struct Refusal {
+    var operation: Operation
+    var reason: ErrorCode
+}
+
+/// The Presence error with `code`.
+function failure(code: borrow ErrorCode) -> TesseraError {
+    return TesseraError {
+        code: code,
+        subsystem: .Presence,
+        flags: ErrorFlags.none,
+        detail: UNumber(0)
+    }
+}
+
+/// The next request on `channel`; handles a client sends are closed, since no request carries any.
+function receive(channel: Handle) -> Result<Request, ReceiveFailure> {
+    let block = zeroedBlock(count: PresenceWire.headerBytes, alignment: 16)
+    let bytes = Buffer { address: block.pointer(), length: PresenceWire.headerBytes }
+    let received = match channelRead(channel, bytes, PresenceWire.handleCapacity) {
+        Ok(value) -> value
+        Error(failed) -> return .Error(.Channel(failed))
+    }
+    closeHandles(received.handles)
+    if received.bytes < PresenceWire.headerBytes {
+        return .Error(.Channel(failure(.InvalidArgument)))
+    }
+    let raw = blockLoad<U32>(block, 0)
+    let operation = try caseWithCode(allCases_Operation(), raw) otherwise return .Error(
+        .UnknownOperation(raw)
+    )
+    return match operation {
+        Verify -> .Ok(
+            .Verify(
+                VerifyToken {
+                    idLow: UNumber(blockLoad<U64>(block, 8)),
+                    idHigh: UNumber(blockLoad<U64>(block, 16)),
+                    surfaceId: UNumber(blockLoad<U64>(block, 24)),
+                }
+            )
+        )
+    }
+}
+
+/// Sends one answer under the raw `operation`: the outcome, and no payload.
+function send(
+    channel: Handle,
+    operation: UN32,
+    outcome: borrow ErrorCode
+) -> Result<Void, TesseraError> {
+    let block = zeroedBlock(count: PresenceWire.headerBytes, alignment: 16)
+    blockStore<U32>(block, 0, operation)
+    blockStore<U32>(block, 4, outcome.rawValue())
+    let none: [Handle] = []
+    return channelWrite(channel, Buffer { address: block.pointer(), length: PresenceWire.headerBytes }, none)
+}
+
+/// An answer: a client that cannot be sent to has gone, and its channel's wait closes it.
+function answer(channel: Handle, operation: UN32, outcome: borrow ErrorCode) {
+    match send(channel, operation, outcome) {
+        // The answer is sent, so there is nothing more to do.
+        Ok -> {}
+        Error(failed) -> log warn("a client could not be answered", error: errorName(failed))
+    }
+}

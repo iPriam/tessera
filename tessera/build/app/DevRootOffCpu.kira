@@ -1,0 +1,194 @@
+import Foundation
+import Build
+
+// Time off the CPUs: each switch away from a thread (`blocks`, with the call
+// chain it blocked in) lasts until the next switch back to it (`resumes`).
+// Each wait is counted in microseconds against its stack, innermost first:
+// the system call it blocked in, as `[ppoll]`, then the program's own
+// frames, so the report says which functions waited and on what. The
+// sampled span's start and end close the resumes file.
+
+namespace OffCpuReport {
+    let functions: Number = 40
+    let longest: Number = 25
+    // Frames of a long wait's stack shown beside it.
+    let shownFrames: Number = 6
+    let systemCall: String = "__arm64_sys_"
+}
+
+struct SampleNaming {
+    let symbols: SampleRoots
+    let kernel: [SampleSymbol]
+}
+
+struct OffCpuWait {
+    let process: String
+    let micros: Number
+    let stack: String
+}
+
+struct OffCpu {
+    var tally: SampleTally = SampleTally {}
+    var waits: [OffCpuWait] = []
+    var span: Number = 0
+}
+
+// Per stack in a blocks or resumes file: pid, tid, time, frame count, frames.
+struct TimedStack {
+    let pid: Number
+    let tid: Number
+    let time: Number
+    let frames: [Number]
+}
+
+function timedStacks(bytes: borrow [UN8]) -> [TimedStack] {
+    var stacks: [TimedStack] = []
+    var at = 0
+    while at + 32 <= bytes.count {
+        let count = elfField(bytes, at + 24, 8)
+        if at + 32 + count * 8 > bytes.count { break }
+        var frames: [Number] = []
+        for index in 0..count { frames.append(elfField(bytes, at + 32 + index * 8, 8)) }
+        stacks.append(
+            TimedStack {
+                pid: elfField(bytes, at, 8),
+                tid: elfField(bytes, at + 8, 8),
+                time: elfField(bytes, at + 16, 8),
+                frames: frames
+            }
+        )
+        at += 32 + count * 8
+    }
+    return stacks
+}
+
+// The first of `times`, sorted, after `time`; none when there is none.
+function nextAfter(times: borrow [Number], time: Number) -> Number? {
+    var low = 0
+    var high = times.count
+    while low < high {
+        let middle = trunc((low + high) / 2)
+        if times[middle] <= time { low = middle + 1 } else { high = middle }
+    }
+    return low < times.count ? .Some(times[low]) : .None
+}
+
+function offCpuTally(
+    blocked: borrow [UN8],
+    resumed: borrow [UN8],
+    processes: borrow mut Map<Number, SampledProcessFacts>,
+    images: borrow mut Map<String, SampledImage?>,
+    naming: borrow SampleNaming
+) -> OffCpu {
+    var result = OffCpu {}
+    let resumes = timedStacks(resumed)
+    if resumes.count < 2 { return result }
+    let began = resumes[resumes.count - 2].time
+    let ended = resumes[resumes.count - 1].time
+    result.span = ended - began
+    var byThread: Map<Number, [Number]> = Map {}
+    for index in 0..resumes.count - 2 {
+        let resume = resumes[index]
+        var times = match byThread.value(resume.tid) {
+            Some(known) -> known
+            None -> []
+        }
+        times.append(resume.time)
+        byThread.set(resume.tid, move times)
+    }
+    var sorted: Map<Number, [Number]> = Map {}
+    for entry in byThread.entries() {
+        sorted.set(entry.key, entry.value.sorted({ left, right in return left < right }))
+    }
+    for block in timedStacks(blocked) {
+        if block.pid == 0 || block.time < began || block.time >= ended { continue }
+        let resumedAt = match sorted.value(block.tid) {
+            Some(times) -> nextAfter(times, block.time)
+            None -> .None
+        }
+        let back = match resumedAt {
+            Some(time) -> min(time, ended)
+            None -> ended
+        }
+        let micros = trunc((back - block.time) / 1000)
+        if micros <= 0 { continue }
+        var facts = match processes.value(block.pid) {
+            Some(known) -> known
+            None -> SampledProcessFacts { name: "pid \(block.pid)" }
+        }
+        let named = stackNames(block.frames, 0, facts, images, naming.symbols, naming.kernel)
+        let names = offCpuNames(named)
+        tallyStack(result.tally, facts.name, names, micros)
+        result.waits.append(
+            OffCpuWait { process: copy facts.name, micros: micros, stack: shownStack(names) }
+        )
+        processes.set(block.pid, move facts)
+    }
+    return result
+}
+
+// The system call a wait blocked in, then the program's frames.
+function offCpuNames(named: borrow [String]) -> [String] {
+    var names: [String] = []
+    for name in named {
+        if name.startsWith("[k] ") {
+            let kernel = name.substring(4, name.count)
+            if names.count == 0 && kernel.startsWith(OffCpuReport.systemCall) {
+                names.append(
+                    "[" + kernel.substring(OffCpuReport.systemCall.count, kernel.count) + "]"
+                )
+            }
+            continue
+        }
+        if names.count == 0 { names.append("[kernel]") }
+        names.append(copy name)
+    }
+    return names
+}
+
+function shownStack(names: borrow [String]) -> String {
+    var shown = ""
+    for (index, name) in names.enumerated() {
+        if index >= OffCpuReport.shownFrames { break }
+        shown = index == 0 ? copy name : shown + " < " + name
+    }
+    return shown
+}
+
+function offCpuReportText(offCpu: borrow OffCpu) -> String {
+    let tally = offCpu.tally
+    var text = "\noff the CPUs, in ms, over \(millisText(trunc(offCpu.span / 1000))) ms of sampling\n"
+    text.append("\nprocesses, waiting\n")
+    for entry in descending(tally.processes) {
+        if entry.key == "idle" { continue }
+        text.append(millisRow(entry.value, entry.key))
+    }
+    text.append("\nsystem calls waited in\n")
+    for (index, entry) in descending(tally.leaves).enumerated() {
+        if index >= OffCpuReport.functions { break }
+        text.append(millisRow(entry.value, entry.key))
+    }
+    text.append("\nfunctions, waiting with what they called\n")
+    for (index, entry) in descending(tally.within).enumerated() {
+        if index >= OffCpuReport.functions { break }
+        text.append(millisRow(entry.value, entry.key))
+    }
+    text.append("\nlongest single waits\n")
+    let waits = offCpu.waits.sorted({ left, right in return left.micros > right.micros })
+    for (index, wait) in waits.enumerated() {
+        if index >= OffCpuReport.longest { break }
+        text.append(millisRow(wait.micros, wait.process + ": " + wait.stack))
+    }
+    return text
+}
+
+function millisText(micros: Number) -> String {
+    let tenths = trunc(micros / 100)
+    return "\(trunc(tenths / 10)).\(tenths % 10)"
+}
+
+function millisRow(micros: Number, name: borrow String) -> String {
+    var shown = millisText(micros)
+    while shown.count < 10 { shown = " " + shown }
+    return "\(shown)  \(name)\n"
+}

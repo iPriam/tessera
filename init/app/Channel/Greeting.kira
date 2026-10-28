@@ -1,0 +1,204 @@
+import Foundation
+import Heap
+import LibTessera
+
+// The first message a service is sent, and the links PID 1 makes between
+// services.
+
+let machineFile: String = "/" + SystemFile.release
+
+// Sends the first message on a service's channel, carrying a File to read
+// the machine's own description through.
+//
+// The File is the point. The four words could have gone anywhere; what could
+// not is the open file that arrives with them, which the receiver reads
+// without ever having opened anything or known a path.
+function greet(calls: Handle, channel: Handle, name: borrow String) {
+    if channel == Handle.invalid { return }
+    var carried: [Handle] = []
+    match openForReading(calls, machineFile) {
+        Ok(file) -> carried.append(file)
+        Error(failed) -> {
+            log warn(
+                "no machine file to hand a service",
+                file: machineFile,
+                service: name,
+                error: errorName(failed)
+            )
+        }
+    }
+    match sendMessage(channel, .Hello, UN32(carried.count), carried) {
+        Ok -> {}
+        Error(failed) -> {
+            log warn("could not greet a service", service: name, error: errorName(failed))
+            return
+        }
+    }
+    log info("handed a service the machine file", service: name, file: machineFile)
+}
+
+// Sends one end of a display link to a service.
+function handLink(channel: Handle, name: borrow String, link: Handle, detail: UN32) {
+    if channel == Handle.invalid || link == Handle.invalid { return }
+    match sendMessage(channel, .DisplayLink, detail, [link]) {
+        Ok -> {}
+        Error(failed) -> {
+            log warn(
+                "could not hand a service the display link",
+                service: name,
+                error: errorName(failed)
+            )
+            return
+        }
+    }
+    log info("handed a service the display link", service: name)
+}
+
+function displayLinkDetail(clientCount: UN32, role: borrow DisplayRole) -> UN32 {
+    return (role.rawValue() << 16) | (clientCount & UN32(65535))
+}
+
+// A display mode, in pixels.
+struct ScreenSize {
+    let width: Number
+    let height: Number
+}
+
+// What one read of MosaicDisplay's channel found.
+enum DisplayReport {
+    // The mode it chose.
+    Reported(ScreenSize)
+    // Nothing that is a report, which has been said.
+    Nothing
+    // MosaicDisplay has gone.
+    Closed
+}
+
+// The mode MosaicDisplay chose, which it sends PID 1 once it has its links.
+// Read when the channel is readable, so PID 1 never waits on the display
+// server: it goes on relaying every service's output and supervising while
+// MosaicDisplay sets the mode and draws the splash.
+function receiveDisplayMode(channel: Handle) -> DisplayReport {
+    let bodyBytes = zeroedBlock(count: ServiceMessage.headerBytes, alignment: 16)
+    let body = bodyBytes.pointer()
+    let received = match channelRead(
+        channel,
+        Buffer { address: body, length: ServiceMessage.headerBytes },
+        0
+    ) {
+        Ok(value) -> value
+        Error(failed) -> {
+            if failed.code == .PeerClosed { return .Closed }
+            if failed.code != .ShouldWait {
+                log warn("could not receive the selected display mode", error: errorName(failed))
+            }
+            return .Nothing
+        }
+    }
+    releaseAll(received.handles)
+    // MosaicDisplay puts the width and height in the serial and detail words.
+    let header: ServiceHeader = heapLoad(body)
+    let width = header.serial
+    let height = header.detail
+    if received.bytes != ServiceMessage.headerBytes
+        || header.opcode != ServiceOpcode.DisplayMode.rawValue()
+        || header.length != UN32(ServiceMessage.headerBytes) || width <= 0 || height <= 0
+    {
+        log warn("the display server sent what is not a display mode", bytes: received.bytes)
+        return .Nothing
+    }
+    return .Reported(ScreenSize { width: width, height: height })
+}
+
+// Waits for MosaicDisplay's mode and remembers it: for a boot that powers off
+// as soon as its services are up, and so has no loop to hear it in.
+function awaitDisplayMode(calls: Handle, channels: borrow [Handle], services: borrow [Service]) {
+    let server = try displayServerSlot(services) otherwise return
+    if server >= channels.count || channels[server] == Handle.invalid { return }
+    match awaitReadable(calls, channels[server]) {
+        Ok -> {}
+        Error(failed) -> {
+            log warn("could not receive the selected display mode", error: errorName(failed))
+            return
+        }
+    }
+    match receiveDisplayMode(channels[server]) {
+        // A mode that is not remembered is chosen again at the next boot.
+        Reported(mode) -> persistDisplayMode(calls, mode.width, mode.height)
+        Nothing -> {}
+        Closed -> {}
+    }
+}
+
+// The slot the service named `name` runs in.
+function serviceSlot(services: borrow [Service], name: borrow String) -> Number? {
+    for slot in 0..services.count {
+        if services[slot].name == name { return .Some(slot) }
+    }
+    return .None
+}
+
+// Whether `found` is `slot`.
+function isSlot(found: borrow Number?, slot: Number) -> Bool {
+    match found {
+        Some(at) -> return at == slot
+        None -> return false
+    }
+}
+
+// The slot the display server runs in.
+function displayServerSlot(services: borrow [Service]) -> Number? {
+    return serviceSlot(services, "mosaicdisplay")
+}
+
+// Links MosaicDisplay to every live display client once all of them are
+// started. A display client is a service with a display role; the others,
+// such as the device manager, are not linked.
+function connectDisplayClients(channels: borrow [Handle], services: borrow [Service]) {
+    let server = try displayServerSlot(services) otherwise return
+    if services.count != channels.count || channels[server] == Handle.invalid { return }
+
+    var serverEnds: [Handle] = []
+    var clientEnds: [Handle] = []
+    var clientSlots: [Number] = []
+    for slot in 0..channels.count {
+        if channels[slot] != Handle.invalid && slot != server && services[slot].isDisplayClient() {
+            match channelCreate() {
+                Ok(link) -> {
+                    serverEnds.append(link.first)
+                    clientEnds.append(link.second)
+                    clientSlots.append(slot)
+                }
+                Error(failed) -> {
+                    log warn(
+                        "no display link for a client",
+                        service: services[slot].name,
+                        error: errorName(failed)
+                    )
+                }
+            }
+        }
+    }
+    if serverEnds.count == 0 { return }
+
+    let clientCount = UN32(serverEnds.count)
+    // A client's number is its place among the surfaces, which is the surface
+    // MosaicDisplay gives it: the links reach both in this order. The Presence
+    // service has no surface, so it takes no place and the number 0.
+    var surfaceCount: UN32 = 0
+    for index in 0..serverEnds.count {
+        let clientSlot = clientSlots[index]
+        handLink(
+            channels[server],
+            "mosaicdisplay",
+            serverEnds[index],
+            displayLinkDetail(clientCount, services[clientSlot].displayRole)
+        )
+        var number: UN32 = 0
+        if services[clientSlot].hasSurface() {
+            surfaceCount = surfaceCount + UN32(1)
+            number = surfaceCount
+        }
+        handLink(channels[clientSlot], "display client", clientEnds[index], number)
+    }
+}

@@ -1,0 +1,114 @@
+import Foundation
+import FileOperations
+
+// Steps `transfer` to its end, answering every collision with `choice`.
+function finish(transfer: borrow mut Transfer, choice: Collision) -> Number {
+    var steps: Number = 0
+    var answer: Collision? = .None
+    while true {
+        steps += 1
+        match transfer.step(copy answer) {
+            Finished -> return steps
+            Collides -> answer = .Some(choice)
+            Arrived, Skipped, Failed -> answer = .None
+        }
+    }
+    return steps
+}
+
+@Test
+function aCopyKeepsTheSources() {
+    let folder = freshFolder("copy")
+    let into = childPath(folder, "into")
+    expect!(made(makeDirectory(into)))
+    writeText(childPath(folder, "a.txt"), "a")
+    var transfer = transferOf(.Copy, [childPath(folder, "a.txt")], into)
+    finish(transfer, .Skip)
+    expect!(textAt(childPath(into, "a.txt")) == "a")
+    expect!(pathExists(childPath(folder, "a.txt")))
+    let (done, total) = transfer.progress()
+    expect!(done == 1)
+    expect!(total == 1)
+    expect!(removed(removeTree(folder)))
+}
+
+@Test
+function aMoveRemovesTheSources() {
+    let folder = freshFolder("move")
+    let into = childPath(folder, "into")
+    expect!(made(makeDirectory(into)))
+    let tree = childPath(folder, "tree")
+    expect!(made(makeDirectory(tree)))
+    writeText(childPath(tree, "leaf.txt"), "leaf")
+    var transfer = transferOf(.Move, [tree], into)
+    finish(transfer, .Skip)
+    expect!(textAt(childPath(into, "tree/leaf.txt")) == "leaf")
+    expect!(!pathExists(tree))
+    expect!(removed(removeTree(folder)))
+}
+
+@Test
+function collisionsAskAndFollowTheChoice() {
+    let folder = freshFolder("collide")
+    let into = childPath(folder, "into")
+    expect!(made(makeDirectory(into)))
+    writeText(childPath(folder, "a.txt"), "new")
+    writeText(childPath(into, "a.txt"), "old")
+    var asked = transferOf(.Copy, [childPath(folder, "a.txt")], into)
+    let first = match asked.step(.None) {
+        Collides(name) -> name == "a.txt"
+        Arrived, Skipped, Failed, Finished -> false
+    }
+    expect!(first)
+    var skipping = transferOf(.Copy, [childPath(folder, "a.txt")], into)
+    finish(skipping, .Skip)
+    expect!(textAt(childPath(into, "a.txt")) == "old")
+    var both = transferOf(.Copy, [childPath(folder, "a.txt")], into)
+    finish(both, .KeepBoth)
+    expect!(textAt(childPath(into, "a 2.txt")) == "new")
+    var replacing = transferOf(.Copy, [childPath(folder, "a.txt")], into)
+    finish(replacing, .Replace)
+    expect!(textAt(childPath(into, "a.txt")) == "new")
+    expect!(removed(removeTree(folder)))
+}
+
+@Test
+function aCancelledTransferKeepsWhatItDidNotDo() {
+    let folder = freshFolder("cancel")
+    let into = childPath(folder, "into")
+    expect!(made(makeDirectory(into)))
+    writeText(childPath(folder, "a.txt"), "a")
+    writeText(childPath(folder, "b.txt"), "b")
+    var transfer = transferOf(.Move, [childPath(folder, "a.txt"), childPath(folder, "b.txt")], into)
+    let moved = match transfer.step(.None) {
+        Arrived -> true
+        Skipped, Collides, Failed, Finished -> false
+    }
+    expect!(moved)
+    transfer.cancel()
+    expect!(pathExists(childPath(folder, "b.txt")))
+    expect!(!pathExists(childPath(into, "b.txt")))
+    let kept = transfer.kept == [childPath(folder, "b.txt")]
+    expect!(kept)
+    expect!(removed(removeTree(folder)))
+}
+
+@Test
+function aFolderIsNotMovedIntoItself() {
+    let folder = freshFolder("itself")
+    let tree = childPath(folder, "tree")
+    let inner = childPath(tree, "inner")
+    expect!(made(makeDirectory(tree)))
+    expect!(made(makeDirectory(inner)))
+    var transfer = transferOf(.Move, [tree], inner)
+    let refused = match transfer.step(.None) {
+        Failed(failure) -> match failure {
+            IntoItself -> true
+            InvalidName, AlreadyExists, Missing, Refused -> false
+        }
+        Arrived, Skipped, Collides, Finished -> false
+    }
+    expect!(refused)
+    expect!(pathExists(inner))
+    expect!(removed(removeTree(folder)))
+}

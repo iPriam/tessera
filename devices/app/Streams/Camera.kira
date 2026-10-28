@@ -1,0 +1,139 @@
+import Foundation
+import Heap
+import LibTessera
+import DeviceKit
+
+// Camera streams through DeviceKit's Camera family.
+//
+// Every slot is attached to the driver as a user pointer; an enqueued slot
+// is queued to it at once, and a readable connection means a frame is ready
+// to take back.
+
+function configureCamera(
+    service: borrow mut Service,
+    stream: Number
+) -> Result<Void, TesseraError> {
+    let descriptor = service.streams[stream].descriptor
+    let format = descriptor.format
+    let asked = CameraFormat {
+        format: FourCc(format.pixelFormat),
+        width: UN32(format.width),
+        height: UN32(format.height),
+        framesPerSecondQ16: UN32(format.framesPerSecondQ16),
+        colorSpace: UN32(format.colorSpace),
+        flags: UN32(0),
+    }
+    let chosen = try cameraConfigure(
+        service.streams[stream].connection,
+        move asked,
+        descriptor.bufferCount
+    )
+    service.streams[stream].descriptor.format.pixelFormat = chosen.format.raw
+    service.streams[stream].descriptor.format.width = Number(chosen.width)
+    service.streams[stream].descriptor.format.height = Number(chosen.height)
+    // `flags` carries the bytes one frame needs.
+    let frameBytes = Number(chosen.flags)
+    if descriptor.bufferSize < frameBytes {
+        service.streams[stream].descriptor.bufferSize = frameBytes
+    }
+    return .Ok
+}
+
+function attachCamera(service: borrow mut Service, stream: Number) {
+    let connection = service.streams[stream].connection
+    for slot in service.streams[stream].slots {
+        match cameraAttach(
+            connection,
+            slot.index,
+            Buffer { address: slot.address, length: slot.size }
+        ) {
+            Ok -> {}
+            Error(failed) -> log warn(
+                "a camera slot would not attach",
+                slot: slot.index,
+                error: errorName(failed)
+            )
+        }
+    }
+}
+
+function queueCamera(service: borrow mut Service, stream: Number, slot: Number) {
+    match cameraQueue(
+        service.streams[stream].connection,
+        service.streams[stream].slots[slot].index
+    ) {
+        Ok -> {}
+        Error(failed) -> done(service, stream, slot, failed.code, 0, 0, PacketFlags.none)
+    }
+}
+
+// Takes back every frame the driver has filled. A keyframe stays one; a
+// corrupted frame is a discontinuity, and counts as dropped.
+function stepCamera(service: borrow mut Service, stream: Number) {
+    while true {
+        let frame = match cameraDequeue(service.streams[stream].connection) {
+            Ok(value) -> value
+            Error(failed) -> match streamReadFailure(failed) {
+                Failed(reason) -> {
+                    fail(service, stream, reason)
+                    return
+                }
+                Wait -> {
+                if frontSlot(service, stream).isSome() {
+                    arm(service, stream, DeviceEvents.readable)
+                }
+                return
+                }
+            }
+        }
+        let slot = match slotIndex(service.streams[stream], Number(frame.slot)) {
+            Some(value) -> value
+            None -> {
+                log warn("the camera filled a slot the stream does not have", slot: frame.slot)
+                continue
+            }
+        }
+        if !service.streams[stream].slots[slot].queued { continue }
+        var flags = PacketFlags.none
+        if frame.flags.has(CameraFrameFlags.keyframe) { flags = flags | PacketFlags.keyframe }
+        if frame.flags.has(CameraFrameFlags.error) {
+            flags = flags | PacketFlags.discontinuity
+            service.streams[stream].dropped += 1
+        }
+        done(service, stream, slot, .Ok, Number(frame.timestamp), Number(frame.bytes), flags)
+    }
+}
+
+function settingOf(control: borrow CameraControl) -> CameraSetting {
+    return match control {
+        Focus -> CameraSetting.Focus
+        Exposure -> CameraSetting.Exposure
+        Zoom -> CameraSetting.Zoom
+        Torch -> CameraSetting.Torch
+    }
+}
+
+let knownCameraControls: [CameraControl] = [CameraControl.Focus, CameraControl.Exposure, CameraControl.Zoom, CameraControl.Torch]
+
+// LibTessera's controls (focus, exposure, zoom, torch) as DeviceKit's
+// settings. A value sets the control; none reads it.
+function controlCamera(
+    service: borrow mut Service,
+    stream: Number,
+    request: borrow ControlRequest
+) -> Result<Number?, TesseraError> {
+    let control = try caseWithCode(knownCameraControls, request.control) otherwise return .Error(
+        failure(.Unsupported)
+    )
+    let connection = service.streams[stream].connection
+    match request.value {
+        Some(value) -> {
+            let previous = try cameraControl(connection, settingOf(control), value)
+            return .Ok(.None)
+        }
+        None -> {
+            let current = try cameraControl(connection, settingOf(control), CameraValue.read)
+            return .Ok(.Some(current))
+        }
+    }
+}

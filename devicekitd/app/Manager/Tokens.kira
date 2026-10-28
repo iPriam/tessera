@@ -1,0 +1,162 @@
+import Foundation
+import Heap
+import LibTessera
+import DeviceKit
+
+// Transfer tokens (17 §9.6, §10.3, §20.3).
+//
+// An exporter hands over a descriptor, the rights the importer may hold and
+// up to 128 bytes describing the object; it gets back 128 random bits. The
+// first importer to present them gets the descriptor and the description,
+// and the token is gone. One nobody redeems is closed when it expires, and
+// remembered for a minute more so an importer that comes late hears
+// `TokenExpired` rather than `TokenSpent`.
+
+struct Pending {
+    var token: Token
+    var kind: U32
+    var rights: U64
+    // None once the token expired and its descriptor was closed.
+    var descriptor: Descriptor?
+    var expiry: Number
+    var payload: [U8]
+}
+
+namespace Tokens {
+    // At most this many tokens wait at once, so a client that exports and
+    // never imports cannot hold every descriptor the manager may open.
+    let limit: Number = 1024
+    // The longest a token lives, and how long an expired one is remembered.
+    let lifetime: Number = 60000000000
+    let remembered: Number = 60000000000
+    let bytes: Number = 16
+}
+
+function sameToken(left: borrow Token, right: borrow Token) -> Bool {
+    return left.high == right.high && left.low == right.low
+}
+
+// Closes every token past its expiry, and forgets the ones expired long ago.
+function sweepTokens(manager: borrow mut Manager) {
+    match now() {
+        Ok(moment) -> sweepAt(manager, moment)
+        Error(failed) -> log warn("tokens are not swept; the clock cannot be read", error: errorName(failed))
+    }
+}
+
+// Closes every token past `moment`, and forgets the ones expired long ago.
+function sweepAt(manager: borrow mut Manager, moment: Number) {
+    var kept: [Pending] = []
+    for pending in manager.tokens {
+        match pending.descriptor {
+            Some(descriptor) -> {
+                if pending.expiry <= moment {
+                    closeDescriptor(descriptor)
+                    var expired = pending
+                    expired.descriptor = .None
+                    kept.append(expired)
+                } else {
+                    kept.append(pending)
+                }
+            }
+            None -> if pending.expiry + Tokens.remembered > moment { kept.append(pending) }
+        }
+    }
+    manager.tokens = kept
+}
+
+// 128 bits from the system's generator; a zero half is drawn again, so no
+// token is all zeros.
+function tokenBits() -> Result<Token, TesseraError> {
+    let block = zeroedBlock(count: Tokens.bytes, alignment: 16)
+    while true {
+        try randomFill(Buffer { address: block.pointer(), length: Number(Tokens.bytes) })
+        let token = Token { high: blockLoad<U64>(block, 0), low: blockLoad<U64>(block, 8) }
+        if token.high != U64(0) && token.low != U64(0) { return .Ok(token) }
+    }
+    return .Error(failure(.Internal))
+}
+
+function tokenIndex(manager: borrow Manager, token: borrow Token) -> Number? {
+    for (index, pending) in manager.tokens.enumerated() {
+        if sameToken(pending.token, token) { return .Some(index) }
+    }
+    return .None
+}
+
+function removeToken(manager: borrow mut Manager, index: Number) {
+    var kept: [Pending] = []
+    for (position, pending) in manager.tokens.enumerated() {
+        if position != index { kept.append(pending) }
+    }
+    manager.tokens = kept
+}
+
+// Closes the descriptor an export was handed, and answers why the export did
+// not happen.
+function refusedAfterClosing(descriptor: borrow Descriptor, failed: borrow TesseraError) -> Answer {
+    closeDescriptor(descriptor)
+    return refuse(failed.code, failed.detail)
+}
+
+// `Surface.export` and `Fence.export`: the descriptor goes under a token.
+function export(
+    manager: borrow mut Manager,
+    request: borrow Request,
+    passed: Descriptor?
+) -> Answer {
+    let descriptor = try passed otherwise return refuse(.InvalidArgument, U64(0))
+    if manager.tokens.count >= Tokens.limit {
+        closeDescriptor(descriptor)
+        return refuse(.TooManyHandles, U64(Tokens.limit))
+    }
+    let token = match tokenBits() {
+        Ok(value) -> value
+        Error(failed) -> return refusedAfterClosing(descriptor, failed)
+    }
+    let moment = match now() {
+        Ok(value) -> value
+        Error(failed) -> return refusedAfterClosing(descriptor, failed)
+    }
+    var lifetime = request.lifetime
+    if lifetime == 0 || lifetime > Tokens.lifetime { lifetime = Tokens.lifetime }
+    manager.tokens.append(
+        Pending {
+            token: token,
+            kind: request.kind,
+            rights: request.rights,
+            descriptor: .Some(descriptor),
+            expiry: moment + lifetime,
+            payload: request.payload,
+        }
+    )
+    let reply = replyBlock()
+    blockStore<U32>(reply, ReplyAt.kind, request.kind)
+    blockStore<U64>(reply, ReplyAt.tokenHigh, token.high)
+    blockStore<U64>(reply, ReplyAt.tokenLow, token.low)
+    return answered(move reply)
+}
+
+// `Surface.import` and `Fence.import`: the descriptor, its rights and its
+// description, once.
+function importToken(manager: borrow mut Manager, request: borrow Request) -> Answer {
+    let index = try tokenIndex(manager, request.token) otherwise return refuse(.TokenSpent, U64(0))
+    let pending = manager.tokens[index]
+    removeToken(manager, index)
+    let descriptor = try pending.descriptor otherwise return refuse(.TokenExpired, U64(0))
+    let moment = match now() {
+        Ok(value) -> value
+        Error(failed) -> return refusedAfterClosing(descriptor, failed)
+    }
+    if pending.expiry <= moment {
+        closeDescriptor(descriptor)
+        return refuse(.TokenExpired, U64(0))
+    }
+    let reply = replyBlock()
+    blockStore<U32>(reply, ReplyAt.kind, pending.kind)
+    blockStore<U64>(reply, ReplyAt.rights, pending.rights)
+    for (position, byte) in pending.payload.enumerated() {
+        blockStore<U8>(reply, Wire.payloadAt + position, byte)
+    }
+    return Answer { reply: move reply, passing: .Some(descriptor) }
+}

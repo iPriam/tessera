@@ -1,0 +1,152 @@
+import Foundation
+import RenderBox
+
+// `clearMode`: a clear or tinted icon. Its groups are drawn as a mask, how
+// much each place lightens in the red, how much it darkens in the green and
+// how much it is highlighted in the blue; the composite then lays the mask
+// over the glass the icon is shown on, lightening and highlighting through
+// colour matrices and darkening by subtraction.
+
+// The mask's channels as the composite reads them: lightening and
+// highlights as they are, the green turned from how much is left undarkened
+// into how much to darken.
+function maskStrengths() -> [Number] {
+    let lighten = ClearModeDefaults.totalLighteningStrength
+    let darken = ClearModeDefaults.totalDarkeningStrength
+    let highlight = ClearModeDefaults.totalHighlightsStrength
+    return [
+        lighten, 0, 0, 0, 0,
+        0, -darken, 0, 0, darken,
+        0, 0, highlight, 0, 0,
+        0, 0, 0, 1, 0
+    ]
+}
+
+// Under a mask's groups: nothing lightened, nothing darkened.
+function maskGround() -> Background {
+    let undarkened = RGBAColor { r: 0, g: 1, b: 0, a: 1 }
+    return Background {
+        top: copy undarkened,
+        bottom: copy undarkened,
+        space: .StandardRgb,
+        start: Point { x: 0, y: 0 },
+        end: Point { x: 0, y: IconGeometry.canvas }
+    }
+}
+
+// The mask, placed as the icon is in an image `frame.side` across.
+function maskList(
+    groups: borrow [GroupImages],
+    context: borrow GlassContext,
+    frame: borrow IconFrame
+) -> Result<LayerContents, IconRenderFailure> {
+    let list = DisplayList()
+    placeIcon(list, frame)
+    list.addColorMatrixFilter(maskStrengths(), ColorFilterFlags.none)
+    list.addColorClampFilter(clear(), white(), .Device)
+    list.beginLayer(LayerFlags.none)
+    try drawGroups(list, groups, maskGround(), context)
+    try listDrawn(drawEdgeHighlights(list, context.size, .Clear))
+    try listDrawn(list.drawLayer(1, .Normal))
+    return .Ok(list.moveContents())
+}
+
+// The rendered mask over the whole image, whatever the transform.
+function drawMask(
+    list: borrow DisplayList,
+    mask: borrow TextureImage,
+    side: Number
+) -> Result<Void, IconRenderFailure> {
+    list.save()
+    list.setTransform(AffineTransform {})
+    let frame = Rect { width: side, height: side }
+    list.drawShape(rectShape(frame), imageFill(mask, frame), 1, .Normal)
+    return listDrawn(list.restore())
+}
+
+// The matrix making white as opaque as one of the mask's channels.
+function maskCoverage(channel: Number) -> [Number] {
+    var alphaRow: [Number] = [0, 0, 0, 0, 0]
+    alphaRow[channel] = 1
+    var matrix: [Number] = [0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
+    matrix.appendAll(alphaRow)
+    return matrix
+}
+
+namespace MaskChannel {
+    let lightening: Number = 0
+    let highlights: Number = 2
+}
+
+// What is under the mask's `channel`, as much as it covers, through `vcm`.
+function drawMaskPass(
+    list: borrow DisplayList,
+    mask: borrow TextureImage,
+    side: Number,
+    channel: Number,
+    vcm: borrow Vcm
+) -> Result<Void, IconRenderFailure> {
+    list.save()
+    list.beginLayer(LayerFlags.none)
+    list.save()
+    list.addColorMatrixFilter(maskCoverage(channel), ColorFilterFlags.none)
+    list.beginLayer(LayerFlags.none)
+    try drawMask(list, mask, side)
+    try listDrawn(list.drawLayer(1, .Normal))
+    try listDrawn(list.restore())
+    try listDrawn(list.clipLayer(1, .Normal))
+    list.addContentHeadroom(vcm.headroom)
+    list.addColorClampFilter(
+        clear(),
+        RGBAColor { r: vcm.headroom, g: vcm.headroom, b: vcm.headroom, a: 1 },
+        .LinearDisplayP3
+    )
+    list.addColorMatrixFilter(vcmMatrix(vcm), ColorFilterFlags.none)
+    list.beginLayer(LayerFlags.needsBackground)
+    try listDrawn(list.drawLayer(1, .Normal))
+    return listDrawn(list.restore())
+}
+
+// `darkeningUsesVCM` off: the mask's darkening taken from what is under it.
+function drawMaskDarkening(
+    list: borrow DisplayList,
+    mask: borrow TextureImage,
+    side: Number
+) -> Result<Void, IconRenderFailure> {
+    let rest: [Number] = [0, -1, 0, 0, 1]
+    var matrix: [Number] = []
+    for _ in 0..3 { matrix.appendAll(rest) }
+    matrix.appendAll([0, 0, 0, 1, 0])
+    list.save()
+    list.addColorMatrixFilter(move matrix, ColorFilterFlags.none)
+    list.beginLayer(LayerFlags.none)
+    try drawMask(list, mask, side)
+    try listDrawn(list.drawLayer(1, .PlusDarker))
+    return listDrawn(list.restore())
+}
+
+// The clear mode composite: the chiclet's shadow, then inside it the glass,
+// lightened, darkened and highlighted by the mask, `passOrder` lighten
+// first.
+function maskedCompositeList(
+    mask: borrow TextureImage,
+    glass: borrow Background,
+    context: borrow GlassContext,
+    frame: borrow IconFrame
+) -> Result<LayerContents, IconRenderFailure> {
+    let list = DisplayList()
+    list.save()
+    placeIcon(list, frame)
+    list.addContentHeadroom(IconGeometry.headroom)
+    if frame.chicletShadow { try listDrawn(drawChicletShadow(list, context.size)) }
+    list.clipShape(chicletShape(), 1, .Normal)
+    list.beginLayer(LayerFlags.none)
+    drawBackground(list, glass)
+    let side = frame.side
+    try drawMaskPass(list, mask, side, MaskChannel.lightening, ClearModeDefaults.lighteningVcm)
+    try drawMaskDarkening(list, mask, side)
+    try drawMaskPass(list, mask, side, MaskChannel.highlights, ClearModeDefaults.highlightsVcm)
+    try listDrawn(list.drawLayer(1, .Normal))
+    try listDrawn(list.restore())
+    return .Ok(list.moveContents())
+}

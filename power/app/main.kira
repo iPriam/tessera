@@ -1,0 +1,29 @@
+import Foundation
+import LibTessera
+
+// power: the Power service (roadmap/17-devicekit.md §25).
+//
+// One thread and one LibTessera port. The listener and every connection are
+// waited on with `Object.waitAsync`; refreshes and lock expiries are timed
+// by the port's deadline.
+
+@Main
+function main() {
+    var service = match startService() {
+        Ok(value) -> value
+        Error(failed) -> {
+            log fault("the service could not start", error: errorName(failed))
+            return
+        }
+    }
+    log info(
+        "listening",
+        powerSources: service.devices.sources.count,
+        thermalZones: service.devices.zones.count,
+        clocks: service.devices.clocks.count
+    )
+    match run(service) {
+        Ok -> {}
+        Error(failed) -> log fault("the service cannot continue", error: errorName(failed))
+    }
+}

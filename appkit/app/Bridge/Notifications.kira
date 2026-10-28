@@ -1,0 +1,98 @@
+//! The notifications an application posts, as the platform shows them.
+//!
+//! An application says what it has to say over its link, as it says its menus,
+//! and the running platform draws it as a banner. Like the menus, notifications
+//! are plain values, so any toolkit posts them and any platform shows them.
+//!
+//! Each notification travels as one record; see [`NotificationRecord`].
+
+import Foundation
+import LibTessera
+
+/// One notification: the application that posted it, as PID 1 named it, the
+/// display client number it posted from, and what it says.
+public struct BridgeNotification {
+    /// The display client number of the application that posted the notification.
+    var client: Number = 0
+    /// The application's name, as PID 1 named it.
+    var application: String = ""
+    /// The notification's title.
+    var title: String = ""
+    /// The notification's body.
+    var body: String = ""
+}
+
+/// How a notification travels: one record, its fields separated by a tab.
+///
+///     N <title> <body>
+///
+/// A tab or a line break in either would end its field, so each is sent as a
+/// space, as a menu's title is.
+namespace NotificationRecord {
+    let kind: String = "N"
+}
+
+/// Returns the record for a notification titled `title` saying `body`.
+function encodedNotification(title: borrow String, body: borrow String) -> String {
+    return "\(NotificationRecord.kind)\t\(recordText(title))\t\(recordText(body))"
+}
+
+/// Returns the title and the body a record holds, or `.None` when `text` is not one.
+function decodedNotification(text: borrow String) -> (String, String)? {
+    let fields = text.split(MenuRecord.field)
+    if fields.count != 3 || fields[0] != NotificationRecord.kind { return .None }
+    return .Some((copy fields[1], copy fields[2]))
+}
+
+// --- The application's side ---------------------------------------------------
+
+/// Posts a notification titled `title` saying `body` to the platform.
+///
+/// A notification posted before the application has a link is kept, and sent
+/// when one is made.
+///
+/// # Errors
+///
+/// Returns `.Broken` when a link cannot take the notification.
+public function postNotification(
+    handle: BridgeHandle,
+    title: borrow String,
+    body: borrow String
+) -> Result<Void, BridgeFailure> {
+    let record = encodedNotification(title, body)
+    if handle.bridge.links.count == 0 {
+        handle.bridge.unsent.append(record)
+        return .Ok
+    }
+    for link in handle.bridge.links {
+        match writeLink(link.channel, .Notify, record.utf8().count, record) {
+            Ok -> {}
+            Error(failure) -> return .Error(.Broken(failure))
+        }
+    }
+    return .Ok
+}
+
+/// Sends the notifications posted before there was a link, on `channel`, oldest first.
+function sendUnsent(bridge: borrow mut Bridge, channel: Handle) -> Result<Void, BridgeFailure> {
+    let unsent = move bridge.unsent
+    bridge.unsent = []
+    for record in unsent {
+        match writeLink(channel, .Notify, record.utf8().count, record) {
+            Ok -> {}
+            Error(failure) -> return .Error(.Broken(failure))
+        }
+    }
+    return .Ok
+}
+
+// --- The platform's side ---------------------------------------------------------
+
+/// Returns the notifications that arrived since the last call, in the order posted.
+///
+/// The caller is then responsible for showing them.
+public function takeNotifications(handle: BridgeHandle) -> [BridgeNotification] {
+    let taken = move handle.bridge.notifications
+    handle.bridge.notifications = []
+    return taken
+}

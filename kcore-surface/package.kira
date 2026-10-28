@@ -1,0 +1,15 @@
+// KCoreSurface — the types the display protocol is spoken in.
+//
+// One library, no behaviour: handles, bands, channels, buffers, textures, and
+// the device-pixel geometry they carry. MosaicDisplay, Kira UI, and the Dynamic Platforms
+// all import it so a surface handle minted on one side is the same type read on
+// the other, rather than three copies of a struct that drift.
+//
+// It is the bottom of the display stack and depends on nothing above the standard
+// library: a type here cannot reach a compositor, a service, or a platform, which
+// is what keeps the layer a type set rather than a second place policy lives.
+construct KCoreSurface extends Package {
+    let version: String = "0.1.0"
+    let kind: PackageKind = .Library
+    let moduleRoot: String = "KCoreSurface"
+}

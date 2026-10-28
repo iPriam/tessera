@@ -1,0 +1,93 @@
+//! Tests of Focus: the schedule's times, and the manual choice over it.
+import Foundation
+import PlatformKit
+
+/// Ten at night until seven in the morning: the schedule the focus tests share.
+let night: FocusSchedule = FocusSchedule { start: 22 * 60, end: 7 * 60 }
+
+/// The moment at `minute` on day `day`, for the schedule's checks.
+function at(day: Number, minute: Number) -> FocusMoment {
+    return FocusMoment {
+        millis: day + minute * FocusDay.millisPerMinute,
+        minute: minute % FocusDay.minutes
+    }
+}
+
+/// A schedule that runs past midnight covers both sides of it, and a day schedule covers only its own hours.
+@Test
+function aScheduleThroughMidnightCoversBothSides() {
+    expect!(night.covers(23 * 60))
+    expect!(night.covers(3 * 60))
+    expect!(!night.covers(7 * 60))
+    expect!(!night.covers(12 * 60))
+    expect!(night.covers(22 * 60))
+    let day = FocusSchedule { start: 9 * 60, end: 17 * 60 }
+    expect!(day.covers(9 * 60))
+    expect!(!day.covers(17 * 60))
+    let none = FocusSchedule { start: 60, end: 60 }
+    expect!(!none.covers(60))
+}
+
+/// The next boundary is the nearer of the schedule's start and end.
+@Test
+function theNextBoundaryIsTheNearerOfStartAndEnd() {
+    expect!(night.minutesToBoundary(21 * 60) == 60)
+    expect!(night.minutesToBoundary(6 * 60) == 60)
+    expect!(night.minutesToBoundary(22 * 60) == 9 * 60)
+}
+
+/// A Control Center choice holds until the schedule next changes.
+@Test
+function controlCenterHoldsUntilTheScheduleNextChanges() {
+    let choice = FocusChoice { schedule: .Some(night) }
+    let evening = at(0, 23 * 60)
+    expect!(choice.active(evening))
+    let off = choice.toggled(evening)
+    expect!(!off.active(evening))
+    expect!(!off.active(at(0, 23 * 60 + 30)))
+    // At seven the schedule ends and the choice with it; at ten it starts.
+    expect!(!off.active(at(0, 24 * 60 + 7 * 60)))
+    expect!(off.active(at(0, 24 * 60 + 22 * 60)))
+}
+
+/// With no schedule, a Control Center choice holds for good.
+@Test
+function withNoScheduleTheSwitchHoldsForGood() {
+    let choice = FocusChoice {}
+    let noon = at(0, 12 * 60)
+    expect!(!choice.active(noon))
+    let on = choice.toggled(noon)
+    expect!(on.active(at(100 * 24 * 60 * FocusDay.millisPerMinute, 12 * 60)))
+    expect!(!on.toggled(noon).active(noon))
+}
+
+/// Applications on the allowed list still show their banners while Focus is on.
+@Test
+function allowedApplicationsStillShowBanners() {
+    let choice = FocusChoice { schedule: .Some(night), allowed: ["Clock"] }
+    let late = at(0, 23 * 60)
+    expect!(choice.holds("Notes", late))
+    expect!(!choice.holds("Clock", late))
+    expect!(!choice.holds("Notes", at(0, 12 * 60)))
+}
+
+/// Schedules and choices read back as they were written, and malformed text reads as none.
+@Test
+function schedulesAndChoicesReadBackAsWritten() {
+    expect!(focusScheduleText(night) == "22:00-07:00")
+    let read = match focusScheduleFrom("22:00-07:00") {
+        Some(schedule) -> schedule.start == night.start && schedule.end == night.end
+        None -> false
+    }
+    expect!(read)
+    expect!(focusScheduleFrom("25:00-07:00").isNone())
+    expect!(focusScheduleFrom("22:00").isNone())
+    let manual = FocusOverride { on: true, until: .Some(1234) }
+    expect!(focusOverrideText(manual) == "on 1234")
+    let back = match focusOverrideFrom("off") {
+        Some(chosen) -> !chosen.on && chosen.until.isNone()
+        None -> false
+    }
+    expect!(back)
+    expect!(focusOverrideFrom("maybe").isNone())
+}

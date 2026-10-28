@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<klist version="1">
+<dict>
+    <!-- The CalVer (YYYYMMW) of this LibTessera build, reported as the OS
+         version until the image carries one of its own. -->
+    <number key="BundleVersion">2026101</number>
+    <!-- The version of the ABI applications link against. -->
+    <number key="ABIVersion">1</number>
+</dict>
+</klist>

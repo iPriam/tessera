@@ -1,0 +1,225 @@
+import Foundation
+import Heap
+import LibTessera
+
+// The broker's wire to the services. Every connection reaches the broker
+// where LibTessera's `brokerListen` listens; a client's connection is its
+// System channel, which speaks Channel messages (`System.kira`). A
+// service's is its check-in, on which every message is 256 bytes, with at
+// most one Channel riding along:
+//
+//     check-in     @0 op 1  @8 name length  @16 name (96 bytes)
+//     reply        @0 op  @4 code
+//     connection   @0 op 16  @8 client process  @16 program length
+//                  @24 program (232 bytes)
+//     post         @0 op 17  @8 body length  @16 ordinal
+//                  @24 entitlement length  @32 entitlement (64 bytes)
+//                  @96 body (160 bytes)
+//
+// A check-in connection stays open for as long as the service runs. The
+// broker sends a `Connection` down it, with the service's end of a new
+// channel, for every client that reaches it, and the service sends `Post`
+// up it.
+//
+// The layout is LibTessera's `Channel/Service.kira`; the two change
+// together. How either kind of message travels is the library's.
+
+namespace CheckInWire {
+    let messageBytes: Number = 256
+    let nameBytes: Number = 96
+    let programBytes: Number = 232
+    let entitlementBytes: Number = 64
+    let bodyBytes: Number = 160
+}
+
+// A reply, and the operation code every message starts with.
+@FFI.Struct { layout: c }
+struct ReplyHead {
+    var operationCode: U32
+    var code: U32
+}
+
+@FFI.Struct { layout: c }
+struct CheckInHead {
+    var operationCode: U32
+    var nameLength: U64
+}
+
+@FFI.Struct { layout: c }
+struct ConnectionHead {
+    var operationCode: U32
+    var process: U64
+    var programLength: U64
+}
+
+@FFI.Struct { layout: c }
+struct PostHead {
+    var operationCode: U32
+    var bodyLength: U64
+    var ordinal: U64
+    var entitlementLength: U64
+}
+
+namespace CheckInField {
+    let nameAt: Number = 16
+    let programAt: Number = 24
+    let entitlementAt: Number = 32
+    let bodyAt: Number = 96
+}
+
+@Derive(Copy)
+@Derive(CaseIterable)
+enum CheckInOp: UN32 {
+    CheckIn = 1
+    Connection = 16
+    // A service's event, which the broker sends on every System channel whose
+    // program holds the entitlement it names (`System.kira`).
+    Post = 17
+}
+
+// A service's event: its ordinal, who may hear it, and its body, which
+// stays in the block it was read into.
+struct PostedEvent {
+    let ordinal: Number
+    let entitlement: String?
+    let body: Buffer
+}
+
+// What a message on the check-in wire asks.
+enum CheckInRequest {
+    // To check in as the named service.
+    CheckIn(String)
+    Post(PostedEvent)
+    // A check-in without a name, or a post longer than the wire carries.
+    Malformed(UN32)
+    // An operation a service does not send.
+    Unsupported(UN32)
+}
+
+// The text of `length` bytes at `offset`, or none when there are none.
+function wireText(block: RawPtr, offset: Number, length: Number) -> String? {
+    if length == 0 { return .None }
+    return .Some(stringFromCBytes(heapOffset(block, offset), length))
+}
+
+// The request in a check-in message read into `block`.
+function checkInRequest(block: RawPtr) -> CheckInRequest {
+    let reply: ReplyHead = heapLoad(block)
+    let operationCode = reply.operationCode
+    let operation = try caseWithCode(
+        allCases_CheckInOp(),
+        operationCode
+    ) otherwise return .Unsupported(operationCode)
+    match operation {
+        CheckIn -> {
+            let head: CheckInHead = heapLoad(block)
+            if head.nameLength > CheckInWire.nameBytes { return .Malformed(operationCode) }
+            match wireText(block, CheckInField.nameAt, head.nameLength) {
+                Some(name) -> return .CheckIn(name)
+                None -> return .Malformed(operationCode)
+            }
+        }
+        Post -> {
+            let head: PostHead = heapLoad(block)
+            if head.bodyLength > CheckInWire.bodyBytes || head.entitlementLength > CheckInWire.entitlementBytes {
+                return .Malformed(operationCode)
+            }
+            return .Post(
+                PostedEvent {
+                    ordinal: head.ordinal,
+                    entitlement: wireText(
+                        block,
+                        CheckInField.entitlementAt,
+                        head.entitlementLength
+                    ),
+                    body: Buffer {
+                        address: heapOffset(block, CheckInField.bodyAt),
+                        length: head.bodyLength
+                    },
+                }
+            )
+        }
+        Connection -> return .Unsupported(operationCode)
+    }
+}
+
+// One message from `connection` into `block`, which holds
+// `CheckInWire.messageBytes`; a System channel's are no longer than that.
+function receiveBrokerMessage(
+    connection: Handle,
+    block: RawPtr
+) -> Result<BrokerMessage, TesseraError> {
+    zeroBytes(block, CheckInWire.messageBytes)
+    return brokerReceive(connection, Buffer { address: block, length: CheckInWire.messageBytes })
+}
+
+// The reply to the check-in message whose operation was `operationCode`.
+function sendCheckInReply(
+    connection: Handle,
+    operationCode: UN32,
+    code: borrow ErrorCode
+) -> Result<Void, TesseraError> {
+    let blockBytes = zeroedBlock(count: CheckInWire.messageBytes, alignment: 16)
+    let block = blockBytes.pointer()
+    heapStore(block, ReplyHead { operationCode: operationCode, code: code.rawValue() })
+    return brokerSend(
+        connection,
+        Buffer { address: block, length: CheckInWire.messageBytes },
+        .None
+    )
+}
+
+// Gives a service `channel`, its end of a new client's, naming the client;
+// a client whose program is not known is named by none.
+function sendConnection(
+    connection: Handle,
+    client: borrow Peer,
+    channel: Handle
+) -> Result<Void, TesseraError> {
+    let blockBytes = zeroedBlock(count: CheckInWire.messageBytes, alignment: 16)
+    let block = blockBytes.pointer()
+    // A zero length says the program is not known.
+    var length = 0
+    match client.program {
+        Some(program) -> {
+            length = min(Number(program.count), CheckInWire.programBytes)
+            copyBytes(heapOffset(block, CheckInField.programAt), program.data, length)
+        }
+        // Nothing is copied, so the length stays zero.
+        None -> {}
+    }
+    heapStore(
+        block,
+        ConnectionHead {
+            operationCode: code(CheckInOp.Connection),
+            process: UNumber(client.process),
+            programLength: UNumber(length),
+        }
+    )
+    return brokerSend(
+        connection,
+        Buffer { address: block, length: CheckInWire.messageBytes },
+        .Some(channel)
+    )
+}
+
+// Whether a connection that failed to read is still open: it had nothing
+// more, or something too long for it.
+function isStillOpen(failed: borrow TesseraError) -> Bool {
+    return failed.code == .ShouldWait || failed.code == .BufferTooSmall
+}
+
+// Closes `handle`; a close that fails is said, since nothing else can be
+// done about it.
+function release(handle: Handle) {
+    match handleClose(handle) {
+        // The handle is closed; there is nothing else to do with it.
+        Ok -> {}
+        Error(failed) -> log warn("could not close a handle", error: errorName(failed))
+    }
+}
+
+// The monotonic clock.
+function now() -> Result<Number, TesseraError> {
+    return timeRead(.Monotonic)
+}

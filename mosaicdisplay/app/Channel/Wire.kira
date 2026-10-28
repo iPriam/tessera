@@ -1,0 +1,150 @@
+import Foundation
+import Heap
+import LibTessera
+import DeviceKit
+import TesseraDisplayClient
+
+// The service's channel to PID 1, and reading and writing messages on
+// channels. The display protocol's messages are TesseraDisplayClient's to
+// encode and decode.
+
+// The ParentChannel PID 1 started this process with (roadmap/16 §11.4). This
+// program did not open it and knows no name for it; it is simply there, and
+// `NotFound` when it is not.
+function serviceChannel() -> Result<Handle, TesseraError> {
+    return match startupHandle(StartupTag.parentChannel) {
+        Some(channel) -> .Ok(channel)
+        None -> .Error(failure(.NotFound))
+    }
+}
+
+function failure(code: borrow ErrorCode) -> TesseraError {
+    return TesseraError {
+        code: code,
+        subsystem: .Display,
+        flags: ErrorFlags.none,
+        detail: UNumber(0)
+    }
+}
+
+function closeHandle(handle: Handle) {
+    match handleClose(handle) {
+        Ok -> {}
+        Error(failed) -> log warn("a handle could not be closed", error: errorName(failed))
+    }
+}
+
+function closeHandles(handles: borrow [Handle]) {
+    if handles.count == 0 { return }
+    match handleCloseMany(handles) {
+        Ok -> {}
+        Error(failed) -> log warn("handles could not be closed", error: errorName(failed))
+    }
+}
+
+function closeRef(ref: Ref) {
+    match refClose(ref) {
+        Ok -> {}
+        Error(failed) -> log warn(
+            "a device reference could not be closed",
+            error: errorName(failed)
+        )
+    }
+}
+
+// One completion off `port`, waiting as long as it takes.
+function nextCompletion(port: Handle) -> Result<Completion, TesseraError> {
+    let waited = try portWait(port, 1, Number(Deadline.infinite))
+    if waited.count == 0 { return .Error(failure(.Internal)) }
+    return .Ok(waited[0])
+}
+
+// The next completion on `port` that is ready, none when none is.
+function readyCompletion(port: Handle) -> Result<Completion?, TesseraError> {
+    return match portWait(port, 1, Deadline.poll) {
+        Ok(taken) -> .Ok(taken.count > 0 ? .Some(taken[0]) : .None)
+        Error(failed) -> failed.code == .Timeout ? .Ok(.None) : .Error(failed)
+    }
+}
+
+// The next completion on `port`, waited for.
+function nextReady(port: Handle) -> Result<Completion?, TesseraError> {
+    return .Ok(.Some(try nextCompletion(port)))
+}
+
+// The completion of the one request just made on `port`, as its answer.
+function awaitAnswer(port: Handle) -> Result<Completion, TesseraError> {
+    let done = try nextCompletion(port)
+    if done.error.code != .Ok { return .Error(done.error) }
+    return .Ok(done)
+}
+
+// The next message on `channel` into `body`, waiting on `reader` for one to
+// arrive. `PeerClosed` once the other end has gone and nothing is left to
+// read. `reader` is not the loop's port, so a read made inside a step of the
+// protocol never takes a completion the loop is waiting for.
+function readMessage(
+    reader: Handle,
+    channel: Handle,
+    body: borrow ByteBlock,
+    handleCapacity: Number
+) -> Result<ReceivedMessage, TesseraError> {
+    while true {
+        match channelRead(
+            channel,
+            Buffer { address: body.pointer(), length: Number(body.count) },
+            handleCapacity
+        ) {
+            Ok(message) -> return .Ok(message)
+            Error(reason) -> if reason.code != .ShouldWait { return .Error(reason) }
+        }
+        try objectWaitAsync(channel, Signals.readable | Signals.peerClosed, .Once, reader, 1)
+        try nextCompletion(reader)
+    }
+    return .Error(failure(.Internal))
+}
+
+// Writes `body` on `channel`, carrying no handle.
+function writeMessage(channel: Handle, body: borrow ByteBlock) -> Result<Void, TesseraError> {
+    let none: [Handle] = []
+    return channelWrite(
+        channel,
+        Buffer { address: body.pointer(), length: Number(body.count) },
+        none
+    )
+}
+
+// What a read from a client gave.
+enum Received {
+    Message(DisplayMessage)
+    // The client closed its end: nothing was received, and nothing will be.
+    Closed
+    // Not a display message: the wrong size or version, an opcode or value
+    // the protocol does not know, or a handle, which no display message
+    // carries — a surface crosses as a DeviceKit token.
+    Invalid
+}
+
+function receive(channel: Handle) -> Received {
+    return match receiveDisplayMessage(channel) {
+        Ok(message) -> .Message(message)
+        Error(reason) -> receiveFailure(reason)
+    }
+}
+
+function receiveFailure(reason: borrow TesseraError) -> Received {
+    if reason.code == .PeerClosed { return .Closed }
+    log warn("a client could not be read", error: errorName(reason))
+    return .Invalid
+}
+
+// Sends a message nothing waits on the outcome of: a client that cannot
+// take it is said, and is left to its session's end. A client that has gone
+// away answers the write with `PeerClosed`, which never ends the display
+// server because one application quit.
+function tell(channel: Handle, message: borrow DisplayMessage) {
+    match sendDisplayMessage(channel, message) {
+        Ok -> {}
+        Error(failed) -> log info("a client could not be told", error: errorName(failed))
+    }
+}

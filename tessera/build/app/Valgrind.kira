@@ -1,0 +1,89 @@
+import Foundation
+import Build
+
+// Valgrind on the machine, for `-valgrind <component>`: knvm's build of it
+// for the target (`knvm valgrind install`), its launcher, memcheck and the two
+// preloads memcheck puts in front of a program, stripped, at the prefix they
+// were built for, glibc's debug information, and a file naming the one
+// program LibTessera starts under memcheck.
+
+namespace ValgrindLayout {
+    // Where the release names that program, by its absolute path;
+    // LibTessera's `ValgrindLaunch.program` names the same.
+    let program: String = "etc/tessera-valgrind"
+    // The prefix knvm configures Valgrind with, which is where it looks for
+    // its tools.
+    let prefix: String = "usr/lib/valgrind"
+    // Where libc6-dbg keeps glibc's debug information, by build ID.
+    let debug: String = "usr/lib/debug"
+}
+
+// The components `-valgrind` may name, and `none`, the fallback: only a
+// program or an application is started as a process of its own.
+function valgrindChoices() -> [String] {
+    var names = ["none"]
+    for component in tesseraComponents() {
+        if component.kind == .Application || component.kind == .Program {
+            names.append(copy component.name)
+        }
+    }
+    return names
+}
+
+// Valgrind's tree for `context`'s architecture, naming `program`, the
+// installed path of what it starts, from the release's root.
+function platformValgrind(
+    graph: borrow mut Graph,
+    context: borrow BuildContext,
+    program: borrow String
+) -> Result<Artifact, String> {
+    let root = match context.host.valgrind(context.architecture) {
+        Ok(found) -> found
+        Error(problem) -> return .Error(
+            "\(problem): run `knvm valgrind install --target \(context.architecture.multiarch()) --sysroot \(stagedSysroot(context.host, context.architecture))` after `kira build sysroot`"
+        )
+    }
+    let architecture = context.architecture.name()
+    let platform = context.architecture.valgrindPlatform()
+    let binaries = [
+        "bin/valgrind",
+        "libexec/valgrind/memcheck-\(platform)",
+        "libexec/valgrind/vgpreload_core-\(platform).so",
+        "libexec/valgrind/vgpreload_memcheck-\(platform).so"
+    ]
+    var parts: [TreePart] = []
+    for binary in binaries {
+        let path = "\(ValgrindLayout.prefix)/\(binary)"
+        let stripped = graph.strip(
+            "\(architecture)/valgrind/\(binary)",
+            graph.source(joinedPath(root, path))
+        )
+        parts.append(.Place(TreePlace { path: path, artifact: stripped.binary }))
+    }
+    let suppressions = "\(ValgrindLayout.prefix)/libexec/valgrind/default.supp"
+    parts.append(
+        .Place(
+            TreePlace {
+                path: suppressions,
+                artifact: graph.source(joinedPath(root, suppressions)),
+                mode: FileMode.data
+            }
+        )
+    )
+    // glibc's debug information, at the build-ID paths memcheck looks under:
+    // it needs the loader's symbols to start, and the C library's name the
+    // frames of an error.
+    let debug = graph.subtree(
+        "\(architecture)/valgrind/debug",
+        context.sysroot.tree,
+        ValgrindLayout.debug
+    )
+    parts.append(.Place(TreePlace { path: ValgrindLayout.debug, artifact: debug }))
+    let named = graph.write(
+        "\(architecture)/valgrind/tessera-valgrind",
+        textLines(["/" + program]),
+        FileMode.data
+    )
+    parts.append(.Place(TreePlace { path: ValgrindLayout.program, artifact: named }))
+    return .Ok(graph.tree("\(architecture)/valgrind", parts))
+}

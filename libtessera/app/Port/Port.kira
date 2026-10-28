@@ -1,0 +1,195 @@
+import Foundation
+
+// Ports (§5): the queue every asynchronous result reaches the process
+// through.
+//
+// A port lives in this process. Its packets are kept in one queue shared by
+// every port, in the order they were posted, and an operation that waits for
+// the kernel is a pending operation (`Pending.kira`) that `Port.wait`
+// advances.
+
+struct QueuedCompletion {
+    var live: Bool
+    var port: Number
+    var source: Number?
+    var user: Bool
+    var completion: Completion
+}
+
+let portUserCapacity: U64 = U64(65536)
+
+// A completion stamped with the monotonic clock.
+function completionMake(
+    key: U64,
+    outcome: borrow Result<Void, TesseraError>,
+    kind: borrow CompletionKind,
+    flags: CompletionFlags,
+    result0: U64,
+    result1: U64,
+    aux: U64
+) -> Completion {
+    return Completion {
+        key: key,
+        error: completionStatus(outcome),
+        kind: kind,
+        flags: flags,
+        result0: result0,
+        result1: result1,
+        aux: aux,
+        timestamp: monotonicNow(),
+    }
+}
+
+// Queues `completion` on the port object `port`. `source` is the pending
+// operation that produced it, if one did.
+function portDeliver(port: Number, completion: borrow Completion, source: Number?) {
+    if port < 0 || !library.objects[port].live || kindOf(library.objects[port].state) != .Port {
+        return
+    }
+    let entry = QueuedCompletion {
+        live: true,
+        port: port,
+        source: source,
+        user: false,
+        completion: completion
+    }
+    library.completions.append(entry)
+    library.liveCompletions += 1
+}
+
+// The operation's result, posted at once: the path every call that does its
+// work at submission takes.
+function portComplete(
+    port: Number,
+    key: U64,
+    outcome: borrow Result<Void, TesseraError>,
+    kind: borrow CompletionKind,
+    result0: U64,
+    result1: U64,
+    aux: U64
+) {
+    portDeliver(
+        port,
+        completionMake(key, outcome, kind, CompletionFlags.none, result0, result1, aux),
+        .None
+    )
+}
+
+function portHasQueued(port: Number) -> Bool {
+    for index in 0..library.completions.count {
+        if library.completions[index].live && library.completions[index].port == port {
+            return true
+        }
+    }
+    return false
+}
+
+// Takes up to `max` packets for `port`, oldest first.
+function portTake(port: Number, max: U32) -> Result<[Completion], TesseraError> {
+    var queue = try portOf(port)
+    var out: [Completion] = []
+    for index in 0..library.completions.count {
+        if U32(out.count) >= max { break }
+        if library.completions[index].live && library.completions[index].port == port {
+            out.append(library.completions[index].completion)
+            library.completions[index].live = false
+            library.liveCompletions -= 1
+            if library.completions[index].user {
+                queue.userQueued -= U64(1)
+            }
+            match library.completions[index].source {
+                Some(source) -> pendingDelivered(source)
+                None -> {}
+            }
+        }
+    }
+    if library.liveCompletions == 0 { library.completions = [] }
+    setPort(port, move queue)
+    return .Ok(out)
+}
+
+// A closed port drops what it held; operations that would have reached it
+// are forgotten.
+function portTeardown(port: Number) {
+    for index in 0..library.completions.count {
+        if library.completions[index].live && library.completions[index].port == port {
+            library.completions[index].live = false
+            library.liveCompletions -= 1
+        }
+    }
+    if library.liveCompletions == 0 { library.completions = [] }
+    pendingForgetPort(port)
+}
+
+// The port object an asynchronous call's completion goes to.
+function portTarget(port: Handle) -> Result<Number, TesseraError> {
+    return resolveObject(port, .Port, Rights.none)
+}
+
+// What a port is made with; there are no options yet.
+@Derive(Copy)
+public enum PortOptions: U32 {
+    None = 0
+}
+
+public function portCreate(options: PortOptions) -> Result<Handle, TesseraError> {
+    let object = objectCreateUnbacked(.Port(PortObject { userQueued: U64(0) }))
+    return handleForNew(object, Rights.processDefault)
+}
+
+// Up to `max` packets, waiting until one is there or `deadline` passes.
+// `deadline` 0 polls.
+public function portWait(
+    port: Handle,
+    max: UNumber,
+    deadline: UNumber
+) -> Result<[Completion], TesseraError> {
+    if max == 0 { return .Error(failure(.InvalidArgument)) }
+    let object = try resolveObject(port, .Port, Rights.wait)
+    while true {
+        pendingAdvance(object)
+        let taken = try portTake(object, max)
+        if taken.count > 0 { return .Ok(taken) }
+        let now = monotonicNow()
+        if deadline != Deadline.infinite && now >= deadline { return .Error(failure(.Timeout)) }
+        pendingBlock(object, deadline, now)
+    }
+    return .Error(failure(.Internal))
+}
+
+// A user packet; `kind` is forced to `User`.
+public function portPost(port: Handle, packet: borrow Completion) -> Result<Void, TesseraError> {
+    let object = try resolveObject(port, .Port, Rights.write)
+    var queue = try portOf(object)
+    if queue.userQueued >= portUserCapacity { return .Error(failure(.ShouldWait)) }
+    let completion = Completion {
+        key: packet.key,
+        error: packet.error,
+        kind: .User,
+        flags: packet.flags,
+        result0: packet.result0,
+        result1: packet.result1,
+        aux: packet.aux,
+        timestamp: monotonicNow(),
+    }
+    library.completions.append(
+        QueuedCompletion {
+            live: true,
+            port: object,
+            source: .None,
+            user: true,
+            completion: completion
+        }
+    )
+    library.liveCompletions += 1
+    queue.userQueued += U64(1)
+    setPort(object, move queue)
+    return .Ok
+}
+
+// Cancels every pending operation reaching `port` with `key`; each still
+// delivers its completion, as `Cancelled`. Answers how many there were.
+public function portCancel(port: Handle, key: UNumber) -> Result<UNumber, TesseraError> {
+    let object = try resolveObject(port, .Port, Rights.none)
+    return .Ok(pendingCancelKey(object, key))
+}

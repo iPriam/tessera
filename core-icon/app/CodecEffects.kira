@@ -1,0 +1,213 @@
+import Foundation
+import Kten
+
+// The glass, blending and placement properties of a `.tessicon` document's
+// groups and layers, in Kten.
+
+// Each blend mode and the case name a document spells it with.
+let blendNames: [(IconBlendMode, String)] = [
+    (.Normal, "Normal"),
+    (.Darken, "Darken"),
+    (.Multiply, "Multiply"),
+    (.PlusDarker, "PlusDarker"),
+    (.ColorBurn, "ColorBurn"),
+    (.Lighten, "Lighten"),
+    (.Screen, "Screen"),
+    (.PlusLighter, "PlusLighter"),
+    (.ColorDodge, "ColorDodge"),
+    (.Overlay, "Overlay"),
+    (.SoftLight, "SoftLight"),
+    (.HardLight, "HardLight"),
+    (.Difference, "Difference"),
+    (.Exclusion, "Exclusion"),
+    (.Hue, "Hue"),
+    (.Saturation, "Saturation"),
+    (.Color, "Color"),
+    (.Luminosity, "Luminosity")
+]
+
+function blendIn(value: borrow Kten) -> Result<IconBlendMode, IconReadFailure> {
+    let variant = try caseIn(value)
+    for (mode, name) in blendNames {
+        if name == variant.name { return .Ok(mode) }
+    }
+    return .Error(.UnknownCase(variant.name))
+}
+
+// The name of `mode`, which the table holds for every case.
+public function blendModeName(mode: IconBlendMode) -> String {
+    for (known, name) in blendNames {
+        if known == mode { return copy name }
+    }
+    return "Normal"
+}
+
+// Every blend mode, in the order Icon Composer's menu lists them.
+public function blendModes() -> [IconBlendMode] {
+    var modes: [IconBlendMode] = []
+    for entry in blendNames { modes.append(entry.0) }
+    return modes
+}
+
+function blendKten(mode: IconBlendMode) -> Kten {
+    return caseKten(blendModeName(mode))
+}
+
+function specularIn(value: borrow Kten) -> Result<IconSpecular, IconReadFailure> {
+    let variant = try caseIn(value)
+    return match variant.name {
+        "Off" -> .Ok(.Off)
+        "Inside" -> .Ok(.Inside)
+        "Outside" -> .Ok(.Outside)
+        else -> .Error(.UnknownCase(variant.name))
+    }
+}
+
+function specularKten(specular: IconSpecular) -> Kten {
+    return caseKten(
+        match specular {
+            Off -> "Off"
+            Inside -> "Inside"
+            Outside -> "Outside"
+        }
+    )
+}
+
+function lightingIn(value: borrow Kten) -> Result<IconLighting, IconReadFailure> {
+    let variant = try caseIn(value)
+    return match variant.name {
+        "Combined" -> .Ok(.Combined)
+        "Individual" -> .Ok(.Individual)
+        else -> .Error(.UnknownCase(variant.name))
+    }
+}
+
+function lightingKten(lighting: IconLighting) -> Kten {
+    return caseKten(
+        match lighting {
+            Combined -> "Combined"
+            Individual -> "Individual"
+        }
+    )
+}
+
+function blurIn(value: borrow Kten) -> Result<IconBlur, IconReadFailure> {
+    let defaults = IconBlur {}
+    return .Ok(
+        IconBlur {
+            enabled: try boolField(value, "enabled", defaults.enabled),
+            amount: try numberField(value, "amount", defaults.amount)
+        }
+    )
+}
+
+function blurKten(blur: borrow IconBlur) -> Kten {
+    return ktenObject(
+        "Blur",
+        [ktenField("enabled", .Bool(blur.enabled)), ktenField("amount", .Number(blur.amount))]
+    )
+}
+
+function refractionIn(value: borrow Kten) -> Result<IconRefraction, IconReadFailure> {
+    let defaults = IconRefraction {}
+    return .Ok(
+        IconRefraction {
+            enabled: try boolField(value, "enabled", defaults.enabled),
+            depth: try numberField(value, "depth", defaults.depth),
+            spread: try numberField(value, "spread", defaults.spread)
+        }
+    )
+}
+
+function refractionKten(refraction: borrow IconRefraction) -> Kten {
+    return ktenObject(
+        "Refraction",
+        [
+            ktenField("enabled", .Bool(refraction.enabled)),
+            ktenField("depth", .Number(refraction.depth)),
+            ktenField("spread", .Number(refraction.spread))
+        ]
+    )
+}
+
+function translucencyIn(value: borrow Kten) -> Result<IconTranslucency, IconReadFailure> {
+    let defaults = IconTranslucency {}
+    return .Ok(
+        IconTranslucency {
+            enabled: try boolField(value, "enabled", defaults.enabled),
+            amount: try numberField(value, "amount", defaults.amount)
+        }
+    )
+}
+
+function translucencyKten(translucency: borrow IconTranslucency) -> Kten {
+    return ktenObject(
+        "Translucency",
+        [
+            ktenField("enabled", .Bool(translucency.enabled)),
+            ktenField("amount", .Number(translucency.amount))
+        ]
+    )
+}
+
+function shadowKindIn(value: borrow Kten) -> Result<IconShadowKind, IconReadFailure> {
+    let variant = try caseIn(value)
+    return match variant.name {
+        "None" -> .Ok(.None)
+        "Neutral" -> .Ok(.Neutral)
+        "Chromatic" -> .Ok(.Chromatic)
+        else -> .Error(.UnknownCase(variant.name))
+    }
+}
+
+function shadowKindKten(kind: IconShadowKind) -> Kten {
+    return caseKten(
+        match kind {
+            None -> "None"
+            Neutral -> "Neutral"
+            Chromatic -> "Chromatic"
+        }
+    )
+}
+
+function shadowIn(value: borrow Kten) -> Result<IconShadow, IconReadFailure> {
+    let defaults = IconShadow {}
+    let kind = match try fieldIn(value, "kind") {
+        Some(named) -> try shadowKindIn(named)
+        None -> defaults.kind
+    }
+    return .Ok(
+        IconShadow { kind: kind, opacity: try numberField(value, "opacity", defaults.opacity) }
+    )
+}
+
+function shadowKten(shadow: borrow IconShadow) -> Kten {
+    return ktenObject(
+        "Shadow",
+        [ktenField("kind", shadowKindKten(shadow.kind)), ktenField(
+            "opacity",
+            .Number(shadow.opacity)
+        )]
+    )
+}
+
+function positionIn(value: borrow Kten) -> Result<IconPosition, IconReadFailure> {
+    return .Ok(
+        IconPosition {
+            scale: try numberField(value, "scale", 1),
+            x: try numberField(value, "x", 0),
+            y: try numberField(value, "y", 0)
+        }
+    )
+}
+
+function positionKten(position: borrow IconPosition) -> Kten {
+    return ktenObject(
+        "Position",
+        [
+            ktenField("scale", .Number(position.scale)),
+            ktenField("x", .Number(position.x)),
+            ktenField("y", .Number(position.y))
+        ]
+    )
+}

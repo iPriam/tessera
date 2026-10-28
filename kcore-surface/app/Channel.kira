@@ -1,0 +1,117 @@
+//! Channels: the values an app declares on a surface for the platform to read.
+//!
+//! The platform reads these values, not the app's widget tree. An app sets a
+//! title, a badge, a focus graph and the rest, and the platform draws the chrome
+//! from them without knowing what drew the surface. The types here are data.
+//! Behaviour that acts on a channel, such as focus navigation or now-playing,
+//! lives in the layers above this library.
+
+import Foundation
+
+/// The posture of a foldable display: its state and, when half open, its hinge angle.
+///
+/// MosaicDisplay owns and reports the posture. It is a value here so a surface
+/// can carry it, and so the adaptive layer can react to it without this library
+/// depending on that layer.
+public enum Posture {
+    /// The fold is closed.
+    Closed
+    /// The fold is half open. The associated number is the hinge angle in degrees.
+    HalfOpen(Number)
+    /// The fold is flat.
+    Flat
+}
+
+/// One region an app publishes for focus navigation.
+///
+/// Each direction names the neighbour focus moves to by id. An absent neighbour
+/// means focus stops at this node's edge. The graph is derived from the app's
+/// focusable widgets rather than written by hand.
+public struct FocusNode {
+    /// The node's id, unique within its graph.
+    var id: FocusNodeId
+    /// The region the node occupies on the surface.
+    var frame: Rect = Rect {}
+    /// The neighbour focus moves to when it goes up, or `.None` at the edge.
+    var up: FocusNodeId? = .None
+    /// The neighbour focus moves to when it goes down, or `.None` at the edge.
+    var down: FocusNodeId? = .None
+    /// The neighbour focus moves to when it goes left, or `.None` at the edge.
+    var left: FocusNodeId? = .None
+    /// The neighbour focus moves to when it goes right, or `.None` at the edge.
+    var right: FocusNodeId? = .None
+}
+
+/// The id of a [`FocusNode`].
+public distinct FocusNodeId = UNumber
+
+/// A surface's focus graph: the set of nodes focus moves between.
+public struct FocusGraph {
+    /// The nodes of the graph, in no particular order.
+    var nodes: [FocusNode] = []
+}
+
+/// The margins a surface must keep clear of system chrome.
+///
+/// An app that draws under a status bar, or around a fold hinge, declares the
+/// margins it needs and the platform leaves that much room. The values are in
+/// the same units as the rest of the geometry.
+public struct Insets {
+    /// The margin at the top edge.
+    var top: Number = 0
+    /// The margin at the right edge.
+    var right: Number = 0
+    /// The margin at the bottom edge.
+    var bottom: Number = 0
+    /// The margin at the left edge.
+    var left: Number = 0
+}
+
+/// What an app tells the platform to show when the app is the one playing media.
+public struct NowPlayingHint {
+    /// The title of the current item.
+    var title: String = ""
+    /// The artist of the current item.
+    var artist: String = ""
+    /// Whether the item is playing rather than paused.
+    var playing: Bool = false
+}
+
+/// The value declared on one channel.
+///
+/// A surface carries a [`ChannelTable`] of these, and the platform reads the
+/// channels it presents.
+public enum Channel {
+    /// The title the platform shows in the chrome.
+    NavigationTitle(String)
+    /// A number the platform shows as a badge.
+    Badge(Number)
+    /// The surface's focus graph.
+    Focus(FocusGraph)
+    /// The margins the surface needs kept clear.
+    SafeAreaNeeds(Insets)
+    /// What the app is playing.
+    NowPlaying(NowPlayingHint)
+    /// The postures the surface supports.
+    SupportsPosture([Posture])
+}
+
+/// The channels a surface has declared, one slot for each well-known channel.
+///
+/// A slot is `.None` until the app declares that channel. The set of channels
+/// is fixed and small, so each is a field the platform reads directly, with no
+/// lookup that can miss.
+public struct ChannelTable {
+    /// The declared navigation title, or `.None`.
+    var navigationTitle: String? = .None
+    /// The declared badge, or `.None`.
+    var badge: Number? = .None
+    /// The declared focus graph, or `.None`.
+    var focusGraph: FocusGraph? = .None
+    /// The declared safe-area needs, or `.None`.
+    var safeAreaNeeds: Insets? = .None
+    /// The declared now-playing hint, or `.None`.
+    var nowPlayingHint: NowPlayingHint? = .None
+    /// The declared postures, or `.None`.
+    var supportsPosture: [Posture]? = .None
+}

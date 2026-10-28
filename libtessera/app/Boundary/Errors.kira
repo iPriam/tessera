@@ -1,0 +1,249 @@
+import Foundation
+
+// Errors (§4). Every call answers with a structured value: what went wrong,
+// which layer said so, and a detail word.
+
+@Derive(Copy)
+@Derive(CaseIterable)
+public enum Subsystem: U16 {
+    LibTessera = 0
+    Kernel = 1
+    Namespace = 2
+    Presence = 3
+    Launcher = 4
+    Devices = 5
+    Network = 6
+    Display = 7
+    Power = 8
+    Audit = 9
+    DeviceKit = 10
+    Pasteboard = 11
+    Trash = 12
+}
+
+@Derive(Copy)
+@Derive(CaseIterable)
+public enum ErrorCode: U32 {
+    Ok = 0
+    InvalidArgument = 1
+    InvalidHandle = 2
+    WrongType = 3
+    AccessDenied = 4
+    NotEntitled = 5
+    OutOfRange = 6
+    BufferTooSmall = 7
+    NameTooLong = 8
+    InvalidPath = 9
+    Unsupported = 10
+    NotFound = 20
+    AlreadyExists = 21
+    Busy = 22
+    BadState = 23
+    ShouldWait = 24
+    Timeout = 25
+    Cancelled = 26
+    PeerClosed = 27
+    OutOfMemory = 30
+    NoSpace = 31
+    QuotaExceeded = 32
+    TooManyHandles = 33
+    NotDirectory = 40
+    IsDirectory = 41
+    NotEmpty = 42
+    ProtectedNode = 43
+    GrantExpired = 44
+    GrantRevoked = 45
+    NoInteraction = 50
+    NotFrontmost = 51
+    NotMainProcess = 52
+    UserDenied = 53
+    ConnectionRefused = 60
+    ConnectionReset = 61
+    Unreachable = 62
+    AddressInUse = 63
+    AddressNotAvailable = 64
+    DeviceLost = 70
+    DeviceBusy = 71
+    FormatUnsupported = 72
+    Overrun = 73
+    Underrun = 74
+    Internal = 90
+    GpuReset = 100
+    ContextLost = 101
+    IncompatibleModifier = 102
+    FenceRegressed = 103
+    NotMaster = 110
+    ModeRejected = 111
+    ScanoutRejected = 112
+    FlipPending = 113
+    TokenExpired = 120
+    TokenSpent = 121
+    TokenNotForYou = 122
+    Suspended = 130
+    Purged = 131
+    IntegrityFailure = 135
+    KeyRejected = 136
+}
+
+// The error every call that has nothing else to answer returns; `code` is `Ok`
+// on success.
+@Derive(Copy)
+public struct TesseraError {
+    var code: ErrorCode
+    var subsystem: Subsystem
+    var flags: ErrorFlags
+    var detail: UNumber
+}
+
+// `TesseraError.flags`: whether the detail word is an audit reference or a
+// backend code, and whether trying again may succeed.
+@Derive(Copy)
+public distinct ErrorFlags = UNumber
+
+public namespace ErrorFlags {
+    let none: ErrorFlags = ErrorFlags(0)
+    let hasAuditRef: ErrorFlags = ErrorFlags(1)
+    let hasBackendCode: ErrorFlags = ErrorFlags(2)
+    let retryable: ErrorFlags = ErrorFlags(4)
+}
+
+public function errorIsOk(error: borrow TesseraError) -> Bool {
+    return error.code == .Ok
+}
+
+// The code a peer wrote as `raw`. A code this library does not know, from a
+// later release, reads as `Internal` rather than stopping the process.
+public function errorCodeFrom(raw: UNumber) -> ErrorCode {
+    return caseWithCode(allCases_ErrorCode(), raw).or(ErrorCode.Internal)
+}
+
+// The subsystem a peer wrote as `raw`; one this library does not know reads
+// as `LibTessera`.
+public function subsystemFrom(raw: UNumber) -> Subsystem {
+    return caseWithCode(allCases_Subsystem(), raw).or(Subsystem.LibTessera)
+}
+
+let ok: TesseraError = TesseraError {
+    code: .Ok,
+    subsystem: .LibTessera,
+    flags: ErrorFlags.none,
+    detail: U64(0)
+}
+
+// Whether `outcome` succeeded, for code that keeps the outcome to pass on.
+function succeeded(outcome: borrow Result<Void, TesseraError>) -> Bool {
+    match outcome {
+        Ok -> return true
+        Error(failed) -> return failed.code == .Ok
+    }
+}
+
+// Whether `outcome` failed with `code`.
+function failedWith(outcome: borrow Result<Void, TesseraError>, code: borrow ErrorCode) -> Bool {
+    match outcome {
+        Ok -> return false
+        Error(failed) -> return failed.code == code
+    }
+}
+
+// The status word a completion carries: `ok` when the call succeeded.
+function completionStatus(outcome: borrow Result<Void, TesseraError>) -> TesseraError {
+    match outcome {
+        Ok -> return ok
+        Error(failed) -> return failed
+    }
+}
+
+// The outcome a completion's status word says.
+function completionOutcome(status: borrow TesseraError) -> Result<Void, TesseraError> {
+    if status.code == .Ok { return .Ok }
+    return .Error(status)
+}
+
+function failure(code: borrow ErrorCode) -> TesseraError {
+    return TesseraError {
+        code: code,
+        subsystem: .LibTessera,
+        flags: ErrorFlags.none,
+        detail: U64(0)
+    }
+}
+
+function failureDetail(code: borrow ErrorCode, detail: U64) -> TesseraError {
+    return TesseraError {
+        code: code,
+        subsystem: .LibTessera,
+        flags: ErrorFlags.none,
+        detail: detail
+    }
+}
+
+function failureIn(code: borrow ErrorCode, subsystem: borrow Subsystem) -> TesseraError {
+    return TesseraError { code: code, subsystem: subsystem, flags: ErrorFlags.none, detail: U64(0) }
+}
+
+// The code's name, for a log line: `NotFound`. The backend's own number,
+// when there is one, stays in `detail`.
+public function errorName(error: borrow TesseraError) -> String {
+    return match error.code {
+        Ok -> "Ok"
+        InvalidArgument -> "InvalidArgument"
+        InvalidHandle -> "InvalidHandle"
+        WrongType -> "WrongType"
+        AccessDenied -> "AccessDenied"
+        NotEntitled -> "NotEntitled"
+        OutOfRange -> "OutOfRange"
+        BufferTooSmall -> "BufferTooSmall"
+        NameTooLong -> "NameTooLong"
+        InvalidPath -> "InvalidPath"
+        Unsupported -> "Unsupported"
+        NotFound -> "NotFound"
+        AlreadyExists -> "AlreadyExists"
+        Busy -> "Busy"
+        BadState -> "BadState"
+        ShouldWait -> "ShouldWait"
+        Timeout -> "Timeout"
+        Cancelled -> "Cancelled"
+        PeerClosed -> "PeerClosed"
+        OutOfMemory -> "OutOfMemory"
+        NoSpace -> "NoSpace"
+        QuotaExceeded -> "QuotaExceeded"
+        TooManyHandles -> "TooManyHandles"
+        NotDirectory -> "NotDirectory"
+        IsDirectory -> "IsDirectory"
+        NotEmpty -> "NotEmpty"
+        ProtectedNode -> "ProtectedNode"
+        GrantExpired -> "GrantExpired"
+        GrantRevoked -> "GrantRevoked"
+        NoInteraction -> "NoInteraction"
+        NotFrontmost -> "NotFrontmost"
+        NotMainProcess -> "NotMainProcess"
+        UserDenied -> "UserDenied"
+        ConnectionRefused -> "ConnectionRefused"
+        ConnectionReset -> "ConnectionReset"
+        Unreachable -> "Unreachable"
+        AddressInUse -> "AddressInUse"
+        AddressNotAvailable -> "AddressNotAvailable"
+        DeviceLost -> "DeviceLost"
+        DeviceBusy -> "DeviceBusy"
+        FormatUnsupported -> "FormatUnsupported"
+        Overrun -> "Overrun"
+        Underrun -> "Underrun"
+        Internal -> "Internal"
+        GpuReset -> "GpuReset"
+        ContextLost -> "ContextLost"
+        IncompatibleModifier -> "IncompatibleModifier"
+        FenceRegressed -> "FenceRegressed"
+        NotMaster -> "NotMaster"
+        ModeRejected -> "ModeRejected"
+        ScanoutRejected -> "ScanoutRejected"
+        FlipPending -> "FlipPending"
+        TokenExpired -> "TokenExpired"
+        TokenSpent -> "TokenSpent"
+        TokenNotForYou -> "TokenNotForYou"
+        Suspended -> "Suspended"
+        Purged -> "Purged"
+        IntegrityFailure -> "IntegrityFailure"
+        KeyRejected -> "KeyRejected"
+    }
+}

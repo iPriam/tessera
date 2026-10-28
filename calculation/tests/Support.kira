@@ -1,0 +1,10 @@
+import Foundation
+
+// What the calculator shows for one expression: the value as exact text, or
+// the message for why there is none.
+function outcome(expression: borrow String) -> String {
+    return match calculate(expression) {
+        Ok(value) -> String(value)
+        Error(failure) -> failureText(failure)
+    }
+}

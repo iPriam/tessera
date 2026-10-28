@@ -1,0 +1,411 @@
+import Foundation
+import Heap
+import LibTessera
+
+// Audio (17 §14.1) over ALSA PCM ioctls, no alsa-lib.
+//
+// The connection's descriptor is the PCM node the manager opened.
+//
+// `struct snd_pcm_hw_params` is 608 bytes: `flags`, three masks (access,
+// format, subformat) of 32 bytes from 4, five reserved masks, then twelve
+// 12-byte intervals from 260 (`min`, `max`, flags with bit 2 `integer`) for
+// parameters 8 to 19, then `rmask` @512 and `cmask` @516.
+
+namespace Pcm {
+    let hwRefine: U64 = U64(0xC2604110)
+    let hwParams: U64 = U64(0xC2604111)
+    let delay: U64 = U64(0x80084121)
+    let prepare: U64 = U64(0x4140)
+    let start: U64 = U64(0x4142)
+    let drop: U64 = U64(0x4143)
+    let writeFrames: U64 = U64(0x40184150)
+    let readFrames: U64 = U64(0x80184151)
+    let paramsBytes: Number = 608
+    // The masks: `SNDRV_PCM_HW_PARAM_ACCESS` 0 and `FORMAT` 1, with
+    // `SNDRV_PCM_ACCESS_RW_INTERLEAVED` 3.
+    let accessMask: Number = 0
+    let formatMask: Number = 1
+    let interleaved: Number = 3
+    // `SNDRV_PCM_HW_PARAM_*` intervals.
+    let channels: Number = 10
+    let rate: Number = 11
+    let periodSize: Number = 13
+    let periods: Number = 15
+    let firstInterval: Number = 8
+    let intervalEnd: Number = 20
+    // The interval flag that asks for whole numbers.
+    let integer: U32 = U32(4)
+    let unbounded: U32 = U32(0xFFFFFFFF)
+}
+
+namespace AudioDefault {
+    let rate: UN32 = 48000
+    let channels: UN32 = 2
+    // A period is 10 ms: a hundredth of the rate.
+    let periodsPerSecond: UN32 = 100
+    let periods: UN32 = 2
+    // How long `stop` with `drain` waits for the device, and how often it
+    // looks.
+    let drainLimit: Number = 2000000000
+    let drainStep: Number = 5000000
+}
+
+// What an Audio connection keeps besides its object.
+struct AudioConnection {
+    var object: Number
+    // The bytes one frame takes, once configured.
+    var frameBytes: Number?
+    var state: AudioState
+    // Frames moved since `start`.
+    var frames: U64
+    var playback: Bool
+}
+
+// A playback PCM's node ends in `p`, a capture PCM's in `c`.
+function isPlayback(object: Number) -> Result<Bool, TesseraError> {
+    let found = try entryNamed(deviceLibrary.objects[object].entry)
+    return match found {
+        Some(entry) -> .Ok(entry.node.or("").endsWith("p"))
+        None -> .Ok(false)
+    }
+}
+
+// An Audio connection's record, made the first time a call needs it.
+function audioOf(object: Number) -> Result<Number, TesseraError> {
+    for (index, audio) in deviceLibrary.audios.enumerated() {
+        if audio.object == object { return .Ok(index) }
+    }
+    let playback = try isPlayback(object)
+    deviceLibrary.audios.append(
+        AudioConnection {
+            object: object,
+            frameBytes: .None,
+            state: .Stopped,
+            frames: U64(0),
+            playback: playback
+        }
+    )
+    return .Ok(deviceLibrary.audios.count - 1)
+}
+
+function resolveAudio(audio: Ref, rights: RefRights) -> Result<Number, TesseraError> {
+    let object = try resolveConnection(audio, .Audio, rights)
+    return audioOf(object)
+}
+
+function audioDevice(index: Number) -> Result<Descriptor, TesseraError> {
+    return deviceOf(deviceLibrary.audios[index].object)
+}
+
+// `AudioConfig.sampleFormat` as `SNDRV_PCM_FORMAT_*`, little-endian.
+function pcmFormat(format: borrow PcmFormat) -> Number {
+    return match format {
+        I16 -> 2
+        I24 -> 6
+        I32 -> 10
+        F32 -> 14
+    }
+}
+
+function sampleBytes(format: borrow PcmFormat) -> Number {
+    return match format {
+        I16 -> 2
+        I24 -> 4
+        I32 -> 4
+        F32 -> 4
+    }
+}
+
+function intervalAt(param: Number) -> Number { return 260 + (param - Pcm.firstInterval) * 12 }
+
+// Every configuration the device allows, as `_snd_pcm_hw_params_any` does.
+function paramsAny(block: RawPtr) {
+    zeroBytes(block, Pcm.paramsBytes)
+    for index in 0..24 { heapStore<U32>(block, 4 + index * 4, Pcm.unbounded) }
+    for param in Pcm.firstInterval..Pcm.intervalEnd {
+        heapStore<U32>(block, intervalAt(param) + 4, Pcm.unbounded)
+    }
+    heapStore<U32>(block, 512, Pcm.unbounded)
+    heapStore<U32>(block, 520, Pcm.unbounded)
+}
+
+function maskOnly(block: RawPtr, mask: Number, bit: Number) {
+    let at = 4 + mask * 32
+    zeroBytes(heapOffset(block, at), 32)
+    heapStore<U32>(block, at + trunc(bit / 32) * 4, U32(1) << U32(bit % 32))
+}
+
+function maskHas(block: RawPtr, mask: Number, bit: Number) -> Bool {
+    return (
+        heapLoad<U32>(block, 4 + mask * 32 + trunc(bit / 32) * 4) & (U32(1) << U32(bit % 32))
+    ) != 0
+}
+
+function setInterval(block: RawPtr, param: Number, low: U32, high: U32) {
+    let at = intervalAt(param)
+    heapStore<U32>(block, at, low)
+    heapStore<U32>(block, at + 4, high)
+    heapStore<U32>(block, at + 8, Pcm.integer)
+}
+
+namespace AudioFormatsRecord {
+    let bytes: Number = 32
+}
+
+// One 32-byte record: the rate, channel and period-size ranges as `u32`
+// pairs, then a `u64` of the sample formats the PCM takes (a bit per
+// `AudioConfig.sampleFormat`).
+public function audioFormats(audio: Ref, out: borrow Buffer) -> Result<Number, TesseraError> {
+    let index = try resolveAudio(audio, RefRights.read)
+    try requireRoom(out, AudioFormatsRecord.bytes)
+    let device = try audioDevice(index)
+    let blockBytes = zeroedBlock(count: Pcm.paramsBytes, alignment: 16)
+    let block = blockBytes.pointer()
+    paramsAny(block)
+    let refined = try device.control(Pcm.hwRefine, block)
+    for (item, param) in [Pcm.rate, Pcm.channels, Pcm.periodSize].enumerated() {
+        heapStore<U32>(out.address, item * 8, heapLoad<U32>(block, intervalAt(param)))
+        heapStore<U32>(out.address, item * 8 + 4, heapLoad<U32>(block, intervalAt(param) + 4))
+    }
+    var formats = U64(0)
+    for format in [PcmFormat.I16, PcmFormat.I24, PcmFormat.I32, PcmFormat.F32] {
+        if maskHas(block, Pcm.formatMask, pcmFormat(format)) {
+            formats = formats | (U64(1) << U64(code(format)))
+        }
+    }
+    heapStore<U64>(out.address, 24, formats)
+    return .Ok(1)
+}
+
+// One `HW_PARAMS` attempt for `config`, with or without its period size.
+function setHardware(
+    device: borrow Descriptor,
+    block: RawPtr,
+    config: borrow AudioConfig,
+    withPeriod: Bool
+) -> Result<Number, TesseraError> {
+    paramsAny(block)
+    maskOnly(block, Pcm.accessMask, Pcm.interleaved)
+    maskOnly(block, Pcm.formatMask, pcmFormat(config.sampleFormat))
+    setInterval(block, Pcm.channels, config.channels, config.channels)
+    setInterval(block, Pcm.rate, config.sampleRate, config.sampleRate)
+    setInterval(block, Pcm.periods, config.periods, Pcm.unbounded)
+    if withPeriod { setInterval(block, Pcm.periodSize, config.periodFrames, config.periodFrames) }
+    return device.control(Pcm.hwParams, block)
+}
+
+// `config` as asked, then without its period size when that is refused.
+function setHardwareNear(
+    device: borrow Descriptor,
+    block: RawPtr,
+    config: borrow AudioConfig
+) -> Result<Number, TesseraError> {
+    return match setHardware(device, block, config, true) {
+        Ok(value) -> .Ok(value)
+        Error(failed) -> setHardware(device, block, config, false)
+    }
+}
+
+// Zero fields mean 48 kHz, stereo, 10 ms periods, two periods.
+function withDefaults(config: borrow AudioConfig) -> AudioConfig {
+    var filled = config
+    if filled.sampleRate == 0 { filled.sampleRate = AudioDefault.rate }
+    if filled.channels == 0 { filled.channels = AudioDefault.channels }
+    if filled.periodFrames == 0 {
+        // A period is whole frames: a rate that is no whole number of
+        // hundreds gives the frames below its hundredth.
+        filled.periodFrames = UN32(trunc(filled.sampleRate / AudioDefault.periodsPerSecond))
+    }
+    if filled.periods < AudioDefault.periods { filled.periods = AudioDefault.periods }
+    return filled
+}
+
+// Sets the hardware parameters. A period size the device will not take is
+// dropped for its nearest, and the answer says which it chose.
+public function audioConfigure(
+    audio: Ref,
+    config: borrow AudioConfig
+) -> Result<AudioConfig, TesseraError> {
+    let index = try resolveAudio(audio, RefRights.write)
+    if deviceLibrary.audios[index].state == .Running { return .Error(failure(.BadState)) }
+    let device = try audioDevice(index)
+    var chosen = withDefaults(config)
+    let blockBytes = zeroedBlock(count: Pcm.paramsBytes, alignment: 16)
+    let block = blockBytes.pointer()
+    match setHardwareNear(device, block, chosen) {
+        Ok(value) -> {}
+        Error(failed) -> {
+            match errnoOf(failed) {
+                Invalid -> return .Error(failure(.FormatUnsupported, Number(code(Errno.Invalid))))
+                else -> return .Error(failed)
+            }
+        }
+    }
+    chosen.periodFrames = heapLoad<U32>(block, intervalAt(Pcm.periodSize))
+    chosen.periods = heapLoad<U32>(block, intervalAt(Pcm.periods))
+    deviceLibrary.audios[index].frameBytes = .Some(
+        sampleBytes(chosen.sampleFormat) * Number(chosen.channels)
+    )
+    deviceLibrary.audios[index].state = .Stopped
+    deviceLibrary.audios[index].frames = U64(0)
+    let prepared = try device.controlValue(Pcm.prepare, 0)
+    return .Ok(chosen)
+}
+
+// Capture starts here. Playback starts with the first frames written: the
+// kernel's start threshold after `configure` is one frame.
+public function audioStart(audio: Ref) -> Result<Void, TesseraError> {
+    let index = try resolveAudio(audio, RefRights.write)
+    if deviceLibrary.audios[index].frameBytes.isNone() { return .Error(failure(.BadState)) }
+    if !deviceLibrary.audios[index].playback {
+        let device = try audioDevice(index)
+        match device.controlValue(Pcm.start, 0) {
+            Ok(started) -> {}
+            Error(failed) -> {
+                match errnoOf(failed) {
+                    // Already running.
+                    BadDescriptorState -> {}
+                    else -> return .Error(failed)
+                }
+            }
+        }
+    }
+    deviceLibrary.audios[index].state = .Running
+    deviceLibrary.audios[index].frames = U64(0)
+    return .Ok
+}
+
+// Frames between the call and the speaker or from the microphone.
+function delayFrames(device: borrow Descriptor) -> Result<Number, TesseraError> {
+    let blockBytes = zeroedBlock(count: 8, alignment: 16)
+    let block = blockBytes.pointer()
+    let read = try device.control(Pcm.delay, block)
+    return .Ok(Number(signedOf(heapLoad<U64>(block, 0))))
+}
+
+// Waits, up to two seconds, for what was written to play out.
+function drainPlayback(device: borrow Descriptor) -> Result<Void, TesseraError> {
+    let start = try monotonicNow()
+    let deadline = start + AudioDefault.drainLimit
+    while true {
+        let delay = try delayFrames(device)
+        if delay <= 0 { return .Ok }
+        let now = try monotonicNow()
+        if now >= deadline { return .Ok }
+        pause(AudioDefault.drainStep)
+    }
+    return .Ok
+}
+
+// With `drain`, waits for what was written to play out first. The PCM is
+// prepared again either way, ready for the next `start`.
+public function audioStop(audio: Ref, drain: Bool) -> Result<Void, TesseraError> {
+    let index = try resolveAudio(audio, RefRights.write)
+    let device = try audioDevice(index)
+    if drain && deviceLibrary.audios[index].playback { try drainPlayback(device) }
+    let dropped = try device.controlValue(Pcm.drop, 0)
+    deviceLibrary.audios[index].state = .Stopped
+    let prepared = try device.controlValue(Pcm.prepare, 0)
+    return .Ok
+}
+
+// After an xrun the PCM is prepared again, and a capture PCM restarted, so
+// the next call carries on.
+function recoverXrun(device: borrow Descriptor, output: Bool) -> Result<Void, TesseraError> {
+    let prepared = try device.controlValue(Pcm.prepare, 0)
+    if !output { let started = try device.controlValue(Pcm.start, 0) }
+    return .Ok
+}
+
+// One `WRITEI` or `READI` of whole frames (`struct snd_xferi`: the result
+// @0, the buffer @8, the frames @16). `ShouldWait` when the device has no
+// room or nothing yet; `Underrun` or `Overrun` after an xrun.
+function transferFrames(
+    index: Number,
+    frames: borrow Buffer,
+    output: Bool
+) -> Result<Number, TesseraError> {
+    let frameBytes = try deviceLibrary.audios[index].frameBytes otherwise return .Error(
+        failure(.BadState)
+    )
+    if deviceLibrary.audios[index].playback != output { return .Error(failure(.WrongType)) }
+    let count = floor(frames.length / frameBytes)
+    if count == 0 { return .Ok(0) }
+    let object = deviceLibrary.audios[index].object
+    let device = try deviceOf(object)
+    let blockBytes = zeroedBlock(count: 24, alignment: 16)
+    let block = blockBytes.pointer()
+    heapStore<RawPtr>(block, 8, frames.address)
+    heapStore<U64>(block, 16, U64(count))
+    match device.control(output ? Pcm.writeFrames : Pcm.readFrames, block) {
+        Ok(done) -> {}
+        Error(failed) -> {
+            match errnoOf(failed) {
+                Again -> return .Error(failure(.ShouldWait))
+                BrokenPipe -> {
+                    deviceLibrary.audios[index].state = .Xrun
+                    try recoverXrun(device, output)
+                    return .Error(failure(output ? .Underrun : .Overrun))
+                }
+                NoDevice -> deviceLibrary.objects[object].state = .Lost
+                InputOutput -> deviceLibrary.objects[object].state = .Lost
+                // Any other failure leaves the device as it was; the caller
+                // hears of it.
+                else -> {}
+            }
+            return .Error(failed)
+        }
+    }
+    let moved = heapLoad<U64>(block, 0)
+    deviceLibrary.audios[index].state = .Running
+    deviceLibrary.audios[index].frames += moved
+    return .Ok(Number(moved))
+}
+
+public function audioWrite(audio: Ref, frames: borrow Buffer) -> Result<Number, TesseraError> {
+    let index = try resolveAudio(audio, RefRights.write)
+    return transferFrames(index, frames, true)
+}
+
+public function audioRead(audio: Ref, frames: borrow Buffer) -> Result<Number, TesseraError> {
+    let index = try resolveAudio(audio, RefRights.read)
+    return transferFrames(index, frames, false)
+}
+
+public function audioPosition(audio: Ref) -> Result<AudioPosition, TesseraError> {
+    let index = try resolveAudio(audio, RefRights.read)
+    let device = try audioDevice(index)
+    // A PCM that is not running has nothing in flight.
+    let delay = match delayFrames(device) {
+        Ok(value) -> value < 0 ? 0 : value
+        Error(failed) -> {
+            match errnoOf(failed) {
+                BadDescriptorState -> 0
+                else -> return .Error(failed)
+            }
+        }
+    }
+    return .Ok(
+        AudioPosition {
+            frames: deviceLibrary.audios[index].frames,
+            delay: U32(delay),
+            state: deviceLibrary.audios[index].state,
+            timestamp: U64(try monotonicNow()),
+        }
+    )
+}
+
+function audioRelease(object: Number) {
+    match deviceLibrary.objects[object].device {
+        Some(device) -> match device.controlValue(Pcm.drop, 0) {
+            Ok(dropped) -> {}
+            Error(failed) -> log debug("a PCM did not stop as it closed", error: errorName(failed))
+        }
+        None -> {}
+    }
+    var kept: [AudioConnection] = []
+    for audio in deviceLibrary.audios {
+        if audio.object != object { kept.append(audio) }
+    }
+    deviceLibrary.audios = kept
+}

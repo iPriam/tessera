@@ -1,0 +1,64 @@
+import Foundation
+import KiraUI
+
+// The home indicator (roadmap/11-adaptive-desktop.md, "The Dock"): the bar
+// along the bottom of a touch screen while an application fills it, as an
+// iPad's and an iPhone's. Tapping it, or the band it stands in, goes home.
+
+// How the home indicator is laid out, in points.
+namespace HomeIndicatorMetrics {
+    // The bar, and how far it floats above the bottom edge.
+    let width: Number = 140
+    let height: Number = 5
+    let margin: Number = 8
+    // The band along the bottom of the screen that takes a tap on it: the
+    // bar, and room round it for a finger.
+    let band: Number = 24
+}
+
+let homeIndicatorHit: RGBAColor = RGBAColor { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }
+
+// The bar along the bottom edge of a touch screen that says the screen above
+// it can be swiped away: on the lock screen, and over an application, in
+// `ink`, which turns dark over a light picture as an iPad's does.
+public construct HomeIndicatorBar(
+    ink: RGBAColor = RGBAColor { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }
+) extends Widget {
+    body {
+        Capsule()
+        .fill(ink)
+        .width(resolvedLength(HomeIndicatorMetrics.width))
+        .height(resolvedLength(HomeIndicatorMetrics.height))
+    }
+}
+
+// The band the home indicator takes along the bottom of the screen.
+public function homeIndicatorBand() -> Number {
+    return HomeIndicatorMetrics.band
+}
+
+// The home indicator along the bottom of the screen; `home` is what tapping
+// it does, and `ink` its bar's.
+public construct HomeIndicator(
+    home: () -> Void,
+    ink: RGBAColor = RGBAColor { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }
+) extends Widget {
+    body {
+        VStack(alignment = .Center) {
+            Spacer()
+            ZStack(alignment = .Bottom) {
+                Rectangle()
+                .fill(homeIndicatorHit)
+                .fillWidth()
+                .height(resolvedLength(HomeIndicatorMetrics.band))
+                HomeIndicatorBar(ink = ink)
+                .edgePadding(EdgeSet.bottom, resolvedLength(HomeIndicatorMetrics.margin))
+            }
+            .fillWidth()
+            .height(resolvedLength(HomeIndicatorMetrics.band))
+            .onClick(home)
+        }
+        .fillWidth()
+        .fillHeight()
+    }
+}

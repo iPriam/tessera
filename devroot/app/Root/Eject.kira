@@ -1,0 +1,145 @@
+import Foundation
+import Heap
+import LibTessera
+
+// Ejecting the dev root volume once a request is done, so the stick is
+// pulled from a machine that has let it go. Pulled while mounted, ext4 shuts
+// the file system down under the mount and the kernel says so at alert level
+// on every request.
+//
+// The Volume service is asked over its own wire, as `diskutil` asks it: a
+// 32-byte header, `op` @0, `code` @4 (an `ErrorCode` value), `a` @8. `List`
+// answers `a` records of 160 bytes, the registry entry @0 and the mount
+// point @96, NUL-padded to 64 bytes; `Eject` carries the entry in `a`. The
+// service answers once and closes the channel.
+
+namespace EjectWire {
+    let list: UN32 = 1
+    let eject: UN32 = 4
+    let headerBytes: Number = 32
+    let recordBytes: Number = 160
+    let mountPoint: Number = 96
+    let textBytes: Number = 64
+    let answerBytes: Number = 65536
+    let alignment: Number = 16
+    // The service scans every disk before it answers anyone.
+    let answerWait: Number = 30000000000
+    let readyKey: Number = 1
+}
+
+@FFI.Struct { layout: c }
+struct EjectHeader {
+    var operation: U32
+    var code: U32
+    var a: U64
+    var b: U64
+    var c: U64
+}
+
+// One request to the Volume service and the bytes of its answer.
+function askVolume(operation: UN32, a: Number) -> Result<ByteBlock, TesseraError> {
+    let channel = try serviceConnect("tessera.volume")
+    let request = zeroedBlock(count: EjectWire.headerBytes, alignment: EjectWire.alignment)
+    heapStore(
+        request.pointer(),
+        EjectHeader { operation: operation, code: UN32(0), a: a, b: UNumber(0), c: UNumber(0) }
+    )
+    let none: [Handle] = []
+    let answer = zeroedBlock(count: EjectWire.answerBytes, alignment: EjectWire.alignment)
+    let read = exchange(channel, request, answer, none)
+    match handleClose(channel) {
+        Ok -> {}
+        Error(failed) -> log warn(
+            "cannot close the Volume service's channel",
+            error: errorName(failed)
+        )
+    }
+    try read
+    let header: EjectHeader = heapLoad(answer.pointer())
+    if header.code != UN32(0) { return .Error(storageFailure(errorCodeFrom(header.code))) }
+    return .Ok(move answer)
+}
+
+// Writes `request` on `channel` and reads the one answer into `answer`.
+function exchange(
+    channel: Handle,
+    request: borrow ByteBlock,
+    answer: borrow ByteBlock,
+    none: borrow [Handle]
+) -> Result<Void, TesseraError> {
+    try channelWrite(
+        channel,
+        Buffer { address: request.pointer(), length: EjectWire.headerBytes },
+        none
+    )
+    let port = try portCreate(.None)
+    let ready = Signals.readable | Signals.peerClosed
+    let waited = waitReadable(channel, port, ready)
+    release(port)
+    try waited
+    let received = try channelRead(
+        channel,
+        Buffer { address: answer.pointer(), length: EjectWire.answerBytes },
+        UN32(0)
+    )
+    if received.bytes < EjectWire.headerBytes { return .Error(storageFailure(.InvalidArgument)) }
+    return .Ok
+}
+
+function waitReadable(channel: Handle, port: Handle, ready: Signals) -> Result<Void, TesseraError> {
+    try objectWaitAsync(channel, ready, .Once, port, EjectWire.readyKey)
+    let now = try timeRead(.Monotonic)
+    let woke = try portWait(port, 1, now + EjectWire.answerWait)
+    if woke.count == 0 { return .Error(storageFailure(.Timeout)) }
+    return .Ok
+}
+
+// The registry entry of the volume mounted at `mountPoint`, if one is.
+function volumeMountedAt(mountPoint: borrow String) -> Result<Number?, TesseraError> {
+    let answer = try askVolume(EjectWire.list, 0)
+    let header: EjectHeader = heapLoad(answer.pointer())
+    let held = trunc((EjectWire.answerBytes - EjectWire.headerBytes) / EjectWire.recordBytes)
+    let said = Number(header.a)
+    for index in 0.. (said < held ? said : held) {
+        let record = heapOffset(
+            answer.pointer(),
+            EjectWire.headerBytes + index * EjectWire.recordBytes
+        )
+        if paddedField(record, EjectWire.mountPoint) == mountPoint {
+            let entry: U64 = heapLoad(record)
+            return .Ok(.Some(Number(entry)))
+        }
+    }
+    return .Ok(.None)
+}
+
+// A NUL-padded field of a record, cut at its first NUL.
+function paddedField(record: RawPtr, offset: Number) -> String {
+    for length in 0..EjectWire.textBytes {
+        if heapLoad<U8>(record, offset + length) == UN8(0) {
+            return stringFromCBytes(heapOffset(record, offset), length)
+        }
+    }
+    return stringFromCBytes(heapOffset(record, offset), EjectWire.textBytes)
+}
+
+// Ejects the dev root volume. One already gone has nothing to eject.
+function ejectRequestVolume() {
+    let found = match volumeMountedAt(RequestVolume.path) {
+        Ok(value) -> value
+        Error(failed) -> {
+            log warn(
+                "cannot ask the Volume service for the dev root volume",
+                error: errorName(failed)
+            )
+            return
+        }
+    }
+    match found {
+        Some(entry) -> match askVolume(EjectWire.eject, entry) {
+            Ok -> log info("ejected the dev root volume")
+            Error(failed) -> log warn("cannot eject the dev root volume", error: errorName(failed))
+        }
+        None -> {}
+    }
+}

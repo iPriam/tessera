@@ -1,0 +1,43 @@
+//! The system pasteboard for Kira UI's text fields: copying writes the
+//! Pasteboard service's item, and pasting reads it with the token of the key
+//! press or click that asked, which the service has Presence verify
+//! (roadmap/23-product-experience.md §5.1). An application in the background
+//! has no such token, so it cannot read what was copied.
+
+import Foundation
+import KiraUI
+import LibTessera
+
+/// Tells Kira UI how its fields reach the Pasteboard service.
+function usePasteboardService() {
+    pasteboardAccessSet(
+        PasteboardAccess {
+            write: { text in pasteboardServiceWrite(text) },
+            read: { in return pasteboardServiceRead() }
+        }
+    )
+}
+
+/// Copies `text` to the pasteboard; a failure is logged, and nothing else is done.
+function pasteboardServiceWrite(text: borrow String) {
+    match pasteboardWrite(text) {
+        Ok -> {}
+        Error(failed) -> log warn("the text could not be copied", error: errorName(failed))
+    }
+}
+
+/// The pasteboard's text, read for the application's current interaction; a refusal names why it was not read.
+function pasteboardServiceRead() -> Result<String, PasteboardRefusal> {
+    let token = match interactionCurrent() {
+        Some(value) -> value
+        None -> return .Error(.NoInteraction)
+    }
+    match pasteboardRead(move token) {
+        Ok(text) -> return text.count == 0 ? .Error(.Empty) : .Ok(text)
+        Error(failed) -> return match failed.code {
+            NoInteraction -> .Error(.NoInteraction)
+            NotFound -> .Error(.Empty)
+            else -> .Error(.Unavailable(errorName(failed)))
+        }
+    }
+}

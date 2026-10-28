@@ -1,0 +1,97 @@
+import Foundation
+import KiraUI
+
+// The status bar's ink, read from how bright the picture under it is, as
+// MosaicDisplay measures it, and not from the system's appearance: dark ink
+// over a light picture, light ink over a dark one, one ink for its text and
+// its icons alike. A pixel-by-pixel choice would flip the moment an
+// application with another top edge came to the front; here the picture has
+// to stay past a threshold for `hold` before the ink turns, the two
+// thresholds stand apart so a picture between them keeps the ink it has, and
+// the ink then fades across over `fade`.
+
+namespace StatusBarToneRules {
+    // In thousandths of full luminance.
+    let darkAbove: Number = 600
+    let lightBelow: Number = 450
+    // In milliseconds.
+    let hold: Number = 600
+    let fade: Number = 350
+}
+
+public let statusBarLightInk: RGBAColor = RGBAColor { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }
+let statusBarDarkInk: RGBAColor = RGBAColor { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }
+
+// What the status bar's ink is and is turning to. Times are milliseconds of
+// the wall clock the platform draws by.
+public struct StatusBarTone {
+    // Whether the ink is dark, over a light picture.
+    var dark: Bool = false
+    // When the ink last turned, for its fade; 0 for never.
+    var turned: Number = 0
+    // The side the picture moved to while the ink is still the other, and
+    // since when; none while the picture agrees with the ink.
+    var wanted: Bool? = .None
+    var wantedSince: Number = 0
+}
+
+extend StatusBarTone {
+    // MosaicDisplay measured the picture under the bar at `luminance`
+    // thousandths at `now`.
+    function heard(borrow mut self, luminance: Number, now: Number) {
+        var wants = dark
+        if luminance > StatusBarToneRules.darkAbove { wants = true }
+        if luminance < StatusBarToneRules.lightBelow { wants = false }
+        if wants == dark {
+            wanted = .None
+            return
+        }
+        match wanted {
+            // Already waiting to turn that way.
+            Some(waiting) -> if waiting == wants { return }
+            None -> {}
+        }
+        wanted = .Some(wants)
+        wantedSince = now
+    }
+
+    // Turns the ink once the picture has stayed on the other side for
+    // `hold`.
+    function settle(borrow mut self, now: Number) {
+        match wanted {
+            Some(wants) -> {
+                if now - wantedSince < StatusBarToneRules.hold { return }
+                dark = wants
+                turned = now
+                wanted = .None
+            }
+            None -> {}
+        }
+    }
+
+    // The ink at `now`, part way across its fade while it turns.
+    function ink(borrow self, now: Number) -> RGBAColor {
+        let to = dark ? statusBarDarkInk : statusBarLightInk
+        if turned == 0 { return to }
+        let from = dark ? statusBarLightInk : statusBarDarkInk
+        let t = min(max((now - turned) / StatusBarToneRules.fade, 0.0), 1.0)
+        // Eased in and out, as a cross-fade is.
+        let eased = t * t * (3.0 - 2.0 * t)
+        return RGBAColor {
+            r: from.r + (to.r - from.r) * eased,
+            g: from.g + (to.g - from.g) * eased,
+            b: from.b + (to.b - from.b) * eased,
+            a: 1.0
+        }
+    }
+
+    // How many seconds from `now` the bar wants drawing again: at once while
+    // the ink fades, when a wanted turn comes due, or never.
+    function redrawIn(borrow self, now: Number) -> Number? {
+        if turned != 0 && now - turned < StatusBarToneRules.fade { return .Some(0.0) }
+        return match wanted {
+            Some(wants) -> .Some(max(StatusBarToneRules.hold - (now - wantedSince), 0.0) / 1000.0)
+            None -> .None
+        }
+    }
+}

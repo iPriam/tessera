@@ -1,0 +1,475 @@
+import Foundation
+import KiraUI
+import PlatformKit
+
+// Control Center (roadmap/11-adaptive-desktop.md, "Control Center"): the
+// switches a person reaches for without opening an application, as modules on
+// glass, from the iOS 27 kit's `Control Center - iPad`: Now Playing, the
+// connectivity module, brightness and volume, Focus, and a grid of round
+// toggles. On a desktop it hangs from its symbol at the trailing end of the
+// bar, laid out as macOS Tahoe's (`ControlCenterMac.kira`); on a touch screen
+// it comes down over a dimmed screen at the top trailing corner, as an iPad's
+// does, and on a phone it takes the whole screen, its modules centred across
+// it, as an iPhone's does. Either way each module stands on its own glass,
+// with no panel under them. Choosing a module leaves Control Center open; a
+// click or a tap anywhere else puts it away.
+
+// One of the platform's switches: what it is called, its symbol, whether it
+// is on, what it says under its name, whether it is a module two units wide,
+// and what choosing it does.
+public struct ControlCenterControl {
+    let title: String
+    let symbol: Symbol
+    let on: Bool
+    let detail: String
+    let wide: Bool
+    let toggle: () -> Void
+}
+
+// What Control Center holds: whether it is out, and whether Focus is on,
+// which holds back notification banners, as Do Not Disturb does.
+public struct ControlCenterState {
+    var open: Bool = false
+    var focus: Bool = false
+}
+
+// What a person did in Control Center: its symbol on the bar opened or closed
+// it, they put it away, or they chose a switch.
+@Derive(Copy)
+public enum ControlCenterAction {
+    Toggle
+    Close
+    Focus
+    StageManager
+    WindowedApps
+}
+
+// How applications share the output, as Control Center shows it: Stage
+// Manager on or off, and, where the platform offers both, whether
+// applications open as windows that float free, as an iPad's Windowed Apps.
+public struct ControlCenterArrangement {
+    let staged: Bool
+    // None where the platform has no other way to show applications than
+    // its own, as a Mac's windows always float free.
+    let windowed: Bool? = .None
+}
+
+// The platform's switches: Focus first, the Focus tile, then Stage Manager,
+// and Windowed Apps where the platform offers it, among the grid's toggles.
+// Each one chosen hands `act` what it is.
+public function controlCenterControls(
+    state: borrow ControlCenterState,
+    arrangement: borrow ControlCenterArrangement,
+    act: (ControlCenterAction) -> Void
+) -> [ControlCenterControl] {
+    let focusAct = copy act
+    let stageAct = copy act
+    var controls = [
+        ControlCenterControl {
+            title: "Focus",
+            symbol: .MoonFill,
+            on: state.focus,
+            detail: state.focus ? "On" : "Off",
+            wide: true,
+            toggle: { in focusAct(.Focus) },
+        },
+        ControlCenterControl {
+            title: "Stage Manager",
+            symbol: .SidebarLeft,
+            on: arrangement.staged,
+            detail: arrangement.staged ? "On" : "Off",
+            wide: false,
+            toggle: { in stageAct(.StageManager) },
+        },
+    ]
+    match arrangement.windowed {
+        Some(windowed) -> {
+            let windowAct = copy act
+            controls.append(
+                ControlCenterControl {
+                    title: "Windowed Apps",
+                    symbol: .Macwindow,
+                    on: windowed,
+                    detail: windowed ? "On" : "Off",
+                    wide: false,
+                    toggle: { in windowAct(.WindowedApps) },
+                }
+            )
+        }
+        None -> {}
+    }
+    return controls
+}
+
+// How Control Center is laid out: the kit's lengths, in its points, times
+// `scale`, and where it stands, in points.
+public struct ControlCenterMetrics {
+    let scale: Number
+    // A grid cell's side and the gap between two, and a large module's corner.
+    let cell: Number = 72
+    let spacing: Number = 16
+    let moduleCorner: Number = 38
+    // How far the modules stand below the top band and in from the trailing
+    // edge.
+    let top: Number
+    let trailing: Number
+    // How dark the screen goes behind it.
+    let dim: Number
+
+    // `length` of the kit's points in this interface's.
+    function pt(length: Number) -> Number {
+        return length * scale
+    }
+
+    // The length `count` cells and the gaps between them take.
+    function span(count: Number) -> Number {
+        return pt(count * cell + (count - 1) * spacing)
+    }
+}
+
+// Control Center for the interface in use: a Mac's on a desktop, an iPad's on
+// a touch screen, both small enough to stand under the bar on an output
+// 630 points tall.
+public function controlCenterMetrics() -> ControlCenterMetrics {
+    return match interfaceMode() {
+        AdaptiveDesktop -> ControlCenterMetrics { scale: 0.8, top: 6, trailing: 8, dim: 0, }
+        AdaptiveMobile -> ControlCenterMetrics { scale: 0.8, top: 16, trailing: 50, dim: 0.6, }
+    }
+}
+
+// How far a phone's Control Center keeps its modules in from the screen's
+// sides, and how dark it makes the screen under them.
+namespace PhoneControlCenter {
+    let side: Number = 20
+    let dim: Number = 0.85
+}
+
+// Control Center on a phone, a touch screen `width` by `height` points that
+// `statusBarTall` calls tall, holding `toggles` in its grid: over the whole
+// screen as an iPhone's, its modules as wide as the screen less its sides,
+// or as large as fit between the band `top` points tall and the home
+// indicator's with the same gap above and below, and centred.
+function phoneControlCenterMetrics(
+    width: Number,
+    height: Number,
+    top: Number,
+    toggles: Number
+) -> ControlCenterMetrics {
+    let unit = ControlCenterMetrics { scale: 1, top: 16, trailing: 0, dim: 0 }
+    let kit = controlCenterSize(unit, toggles)
+    let across = (width - PhoneControlCenter.side * 2) / kit.width
+    let down = (height - top - unit.top * 2 - homeIndicatorBand()) / kit.height
+    let scale = max(min(across, down), 0.5)
+    return ControlCenterMetrics {
+        scale: scale,
+        top: unit.top,
+        trailing: (width - kit.width * scale) / 2,
+        dim: PhoneControlCenter.dim,
+    }
+}
+
+let controlBackdrop: RGBAColor = RGBAColor { r: 0.267, g: 0.267, b: 0.267, a: 1.0 }
+
+// The toggles of the grid Control Center keeps itself, after the platform's.
+namespace ControlCenterGrid {
+    let ownToggles: Number = 11
+}
+
+// The modules' size, in points, holding `toggles` in the grid.
+function controlCenterSize(metrics: borrow ControlCenterMetrics, toggles: Number) -> Size {
+    let rows = trunc((toggles + 2 + 3) / 4)
+    let cell = metrics.pt(metrics.cell)
+    let gap = metrics.pt(metrics.spacing)
+    return Size {
+        width: metrics.span(4),
+        height: metrics.pt(160) + gap + metrics.span(2) + gap + cell * rows + gap * (rows - 1)
+    }
+}
+
+// The toggles in the grid, the platform's after the Focus tile and then
+// Control Center's own.
+function controlCenterToggles(controls: borrow [ControlCenterControl]) -> Number {
+    return max(controls.count - 1, 0) + ControlCenterGrid.ownToggles
+}
+
+// Control Center over the whole output, below the band `top` points tall
+// along its top, holding the platform's `controls`; nothing when `open` is
+// false. A click or a tap off the modules calls `dismiss`. A platform, whose
+// glass the compositor draws, leaves `ownGlass` unset.
+public construct ControlCenter(
+    controls: [ControlCenterControl],
+    open: Bool,
+    top: Number,
+    ownGlass: Bool,
+    dismiss: () -> Void
+) extends Widget {
+    @State var airplane: Bool = false
+    @State var airDrop: Bool = true
+    @State var wifi: Bool = true
+    @State var cellular: Bool = true
+    @State var bluetooth: Bool = true
+    @State var hotspot: Bool = false
+    @State var vpn: Bool = true
+    @State var brightness: Number = 0.57
+    @State var volume: Number = 0.7
+    @State var focusMode: String = "Reduce Interruptions"
+    @State var rotationLocked: Bool = true
+    @State var flashlight: Bool = false
+    @State var darkMode: Bool = false
+    @State var lowPower: Bool = false
+    @State var trueTone: Bool = false
+    @State var recording: Bool = false
+    @State var mirroring: Bool = false
+    @State var reduceMotion: Bool = false
+    @State var keyboardLight: Bool = false
+    @State var playing: Bool = true
+    @State var playedFrom: Number = 0
+    @State var pausedAt: Number = 2
+
+    body {
+        let desktop = interfaceMode() == .AdaptiveDesktop
+        let phone = !desktop && statusBarTall(viewportWidth(), viewportHeight())
+        let metrics = phone ? phoneControlCenterMetrics(
+            viewportWidth(),
+            viewportHeight(),
+            top,
+            controlCenterToggles(controls)
+        ) : controlCenterMetrics()
+        let dim = RGBAColor {
+            r: controlBackdrop.r,
+            g: controlBackdrop.g,
+            b: controlBackdrop.b,
+            a: metrics.dim
+        }
+        ZStack(alignment = .TopTrailing) {
+            if open {
+                Rectangle()
+                .fill(copy dim)
+                .fillWidth()
+                .fillHeight()
+                .onClick(copy dismiss)
+                .transition(opacityTransition(), .Smooth)
+                if desktop {
+                    MacControlModules(
+                        controls = copy controls,
+                        metrics = copy metrics,
+                        wifi = $wifi,
+                        bluetooth = $bluetooth,
+                        airDrop = $airDrop,
+                        mirroring = $mirroring,
+                        darkMode = $darkMode,
+                        keyboardLight = $keyboardLight,
+                        brightness = $brightness,
+                        volume = $volume,
+                        focusMode = $focusMode,
+                        playing = $playing,
+                        playedFrom = $playedFrom,
+                        pausedAt = $pausedAt
+                    )
+                    .edgePadding(EdgeSet.top, resolvedLength(top + metrics.top))
+                    .edgePadding(EdgeSet.trailing, resolvedLength(metrics.trailing))
+                    .transition(modulesTransition(ownGlass), .Smooth)
+                } else {
+                    self.modules(metrics)
+                    .edgePadding(EdgeSet.top, resolvedLength(top + metrics.top))
+                    .edgePadding(EdgeSet.trailing, resolvedLength(metrics.trailing))
+                    .transition(modulesTransition(ownGlass), .Smooth)
+                }
+            }
+        }
+        .fillWidth()
+        .fillHeight()
+    }
+
+    function modules(metrics: borrow ControlCenterMetrics) -> Any Widget {
+        let gap = metrics.pt(metrics.spacing)
+        let size = controlCenterSize(metrics, controlCenterToggles(controls))
+        return VStack(spacing = .Length(gap), alignment = .Center) {
+            NowPlayingCard(
+                playing = $playing,
+                playedFrom = $playedFrom,
+                pausedAt = $pausedAt,
+                metrics = copy metrics
+            )
+            HStack(spacing = .Length(gap), alignment = .Center) {
+                ConnectivityModule(
+                    metrics = copy metrics,
+                    airplane = $airplane,
+                    airDrop = $airDrop,
+                    wifi = $wifi,
+                    cellular = $cellular,
+                    bluetooth = $bluetooth,
+                    hotspot = $hotspot,
+                    vpn = $vpn
+                )
+                ControlSlider(value = $brightness, title = "Brightness", metrics = copy metrics) {
+                    Icon(symbol = .SunMaxFill)
+                    .foregroundColor(.Yellow)
+                }
+                ControlSlider(value = $volume, title = "Volume", metrics = copy metrics) {
+                    Icon(symbol = .Speaker3Fill)
+                    .foregroundColor(.Blue)
+                }
+            }
+            self.grid(metrics)
+        }
+        .width(resolvedLength(size.width))
+        .height(resolvedLength(size.height))
+    }
+
+    // The Focus tile and the round toggles, four to a row.
+    function grid(metrics: borrow ControlCenterMetrics) -> Any Widget {
+        let cell = metrics.pt(metrics.cell)
+        let style = ControlToggleStyle(diameter = cell)
+        var toggles: [Any Widget] = []
+        for (index, control) in controls.enumerated() {
+            if index > 0 {
+                let flip = copy control.toggle
+                let on = control.on
+                toggles.append(
+                    ControlButton(
+                        title = copy control.title,
+                        systemImage = copy control.symbol,
+                        isOn = Binding<Bool> {
+                            get: { in
+                                return on
+                            },
+                            set: { value in flip() }
+                        },
+                        style = copy style
+                    )
+                )
+            }
+        }
+        toggles.append(
+            ControlButton(
+                title = "Orientation Lock",
+                systemImage = .LockRotation,
+                isOn = $rotationLocked,
+                style = ControlToggleStyle(diameter = cell, onTint = .White, onForeground = .Red)
+            )
+        )
+        toggles.append(
+            ControlButton(
+                title = "Flashlight",
+                systemImage = .LightbulbFill,
+                isOn = $flashlight,
+                style = copy style
+            )
+        )
+        toggles.append(
+            ControlButton(
+                title = "Dark Mode",
+                systemImage = .CircleLefthalfFill,
+                isOn = $darkMode,
+                style = copy style
+            )
+        )
+        toggles.append(
+            ControlButton(
+                title = "Low Power Mode",
+                systemImage = .Battery25Percent,
+                isOn = $lowPower,
+                style = ControlToggleStyle(diameter = cell, onTint = .Yellow, onForeground = .Black)
+            )
+        )
+        toggles.append(
+            ControlButton(
+                title = "Hearing",
+                systemImage = .Ear,
+                isOn = controlMomentary(),
+                style = copy style
+            )
+        )
+        toggles.append(
+            ControlButton(
+                title = "True Tone",
+                systemImage = .SunMaxFill,
+                isOn = $trueTone,
+                style = copy style
+            )
+        )
+        toggles.append(
+            ControlButton(
+                title = "Screen Recording",
+                systemImage = .Recordingtape,
+                isOn = $recording,
+                style = ControlToggleStyle(diameter = cell, onTint = .Red, onForeground = .White)
+            )
+        )
+        toggles.append(
+            ControlButton(
+                title = "Screen Mirroring",
+                systemImage = .RectangleOnRectangle,
+                isOn = $mirroring,
+                style = copy style
+            )
+        )
+        toggles.append(
+            ControlButton(
+                title = "Reduce Motion",
+                systemImage = .CircleGrid3x3Fill,
+                isOn = $reduceMotion,
+                style = copy style
+            )
+        )
+        toggles.append(
+            ControlButton(
+                title = "Calculator",
+                systemImage = .Plusminus,
+                isOn = controlMomentary(),
+                style = copy style
+            )
+        )
+        toggles.append(
+            ControlButton(
+                title = "Visual Intelligence",
+                systemImage = .Viewfinder,
+                isOn = controlMomentary(),
+                style = copy style
+            )
+        )
+        var rows: [Any Widget] = []
+        var row: [Any Widget] = [
+            FocusTile(focus = copy controls[0], mode = $focusMode, metrics = copy metrics)
+            .gridCellColumns(2)
+        ]
+        var used = 2
+        for toggle in toggles {
+            if used == 4 {
+                rows.append(GridRow(children = move row))
+                row = []
+                used = 0
+            }
+            row.append(toggle)
+            used += 1
+        }
+        if row.count > 0 { rows.append(GridRow(children = move row)) }
+        let gap = metrics.pt(metrics.spacing)
+        return Grid(
+            alignment = .TopLeading,
+            horizontalSpacing = .Length(gap),
+            verticalSpacing = .Length(gap),
+            children = move rows
+        )
+        .width(resolvedLength(metrics.span(4)))
+    }
+}
+
+// How the modules come and go: down from the top on their own glass, and in
+// place on a platform's surface, whose glass the compositor draws and which
+// comes and goes with the frame and cannot follow them.
+function modulesTransition(ownGlass: Bool) -> Transition {
+    if ownGlass { return opacityTransition().combined(moveTransition(.Top)) }
+    return opacityTransition()
+}
+
+// The symbol at the trailing end of a desktop's bar that opens Control
+// Center, as a Mac's does; choosing it calls `toggle`.
+public construct ControlCenterButton(toggle: () -> Void) extends Widget {
+    body {
+        Icon(symbol = .SliderHorizontal3)
+        .font(size: resolvedLength(13), weight: .Medium)
+        .onClick(copy toggle)
+    }
+}

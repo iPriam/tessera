@@ -1,0 +1,350 @@
+//! Evaluates the tokens of an expression with the calculator's grammar.
+//!
+//! The grammar, lowest precedence first:
+//!
+//! ```text
+//! sum     := product (('+' | '-') product)*
+//! product := unary (('*' | '/') unary)*
+//! unary   := '-' unary | primary
+//! primary := atom '%'*
+//! atom    := number | '(' sum ')'
+//! ```
+//!
+//! A percent divides by one hundred. As on Apple's Calculator, `a + b%` and
+//! `a - b%` take `b` per cent of `a` when the percent ends the operand, so
+//! `200+10%` is `220`.
+
+import Foundation
+
+/// The value of an expression, or the reason it has none.
+///
+/// The text is tokenized and then parsed with the grammar in this module's
+/// header, so operator precedence and percent rules apply.
+///
+/// # Errors
+///
+/// - `.Empty` when the text holds no tokens.
+/// - `.Malformed` when the tokens do not form an expression.
+/// - `.Unbalanced` when a closing bracket has no opening bracket, or a bracket is left open.
+/// - `.TooManyDecimals` when a literal has more than 18 decimal places.
+/// - `.Overflow` when a result leaves the range of a `Number`.
+/// - `.DivideByZero` when a division's divisor is zero.
+///
+/// # Examples
+///
+/// ```kira
+/// match calculate("200+10%") {
+///     Ok(value) -> print(value)
+///     Error(failure) -> print(failureText(failure))
+/// }
+/// ```
+public function calculate(text: borrow String) -> Result<Number, CalculationFailure> {
+    match tokenize(text) {
+        Ok(tokens) -> { return evaluateTokens(tokens) }
+        Error(failure) -> { return .Error(failure) }
+    }
+}
+
+/// A parsed part of an expression and the index of the token after it.
+struct Step {
+    /// The value of the parsed part.
+    let value: Number
+    /// The index of the first token the part did not consume.
+    let next: Number
+}
+
+/// Evaluates a whole token list, which must be a single expression.
+///
+/// Stops at the first token the grammar cannot take. A leftover closing bracket
+/// is `.Unbalanced`, and any other leftover token is `.Malformed`.
+function evaluateTokens(tokens: borrow [Token]) -> Result<Number, CalculationFailure> {
+    if tokens.count == 0 {
+        return .Error(.Empty)
+    }
+    match parseSum(tokens, 0) {
+        Ok(step) -> {
+            if step.next < tokens.count {
+                if isClose(tokens[step.next]) {
+                    return .Error(.Unbalanced)
+                }
+                return .Error(.Malformed)
+            }
+            return .Ok(step.value)
+        }
+        Error(failure) -> { return .Error(failure) }
+    }
+}
+
+/// Whether a token is a closing bracket.
+function isClose(token: borrow Token) -> Bool {
+    match token {
+        Close -> { return true }
+        Open -> { return false }
+        Literal(value) -> { return false }
+        Operation(kind) -> { return false }
+        Percent -> { return false }
+    }
+}
+
+/// Whether a token is a percent sign.
+function isPercent(token: borrow Token) -> Bool {
+    match token {
+        Percent -> { return true }
+        Open -> { return false }
+        Close -> { return false }
+        Literal(value) -> { return false }
+        Operation(kind) -> { return false }
+    }
+}
+
+/// The operator a token stands for, or `.None` when it is not an operator.
+function operationOf(token: borrow Token) -> Operator? {
+    match token {
+        Operation(kind) -> { return .Some(kind) }
+        Literal(value) -> { return .None }
+        Open -> { return .None }
+        Close -> { return .None }
+        Percent -> { return .None }
+    }
+}
+
+/// Whether a token is a minus sign that negates the operand after it.
+///
+/// A minus in operand position is a negation. The parser only asks this where
+/// an operand is expected, so every `Subtract` reached there is a sign.
+function isNegation(token: borrow Token) -> Bool {
+    match token {
+        Operation(kind) -> { return kind == .Subtract }
+        Literal(value) -> { return false }
+        Open -> { return false }
+        Close -> { return false }
+        Percent -> { return false }
+    }
+}
+
+/// Whether an operand ends at `index`: the expression ends there, a bracket
+/// closes, or a plus or minus follows.
+function endsOperand(tokens: borrow [Token], index: Number) -> Bool {
+    if index >= tokens.count {
+        return true
+    }
+    if isClose(tokens[index]) {
+        return true
+    }
+    match operationOf(tokens[index]) {
+        Some(kind) -> { return kind == .Add || kind == .Subtract }
+        None -> { return false }
+    }
+}
+
+/// The number `b` of a `b%` operand that ends where a plus or minus takes its
+/// share of the running total, or `.None` when the operand is not that.
+///
+/// The operand must be a literal followed by one percent sign, and the
+/// percent must end the operand.
+function percentOperand(tokens: borrow [Token], start: Number) -> Number? {
+    if start + 1 >= tokens.count {
+        return .None
+    }
+    if !isPercent(tokens[start + 1]) {
+        return .None
+    }
+    if !endsOperand(tokens, start + 2) {
+        return .None
+    }
+    match tokens[start] {
+        Literal(value) -> { return .Some(value) }
+        Open -> { return .None }
+        Close -> { return .None }
+        Operation(kind) -> { return .None }
+        Percent -> { return .None }
+    }
+}
+
+/// The share `percent` per cent of `value`: `value * percent / 100`.
+///
+/// # Errors
+///
+/// Returns `.Overflow` when the product leaves the range of a `Number`.
+function shareOf(value: Number, percent: Number) -> Result<Number, CalculationFailure> {
+    match applyOperator(.Multiply, value, percent) {
+        Ok(product) -> { return applyOperator(.Divide, product, 100) }
+        Error(failure) -> { return .Error(failure) }
+    }
+}
+
+/// Parses a sum: products joined by `+` and `-`, left to right.
+///
+/// A plus or minus after an operand that ends with `%` takes that percent of
+/// the running total, as [`percentOperand`] describes.
+///
+/// # Errors
+///
+/// Returns the failure of the first operand or operator that cannot be
+/// evaluated.
+function parseSum(tokens: borrow [Token], start: Number) -> Result<Step, CalculationFailure> {
+    var value: Number = 0
+    var next: Number = start
+    match parseProduct(tokens, start) {
+        Ok(first) -> {
+            value = first.value
+            next = first.next
+        }
+        Error(failure) -> { return .Error(failure) }
+    }
+    while true {
+        if next >= tokens.count { break }
+        match operationOf(tokens[next]) {
+            Some(kind) -> {
+                if kind == .Multiply || kind == .Divide {
+                    break
+                }
+                match percentOperand(tokens, next + 1) {
+                    Some(percent) -> {
+                        match shareOf(value, percent) {
+                            Ok(share) -> {
+                                match applyOperator(kind, value, share) {
+                                    Ok(result) -> { value = result }
+                                    Error(failure) -> { return .Error(failure) }
+                                }
+                            }
+                            Error(failure) -> { return .Error(failure) }
+                        }
+                        next = next + 3
+                    }
+                    None -> {
+                        match parseProduct(tokens, next + 1) {
+                            Ok(right) -> {
+                                match applyOperator(kind, value, right.value) {
+                                    Ok(result) -> { value = result }
+                                    Error(failure) -> { return .Error(failure) }
+                                }
+                                next = right.next
+                            }
+                            Error(failure) -> { return .Error(failure) }
+                        }
+                    }
+                }
+            }
+            None -> { break }
+        }
+    }
+    return .Ok(Step { value: value, next: next })
+}
+
+/// Parses a product: unary operands joined by `*` and `/`, left to right.
+///
+/// # Errors
+///
+/// Returns the failure of the first operand or operator that cannot be
+/// evaluated.
+function parseProduct(tokens: borrow [Token], start: Number) -> Result<Step, CalculationFailure> {
+    var value: Number = 0
+    var next: Number = start
+    match parseUnary(tokens, start) {
+        Ok(first) -> {
+            value = first.value
+            next = first.next
+        }
+        Error(failure) -> { return .Error(failure) }
+    }
+    while true {
+        if next >= tokens.count { break }
+        match operationOf(tokens[next]) {
+            Some(kind) -> {
+                if kind == .Add || kind == .Subtract {
+                    break
+                }
+                match parseUnary(tokens, next + 1) {
+                    Ok(right) -> {
+                        match applyOperator(kind, value, right.value) {
+                            Ok(result) -> { value = result }
+                            Error(failure) -> { return .Error(failure) }
+                        }
+                        next = right.next
+                    }
+                    Error(failure) -> { return .Error(failure) }
+                }
+            }
+            None -> { break }
+        }
+    }
+    return .Ok(Step { value: value, next: next })
+}
+
+/// Parses a unary operand: any number of leading minus signs, then a primary.
+///
+/// # Errors
+///
+/// Returns the failure of the primary that follows the minus signs.
+function parseUnary(tokens: borrow [Token], start: Number) -> Result<Step, CalculationFailure> {
+    if start < tokens.count && isNegation(tokens[start]) {
+        match parseUnary(tokens, start + 1) {
+            Ok(inner) -> { return .Ok(Step { value: 0 - inner.value, next: inner.next }) }
+            Error(failure) -> { return .Error(failure) }
+        }
+    }
+    return parsePrimary(tokens, start)
+}
+
+/// Parses a primary: an atom followed by any number of percent signs.
+///
+/// Each percent sign divides the value by one hundred.
+///
+/// # Errors
+///
+/// Returns the failure of the atom, or `.Overflow` when a division cannot be
+/// applied.
+function parsePrimary(tokens: borrow [Token], start: Number) -> Result<Step, CalculationFailure> {
+    var value: Number = 0
+    var next: Number = start
+    match parseAtom(tokens, start) {
+        Ok(atom) -> {
+            value = atom.value
+            next = atom.next
+        }
+        Error(failure) -> { return .Error(failure) }
+    }
+    while true {
+        if next >= tokens.count { break }
+        if !isPercent(tokens[next]) { break }
+        match applyOperator(.Divide, value, 100) {
+            Ok(result) -> { value = result }
+            Error(failure) -> { return .Error(failure) }
+        }
+        next = next + 1
+    }
+    return .Ok(Step { value: value, next: next })
+}
+
+/// Parses an atom: a literal, or a parenthesised sum.
+///
+/// # Errors
+///
+/// Returns `.Malformed` when the token is missing or cannot start an atom, and
+/// `.Unbalanced` when a parenthesised sum is not followed by its closing bracket.
+function parseAtom(tokens: borrow [Token], start: Number) -> Result<Step, CalculationFailure> {
+    if start >= tokens.count {
+        return .Error(.Malformed)
+    }
+    match tokens[start] {
+        Literal(value) -> { return .Ok(Step { value: value, next: start + 1 }) }
+        Open -> {
+            match parseSum(tokens, start + 1) {
+                Ok(inner) -> {
+                    if inner.next >= tokens.count {
+                        return .Error(.Unbalanced)
+                    }
+                    if isClose(tokens[inner.next]) {
+                        return .Ok(Step { value: inner.value, next: inner.next + 1 })
+                    }
+                    return .Error(.Unbalanced)
+                }
+                Error(failure) -> { return .Error(failure) }
+            }
+        }
+        Close -> { return .Error(.Malformed) }
+        Operation(kind) -> { return .Error(.Malformed) }
+        Percent -> { return .Error(.Malformed) }
+    }
+}

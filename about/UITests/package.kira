@@ -1,0 +1,9 @@
+//! The About app's UI tests, run beside it with `ui test about`.
+construct AboutUITests extends Package {
+    let version: String = "0.1.0"
+    let kind: PackageKind = .App
+    let dependencies: [Dependency] = [
+        Dependency { name: "KiraUI", path: "../../kira-ui" },
+        Dependency { name: "KiraUITesting", path: "../../kira-ui/UITesting" }
+    ]
+}

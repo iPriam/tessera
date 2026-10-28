@@ -1,0 +1,105 @@
+import Foundation
+import ArgumentParser
+import LibTessera
+import PlatformKit
+import TesseraDisplayClient
+import TesseraUI
+
+// The output dims and blanks for want of input on the times this platform
+// sets (roadmap/11-adaptive-desktop.md, "Idle"): ten minutes, or what the
+// platform was started with, and the lock screen closes when it blanks.
+
+// The platform's command line: `--display-sleep` sets the seconds without
+// input before the output blanks, as `pmset displaysleep` sets a Mac's.
+function platformCommand() -> CommandRouter {
+    return CommandRouter {
+        root: Command {
+            configuration: CommandConfiguration {
+                name: "adaptive-desktop",
+                abstract: "The Adaptive Desktop platform"
+            },
+            arguments: [option(
+                name: "display-sleep",
+                help: "Seconds without input before the output blanks"
+            ).whole().placeholder("SECONDS").defaulting(String(IdlePolicy.desktopBlank)), flag(
+                name: "unlocked",
+                help: "Start with the lock screen open, as when switched in"
+            )]
+        }
+    }
+}
+
+// The seconds without input the output blanks after: what the platform was
+// started with, else what Settings holds, else ten minutes.
+function displaySleep() -> Number {
+    let router = platformCommand()
+    let tokens = commandLineArguments()
+    if !tokens.contains("--display-sleep") {
+        match storedDisplaySleep(settingValue(IdleSetting.key, "")) {
+            Some(seconds) -> return seconds
+            None -> {}
+        }
+    }
+    return match router.parse(tokens) {
+        Ok(parsed) -> parsed.requiredNumber("display-sleep")
+        Error(error) -> {
+            router.explain(error, tokens)
+            IdlePolicy.desktopBlank
+        }
+    }
+}
+
+// Tells the display server when the output dims and blanks.
+function keepIdleTimes(channel: Handle) {
+    let times = idleTimes(displaySleep())
+    let idle = DisplayIdle { dim: UNumber(times.dim), blank: UNumber(times.blank) }
+    match sent(sendSetIdle(channel, move idle)) {
+        Ok(sent) -> if sent {
+            log info("the output blanks for want of input", dim: times.dim, blank: times.blank)
+        }
+        Error(failed) -> requestFailed("set the idle times", failed)
+    }
+}
+
+// The output dimmed, blanked or woke. The lock screen closes as it blanks, so
+// it is what the output wakes to.
+function idleChanged(desktop: borrow mut Desktop, state: borrow DisplayIdleState) {
+    log info("the output changed for want of input", state: displayIdleStateName(state))
+    match state {
+        Blanked -> lockScreen(desktop)
+        Awake, Dimmed -> {}
+    }
+}
+
+// One of the platform's own waits completed: the System channel's events
+// are read, and the settings they say changed are followed, the appearance,
+// the time zone and the Dynamic Platform at once and the idle times on the
+// next input.
+function platformWoke(desktop: borrow mut Desktop, key: Number) {
+    systemWoke(desktop.watch, key)
+    let changed = copy desktop.watch.settingsChanged
+    desktop.watch.settingsChanged = []
+    for setting in changed {
+        noteSettingsChanged()
+        if setting == "appearance.scheme" { applyAppearanceSetting() }
+        if setting == TimeZoneSetting.key { desktop.zone = currentTimeZone() }
+        if setting == PlatformSetting.key { followPlatformSetting(PlatformSetting.adaptiveDesktop) }
+        if setting == IdleSetting.key {
+            match desktop.channel {
+                Some(channel) -> keepIdleTimes(copy channel)
+                None -> {}
+            }
+        }
+    }
+}
+
+// Whether the platform starts with the lock screen open: PID 1 starts a
+// platform a person switched to that way, since they are past it already.
+function startsUnlocked() -> Bool {
+    let router = platformCommand()
+    let tokens = commandLineArguments()
+    return match router.parse(tokens) {
+        Ok(parsed) -> parsed.flag("unlocked")
+        Error(error) -> false
+    }
+}

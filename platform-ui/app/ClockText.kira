@@ -1,0 +1,57 @@
+import Foundation
+
+// The time and the date as the lock screen and the status area say them, from
+// the wall clock in milliseconds since 1970 moved into the person's time zone,
+// as `TimeZone.local` gives it.
+
+namespace ClockMillis {
+    let perSecond: Number = 1000
+}
+
+let weekdayNames: [String] = [
+    "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"
+]
+
+let monthNames: [String] = [
+    "January", "February", "March", "April", "May", "June", "July", "August", "September",
+    "October", "November", "December"
+]
+
+// The day since 1970 the wall clock `realtime` falls in.
+function dayOf(realtime: Number) -> Number {
+    return floor(floor(realtime / ClockMillis.perSecond) / CivilTime.secondsPerDay)
+}
+
+// `9:41`: the hour without a leading zero and the minute with one, as the lock
+// screen sets it.
+public function clockTime(realtime: Number) -> String {
+    let seconds = floor(realtime / ClockMillis.perSecond)
+    let rest = seconds % CivilTime.secondsPerDay
+    let hour = floor(rest / CivilTime.secondsPerHour)
+    let minute = floor(rest % CivilTime.secondsPerHour / CivilTime.secondsPerMinute)
+    return "\(hour):\(zeroPadded(minute, 2))"
+}
+
+// `Monday 12 October`: the weekday, the day and the month, as the lock screen
+// sets the date above the time.
+public function clockDate(realtime: Number) -> String {
+    let day = dayOf(realtime)
+    let date = civilDate(day)
+    return "\(weekdayNames[weekdayOf(day)]) \(date.day) \(monthNames[date.month - 1])"
+}
+
+// `Mon 12 Oct 9:41`: the weekday and the month cut to three letters, the day,
+// and the time, as a Mac's bar sets them at its trailing end.
+public function clockBar(realtime: Number) -> String {
+    return "\(clockShortDate(realtime))  \(clockTime(realtime))"
+}
+
+// `Mon 12 Oct`: the weekday and the month cut to three letters, with the day,
+// as an iPad's status bar sets the date after the time.
+public function clockShortDate(realtime: Number) -> String {
+    let day = dayOf(realtime)
+    let date = civilDate(day)
+    let weekday = weekdayNames[weekdayOf(day)].substring(0, 3)
+    let month = monthNames[date.month - 1].substring(0, 3)
+    return "\(weekday) \(date.day) \(month)"
+}

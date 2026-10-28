@@ -1,0 +1,307 @@
+import Foundation
+import LibTessera
+import DeviceKit
+
+// Connections: the page, wake locks and scheduled wakes.
+//
+// A connection's program is where its process was started from, and what
+// it may ask follows from that, as in the Devices service: a program under
+// `/bin` is part of the system and may take any wake lock and schedule
+// wakes; anything else may take only an audio lock, the one LibTessera
+// grants without `tessera.power.wakelock`, as iOS lets audio playback keep
+// a device awake without asking.
+//
+// A wake lock is its connection, as an IOPMAssertion is its id: the service
+// holds a DeviceKit wake source while the connection is open and lets go
+// when the client closes it or the timeout passes, closing the connection
+// so the client's WakeLock asserts `PEER_CLOSED`.
+//
+// A scheduled wake arms the real-time clock's alarm for the earliest
+// deadline still ahead, as `IOPMSchedulePowerEvent` does; the client's own
+// timer is what completes it.
+
+struct Client {
+    var id: Number
+    var channel: Handle
+    var program: String
+    var lock: WakeLock?
+}
+
+struct WakeLock {
+    var source: Ref
+    var kind: WakeLockKind
+    // The monotonic instant the lock is let go.
+    var expiry: Number
+    // Why the lock is held, as the client said: an IOPMAssertion's name.
+    var reason: String
+}
+
+namespace Seconds {
+    let nanoseconds: Number = 1000000000
+}
+
+function isSystem(program: borrow String) -> Bool {
+    return program.startsWith("/" + SystemDirectory.programs + "/")
+}
+
+function kindName(kind: borrow WakeLockKind) -> String {
+    return match kind {
+        Cpu -> "CPU"
+        Display -> "display"
+        Audio -> "audio"
+        Network -> "network"
+    }
+}
+
+// Whether `program` may hold a lock of `kind`.
+function mayHold(program: borrow String, kind: borrow WakeLockKind) -> Bool {
+    if isSystem(program) { return true }
+    return match kind {
+        Audio -> true
+        Cpu -> false
+        Display -> false
+        Network -> false
+    }
+}
+
+function clientIndex(service: borrow Service, id: Number) -> Number? {
+    for (index, client) in service.clients.enumerated() {
+        if client.id == id { return .Some(index) }
+    }
+    return .None
+}
+
+// Takes every connection waiting on the listener.
+function accept(service: borrow mut Service) {
+    while true {
+        let channel = match serviceAccept(service.listener) {
+            Ok(value) -> value
+            Error(failed) -> {
+                if failed.code != .ShouldWait {
+                    log warn("a connection could not be taken", error: errorName(failed))
+                }
+                return
+            }
+        }
+        let program = match servicePeerProgram(channel) {
+            Ok(value) -> value
+            Error(failed) -> {
+                log warn("a connection's program is unknown", error: errorName(failed))
+                ""
+            }
+        }
+        let id = service.nextClient
+        service.nextClient += 1
+        match objectWaitAsync(
+            channel,
+            Signals.readable | Signals.peerClosed,
+            .Repeat,
+            service.port,
+            channelKey(id)
+        ) {
+            Ok -> service.clients.append(
+                Client { id: id, channel: channel, program: program, lock: .None }
+            )
+            Error(failed) -> {
+                log warn("a connection cannot be waited on", program, error: errorName(failed))
+                closeHandle(channel)
+            }
+        }
+    }
+}
+
+function release(lock: borrow WakeLock, program: borrow String) {
+    log info("a wake lock was released", program, reason: lock.reason)
+    match wakeSourceDeactivate(lock.source) {
+        // The source is let go, so the lock no longer holds the device awake.
+        Ok -> {}
+        Error(failed) -> log warn("a wake source could not be let go", error: errorName(failed))
+    }
+    closeRef(lock.source)
+}
+
+// Lets go of a connection's lock and closes it.
+function closeClient(service: borrow mut Service, id: Number) {
+    let index = try clientIndex(service, id) otherwise return
+    let client = service.clients[index]
+    match client.lock {
+        Some(lock) -> release(lock, client.program)
+        // A connection that never took a lock has nothing to let go.
+        None -> {}
+    }
+    cancelWaits(service.port, channelKey(id))
+    closeHandle(client.channel)
+    var kept: [Client] = []
+    for other in service.clients {
+        if other.id != id { kept.append(other) }
+    }
+    service.clients = kept
+}
+
+function pageRequest(service: borrow Service, client: borrow Client) {
+    let page = match pageHandle(service.page) {
+        Ok(value) -> value
+        Error(failed) -> {
+            log warn("the page could not be shared", error: errorName(failed))
+            answer(client.channel, code(Operation.Page), failed.code)
+            return
+        }
+    }
+    let handles: [Handle] = [page]
+    match send(client.channel, code(Operation.Page), .Ok, handles) {
+        // The page is sent, and the client now holds its own handle to it.
+        Ok -> {}
+        Error(failed) -> {
+            log warn("a client could not be answered", error: errorName(failed))
+            closeHandles(handles)
+        }
+    }
+}
+
+enum LockFailure {
+    Refused(ErrorCode)
+    Clock(TesseraError)
+}
+
+function takeLock(
+    client: borrow Client,
+    request: borrow LockRequest
+) -> Result<WakeLock, LockFailure> {
+    if client.lock.isSome() { return .Error(.Refused(.InvalidArgument)) }
+    if !mayHold(client.program, request.kind) { return .Error(.Refused(.NotEntitled)) }
+    let source = match wakeSourceCreate("tessera-lock-" + String(client.id)) {
+        Ok(value) -> value
+        Error(failed) -> return .Error(.Refused(failed.code))
+    }
+    match wakeSourceActivate(source, request.timeout) {
+        // The source is active, so it holds the device awake until the timeout.
+        Ok -> {}
+        Error(failed) -> {
+            // The source is released before the failure is returned; try
+            // would leak it.
+            closeRef(source)
+            return .Error(.Refused(failed.code))
+        }
+    }
+    let now = match monotonic() {
+        Ok(value) -> value
+        Error(failed) -> {
+            closeRef(source)
+            return .Error(.Clock(failed))
+        }
+    }
+    return .Ok(
+        WakeLock {
+            source: source,
+            kind: request.kind,
+            expiry: now + request.timeout,
+            reason: request.reason
+        }
+    )
+}
+
+function wakeLockRequest(service: borrow mut Service, index: Number, request: borrow LockRequest) {
+    let client = service.clients[index]
+    let lock = match takeLock(client, request) {
+        Ok(value) -> value
+        Error(failure) -> {
+            match failure {
+                Refused(reason) -> answer(client.channel, code(Operation.WakeLock), reason)
+                Clock(failed) -> {
+                    log fault("cannot time a wake lock", error: errorName(failed))
+                    answer(client.channel, code(Operation.WakeLock), .Internal)
+                }
+            }
+            return
+        }
+    }
+    // As `pmset -g assertionslog` says an assertion was created.
+    log info(
+        "a wake lock was taken",
+        program: client.program,
+        kind: kindName(lock.kind),
+        seconds: floor(request.timeout / Seconds.nanoseconds),
+        reason: lock.reason
+    )
+    service.clients[index].lock = .Some(lock)
+    answer(client.channel, code(Operation.WakeLock), .Ok)
+}
+
+// Arms the clock for the earliest wake still ahead, or clears it.
+function armClock(service: borrow mut Service) -> Result<Void, TesseraError> {
+    let now = try boottime()
+    var ahead: [Number] = []
+    var earliest: Number? = .None
+    for wake in service.wakes {
+        if wake <= now { continue }
+        ahead.append(wake)
+        match earliest {
+            Some(known) -> earliest = .Some(min(known, wake))
+            None -> earliest = .Some(wake)
+        }
+    }
+    service.wakes = ahead
+    if earliest == service.armed || service.devices.clocks.count == 0 { return .Ok }
+    // 0 clears the alarm.
+    let deadline = earliest.or(0)
+    match rtcSetWake(service.devices.clocks[0], deadline) {
+        Ok -> {
+            service.armed = earliest
+            return .Ok
+        }
+        Error(failed) -> return .Error(failed)
+    }
+}
+
+function scheduleWakeRequest(service: borrow mut Service, client: borrow Client, deadline: Number) {
+    if !isSystem(client.program) {
+        answer(client.channel, code(Operation.ScheduleWake), .NotEntitled)
+        return
+    }
+    let now = match boottime() {
+        Ok(value) -> value
+        Error(failed) -> {
+            log warn("cannot schedule a wake without the boot clock", error: errorName(failed))
+            answer(client.channel, code(Operation.ScheduleWake), .Internal)
+            return
+        }
+    }
+    if deadline > now {
+        let earlier = copy service.wakes
+        service.wakes.append(deadline)
+        match armClock(service) {
+            Ok -> {}
+            Error(failed) -> {
+                service.wakes = earlier
+                log warn("cannot arm the requested wake", error: errorName(failed))
+                answer(client.channel, code(Operation.ScheduleWake), .Internal)
+                return
+            }
+        }
+    }
+    answer(client.channel, code(Operation.ScheduleWake), .Ok)
+}
+
+// Answers everything a connection has sent; closes it once its peer has
+// gone.
+function serveClient(service: borrow mut Service, id: Number) {
+    while true {
+        let index = try clientIndex(service, id) otherwise return
+        let client = service.clients[index]
+        match receive(client.channel) {
+            Ok(request) -> match request {
+                Page -> pageRequest(service, client)
+                WakeLock(lock) -> wakeLockRequest(service, index, lock)
+                ScheduleWake(deadline) -> scheduleWakeRequest(service, client, deadline)
+            }
+            Error(failed) -> match failed {
+                Channel(error) -> {
+                    if error.code != .ShouldWait { closeClient(service, id) }
+                    return
+                }
+                UnknownOperation(operation) -> answer(client.channel, operation, .Unsupported)
+                Refused(refusal) -> answer(client.channel, code(refusal.operation), refusal.reason)
+            }
+        }
+    }
+}

@@ -1,0 +1,53 @@
+TessIcon {
+    fill: .Automatic,
+    groups: [
+        Group {
+            name: "Group",
+            layers: [
+                Layer { name: "5.7.pivot", image: "5.7.pivot.svg", fill: .Solid(Color { space: .Srgb, red: 0.204, green: 0.22, blue: 0.227, alpha: 1 }), position: Position { scale: 1.00391, x: -1, y: -1 } }
+            ],
+            lighting: .Individual,
+            specular: .Inside,
+            translucency: Translucency { enabled: false, amount: 0 },
+            shadow: Shadow { kind: .Neutral, opacity: 0.6 }
+        },
+        Group {
+            name: "Group 2",
+            layers: [
+                Layer { name: "Image 7", image: "Image-7.png", glass: Choice { light: false, dark: true }, fill: .Solid(Color { space: .Srgb, red: 0.267, green: 0.286, blue: 0.302, alpha: 1 }), opacity: Choice { light: 0, dark: 1 }, position: Position { scale: 0.147461, x: -0.5, y: -193 } },
+                Layer { name: "10.12.screw.stop4", image: "10.12.screw.stop4.svg", glass: Choice { light: true, dark: false }, fill: Choice { light: .Automatic, dark: .Solid(Color { space: .Srgb, red: 0.267, green: 0.286, blue: 0.302, alpha: 1 }) }, opacity: Choice { light: 1, dark: 0 }, position: Position { scale: 1.00391, x: -1, y: -1 } }
+            ],
+            lighting: .Individual,
+            specular: Choice { light: .Outside, dark: .Inside },
+            translucency: Translucency { enabled: false, amount: 0 },
+            shadow: Shadow { kind: .Neutral, opacity: 0.5 }
+        },
+        Group {
+            name: "Group 3",
+            layers: [
+                Layer { name: "8.10.screw.stop2", image: "8.10.screw.stop2.svg", fill: Choice { light: .Solid(Color { space: .Srgb, red: 0.204, green: 0.22, blue: 0.227, alpha: 1 }), dark: .Solid(Color { space: .Srgb, red: 0.804, green: 0.872, blue: 0.9, alpha: 1 }) }, position: Position { scale: 1.00391, x: -1, y: -1 } },
+                Layer { name: "9.10.screw.stop3", image: "9.10.screw.stop3.svg", fill: Choice { light: .Solid(Color { space: .Srgb, red: 0.204, green: 0.22, blue: 0.227, alpha: 1 }), dark: .Solid(Color { space: .Srgb, red: 0.804, green: 0.872, blue: 0.9, alpha: 1 }) }, position: Position { scale: 1.00391, x: -1, y: -1 } },
+                Layer { name: "7.9.screw.stop1", image: "7.9.screw.stop1.svg", fill: Choice { light: .Solid(Color { space: .Srgb, red: 0.204, green: 0.22, blue: 0.227, alpha: 1 }), dark: .Solid(Color { space: .Srgb, red: 0.804, green: 0.872, blue: 0.9, alpha: 1 }) }, position: Position { scale: 1.00391, x: -1, y: -1 } },
+                Layer { name: "6.8.screw", image: "6.8.screw.svg", fill: Choice { light: .Solid(Color { space: .Srgb, red: 0.204, green: 0.22, blue: 0.227, alpha: 1 }), dark: .Solid(Color { space: .Srgb, red: 0.804, green: 0.873, blue: 0.9, alpha: 1 }) }, position: Position { scale: 1.00391, x: -1, y: -1 } },
+                Layer { name: "4.5.legs", image: "4.5.legs.svg", fill: Choice { light: .Solid(Color { space: .Srgb, red: 0.44, green: 0.477, blue: 0.5, alpha: 1 }), dark: .Solid(Color { space: .Srgb, red: 0.574, green: 0.623, blue: 0.643, alpha: 1 }) }, position: Position { scale: 1.00391, x: -1, y: -1 } }
+            ],
+            lighting: .Individual,
+            specular: Choice { light: .Inside, dark: .Outside },
+            translucency: Translucency { enabled: false, amount: 0 },
+            shadow: Shadow { kind: .Chromatic, opacity: 0.3 }
+        },
+        Group {
+            name: "Group 4",
+            layers: [
+                Layer { name: "2.3.tessera.mark", image: "2.3.tessera.mark.svg", glass: false, fill: Choice { light: .Solid(Color { space: .Srgb, red: 0.568, green: 0.617, blue: 0.646, alpha: 1 }), dark: .Solid(Color { space: .Srgb, red: 0.893, green: 0.969, blue: 1, alpha: 1 }) }, position: Position { scale: 1.00391, x: -1, y: -1 } },
+                Layer { name: "3.5.grip", image: "3.5.grip.svg", glass: Choice { light: false, dark: true }, fill: Choice { light: .Solid(Color { space: .Srgb, red: 0.655, green: 0.711, blue: 0.744, alpha: 1 }), dark: .Solid(Color { space: .Srgb, red: 0.804, green: 0.873, blue: 0.9, alpha: 1 }) }, opacity: Choice { light: 0, dark: 1 }, position: Position { scale: 1.00391, x: -1, y: -1 } },
+                Layer { name: "4.5.grip.default", image: "4.5.grip.default.svg", glass: Choice { light: true, dark: false }, fill: .Solid(Color { space: .Srgb, red: 0.655, green: 0.711, blue: 0.744, alpha: 1 }), opacity: Choice { light: 1, dark: 0 }, position: Position { scale: 1.00391, x: -1, y: -1 } },
+                Layer { name: "1.2.chip", image: "1.2.chip.svg", fill: Choice { light: .Solid(Color { space: .Srgb, red: 0.204, green: 0.22, blue: 0.227, alpha: 1 }), dark: .Solid(Color { space: .Srgb, red: 0.362, green: 0.39, blue: 0.404, alpha: 1 }) }, position: Position { scale: 1.00391, x: -1, y: -1 } }
+            ],
+            lighting: .Individual,
+            specular: .Inside,
+            translucency: Translucency { enabled: true, amount: 0.2 },
+            shadow: Choice { light: Shadow { kind: .Chromatic, opacity: 0.3 }, dark: Shadow { kind: .Neutral, opacity: 0.7 } }
+        }
+    ]
+}

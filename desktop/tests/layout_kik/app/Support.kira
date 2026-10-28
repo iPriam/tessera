@@ -1,0 +1,22 @@
+import Foundation
+import HomeLayout
+
+// A page of four in rows of two, small enough to fill in a test.
+let smallSpace: HomeSpace = HomeSpace { perPage: 4, columns: 2 }
+
+// The names on `page` of `arrangement`, a folder by its name.
+function namesOn(arrangement: borrow HomeArrangement, page: Number) -> [String] {
+    var names: [String] = []
+    for item in arrangement.pages[page].items { names.append(item.name()) }
+    return names
+}
+
+// The apps of the folder at `index` on `page`, none when no folder is there.
+function folderAt(arrangement: borrow HomeArrangement, page: Number, index: Number) -> [String] {
+    return folderApps(arrangement, HomeSlot { page: page, index: index })
+}
+
+// An arrangement of `names`, as Home first arranges them.
+function arranged(names: borrow [String]) -> HomeArrangement {
+    return withInstalled(HomeArrangement {}, names, false, smallSpace)
+}

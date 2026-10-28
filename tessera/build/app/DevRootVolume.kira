@@ -1,0 +1,306 @@
+import Foundation
+import Build
+
+// A dev root request carried out on the machine `kira build boot -dev`
+// is running, whose devroot service waits for a volume labelled `devroot`
+// (roadmap/18-components.md). The request and the archives go onto a small
+// ext4 image, which is plugged in as a USB stick through QEMU's monitor; the
+// service's answer comes back on the serial line, and the stick is pulled
+// out again.
+//
+// The service does the rest on the machine: it keeps the stack of installed
+// roots, backs up what a root overwrites, restores it on uninstall, refuses
+// to touch a file changed since it was installed unless -force is given,
+// and asks PID 1 to restart what loads the files that changed. `wait` only
+// waits for the service to be running.
+
+namespace DevRootVolume {
+    let label: String = "devroot"
+    let request: String = "request"
+    // From the machine directory: the tree the image is made from, and the
+    // image.
+    let tree: String = "devroot-volume"
+    let image: String = "devroot.img"
+    // The drive id of a stick still plugged in, kept until it is pulled out:
+    // a run stopped while it waited leaves its stick behind, which keeps
+    // /Volumes/devroot taken.
+    let plugged: String = "devroot.plugged"
+    let usage: String = "kira build devroot install|uninstall <component>... [-force] [-only] | reset | sample [seconds] [hz] | crashes | wait"
+    // Room on the stick for what a sample brings back.
+    let sampleBytes: Number = 48 * 1048576
+    // Room for every crash report the machine keeps.
+    let crashBytes: Number = 16 * 1048576
+}
+
+// Carries out the request after `devroot`, `known` naming every component,
+// `selection` what an install packed and the archives in the step's first
+// path when it packed any.
+function carryOutDevRoot(
+    host: borrow Host,
+    architecture: Architecture,
+    known: borrow [String],
+    selection: borrow DevRootSelection,
+    run: borrow StepRun
+) -> Number {
+    return match devRootOutcome(host, architecture, known, selection, run) {
+        Ok -> 0
+        Error(problem) -> {
+            log fault("the dev root request was not carried out", problem)
+            1
+        }
+    }
+}
+
+function devRootOutcome(
+    host: borrow Host,
+    architecture: Architecture,
+    known: borrow [String],
+    selection: borrow DevRootSelection,
+    run: borrow StepRun
+) -> Result<Void, String> {
+    if run.arguments.count == 0 { return .Error("usage: \(DevRootVolume.usage)") }
+    let action = copy run.arguments[0]
+    let logs = host.logDirectory()
+    let serialLog = "\(logs)/serial-\(architecture.name()).log"
+    let monitor = Monitor { path: "\(logs)/qemu-\(architecture.name())-services.monitor" }
+    // `wait` is run beside a machine still starting: QEMU gets a minute to
+    // make them.
+    if action == "wait" {
+        for poll in 0..600 {
+            if pathExists(monitor.path) && fileExists(serialLog) { break }
+            processSleep(100)
+        }
+    }
+    if !pathExists(monitor.path) {
+        return .Error(
+            "no machine is running for \(architecture.name()): \(monitor.path) is missing (boot it with kira build boot -dev)"
+        )
+    }
+    if !fileExists(serialLog) {
+        return .Error("the machine was not booted with -dev: \(serialLog) is missing")
+    }
+    if action == "wait" {
+        if !awaitSerial(serialLog, 3000, { written in return serviceStarted(written) }) {
+            return .Error("the dev root service did not start")
+        }
+        log info("the dev root service is running", architecture: architecture.name())
+        return .Ok
+    }
+    let actions = ["install", "uninstall", "reset", "sample", "crashes"]
+    if !actions.contains(action) {
+        return .Error(
+            "unknown action \(action): install, uninstall, reset, sample, crashes or wait"
+        )
+    }
+    var force = ""
+    var components: [String] = []
+    for index in 1..run.arguments.count {
+        let argument = run.arguments[index]
+        if action == "sample" || action == "crashes" { break }
+        if argument == "-force" {
+            force = " force"
+        } else if known.contains(argument) {
+            components.append(copy argument)
+        } else if argument != "-only" {
+            return .Error("\(argument) is not a component")
+        }
+    }
+    if (action == "install" || action == "uninstall") && components.count == 0 {
+        return .Error("name at least one component")
+    }
+    if action == "install" {
+        for component in selection.install {
+            if !components.contains(component) {
+                log info("installs a dependent of what was named", component: component)
+            }
+        }
+        for component in selection.left {
+            log info("leaves a dependent for the image", component: component)
+        }
+        components = copy selection.install
+    }
+    let machine = host.machineDirectory(architecture)
+    let tree = "\(machine)/\(DevRootVolume.tree)"
+    clearFlatTree(tree)
+    match makePathTree(tree) {
+        Ok -> {}
+        Error(failure) -> return .Error("\(tree) cannot be made: \(traceText(failure))")
+    }
+    let id = String(floor(unixMillis()))
+    var request = "id \(id)\n"
+    var bytes = 0
+    for component in components {
+        if action == "install" {
+            let archive = run.paths.count > 0 ? "\(run.paths[0])/\(component).root" : ""
+            if !fileExists(archive) {
+                return .Error(
+                    "no archive of \(component): install through kira build devroot install \(component)"
+                )
+            }
+            let copied = match copyFile(archive, "\(tree)/\(component).root") {
+                Ok(length) -> Number(length)
+                Error(failure) -> return .Error(
+                    "\(archive) cannot be copied: \(traceText(failure))"
+                )
+            }
+            bytes = bytes + copied
+            log info("packed a component", component: component, bytes: copied)
+        }
+        request.append("\(action) \(component)\(force)\n")
+    }
+    // Reset drops every root at the machine's next boot (roadmap/18 §5).
+    if action == "reset" { request.append("reset\n") }
+    if action == "sample" {
+        let seconds = run.arguments.count > 1 ? copy run.arguments[1] : "3"
+        let hz = run.arguments.count > 2 ? copy run.arguments[2] : "997"
+        request.append("sample \(seconds) \(hz)\n")
+        bytes = DevRootVolume.sampleBytes
+    }
+    if action == "crashes" {
+        request.append("crashes\n")
+        bytes = DevRootVolume.crashBytes
+    }
+    match writeFile("\(tree)/\(DevRootVolume.request)", request) {
+        Ok -> {}
+        Error(failure) -> return .Error("the request cannot be written: \(traceText(failure))")
+    }
+    let image = "\(machine)/\(DevRootVolume.image)"
+    match makeVolume(host, tree, image, bytes + request.count) {
+        Ok -> {}
+        Error(problem) -> return .Error(problem)
+    }
+    let plugged = "\(machine)/\(DevRootVolume.plugged)"
+    if fileExists(plugged) {
+        match readFile(plugged) {
+            Ok(contents) -> monitor.send("device_del \(contents.text.trim())")
+            Error(failure) -> absorb failure
+        }
+    }
+    // A drive id of its own each time: the last one may still be going away.
+    let drive = "devroot\(id)"
+    match writeFile(plugged, drive) {
+        Ok -> {}
+        Error(failure) -> return .Error("\(plugged) cannot be written: \(traceText(failure))")
+    }
+    monitor.send("drive_add 0 if=none,id=\(drive),file=\(image),format=raw")
+    monitor.send("device_add usb-storage,bus=xhci.0,drive=\(drive),id=\(drive)")
+    log info("plugged in the dev root volume; waiting for the answer", request: id)
+    // The service takes a request within seconds of the stick appearing;
+    // carrying it out may take much longer.
+    // Printed lines, which the log's limit on repeats never holds back.
+    let taken = "dev root request taken: id \(id)"
+    let answer = "dev root request done: id \(id) with "
+    let started = awaitSerial(serialLog, 300, { written in return written.shows(taken) })
+    let answered = started && awaitSerial(
+        serialLog,
+        3000,
+        { written in return written.shows(answer) }
+    )
+    monitor.send("device_del \(drive)")
+    match removePath(plugged) {
+        Ok -> {}
+        Error(failure) -> absorb failure
+    }
+    if !started { return .Error("the machine did not take request \(id) (see \(serialLog))") }
+    if !answered { return .Error("the machine did not answer request \(id) (see \(serialLog))") }
+    if !readBootLog(serialLog).shows(answer + "0 failures") {
+        return .Error("the machine refused part of request \(id) (see \(serialLog))")
+    }
+    log info("the dev root request is done", request: id)
+    if action == "sample" {
+        let roots = SampleRoots {
+            symbols: run.paths.count > 0 ? copy run.paths[0] : "",
+            system: run.paths.count > 1 ? copy run.paths[1] : ""
+        }
+        return reportSamples(host, image, roots, "\(logs)/sample-\(id).txt")
+    }
+    if action == "crashes" {
+        let roots = SampleRoots {
+            symbols: run.paths.count > 0 ? copy run.paths[0] : "",
+            system: run.paths.count > 1 ? copy run.paths[1] : ""
+        }
+        return reportCrashes(host, image, roots, "\(logs)/crashes")
+    }
+    return .Ok
+}
+
+// Makes `image` an ext4 volume labelled `devroot` holding `tree`, with room
+// for its `bytes` and ext4's own bookkeeping.
+function makeVolume(
+    host: borrow Host,
+    tree: borrow String,
+    image: borrow String,
+    bytes: Number
+) -> Result<Void, String> {
+    let megabytes = floor(bytes * 5 / 4 / 1048576) + 8
+    if fileExists(image) {
+        match removePath(image) {
+            Ok -> {}
+            Error(failure) -> return .Error("\(image) cannot be removed: \(traceText(failure))")
+        }
+    }
+    match setFileLength(image, UNumber(megabytes * 1048576)) {
+        Ok -> {}
+        Error(failure) -> return .Error("\(image) cannot be made: \(traceText(failure))")
+    }
+    let command = ProcessCommand {
+        program: host.find("mkfs.ext4"),
+        arguments: ["-q", "-F", "-L", copy DevRootVolume.label, "-d", copy tree, copy image],
+        input: .Null
+    }
+    let child = match command.start() {
+        Ok(started) -> started
+        Error(failure) -> return .Error("mkfs.ext4 did not start: \(traceText(failure))")
+    }
+    let ended = child.wait()
+    match child.release() {
+        Ok -> {}
+        Error(failure) -> absorb failure
+    }
+    return match ended {
+        Ok(exit) -> exitStatus(exit) == 0 ? .Ok : .Error("mkfs.ext4 could not make \(image)")
+        Error(failure) -> .Error("mkfs.ext4 could not be waited for: \(traceText(failure))")
+    }
+}
+
+// Removes `tree` and the files directly in it, which is all a request's
+// tree holds.
+function clearFlatTree(tree: borrow String) {
+    if !pathExists(tree) { return }
+    match listDirectory(tree) {
+        Ok(listing) -> {
+            for index in 0..listing.count() {
+                match listing.entry(index) {
+                    Some(name) -> match removePath("\(tree)/\(name)") {
+                        Ok -> {}
+                        Error(failure) -> absorb failure
+                    }
+                    None -> {}
+                }
+            }
+        }
+        Error(failure) -> absorb failure
+    }
+    match removePath(tree) {
+        Ok -> {}
+        Error(failure) -> absorb failure
+    }
+}
+
+// Polls the serial log until `holds` answers yes or `polls` tenths of a
+// second pass.
+function awaitSerial(path: borrow String, polls: Number, holds: (BootLog) -> Bool) -> Bool {
+    for poll in 0..polls {
+        if holds(readBootLog(path)) { return true }
+        processSleep(100)
+    }
+    return false
+}
+
+// Whether the devroot service said it is starting.
+function serviceStarted(written: borrow BootLog) -> Bool {
+    for entry in written.entries {
+        if entry.header.contains("[DevRoot") && entry.header.contains("]: starting") { return true }
+    }
+    return false
+}

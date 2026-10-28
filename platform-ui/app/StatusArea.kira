@@ -1,0 +1,147 @@
+import Foundation
+import KiraUI
+
+// The status area (roadmap/11-adaptive-desktop.md): what the machine says when
+// nothing else is speaking, small, at the trailing end of the system bar. It
+// stays on the lock screen, as a Mac's menu bar extras and an iPhone's status
+// icons do.
+
+// The battery as the status area shows it.
+public struct BatteryLevel {
+    // 0 to 100.
+    let percent: Number
+    let charging: Bool
+}
+
+// How the machine reaches a network, as the status area shows it.
+public enum StatusConnection {
+    // Through Wi-Fi or a cable, and whether the link is up.
+    Wireless(Bool)
+    Wired(Bool)
+}
+
+// What the status area has to say besides the time: Focus while it is on, as
+// the moon an iPhone puts in its status bar, the network the machine is on,
+// and the battery, or the mains on a machine that has no battery.
+public struct StatusItems {
+    var focus: Bool = false
+    var connection: StatusConnection? = .None
+    var battery: BatteryLevel? = .None
+    // Whether the machine runs from the mains with no battery to show.
+    var mains: Bool = false
+}
+
+extend StatusItems {
+    // Whether there is nothing to show.
+    function isEmpty(borrow self) -> Bool {
+        return !focus && connection.isNone() && battery.isNone() && !mains
+    }
+}
+
+// The size status symbols are drawn at, in points.
+namespace StatusSymbol {
+    let size: Number = 13
+}
+
+// The status area's clock: the date and the time in the bar's own text, as a
+// Mac's sits at the trailing end of its menu bar.
+public construct StatusClock(realtime: Number) extends Widget {
+    body {
+        Text(clockBar(realtime))
+        .font(size: resolvedLength(13))
+    }
+}
+
+// Focus, while it is on.
+public construct FocusStatus(size: Number = 13) extends Widget {
+    body {
+        Icon(symbol = .MoonFill)
+        .font(size: resolvedLength(size), weight: .Medium)
+    }
+}
+
+// The network: Wi-Fi's fan, the globe for a cable, or Wi-Fi struck through
+// while no link is up.
+public construct ConnectionStatus(
+    connection: StatusConnection,
+    size: Number = 13
+) extends Widget {
+    body {
+        Icon(symbol = connectionSymbol(connection))
+        .font(size: resolvedLength(size), weight: .Medium)
+    }
+}
+
+function connectionSymbol(connection: borrow StatusConnection) -> Symbol {
+    return match connection {
+        Wireless(up) -> up ? .Wifi : .WifiSlash
+        Wired(up) -> up ? .Globe : .WifiSlash
+    }
+}
+
+// The mains, on a machine without a battery: full, and the bolt.
+public construct MainsStatus(size: Number = 13) extends Widget {
+    body {
+        HStack(spacing = .Length(3), alignment = .Center) {
+            Text("100%")
+            .font(size: resolvedLength(size - 1), weight: .Medium)
+            Icon(symbol = .BoltFill)
+            .font(size: resolvedLength(size), weight: .Medium)
+        }
+        .hugWidth()
+    }
+}
+
+// The battery: how full it is, or the bolt while it charges.
+public construct BatteryStatus(level: BatteryLevel, size: Number = 13) extends Widget {
+    body {
+        Icon(symbol = batterySymbol(level))
+        .font(size: resolvedLength(size), weight: .Medium)
+    }
+}
+
+function batterySymbol(level: borrow BatteryLevel) -> Symbol {
+    if level.charging { return .BatteryCharging }
+    if level.percent >= 88 { return .Battery100 }
+    if level.percent >= 50 { return .Battery75Percent }
+    if level.percent >= 13 { return .Battery25Percent }
+    return .Battery0
+}
+
+// The status items in `items`, in the order a Mac's menu bar and an iPhone's
+// status bar give them, Focus, the network, then the battery or the mains,
+// `spacing` points apart.
+public construct StatusIcons(
+    items: StatusItems,
+    spacing: Number,
+    size: Number = 13
+) extends Widget {
+    body {
+        HStack(
+            spacing = .Length(spacing),
+            alignment = .Center,
+            children = statusItemWidgets(items, size)
+        )
+    }
+}
+
+function statusItemWidgets(items: borrow StatusItems, size: Number) -> [Any Widget] {
+    var widgets: [Any Widget] = []
+    if items.focus { widgets.append(FocusStatus(size = size)) }
+    match items.connection {
+        Some(connection) -> widgets.append(ConnectionStatus(connection = copy connection, size = size))
+        None -> {}
+    }
+    match items.battery {
+        Some(level) -> widgets.append(BatteryStatus(level = copy level, size = size))
+        None -> if items.mains { widgets.append(MainsStatus(size = size)) }
+    }
+    return widgets
+}
+
+// How far apart status items stand on a system bar: as far as one menu's
+// title from the next, padding and all, as a Mac's menu bar extras do.
+public function systemBarStatusSpacing() -> Number {
+    let bar = menuBarMetrics()
+    return bar.titlePadding * 2 + bar.titleSpacing
+}

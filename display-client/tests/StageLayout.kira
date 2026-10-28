@@ -1,0 +1,62 @@
+import Foundation
+
+// Run: sh tests/run-stage-layout.sh
+function checkStage(condition: Bool, name: borrow String) -> Number {
+    if condition { return 0 }
+    print(name)
+    return 1
+}
+
+@Main
+function stageLayoutTests() -> Number {
+    var failures = 0
+    let slot = stageSlot(1440, 900, 28, 80, 0, 2)
+    let portrait = stageThumbnail(slot, 300, 600)
+    let landscape = stageThumbnail(slot, 800, 400)
+    let badge = stageBadge(portrait)
+    failures += checkStage(portrait.x == slot.x, "portrait preview keeps the leading edge")
+    failures += checkStage(
+        portrait.height <= slot.height && portrait.width <= slot.width,
+        "portrait fits its slot"
+    )
+    failures += checkStage(
+        abs(portrait.width / portrait.height - 0.5) < 0.02,
+        "portrait aspect is preserved"
+    )
+    failures += checkStage(
+        landscape.width <= slot.width && landscape.height <= slot.height,
+        "landscape fits its slot"
+    )
+    failures += checkStage(
+        badge.x < portrait.x && badge.x + badge.width > portrait.x,
+        "badge overlaps its own preview"
+    )
+    failures += checkStage(
+        badge.y < portrait.y + portrait.height && badge.y + badge.height > portrait.y + portrait.height,
+        "badge straddles the preview bottom"
+    )
+    failures += checkStage(badge.width <= 32, "badge stays compact")
+    let second = stageSlot(1440, 900, 28, 80, 1, 2)
+    failures += checkStage(second.y > slot.y + slot.height, "slots do not overlap")
+    failures += checkStage(
+        abs((slot.y + second.y + second.height) / 2 - (28 + (900 - 28 - 80) / 2)) <= 1,
+        "actual window count is vertically centered"
+    )
+    let room = stageRoom(1440, 900, 28, 80)
+    let small = stageWindowFrame(room, 400, 240)
+    failures += checkStage(
+        small.width == 400 && small.height == 240,
+        "small windows keep their size"
+    )
+    let large = stageWindowFrame(room, 3000, 2000)
+    failures += checkStage(
+        large.width <= room.width && large.height <= room.height,
+        "oversized windows fit the stage"
+    )
+    failures += checkStage(
+        abs(large.width / large.height - 1.5) < 0.01,
+        "oversized windows keep their aspect"
+    )
+    if failures == 0 { print("Stage layout: 12 passed") }
+    return failures
+}

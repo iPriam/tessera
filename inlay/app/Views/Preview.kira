@@ -1,0 +1,65 @@
+import Foundation
+import KiraUI
+import FileOperations
+
+// A look at the chosen file without opening it (roadmap/19-files-and-
+// documents.md, "Find and inspect documents"), as Quick Look gives one: the
+// start of a text, a picture whole, or, for any other kind, its size alone.
+
+enum PreviewKind {
+    Text
+    Picture
+    Other
+}
+
+namespace PreviewLimit {
+    // How much of a text is shown.
+    let characters: Number = 2000
+    let pictureHeight: Number = 240
+}
+
+// The kind of preview a file's name promises.
+function previewKind(name: borrow String) -> PreviewKind {
+    let (_, extension) = nameParts(name.lowercased())
+    return match extension {
+        ".txt", ".md", ".text", ".log", ".json", ".kira", ".csv", ".ridl" -> .Text
+        ".png", ".jpg", ".jpeg" -> .Picture
+        else -> .Other
+    }
+}
+
+// The preview of the file at `path`, nothing when no file is chosen.
+function previewSection(path: borrow String) -> Any Widget {
+    if path.count == 0 || isDirectory(path) || !fileExists(path) { return EmptyView() }
+    let name = lastPathPart(path)
+    let shown: Any Widget = match previewKind(name) {
+        Text -> textPreview(path)
+        Picture -> ImageFile(path = copy path, aspectFill = false)
+        .height(resolvedLength(PreviewLimit.pictureHeight))
+        Other -> Text("No preview for this kind of document.").foregroundColor(.Secondary)
+    }
+    return Section(children: [shown], header: Text("Preview of \(name)"))
+}
+
+function textPreview(path: borrow String) -> Any Widget {
+    return match readFile(path) {
+        Ok(contents) -> Text(textStart(contents.text, PreviewLimit.characters))
+        Error(failure) -> {
+            log info("a text could not be previewed", failure)
+            Text("This document cannot be read as text.").foregroundColor(.Secondary)
+        }
+    }
+}
+
+// The start of `text`, at most `limit` bytes cut where a character ends, and
+// an ellipsis when there was more.
+function textStart(text: borrow String, limit: Number) -> String {
+    if text.count <= limit { return copy text }
+    var at: Number = 0
+    while at < limit {
+        let width = scalarWidthAt(text, at)
+        if at + width > limit { break }
+        at += width
+    }
+    return text.substring(0, at) + "…"
+}

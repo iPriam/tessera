@@ -1,0 +1,657 @@
+import Foundation
+import Heap
+import LibTessera
+import DeviceKit
+
+// Streams: one per connection that sent `Open`.
+//
+// The stream's device is a DeviceKit connection; its slots are Memory this
+// service made, mapped here and shared with the client. An enqueued slot
+// waits in enqueue order; the engine for the stream's class moves the front
+// one, and `Done` gives it back. When the engine has to wait for the device
+// it arms one wait on the connection; the completion steps it again.
+
+struct Slot {
+    var index: Number
+    var memory: Handle
+    var address: RawPtr
+    var size: Number
+    var length: Number
+    var flags: PacketFlags
+    var queued: Bool
+    var order: Number
+}
+
+// Where a sensor stream finds one channel of its kind in DeviceKit's
+// sample.
+struct Lane {
+    var at: Number
+    var format: SensorChannelFormat
+    var exponent: Number
+}
+
+struct Stream {
+    var client: Number
+    var channel: Handle
+    var device: Device
+    var connection: Ref
+    // The negotiated descriptor, as the client was last told it.
+    var descriptor: StreamDescriptor
+    var state: StreamStatus
+    var waiting: Bool
+    // When a flush gives up waiting; none when no flush is asked.
+    var flushDeadline: Number?
+    // The bytes of the front slot already moved.
+    var progress: Number
+    var frameBytes: Number
+    var delivered: Number
+    var dropped: Number
+    var underruns: Number
+    var nextOrder: Number
+    var slots: [Slot]
+    // A haptic stream's playing effect, and when its last period ends.
+    var effect: UN32?
+    var playUntil: Number?
+    // A sensor stream's channels, and the bytes of one DeviceKit sample.
+    var lanes: [Lane]
+    var rawSample: Number
+}
+
+namespace StreamLimit {
+    let fewestSlots: Number = 2
+    let mostSlots: Number = 32
+    // `StreamInfo`'s bytes.
+    let infoBytes: Number = 64
+}
+
+enum StreamReadFailure {
+    Wait
+    Failed(TesseraError)
+}
+
+function streamReadFailure(reason: borrow TesseraError) -> StreamReadFailure {
+    if reason.code == .ShouldWait { return .Wait }
+    return .Failed(reason)
+}
+
+namespace Nanoseconds {
+    let perSecond: Number = 1000000000
+    // How long a flush waits for the device to play what it was given.
+    let flushTimeout: Number = 2000000000
+    // How often a flush looks again.
+    let flushPoll: Number = 5000000
+}
+
+function streamIndex(service: borrow Service, client: Number) -> Number? {
+    for (index, stream) in service.streams.enumerated() {
+        if stream.client == client { return .Some(index) }
+    }
+    return .None
+}
+
+
+function slotIndex(stream: borrow Stream, index: Number) -> Number? {
+    for (at, slot) in stream.slots.enumerated() {
+        if slot.index == index { return .Some(at) }
+    }
+    return .None
+}
+
+// What a device lookup found: the device, no device, or a refusal the asker
+// was already answered with.
+enum DeviceLookup {
+    Found(Device)
+    Missing
+    Refused
+}
+
+// The lookup's outcome, with the asker answered when it could not be looked
+// up.
+function answeredLookup(asker: borrow Client, failed: borrow TesseraError) -> DeviceLookup {
+    answer(asker.channel, .Open, failed.code)
+    return .Refused
+}
+
+// A found device as the lookup's outcome, or none.
+function lookedUp(found: borrow Device?) -> DeviceLookup {
+    match found {
+        Some(device) -> return .Found(device)
+        None -> {}
+    }
+    return .Missing
+}
+
+// The device could not be opened: the asker is answered, and none is
+// answered to `open`.
+function unopenedDevice(
+    asker: borrow Client,
+    device: borrow Device,
+    failed: borrow TesseraError
+) -> Ref? {
+    log warn("cannot open a device", id: device.id, error: errorName(failed))
+    answer(asker.channel, .Open, failed.code)
+    return .None
+}
+
+// Opens the stream the descriptor asks for, makes its slots and answers
+// with the negotiated descriptor and the slots.
+function open(service: borrow mut Service, client: Number, asked: borrow StreamDescriptor) {
+    let asker = service.clients[client]
+    if streamIndex(service, asker.id).isSome() {
+        answer(asker.channel, .Open, .BadState)
+        return
+    }
+    if !classEntitled(asker, asked.streamClass) {
+        answer(asker.channel, .Open, .NotEntitled)
+        return
+    }
+    let lookup = match findDevice(service, asked.streamClass, asked.deviceId) {
+        Ok(found) -> lookedUp(found)
+        Error(failed) -> answeredLookup(asker, failed)
+    }
+    let device = match lookup {
+        Found(value) -> value
+        Missing -> {
+            answer(asker.channel, .Open, .NotFound)
+            return
+        }
+        Refused -> return
+    }
+    if !entitled(asker, entitlementFor(device.deviceClass, device.kind)) {
+        answer(asker.channel, .Open, .NotEntitled)
+        return
+    }
+    let opened: Ref? = match openDevice(service, device.entry, familyOf(device.deviceClass)) {
+        Ok(value) -> .Some(value)
+        Error(failed) -> unopenedDevice(asker, device, failed)
+    }
+    let connection = match opened {
+        Some(value) -> value
+        None -> return
+    }
+    var descriptor = asked
+    descriptor.deviceId = device.id
+    service.streams.append(
+        Stream {
+            client: asker.id,
+            channel: asker.channel,
+            device: device,
+            connection: connection,
+            descriptor: descriptor,
+            state: .Configured,
+            waiting: false,
+            flushDeadline: .None,
+            progress: 0,
+            frameBytes: 0,
+            delivered: 0,
+            dropped: 0,
+            underruns: 0,
+            nextOrder: 0,
+            slots: [],
+            effect: .None,
+            playUntil: .None,
+            lanes: [],
+            rawSample: 0,
+        }
+    )
+    let stream = service.streams.count - 1
+    match share(service, stream, .Open) {
+        Ok -> log info("a stream was opened", id: device.id, program: asker.program.or("unknown"))
+        Error(failed) -> refusedShare(service, stream, asker.channel, failed)
+    }
+}
+
+function refusedShare(service: borrow mut Service, stream: Number, channel: Handle, reason: borrow TesseraError) {
+    answer(channel, .Open, reason.code)
+    closeStream(service, stream)
+}
+
+function releaseShared(handles: borrow [Handle], reason: borrow TesseraError) -> Result<Void, TesseraError> {
+    closeHandles(handles)
+    return .Error(reason)
+}
+
+function releaseUnmapped(memory: Handle, reason: borrow TesseraError) -> Result<RawPtr, TesseraError> {
+    closeHandle(memory)
+    return .Error(reason)
+}
+
+// Configures the device for the descriptor, makes the slots and answers
+// `op` with them.
+function share(
+    service: borrow mut Service,
+    stream: Number,
+    op: borrow Operation
+) -> Result<Void, TesseraError> {
+    try engineConfigure(service, stream)
+    let shape = service.streams[stream].descriptor
+    if shape.bufferCount < StreamLimit.fewestSlots || shape.bufferCount > StreamLimit.mostSlots || shape.bufferSize <= 0 {
+        return .Error(failure(.FormatUnsupported))
+    }
+    var handles: [Handle] = []
+    for index in 0..shape.bufferCount {
+        match makeSlot(service, stream, Number(index)) {
+            Ok(shared) -> handles.append(shared)
+            Error(failed) -> return releaseShared(handles, failed)
+        }
+    }
+    engineAttach(service, stream)
+    let block = zeroedBlock(count: DeviceWire.descriptorBytes, alignment: 16)
+    descriptorWrite(block.pointer(), service.streams[stream].descriptor)
+    send(
+        service.streams[stream].channel,
+        op,
+        .Ok,
+        UNumber(0),
+        UNumber(0),
+        UNumber(0),
+        Buffer { address: block.pointer(), length: DeviceWire.descriptorBytes },
+        handles
+    )
+    return .Ok
+}
+
+// A slot's Memory, mapped here; the answer is the copy the client gets.
+function makeSlot(
+    service: borrow mut Service,
+    stream: Number,
+    index: Number
+) -> Result<Handle, TesseraError> {
+    let size = service.streams[stream].descriptor.bufferSize
+    let rounded = memoryPageRound(size)
+    let memory = try memoryCreate(rounded, MemoryOptions.none)
+    let mapped: Result<RawPtr, TesseraError> = match memoryMap(
+        memory,
+        0,
+        rounded,
+        Protection.read | Protection.write,
+        MapOptions.none,
+        nullPointer()
+    ) {
+        Ok(value) -> .Ok(value)
+        Error(failed) -> releaseUnmapped(memory, failed)
+    }
+    let address = try mapped
+    service.streams[stream].slots.append(
+        Slot {
+            index: index,
+            memory: memory,
+            address: address,
+            size: size,
+            length: 0,
+            flags: PacketFlags.none,
+            queued: false,
+            order: 0,
+        }
+    )
+    return handleDuplicate(memory, Rights.same)
+}
+
+function releaseSlots(service: borrow mut Service, stream: Number) {
+    for slot in service.streams[stream].slots {
+        match memoryUnmap(slot.address, memoryPageRound(slot.size)) {
+            Ok -> {}
+            Error(failed) -> log warn(
+                "a slot could not be unmapped",
+                slot: slot.index,
+                error: errorName(failed)
+            )
+        }
+        closeHandle(slot.memory)
+    }
+    service.streams[stream].slots = []
+}
+
+// The device's connection goes, and with it any wait still armed on it.
+function closeStream(service: borrow mut Service, stream: Number) {
+    engineStop(service, stream)
+    let client = service.streams[stream].client
+    cancelWaits(service.port, deviceKey(client))
+    closeRef(service.streams[stream].connection)
+    releaseSlots(service, stream)
+    var kept: [Stream] = []
+    for each in service.streams {
+        if each.client != client { kept.append(each) }
+    }
+    service.streams = kept
+}
+
+// The oldest enqueued slot.
+function frontSlot(service: borrow Service, stream: Number) -> Number? {
+    var front: Number? = .None
+    var oldest: Number = 0
+    for (index, slot) in service.streams[stream].slots.enumerated() {
+        if !slot.queued { continue }
+        if front.isNone() || slot.order < oldest {
+            front = .Some(index)
+            oldest = slot.order
+        }
+    }
+    return front
+}
+
+// Gives a slot back to the client.
+function done(
+    service: borrow mut Service,
+    stream: Number,
+    slot: Number,
+    outcome: borrow ErrorCode,
+    timestamp: Number,
+    length: Number,
+    flags: PacketFlags
+) {
+    service.streams[stream].slots[slot].queued = false
+    if outcome == .Ok { service.streams[stream].delivered += 1 }
+    let lengthAndFlags = UNumber(length) | (UNumber(flags.raw) << UNumber(32))
+    let none: [Handle] = []
+    let index = service.streams[stream].slots[slot].index
+    send(
+        service.streams[stream].channel,
+        .Done,
+        outcome,
+        UNumber(index),
+        UNumber(timestamp),
+        lengthAndFlags,
+        noBytes(),
+        none
+    )
+}
+
+function doneAll(service: borrow mut Service, stream: Number, outcome: borrow ErrorCode) {
+    while true {
+        match frontSlot(service, stream) {
+            Some(front) -> done(service, stream, front, outcome, 0, 0, PacketFlags.none)
+            None -> break
+        }
+    }
+    service.streams[stream].progress = 0
+}
+
+function enqueue(service: borrow mut Service, stream: Number, enqueued: borrow EnqueueRequest) {
+    let slot = match slotIndex(service.streams[stream], enqueued.slot) {
+        Some(value) -> value
+        None -> {
+            log warn("a client enqueued a slot it does not have", slot: enqueued.slot)
+            return
+        }
+    }
+    if service.streams[stream].slots[slot].queued {
+        log warn("a client enqueued a slot twice", slot: enqueued.slot)
+        return
+    }
+    var length = enqueued.length
+    let size = service.streams[stream].slots[slot].size
+    if length > size { length = size }
+    let order = service.streams[stream].nextOrder
+    service.streams[stream].nextOrder += 1
+    service.streams[stream].slots[slot].length = length
+    service.streams[stream].slots[slot].flags = enqueued.flags
+    service.streams[stream].slots[slot].queued = true
+    service.streams[stream].slots[slot].order = order
+    if service.streams[stream].state == .Failed {
+        done(service, stream, slot, .DeviceLost, 0, 0, PacketFlags.none)
+        return
+    }
+    engineEnqueue(service, stream, slot)
+    if service.streams[stream].state == .Running { engineStep(service, stream) }
+}
+
+// A request to a connection's stream; one with no stream open is
+// `BadState`.
+function serveRequest(service: borrow mut Service, client: Number, request: borrow Request) {
+    let channel = service.clients[client].channel
+    let found = streamIndex(service, service.clients[client].id)
+    match request {
+        List(deviceClass) -> list(service, client, deviceClass)
+        Open(descriptor) -> open(service, client, descriptor)
+        Enqueue(enqueued) -> match found {
+            Some(stream) -> enqueue(service, stream, enqueued)
+            // An enqueue has no answer to carry the error.
+            None -> log warn("a client enqueued a slot with no stream open", slot: enqueued.slot)
+        }
+        Start -> match found {
+            Some(stream) -> start(service, stream)
+            None -> answer(channel, .Start, .BadState)
+        }
+        Stop -> match found {
+            Some(stream) -> stop(service, stream)
+            None -> answer(channel, .Stop, .BadState)
+        }
+        Flush -> match found {
+            Some(stream) -> flush(service, stream)
+            None -> answer(channel, .Flush, .BadState)
+        }
+        Reconfigure(descriptor) -> match found {
+            Some(stream) -> reconfigure(service, stream, descriptor)
+            None -> answer(channel, .Reconfigure, .BadState)
+        }
+        Control(controlled) -> match found {
+            Some(stream) -> control(service, stream, controlled)
+            None -> answer(channel, .Control, .BadState)
+        }
+        Info -> match found {
+            Some(stream) -> info(service, stream)
+            None -> answer(channel, .Info, .BadState)
+        }
+    }
+}
+
+function start(service: borrow mut Service, stream: Number) {
+    let channel = service.streams[stream].channel
+    let state = service.streams[stream].state
+    if state == .Running || state == .Failed {
+        answer(channel, .Start, .BadState)
+        return
+    }
+    match engineStart(service, stream) {
+        Ok -> {
+            service.streams[stream].state = .Running
+            answer(channel, .Start, .Ok)
+            engineStep(service, stream)
+        }
+        Error(failed) -> answer(channel, .Start, failed.code)
+    }
+}
+
+function stop(service: borrow mut Service, stream: Number) {
+    let channel = service.streams[stream].channel
+    engineStop(service, stream)
+    service.streams[stream].state = .Stopped
+    doneAll(service, stream, .Cancelled)
+    if service.streams[stream].flushDeadline.isSome() {
+        service.streams[stream].flushDeadline = .None
+        answer(channel, .Flush, .Ok)
+    }
+    answer(channel, .Stop, .Ok)
+}
+
+// The monotonic clock for a stream. A clock that cannot be read fails the
+// stream with that reason, and no time comes back.
+function streamTime(service: borrow mut Service, stream: Number) -> Number? {
+    match monotonic() {
+        Ok(value) -> return .Some(value)
+        Error(failed) -> fail(service, stream, failed)
+    }
+    return .None
+}
+
+function flush(service: borrow mut Service, stream: Number) {
+    let now = match streamTime(service, stream) {
+        Some(value) -> value
+        None -> return
+    }
+    service.streams[stream].flushDeadline = .Some(now + Nanoseconds.flushTimeout)
+    flushCheck(service, stream)
+}
+
+// Finishes a flush once nothing is queued and the device has played it, or
+// its time is up. A stream that failed has nothing left to play, so its
+// flush ends.
+function flushCheck(service: borrow mut Service, stream: Number) {
+    let deadline = match service.streams[stream].flushDeadline {
+        Some(value) -> value
+        None -> return
+    }
+    let now = match streamTime(service, stream) {
+        Some(value) -> value
+        None -> return
+    }
+    if service.streams[stream].state == .Running && now < deadline {
+        if frontSlot(service, stream).isSome() { return }
+        match engineDrained(service, stream) {
+            Ok(drained) -> if !drained { return }
+            Error(failed) -> fail(service, stream, failed)
+        }
+    }
+    service.streams[stream].flushDeadline = .None
+    answer(service.streams[stream].channel, .Flush, .Ok)
+}
+
+// The stream's reconfigure failed: its state and the asker's answer say so.
+function failedReconfigure(
+    service: borrow mut Service,
+    stream: Number,
+    channel: Handle,
+    failed: borrow TesseraError
+) {
+    service.streams[stream].state = .Failed
+    answer(channel, .Reconfigure, failed.code)
+}
+
+function reconfigure(service: borrow mut Service, stream: Number, asked: borrow StreamDescriptor) {
+    let channel = service.streams[stream].channel
+    if service.streams[stream].state == .Running {
+        answer(channel, .Reconfigure, .BadState)
+        return
+    }
+    var descriptor = asked
+    if descriptor.streamClass != service.streams[stream].descriptor.streamClass {
+        answer(channel, .Reconfigure, .InvalidArgument)
+        return
+    }
+    doneAll(service, stream, .Cancelled)
+    releaseSlots(service, stream)
+    descriptor.deviceId = service.streams[stream].device.id
+    service.streams[stream].descriptor = descriptor
+    match share(service, stream, .Reconfigure) {
+        Ok -> service.streams[stream].state = .Configured
+        Error(failed) -> failedReconfigure(service, stream, channel, failed)
+    }
+}
+
+function control(service: borrow mut Service, stream: Number, request: borrow ControlRequest) {
+    let channel = service.streams[stream].channel
+    let none: [Handle] = []
+    match engineControl(service, stream, request) {
+        Ok(read) -> match read {
+            Some(value) -> {
+                let block = zeroedBlock(count: DeviceWire.controlBytes, alignment: 16)
+                blockStore<U32>(block, 0, wordOf(value))
+                send(
+                    channel,
+                    .Control,
+                    .Ok,
+                    UNumber(DeviceWire.controlBytes),
+                    UNumber(0),
+                    UNumber(0),
+                    Buffer { address: block.pointer(), length: DeviceWire.controlBytes },
+                    none
+                )
+            }
+            None -> send(
+                channel,
+                .Control,
+                .Ok,
+                UNumber(0),
+                UNumber(0),
+                UNumber(0),
+                noBytes(),
+                none
+            )
+        }
+        Error(failed) -> answer(channel, .Control, failed.code)
+    }
+}
+
+// The asker is answered with the reason the latency is unknown.
+function refusedInfo(channel: Handle, failed: borrow TesseraError) -> Number? {
+    answer(channel, .Info, failed.code)
+    return .None
+}
+
+function info(service: borrow mut Service, stream: Number) {
+    let block = zeroedBlock(count: StreamLimit.infoBytes, alignment: 16)
+    let current = service.streams[stream]
+    // A latency the device cannot report is the asker's refusal, not a zero.
+    let measured: Number? = match engineLatency(service, stream) {
+        Ok(value) -> .Some(value)
+        Error(failed) -> refusedInfo(current.channel, failed)
+    }
+    let latency = match measured {
+        Some(value) -> value
+        None -> return
+    }
+    heapStore(
+        block.pointer(),
+        StreamInfoRecord {
+            state: current.state.rawValue(),
+            latency: UNumber(latency),
+            dropped: UNumber(current.dropped),
+            delivered: UNumber(current.delivered),
+            underruns: UNumber(current.underruns),
+            streamClass: current.descriptor.streamClass.rawValue(),
+            deviceId: UNumber(current.device.id),
+            bufferCount: UN32(current.descriptor.bufferCount),
+            bufferSize: UN32(current.descriptor.bufferSize),
+        }
+    )
+    let none: [Handle] = []
+    send(
+        current.channel,
+        .Info,
+        .Ok,
+        UNumber(0),
+        UNumber(0),
+        UNumber(0),
+        Buffer { address: block.pointer(), length: StreamLimit.infoBytes },
+        none
+    )
+}
+
+// Arms one wait on the device for `events`; its completion steps the
+// stream again.
+function arm(service: borrow mut Service, stream: Number, events: DeviceEvents) {
+    if service.streams[stream].waiting { return }
+    let watched = events | DeviceEvents.lost | DeviceEvents.error
+    let key = UNumber(deviceKey(service.streams[stream].client))
+    match refWaitAsync(service.streams[stream].connection, watched, .Once, service.port, key) {
+        Ok -> service.streams[stream].waiting = true
+        Error(failed) -> fail(service, stream, failed)
+    }
+}
+
+// The device failed: every slot comes back `DeviceLost`.
+function fail(service: borrow mut Service, stream: Number, error: borrow TesseraError) {
+    log warn("a stream failed", id: service.streams[stream].device.id, error: errorName(error))
+    service.streams[stream].state = .Failed
+    doneAll(service, stream, .DeviceLost)
+}
+
+// The device's wait completed.
+function deviceReady(service: borrow mut Service, client: Number, completion: borrow Completion) {
+    let stream = match streamIndex(service, client) {
+        Some(value) -> value
+        None -> return
+    }
+    service.streams[stream].waiting = false
+    if completion.error.code != .Ok {
+        fail(service, stream, completion.error)
+        return
+    }
+    let events = DeviceEvents(UN32(completion.result0))
+    if events.has(DeviceEvents.lost) || events.has(DeviceEvents.error) {
+        fail(service, stream, failure(.DeviceLost))
+        return
+    }
+    if service.streams[stream].state == .Running { engineStep(service, stream) }
+}

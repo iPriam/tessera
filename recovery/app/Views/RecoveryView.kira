@@ -1,0 +1,212 @@
+import Foundation
+import KiraUI
+
+// The recovery's screen, as a Mac's: the menu bar along the top, the
+// wallpaper, and one window in the middle that holds the utilities and
+// becomes the one chosen.
+
+namespace RecoveryColors {
+    let wallpaperTop: RGBAColor = RGBAColor { r: 0.02, g: 0.05, b: 0.18, a: 1.0 }
+    let wallpaperBottom: RGBAColor = RGBAColor { r: 0.10, g: 0.33, b: 0.66, a: 1.0 }
+    let menuBar: RGBAColor = RGBAColor { r: 0.0, g: 0.0, b: 0.0, a: 0.28 }
+    let windowShade: RGBAColor = RGBAColor { r: 0.0, g: 0.0, b: 0.0, a: 0.45 }
+}
+
+// The window's size for each pane, in points: the utilities' is small, as a
+// Mac's recovery window is.
+function paneSize(pane: Number) -> (Number, Number) {
+    if pane == RecoveryPane.utilities { return (620.0, 440.0) }
+    if pane == RecoveryPane.diskUtility { return (900.0, 600.0) }
+    if pane == RecoveryPane.terminal { return (720.0, 460.0) }
+    return (720.0, 520.0)
+}
+
+function paneTitle(pane: Number) -> String {
+    if pane == RecoveryPane.install { return "Install Tessera" }
+    if pane == RecoveryPane.diskUtility { return "Disk Utility" }
+    if pane == RecoveryPane.startupDisk { return "Startup Disk" }
+    if pane == RecoveryPane.terminal { return "Terminal" }
+    return "Tessera Recovery"
+}
+
+public construct RecoveryView(
+    model: RecoveryModel,
+    clock: String = "",
+    install: RecoveryInstall = RecoveryInstall {},
+    actions: RecoveryActions = idleRecoveryActions()
+) extends Widget {
+    @State var pane: Number = 0
+
+    body {
+        ZStack(alignment = .Top) {
+            LinearGradient(
+                start = RecoveryColors.wallpaperTop,
+                end = RecoveryColors.wallpaperBottom,
+                direction = .Diagonal
+            )
+            .fillWidth()
+            .fillHeight()
+
+            VStack(spacing = .None) {
+                RecoveryMenuBar(pane = pane, clock = copy clock)
+                Spacer()
+                RecoveryWindow(
+                    pane = $pane,
+                    model = copy model,
+                    install = copy install,
+                    actions = copy actions
+                )
+                Spacer()
+            }
+            .fillWidth()
+            .fillHeight()
+        }
+        .fillWidth()
+        .fillHeight()
+        .preferredColorScheme(.Some(.Dark))
+    }
+}
+
+// The menu bar: the system's mark, the window's application in bold, and the
+// clock at the far end.
+construct RecoveryMenuBar(pane: Number, clock: String) extends Widget {
+    body {
+        HStack(spacing = .Large, alignment = .Center) {
+            Picture(name = "tessera", points = 16.0)
+            Text(paneTitle(pane))
+            .font(size = resolvedLength(13.0), weight = .Bold)
+            Text("Edit")
+            Text("Utilities")
+            Text("Window")
+            Spacer()
+            Text(copy clock)
+        }
+        .font(size = resolvedLength(13.0), weight = .Medium)
+        .foregroundColor(.White)
+        .edgePadding(EdgeSet.horizontal, resolvedLength(14.0))
+        .height(resolvedLength(28.0))
+        .fillWidth()
+        .background(fill = SurfaceTint(color = RecoveryColors.menuBar))
+    }
+}
+
+// Each pane's title bar, as its own application's window has it on a Mac:
+// the utilities' chooser has only its buttons, Disk Utility its toolbar, and
+// the rest the slim title bar.
+function paneStyle(pane: Number) -> WindowStyle {
+    if pane == RecoveryPane.utilities { return .HiddenTitleBar }
+    return .TitleBar
+}
+
+// The three window buttons, KiraUI's own. Only close does something, and only
+// away from the utilities: it goes back to them. The others stay grey.
+construct RecoveryControls(closes: Bool, close: () -> Void) extends Widget {
+    body {
+        let closeKey = tapSeqKey()
+        let minimizeKey = tapSeqKey()
+        let zoomKey = tapSeqKey()
+        let reveal = closes && hovered(closeKey)
+        HStack(spacing = .Length(windowChromeMetrics().controlSpacing), alignment = .Center) {
+            WindowButton(
+                key = closeKey,
+                ink = closes ? .Red : .Quaternary,
+                glyph = .Close,
+                revealGlyph = reveal,
+                action = closes ? close : { in return },
+            )
+            WindowButton(
+                key = minimizeKey,
+                ink = .Quaternary,
+                glyph = .Minimize,
+                revealGlyph = false,
+                action = { in return }
+            )
+            WindowButton(
+                key = zoomKey,
+                ink = .Quaternary,
+                glyph = .Maximize,
+                revealGlyph = false,
+                action = { in return }
+            )
+        }
+        .hugWidth()
+    }
+}
+
+// The window: its title bar, as its pane's style has it, then the pane.
+construct RecoveryWindow(
+    pane: Binding<Number>,
+    model: RecoveryModel,
+    install: RecoveryInstall,
+    actions: RecoveryActions
+) extends Widget {
+    body {
+        let shown = pane.get()
+        let size = paneSize(shown)
+        let back: () -> Void = { in
+            pane.set(RecoveryPane.utilities)
+            return
+        }
+        let controls = RecoveryControls(closes = shown != RecoveryPane.utilities, close = back)
+        let titled = paneStyle(shown) == .TitleBar
+        let metrics = windowChromeMetrics()
+        let controlsWidth = metrics.controlDiameter * 3.0 + metrics.controlSpacing * 2.0
+        VStack(spacing = .None) {
+            // The bar's 32 is kept whether or not its title is shown, as a
+            // Mac's window keeps it under a hidden title bar.
+            ZStack(alignment = .Bottom) {
+                HStack(spacing = .None, alignment = .Center) {
+                    controls
+                    if titled {
+                        Spacer()
+                        .width(
+                            resolvedLength(
+                                TitleBarMetrics.titleLeading - TitleBarMetrics.controlsLeading - controlsWidth
+                            )
+                        )
+                        Text(paneTitle(shown))
+                        .font(size = resolvedLength(TitleBarMetrics.titleSize), weight = .Bold)
+                    }
+                    Spacer()
+                }
+                .edgePadding(EdgeSet.leading, resolvedLength(TitleBarMetrics.controlsLeading))
+                .height(resolvedLength(TitleBarMetrics.height))
+                .fillWidth()
+                if titled {
+                    Divider()
+                }
+            }
+            .height(resolvedLength(TitleBarMetrics.height))
+            .fillWidth()
+            paneContent(pane, model, install, actions)
+            .fillWidth()
+            .fillHeight()
+        }
+        .fillWidth()
+        .fillHeight()
+        .frame(width = size.0, height = size.1)
+        .background(fill = BackgroundFill(style = .Window, radius = .Large))
+        .shadow(
+            color = RecoveryColors.windowShade,
+            radius = resolvedLength(40.0),
+            x = resolvedLength(0.0),
+            y = resolvedLength(18.0)
+        )
+    }
+}
+
+function paneContent(
+    pane: Binding<Number>,
+    model: borrow RecoveryModel,
+    install: borrow RecoveryInstall,
+    actions: borrow RecoveryActions
+) -> Any Widget {
+    let shown = pane.get()
+    if shown == RecoveryPane.install {
+        return InstallPane(model = copy model, install = copy install, actions = copy actions)
+    }
+    if shown == RecoveryPane.diskUtility { return DiskUtilityPane(model = copy model) }
+    if shown == RecoveryPane.startupDisk { return StartupDiskPane(model = copy model) }
+    if shown == RecoveryPane.terminal { return TerminalPane() }
+    return UtilitiesPane(pane = pane)
+}

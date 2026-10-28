@@ -1,0 +1,7 @@
+//! The Media package: the platform for a television or streaming device.
+/// The Media platform package: the television and streaming-device platform.
+construct Media extends Package {
+    let version: String = "0.1.0"
+    let kind: PackageKind = .App
+    let moduleRoot: String = "Media"
+}

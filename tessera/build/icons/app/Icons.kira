@@ -1,0 +1,140 @@
+import Foundation
+import Build
+import CoreIcon
+
+// An application's `.tessicon` turned into the pictures the system shows, as
+// Xcode's actool compiles an `.icon` at build time: the icon in its own
+// colours light and dark, and as clear glass light and dark, each framed as
+// the Mac's Dock shows it and edge to edge as a touch screen's home screen
+// does. CoreIcon draws them all; the action reruns only when the document or
+// CoreIcon does.
+
+namespace IconRender {
+    // The side the icons are drawn at, in pixels: the largest the system
+    // shows one, at two pixels to the point.
+    let side: Number = 512
+    let output: String = "icons"
+    // The sides, in points, the system shows an icon's art at: the home
+    // screen's pages and folders, the stage strip, notification banners, the
+    // App Library, the Mac's Dock at its tile of 67 (the art 824 of 1024 of
+    // it), the desktop's grid and the switcher. Each is drawn again at its real
+    // size in pixels, at one and two pixels a point, as actool lays an icon's
+    // representations beside it, so none is shown scaled.
+    let shown: [Number] = [14, 14.96, 32, 38, 40, 53.9140625, 68, 96]
+    let scales: [Number] = [1, 2]
+    // The share of a framed picture its art takes: macOS's 824 of 1024.
+    let framedBody: Number = 0.8046875
+}
+
+// One picture an icon is drawn as, and the file it goes in.
+struct IconPicture {
+    let file: String
+    let style: IconStyle
+    let layout: IconLayout
+    // Its side in pixels.
+    var side: Number = IconRender.side
+}
+
+// Every style in both layouts, in files named after the document: an
+// application's `AppIcon.tessicon` is drawn as `AppIcon.png`, `AppIconDark.png`
+// and the rest, an edge-to-edge picture's file having `Edge` after the name.
+function iconPictures(name: borrow String) -> [IconPicture] {
+    var pictures: [IconPicture] = []
+    for (prefix, layout) in [(copy name, IconLayout.Framed), ("\(name)Edge", IconLayout.Edge)] {
+        pictures.append(IconPicture { file: "\(prefix).png", style: .Default, layout: layout })
+        pictures.append(IconPicture { file: "\(prefix)Dark.png", style: .Dark, layout: layout })
+        pictures.append(
+            IconPicture { file: "\(prefix)Clear.png", style: .ClearLight, layout: layout }
+        )
+        pictures.append(
+            IconPicture { file: "\(prefix)ClearDark.png", style: .ClearDark, layout: layout }
+        )
+    }
+    for picture in iconRepresentations(name) { pictures.append(copy picture) }
+    return pictures
+}
+
+// The pictures the system shows in its own colours, light and dark, drawn
+// again at each size it shows them: `AppIcon-134x134.png` beside
+// `AppIcon.png`, the compositor drawing the one whose size it draws at.
+function iconRepresentations(name: borrow String) -> [IconPicture] {
+    var pictures: [IconPicture] = []
+    var made: [String] = []
+    for (prefix, layout) in [(copy name, IconLayout.Framed), ("\(name)Edge", IconLayout.Edge)] {
+        let share = layout == .Framed ? IconRender.framedBody : 1
+        for points in IconRender.shown {
+            for scale in IconRender.scales {
+                let side = round(points / share * scale)
+                for (suffix, style) in [("", IconStyle.Default), ("Dark", IconStyle.Dark)] {
+                    let file = "\(prefix)\(suffix)-\(side)x\(side).png"
+                    if made.contains(file) { continue }
+                    made.append(copy file)
+                    pictures.append(
+                        IconPicture { file: file, style: style, layout: layout, side: side }
+                    )
+                }
+            }
+        }
+    }
+    return pictures
+}
+
+// The pictures `asset`, a `.tessicon` of `component` at `location`, is drawn
+// as, in a tree to lay beside it. Every architecture's bundle shares the one
+// action.
+public function renderedIconTree(
+    graph: borrow mut Graph,
+    component: borrow String,
+    location: borrow String,
+    asset: borrow String
+) -> Artifact {
+    let label = "\(component) icon \(asset)"
+    match graph.outputsOf(label) {
+        Some(made) -> return copy made[0]
+        None -> {}
+    }
+    let document = graph.sourceTree(location + "/" + asset, [])
+    let names = asset.split("/")
+    let file = copy names[names.count - 1]
+    let name = file.substring(0, file.count - IconBundleLayout.extension.count)
+    let made = graph.native(
+        NativeAction {
+            label: copy label,
+            code: sourceDigest!(),
+            inputs: [document],
+            outputs: [Output { name: IconRender.output, kind: .Tree }],
+            work: { run in return renderIcons(run, name) }
+        }
+    )
+    return copy made[0]
+}
+
+function renderIcons(run: borrow NativeRun, name: borrow String) -> Result<Void, BuildFailure> {
+    let bundle = match readIconBundle(run.inputs[0]) {
+        Ok(bundle) -> bundle
+        Error(failure) -> return .Error(
+            .Failed("\(run.inputs[0]) is no icon: \(traceText(failure))")
+        )
+    }
+    for picture in iconPictures(name) {
+        let path = "\(run.outputs[0])/\(picture.file)"
+        let image = match renderedIcon(
+            bundle,
+            copy picture.style,
+            picture.side,
+            picture.layout
+        ) {
+            Ok(image) -> image
+            Error(failure) -> return .Error(
+                .Failed(
+                    "\(run.inputs[0]) cannot be drawn as \(picture.file): \(traceText(failure))"
+                )
+            )
+        }
+        match writeFileBytes(path, encodePng(image)) {
+            Ok -> {}
+            Error(failure) -> return .Error(.Files("cannot write \(path): \(traceText(failure))"))
+        }
+    }
+    return .Ok
+}

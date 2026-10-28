@@ -1,0 +1,19 @@
+//! The Adaptive Mobile app package: the phone, tablet and fold platform, running on Dynamic Platforms.
+/// The Adaptive Mobile package: one Dynamic Platform for phone, tablet and fold.
+construct AdaptiveMobile extends Package {
+    let version: String = "0.1.0"
+    let kind: PackageKind = .App
+    let moduleRoot: String = "AdaptiveMobile"
+    let dependencies: [Dependency] = [Dependency {
+        name: "ArgumentParser",
+        path: "../argument-parser"
+    },
+        Dependency { name: "AppKit", path: "../appkit" },
+        Dependency { name: "KiraUI", path: "../kira-ui" },
+        Dependency { name: "LibTessera", path: "../libtessera" },
+        Dependency { name: "PlatformKit", path: "../platform-kit" },
+        Dependency { name: "PlatformUI", path: "../platform-ui" },
+        Dependency { name: "TesseraDisplayClient", path: "../display-client" },
+        Dependency { name: "TesseraUI", path: "../tessera-ui" }
+    ]
+}

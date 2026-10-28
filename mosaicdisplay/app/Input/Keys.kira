@@ -1,0 +1,13 @@
+import Foundation
+import TesseraDisplayClient
+
+// A key record's value as the state the display protocol carries: released,
+// pressed, or, past pressed, held down long enough for the kernel to repeat
+// it.
+function keyStateOf(value: UN32) -> DisplayKeyState {
+    return match value {
+        0 -> .Released
+        1 -> .Pressed
+        else -> .Repeated
+    }
+}

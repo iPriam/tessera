@@ -1,0 +1,185 @@
+import Foundation
+import Heap
+
+// Laying out what the kernel reads and reading back what it wrote.
+//
+// Kira's typed-memory builtins, `heapLoad<T>` and `heapStore<T>` at a byte
+// offset, lowered in place by the compiler and unaligned by construction; the
+// blocks are `ByteBlock`s from the Heap library.
+
+// The kernel's answer: a value, or `-errno` in the top 4095 values.
+function answerFailed(answer: Number) -> Bool { return answer < 0 && answer >= -4095 }
+
+function answerErrno(answer: Number) -> Number { return -answer }
+
+// An answer a binding reads as the unsigned register it is, as a signed one:
+// its top 4095 values are `-errno`.
+function wideAnswer(answer: U64) -> Number {
+    if answer > U64(0xFFFFFFFFFFFFF000) { return -Number(~answer + U64(1)) }
+    return Number(answer)
+}
+
+// The kernel's failure as an error, or `Ok` for a successful answer.
+function answerStatus(answer: Number) -> Result<Void, TesseraError> {
+    if answerFailed(answer) { return .Error(errnoFailure(answerErrno(answer))) }
+    return .Ok
+}
+
+// Closes a descriptor this library owns. Linux releases the descriptor
+// whatever `close` answers, so there is nothing a failure would change.
+function closeBacking(fd: Number) {
+    match answerStatus(close(fd)) {
+        Ok -> {}
+        Error(failed) -> absorb failed
+    }
+}
+
+// The bytes of a short file such as one under `/sys` or `/proc`, at most 4096
+// of them, and one zero past the last.
+struct SmallFile {
+    let bytes: ByteBlock
+    let count: U64
+}
+
+function readSmallBytes(directory: Number, path: borrow String) -> Result<SmallFile, TesseraError> {
+    let fd = openat(directory, cStringFrom(path), LinuxOpen.readOnly | LinuxOpen.closeOnExec, 0)
+    if answerFailed(fd) { return .Error(errnoFailure(answerErrno(fd))) }
+    let blockBytes = zeroedBlock(count: 4097, alignment: 16)
+    let block = blockBytes.pointer()
+    var total = U64(0)
+    while total < U64(4096) {
+        let got = read(fd, heapOffset(block, total), U64(4096) - total)
+        if answerFailed(got) {
+            closeBacking(fd)
+            return .Error(errnoFailure(answerErrno(got)))
+        }
+        if got == 0 { break }
+        total = total + U64(got)
+    }
+    closeBacking(fd)
+    return .Ok(SmallFile { bytes: move blockBytes, count: total })
+}
+
+// A string read from a short file such as one under `/sys`, without its
+// trailing newline.
+function readSmallFile(directory: Number, path: borrow String) -> Result<String, TesseraError> {
+    let file = try readSmallBytes(directory, path)
+    let block = file.bytes.pointer()
+    var total = file.count
+    while total > U64(0) && heapLoad<U8>(block, Number(total - U64(1))) == U8(10) {
+        total = total - U64(1)
+    }
+    return .Ok(stringFromCBytes(block, total))
+}
+
+// The zero-separated strings of a short file such as `/proc/self/cmdline`.
+function readSmallStrings(
+    directory: Number,
+    path: borrow String
+) -> Result<[String], TesseraError> {
+    let file = try readSmallBytes(directory, path)
+    let block = file.bytes.pointer()
+    let total = file.count
+    var strings: [String] = []
+    var start = U64(0)
+    for at in 0..Number(total) {
+        if heapLoad<U8>(block, at) == U8(0) {
+            strings.append(stringFromCBytes(heapOffset(block, start), U64(at) - start))
+            start = U64(at) + U64(1)
+        }
+    }
+    if start < total { strings.append(stringFromCBytes(heapOffset(block, start), total - start)) }
+    return .Ok(strings)
+}
+
+// The same, or none for a file that is not there: one this kernel or
+// machine does not have, or one of a process that has gone.
+function readSmallFileIfPresent(
+    directory: Number,
+    path: borrow String
+) -> Result<String?, TesseraError> {
+    match readSmallFile(directory, path) {
+        Ok(text) -> return .Ok(.Some(text))
+        Error(failed) -> {
+            if failed.code == .NotFound { return .Ok(.None) }
+            return .Error(failed)
+        }
+    }
+}
+
+// Writes `text` to a short file such as a cgroup control file.
+function writeSmallFile(
+    directory: Number,
+    path: borrow String,
+    text: borrow String
+) -> Result<Void, TesseraError> {
+    let fd = openat(directory, cStringFrom(path), LinuxOpen.writeOnly | LinuxOpen.closeOnExec, 0)
+    if answerFailed(fd) { return .Error(errnoFailure(answerErrno(fd))) }
+    let bytesBytes = bytesOfText(text)
+    let bytes = bytesBytes.pointer()
+    let wrote = write(fd, bytes, U64(text.count))
+    closeBacking(fd)
+    return answerStatus(wrote)
+}
+
+// `struct timespec`, from nanoseconds.
+function storeTimespec(block: RawPtr, offset: U64, nanoseconds: U64) {
+    heapStore<U64>(block, offset, nanoseconds / U64(1000000000))
+    heapStore<U64>(block, Number(offset + U64(8)), nanoseconds % U64(1000000000))
+}
+
+function readTimespec(block: RawPtr, offset: U64) -> U64 {
+    return heapLoad<U64>(block, offset) * U64(1000000000) + heapLoad<U64>(
+        block,
+        Number(offset + U64(8))
+    )
+}
+
+namespace LinuxOpen {
+    // `open` flags that are the same number on both architectures. `O_DIRECTORY`,
+    // `O_NOFOLLOW` and `O_DIRECT` are not, and are answered by `architecture`.
+    let readOnly: Number = 0
+    let writeOnly: Number = 1
+    let readWrite: Number = 2
+    let create: Number = 0x40
+    let exclusive: Number = 0x80
+    let truncate: Number = 0x200
+    let append: Number = 0x400
+    let nonBlock: Number = 0x800
+    let sync: Number = 0x101000
+    let closeOnExec: Number = 0x80000
+    let path: Number = 0x200000
+}
+
+// The machine this program runs on, read once from `uname`. Two numbers in
+// the open flags differ between the architectures Tessera runs on.
+
+function isArm() -> Bool {
+    if !library.machineKnown {
+        let blockBytes = zeroedBlock(count: 390, alignment: 16)
+        let block = blockBytes.pointer()
+        if !answerFailed(uname(block)) {
+            let machine = stringFromCBytes(heapOffset(block, 260), 65)
+            library.machineIsArm = machine.startsWith("aarch64") || machine.startsWith("arm64")
+        }
+        library.machineKnown = true
+    }
+    return library.machineIsArm
+}
+
+// `O_DIRECTORY`, `O_NOFOLLOW` and `O_DIRECT`: the three open flags whose
+// numbers differ between arm64 and x86-64.
+function openDirectoryFlag() -> Number {
+    if isArm() { return 0x4000 }
+    return 0x10000
+}
+
+function openNoFollowFlag() -> Number {
+    if isArm() { return 0x8000 }
+    return 0x20000
+}
+
+function openDirectFlag() -> Number {
+    if isArm() { return 0x10000 }
+    return 0x4000
+}

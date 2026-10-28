@@ -1,0 +1,120 @@
+import Foundation
+
+// Where the system keeps things, laid out as on a Mac. A program names these
+// instead of writing the path, so the layout is decided here once and can
+// change without touching the programs that use it.
+//
+// Each is a name beneath the root, with no slash at either end:
+// `Applications`, `System/Applications`. The caller places the slashes, so a
+// path is always `"/" + SystemDirectory.volumes + "/" + name`.
+public namespace SystemDirectory {
+    // The sealed system volume: everything the system ships.
+    let system: String = "System"
+    // The applications the system ships.
+    let systemApplications: String = "System/Applications"
+    // The system's own programs that are not applications, such as the desktop.
+    let coreServices: String = "System/Library/CoreServices"
+    // The driver bundles DeviceKit loads.
+    let driverExtensions: String = "System/Library/DriverExtensions"
+    // The frameworks programs link to.
+    let frameworks: String = "System/Library/Frameworks"
+    // The time zones' rules, a TZif file each under its IANA name.
+    let zoneInfo: String = "System/Library/ZoneInfo"
+    // The system's command-line programs and services: PID 1, the display
+    // server, the platforms, the utilities.
+    let programs: String = "bin"
+    // The applications the user installed, each an image file.
+    let applications: String = "Applications"
+    // Every mounted volume other than the system's own.
+    let volumes: String = "Volumes"
+    // The people who use the machine, a folder each.
+    let users: String = "Users"
+    // The person's documents, which Inlay opens on: a folder on the data
+    // volume, bound at the root as `/Applications` is.
+    let documents: String = "Documents"
+    // What the person keeps on the desktop, which Adaptive Desktop's desktop
+    // shows, inside their documents.
+    let desktopItems: String = "Documents/Desktop"
+    // Every cache on the machine; the system may empty it at any time.
+    let cache: String = "Cache"
+    // What builds made that is slow to make again; only the person empties it.
+    let buildCache: String = "BuildCache"
+    // The writable data volume.
+    let data: String = "data"
+    // What the system keeps on the data volume.
+    let systemData: String = "data/system"
+    // The system log: what each service wrote, this boot's and the last's.
+    let systemLogs: String = "data/system/logs"
+    // The reports the crash reporter writes, one for each process that
+    // crashed, the newest kept.
+    let diagnosticReports: String = "data/system/DiagnosticReports"
+    // Each application's own data, in a folder named after it.
+    let applicationData: String = "data/appdata"
+    // What lasts only until the machine stops: installed applications mounted
+    // to run, sockets, nothing that outlives a boot.
+    let runtime: String = "run"
+    // Scratch space that lasts until the machine stops.
+    let temporary: String = "tmp"
+    // The developer roots a development machine stacks over the system.
+    let developerRoots: String = "var/db/devroots"
+    // On a dev machine, the sealed system the dev system was taken from,
+    // mounted read-only: the base layer below every dev root
+    // (roadmap/18-components.md §5).
+    let developerRootsBase: String = "var/db/devroots/base"
+    // On a dev machine, each program's and framework's debug information, as
+    // the build's dSYM bundles hold it: `<path>.dSYM/Contents/Resources/DWARF/
+    // <name>` beneath it for the file at `/<path>`, which the crash reporter
+    // names a dying process's frames from. A dev root brings its own.
+    let developerSymbols: String = "System/Developer/Symbols"
+}
+
+// The files the system keeps in a known place, named as `SystemDirectory`'s
+// directories are: beneath the root, with no slash at either end.
+public namespace SystemFile {
+    // The settings, a `key=value` line for each, which the Settings service
+    // keeps and PID 1 reads before it starts.
+    let settings: String = "data/system/Settings"
+    // The system's version and the machine it was built for, as `KEY="value"`
+    // lines.
+    let release: String = "etc/tessera-release"
+    // The same lines, in the system's runtime, which a confined application
+    // sees where `/etc` is hidden from it (as an app reads macOS's
+    // SystemVersion.plist).
+    let systemVersion: String = "System/Library/CoreServices/SystemVersion"
+    // On a dev machine, asks for the dev system to be taken again from the
+    // sealed one at the next boot (roadmap/18-components.md §5): the dev root
+    // service writes it and PID 1 reads it before mounting `system/dev`.
+    let developerRootsReset: String = "var/db/devroots/reset"
+}
+
+// The machine's btrfs volume (roadmap/05-storage-and-state.md): paths inside
+// it, from its top.
+public namespace VolumeLayout {
+    // The volume's label.
+    let label: String = "tessera"
+    // Which system is current.
+    let boot: String = "boot"
+    // The record naming the current system's version.
+    let current: String = "boot/current"
+    // An update not yet known good: the version PID 1 boots once, before the
+    // current one (roadmap/13).
+    let trial: String = "boot/trial"
+    // Written by PID 1 as it boots the trial: a trial found tried at the
+    // next boot did not reach its services, and is rolled back.
+    let tried: String = "boot/tried"
+    // Every system, `system/<version>`, each a read-only snapshot.
+    let systems: String = "system"
+    // A dev machine's writable snapshot of the current system.
+    let devSystem: String = "system/dev"
+    // Inside a system, beside its tree: its composefs image, through which
+    // PID 1 mounts it sealed (roadmap/13).
+    let sealedImage: String = "composefs.img"
+    // Beside it: the build's Ed25519 signature over the image's fs-verity
+    // digest, 64 bytes.
+    let sealedSignature: String = "composefs.sig"
+    // In the initramfs, beside PID 1: the public half of the key the build
+    // signs systems with, 32 bytes.
+    let sealKey: String = "seal.pub"
+    // The subvolume holding everything a person did.
+    let data: String = "data"
+}

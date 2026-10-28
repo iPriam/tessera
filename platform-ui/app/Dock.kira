@@ -1,0 +1,451 @@
+import Foundation
+import KiraUI
+import PlatformKit
+import TesseraUI
+import AppKit
+
+// The Dock (roadmap/11-adaptive-desktop.md, "The Dock"): the row of
+// applications along the bottom of the screen, on a piece of glass, as a
+// Mac's and an iPad's are. The applications kept in it come first, then a
+// rule, then those open that are not kept. Clicking or tapping one opens it,
+// or brings it to the front when it is open. Every Dock is this one; how it
+// looks follows the window model, so a desktop's is a Mac's, with a dot under
+// each open application, drawn by the platform over the windows, and a touch
+// screen's is an iPad's, larger, without dots, which the platform keeps and
+// the home screen draws under its pages (`platformDockItems`).
+
+// One application in the Dock: its name, whether it is open, whether it is
+// kept there when it is not, and what choosing it does.
+public struct DockItem {
+    let name: String
+    let running: Bool
+    let kept: Bool
+    let choose: () -> Void
+    // Takes it out of the Dock, while Home is edited.
+    let unkeep: () -> Void = dockStays
+}
+
+function dockStays() {}
+
+namespace DockBadge {
+    let side: Number = 22
+}
+
+// How the Dock is laid out, in points.
+public struct DockMetrics {
+    // The side of an icon.
+    let icon: Number
+    // The gap between two icons.
+    let spacing: Number
+    // How far the icons stand in from the glass's top, and from its sides.
+    let inset: Number
+    let side: Number
+    // The dot under an open application, and the gap above it; no dot when
+    // zero.
+    let dot: Number
+    let dotGap: Number
+    // How far the glass reaches under the dots, or under the icons where
+    // there are none.
+    let bottom: Number
+    // The glass's corner.
+    let corner: Number
+    // How far the glass floats above the bottom of the screen.
+    let margin: Number
+}
+
+// The Dock for the interface in use: a Mac's on a desktop, an iPad's on a touch
+// screen.
+public function dockMetrics() -> DockMetrics {
+    return match interfaceMode() {
+        AdaptiveDesktop -> desktopDockMetrics(DesktopDock.tile)
+        // The kit's "_Dock - iPad": 68-point icons 19.5 points apart and in
+        // from the glass, a 38-point corner, 28 points above the bottom.
+        AdaptiveMobile -> DockMetrics {
+            icon: 68,
+            spacing: 19.5,
+            inset: 19.5,
+            side: 19.5,
+            dot: 0,
+            dotGap: 0,
+            bottom: 19.5,
+            corner: 38,
+            margin: 28,
+        }
+    }
+}
+
+// macOS Tahoe's Dock, measured on a Retina Mac at its tile size of 67 points,
+// with every length a share of the tile so that a Dock of any size keeps its
+// proportions, as a Mac's does when its size is changed: the art of an icon is
+// a framed picture's body, 54 of the 67 points; 17 points between two icons
+// and in from the glass's sides, 16.5 from its top; the dot 4 points across,
+// 8 under the icon and 4 above the glass's bottom edge; a continuous corner of
+// 28.5; and the glass 5.5 points over the screen's bottom edge.
+namespace DesktopDock {
+    let tile: Number = 67
+    let spacing: Number = 17 / 67
+    let inset: Number = 16.5 / 67
+    let side: Number = 17 / 67
+    let dot: Number = 4 / 67
+    let dotGap: Number = 8 / 67
+    let bottom: Number = 4 / 67
+    let corner: Number = 28.5 / 67
+    let margin: Number = 5.5 / 67
+}
+
+// A Mac's Dock whose tiles are `tile` points across.
+function desktopDockMetrics(tile: Number) -> DockMetrics {
+    return DockMetrics {
+        icon: tile * IconShape.framedBody,
+        spacing: tile * DesktopDock.spacing,
+        inset: tile * DesktopDock.inset,
+        side: tile * DesktopDock.side,
+        dot: tile * DesktopDock.dot,
+        dotGap: tile * DesktopDock.dotGap,
+        bottom: tile * DesktopDock.bottom,
+        corner: tile * DesktopDock.corner,
+        margin: tile * DesktopDock.margin,
+    }
+}
+
+extend DockMetrics {
+    // How tall the Dock's glass is.
+    function glassHeight(borrow self) -> Number {
+        return inset + icon + dotGap + dot + bottom
+    }
+
+    // How tall the band along the bottom of the screen the Dock takes is:
+    // its glass and the margin under it. Windows are laid out above it.
+    function band(borrow self) -> Number {
+        return margin + glassHeight()
+    }
+}
+
+// The band the Dock takes, for the interface in use.
+public function dockBand() -> Number {
+    return dockMetrics().band()
+}
+
+// Whether a point `y` points down an output `height` points tall is on the
+// band the Dock takes.
+public function onDockBand(y: Number, height: Number) -> Bool {
+    return y >= height - dockBand()
+}
+
+// The place among the `count` tiles a Dock keeps, centred on an output
+// `width` points wide, that an icon dropped at `x` takes: before the tile
+// whose left half it is over, or after the last.
+public function dockIndexAt(x: Number, width: Number, count: Number) -> Number {
+    let metrics = dockMetrics()
+    let pitch = metrics.icon + metrics.spacing
+    let row = count * metrics.icon + max(count - 1, 0) * metrics.spacing
+    let start = (width - row) / 2
+    return min(max(floor((x - start - metrics.icon / 2) / pitch) + 1, 0), count)
+}
+
+// What `state`'s Dock holds, to draw: on a touch platform only the
+// `recent` applications used last after what it keeps, as an iPad's, or with
+// none given every running one. Choosing one calls `choose` with its name;
+// taking a kept one out keeps the rest as the Dock's favourites. Only the
+// applications the Dock's tiles and the gaps between them take on an output
+// `width` points wide are shown, the ones kept first.
+public function dockItems(
+    state: borrow PlatformState,
+    choose: (String) -> Void,
+    width: Number,
+    recent: Number? = .None
+) -> [DockItem] {
+    var items: [DockItem] = []
+    var kept: [String] = []
+    let entries = match recent {
+        Some(count) -> state.dockEntriesRecent(count)
+        None -> state.dockEntries()
+    }
+    for entry in entries {
+        if entry.kept { kept.append(copy entry.name) }
+    }
+    for entry in entries {
+        let name = copy entry.name
+        let left = copy name
+        let chosen = copy choose
+        let others = copy kept
+        items.append(
+            DockItem {
+                name: copy entry.name,
+                running: entry.running(),
+                kept: entry.kept,
+                choose: { in chosen(name) },
+                unkeep: { in keepDockFavourites(dockWithout(others, left)) },
+            }
+        )
+    }
+    return dockItemsThatFit(items, width)
+}
+
+// What the platform's Dock holds, as it told the home screen
+// (`platformDock`), to draw there: choosing one asks the platform for it,
+// which brings its window forward or opens it, and taking a kept one out
+// keeps the rest as the Dock's favourites, as `dockItems` does on the
+// platform's side.
+public function platformDockItems(bridge: borrow BridgeHandle, entries: borrow [PlatformDockEntry]) -> [DockItem] {
+    let handle = copy bridge
+    var kept: [String] = []
+    for entry in entries {
+        if entry.kept { kept.append(copy entry.application) }
+    }
+    var items: [DockItem] = []
+    for entry in entries {
+        let name = copy entry.application
+        let left = copy name
+        let others = copy kept
+        items.append(
+            DockItem {
+                name: copy entry.application,
+                running: entry.running,
+                kept: entry.kept,
+                choose: { in chooseInPlatformDock(handle, name) },
+                unkeep: { in keepDockFavourites(dockWithout(others, left)) },
+            }
+        )
+    }
+    return items
+}
+
+// The items of a Dock on an output `width` points wide: as many as its tiles
+// and the gaps between them take, the ones kept first.
+function dockItemsThatFit(items: borrow [DockItem], width: Number) -> [DockItem] {
+    let metrics = dockMetrics()
+    var kept: [DockItem] = []
+    var row = metrics.side * 2
+    for index in 0..items.count {
+        var at = metrics.icon
+        if kept.count > 0 {
+            at += metrics.spacing
+            if dockRuledBefore(items, index) { at += DockRule.width }
+        }
+        if row + at > width { break }
+        row += at
+        kept.append(copy items[index])
+    }
+    return kept
+}
+
+// `kept` without `name`.
+function dockWithout(kept: borrow [String], name: borrow String) -> [String] {
+    var left: [String] = []
+    for each in kept {
+        if each != name { left.append(copy each) }
+    }
+    return left
+}
+
+let dockRule: RGBAColor = RGBAColor { r: 1.0, g: 1.0, b: 1.0, a: 0.28 }
+
+namespace DockRule {
+    // How wide the rule between what is kept and what is only open is.
+    let width: Number = 1
+}
+let dockDot: RGBAColor = RGBAColor { r: 1.0, g: 1.0, b: 1.0, a: 0.85 }
+
+// One application's place in the Dock: its icon, and under it a dot while it
+// is open, where the Dock has dots.
+function dockTile(item: borrow DockItem, metrics: borrow DockMetrics) -> Any Widget {
+    return dockTileFace(item, metrics).onClick(copy item.choose)
+}
+
+// A tile's icon and its dot, which choose nothing.
+function dockTileFace(item: borrow DockItem, metrics: borrow DockMetrics) -> Any Widget {
+    if metrics.dot == 0 {
+        return ApplicationIcon(name = copy item.name, side = metrics.icon)
+    }
+    return VStack(spacing = .Length(metrics.dotGap), alignment = .Center) {
+        ApplicationIcon(name = copy item.name, side = metrics.icon)
+        if item.running {
+            Circle()
+            .fill(dockDot)
+            .width(resolvedLength(metrics.dot))
+            .height(resolvedLength(metrics.dot))
+        } else {
+            FixedGap(width = metrics.dot, height = metrics.dot)
+        }
+    }
+    .hugWidth()
+}
+
+// A kept tile, `edited` while Home is: wobbling, choosing nothing, with a
+// badge that takes it out of the Dock. The same layers either way, so the
+// wobble eases to a stop and the badge shrinks away when the edit ends.
+function dockKeptTile(
+    item: borrow DockItem,
+    index: Number,
+    metrics: borrow DockMetrics,
+    edited: Bool,
+    ask: () -> Void
+) -> Any Widget {
+    let choose = copy item.choose
+    // The badge wobbles with the icon whose corner it stands on.
+    return EditWobble(phase: index * 1.3, active: edited) {
+        ZStack(alignment = .TopLeading) {
+            dockTileFace(item, metrics)
+            if edited {
+                editRemovalBadge(DockBadge.side, -DockBadge.side / 3, -DockBadge.side / 3, move ask)
+            }
+        }
+    }
+    .onClick(
+        { in
+            if !edited { choose() }
+        }
+    )
+}
+
+// The rule between what is kept in the Dock and what is only open: as tall
+// as a tile and its dot, as a Mac's runs nearly the glass's whole height.
+function dockSeparator(metrics: borrow DockMetrics) -> Any Widget {
+    return Rectangle()
+    .fill(dockRule)
+    .width(resolvedLength(DockRule.width))
+    .height(resolvedLength(metrics.icon + metrics.dotGap + metrics.dot))
+}
+
+// Whether the Dock rules off what is only open from what is kept after the
+// tile at `index`: before the first item not kept, when one is kept before it.
+function dockRuledBefore(items: borrow [DockItem], index: Number) -> Bool {
+    if index == 0 || items[index].kept { return false }
+    return items[index - 1].kept
+}
+
+// The Dock along the bottom of the screen, centered, holding `items` in the
+// order given: those kept first, then those only open. With `ownGlass` the
+// Dock draws its glass itself; without it the compositor draws the glass
+// under the Dock (`dockGlass`), refracting the home screen and the windows
+// behind it, and the Dock draws only what sits on it.
+// While Home is edited, `editing`, what the Dock keeps wobbles with a badge
+// that takes it out, as an iPad's does.
+public construct Dock(items: [DockItem], ownGlass: Bool, editing: Bool = false) extends Widget {
+    // The kept item whose badge was pressed, asked about before it goes.
+    @State var askedIndex: Number = 0
+    @State var asked: Bool = false
+
+    body {
+        let metrics = dockMetrics()
+        var tiles: [Any Widget] = []
+        for (index, item) in items.enumerated() {
+            if dockRuledBefore(items, index) { tiles.append(dockSeparator(metrics)) }
+            let at = index
+            tiles.append(
+                item.kept ? dockKeptTile(
+                    item,
+                    index,
+                    metrics,
+                    editing,
+                    { in
+                        askedIndex = at
+                        asked = true
+                    }
+                ) : dockTile(item, metrics)
+            )
+        }
+        let question = editing && asked && askedIndex < items.count
+        let name = question ? copy items[askedIndex].name : ""
+        let unkeep = question ? copy items[askedIndex].unkeep : dockStays
+        // No gap between the row and the margin under it: the margin is all
+        // that stands between the glass and the bottom of the screen.
+        VStack(spacing = .Length(0), alignment = .Center) {
+            Spacer()
+            dockRow(move tiles, metrics, ownGlass)
+            FixedGap(width = 0, height = metrics.margin)
+        }
+        .fillWidth()
+        .fillHeight()
+        .alert(
+            title = "Remove “\(name)”?",
+            isPresented = question,
+            message = "Removing from the Dock will keep the app on your Home Screen and in your App Library.",
+            actions = [
+                Button(
+                    action = { in
+                        unkeep()
+                        asked = false
+                    }
+                ) {
+                    Text("Remove from Dock")
+                },
+                Button(action = { in asked = false }) {
+                    Text("Cancel").fontWeight(.SemiBold)
+                }
+            ]
+        )
+    }
+}
+
+// The Dock's row of tiles, inset from its glass, on the glass when the Dock
+// draws it.
+function dockRow(tiles: [Any Widget], metrics: borrow DockMetrics, ownGlass: Bool) -> Any Widget {
+    let row = HStack(spacing = .Length(metrics.spacing), alignment = .Center, children = tiles)
+    .hugWidth()
+    .edgePadding(EdgeSet.horizontal, resolvedLength(metrics.side))
+    .edgePadding(EdgeSet.top, resolvedLength(metrics.inset))
+    .edgePadding(EdgeSet.bottom, resolvedLength(metrics.bottom))
+    if !ownGlass { return row }
+    return row.glassEffect(dockGlassMaterial(), .Squircle(metrics.corner))
+}
+
+// Where the Dock's glass is on an output `width` by `height` points: as wide
+// as its tiles, the rule and the gaps between them and the inset round them,
+// and as tall as a tile and the insets over and under it, centered over the
+// margin.
+public function dockGlass(items: borrow [DockItem], width: Number, height: Number) -> SurfaceFrame {
+    let metrics = dockMetrics()
+    if items.count == 0 { return emptyFrame() }
+    var tiles = items.count
+    var row = metrics.icon * items.count
+    for index in 0..items.count {
+        if dockRuledBefore(items, index) {
+            tiles += 1
+            row += DockRule.width
+        }
+    }
+    let glassWidth = row + metrics.spacing * (tiles - 1) + metrics.side * 2
+    let glassHeight = metrics.glassHeight()
+    return SurfaceFrame {
+        x: (width - glassWidth) / 2,
+        y: height - metrics.margin - glassHeight,
+        width: glassWidth,
+        height: glassHeight,
+    }
+}
+
+// Where the icon of the application `name` stands in the Dock holding `items`
+// on an output `width` by `height` points, which a window going home flies
+// into; none when the Dock does not hold it.
+public function dockIconFrame(
+    items: borrow [DockItem],
+    name: borrow String,
+    width: Number,
+    height: Number
+) -> SurfaceFrame? {
+    let metrics = dockMetrics()
+    let glass = dockGlass(items, width, height)
+    var x = glass.x + metrics.side
+    for index in 0..items.count {
+        if dockRuledBefore(items, index) { x += DockRule.width + metrics.spacing }
+        if items[index].name == name {
+            return .Some(
+                SurfaceFrame {
+                    x: x,
+                    y: glass.y + metrics.inset,
+                    width: metrics.icon,
+                    height: metrics.icon
+                }
+            )
+        }
+        x += metrics.icon + metrics.spacing
+    }
+    return .None
+}
+
+// The corner of an icon `side` points across.
+public function iconCorner(side: Number) -> Number {
+    return side * IconShape.corner
+}

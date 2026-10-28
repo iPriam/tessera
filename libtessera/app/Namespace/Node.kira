@@ -1,0 +1,509 @@
+import Foundation
+import Heap
+
+// Namespace calls (§13.4), completed as `Namespace` packets. Each does its
+// work when submitted.
+
+@Derive(Copy)
+public struct NodeAttributes {
+    var mask: AttributeMask
+    var attributes: AttributeMask
+    var modified: UNumber
+    var accessed: UNumber
+}
+
+@Derive(Copy)
+public enum CreateKind: U32 {
+    File = 0
+    Directory = 1
+}
+
+@Derive(Copy)
+public distinct CreateOptions = UNumber
+
+public namespace CreateOptions {
+    let none: CreateOptions = CreateOptions(0)
+    // Fail if the name exists.
+    let exclusive: CreateOptions = CreateOptions(1)
+    // Answer the existing file's Node if there is one; needs Read on it.
+    let openExisting: CreateOptions = CreateOptions(2)
+}
+
+@Derive(Copy)
+public distinct DeleteOptions = UNumber
+
+public namespace DeleteOptions {
+    let none: DeleteOptions = DeleteOptions(0)
+    let recursive: DeleteOptions = DeleteOptions(1)
+    let permanent: DeleteOptions = DeleteOptions(2)
+}
+@Derive(Copy)
+public distinct RenameOptions = UNumber
+
+public namespace RenameOptions {
+    let none: RenameOptions = RenameOptions(0)
+    let replace: RenameOptions = RenameOptions(1)
+    let exchange: RenameOptions = RenameOptions(2)
+}
+
+@Derive(Copy)
+public distinct AttributeMask = UNumber
+
+public namespace AttributeMask {
+    let none: AttributeMask = AttributeMask(0)
+    // `NodeAttributes.mask` and `attributes` bits.
+    let modified: AttributeMask = AttributeMask(1)
+    let accessed: AttributeMask = AttributeMask(2)
+    let hidden: AttributeMask = AttributeMask(4)
+    let immutable: AttributeMask = AttributeMask(8)
+    // Whether a file may be run as a program; set only, as `NodeInfo`'s
+    // attributes report it.
+    let executable: AttributeMask = AttributeMask(16)
+}
+
+// A new Node handle around a node backing.
+function nodeMint(backing: Number, rights: Rights) -> Result<Handle, TesseraError> {
+    return handleForNew(objectCreate(.Node, backing), rights)
+}
+
+// The rights asked for, checked against the base's.
+function rightsWithin(asked: Rights, held: Rights) -> Result<Rights, TesseraError> {
+    if asked == Rights.same { return .Ok(held) }
+    if !held.has(asked) { return .Error(failure(.AccessDenied)) }
+    return .Ok(asked)
+}
+
+public function nodeLookup(
+    base: Handle,
+    path: borrow String,
+    rights: Rights,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    try pathCheck(path)
+    var needed = Rights.none
+    if pathComponents(path) > 1 { needed = Rights.traverse }
+    let slot = try resolve(base, .Node, needed)
+    let target = try portTarget(port)
+    let granted = try rightsWithin(rights, library.handles[slot].rights)
+    let slotBacking = try backingOf(objectOfSlot(slot))
+    let opened = match kernelNodeOpen(slotBacking, path) {
+        Ok(value) -> value
+        Error(failed) -> {
+            portComplete(target, key, .Error(failed), .Namespace, U64(0), U64(0), U64(0))
+            return .Ok
+        }
+    }
+    let node = match nodeMint(opened, granted) {
+        Ok(value) -> value
+        Error(failed) -> {
+            portComplete(target, key, .Error(failed), .Namespace, U64(0), U64(0), U64(0))
+            return .Ok
+        }
+    }
+    portComplete(target, key, .Ok, .Namespace, node.raw, U64(0), U64(0))
+    return .Ok
+}
+
+// Packed `DirEntry` records from entry `cursor` on: `result0` the bytes
+// written, `result1` the next cursor (0 at the end).
+public function nodeList(
+    directory: Handle,
+    cursor: UNumber,
+    out: borrow Buffer,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    let object = try resolveObject(directory, .Node, Rights.enumerate)
+    let target = try portTarget(port)
+    let backing = try backingOf(object)
+    let names = match kernelDirectoryList(backing) {
+        Ok(value) -> value
+        Error(failed) -> {
+            portComplete(target, key, .Error(failed), .Namespace, U64(0), U64(0), U64(0))
+            return .Ok
+        }
+    }
+    var written = U64(0)
+    // The first entry that did not fit, or `names.count`.
+    var stopped = names.count
+    for index in cursor..names.count {
+        let length = U64(names[index].name.count)
+        let size = (U64(32) + length + U64(7)) & ~U64(7)
+        if written + size > out.length {
+            stopped = index
+            break
+        }
+        let entry = heapOffset(out.address, written)
+        zeroBytes(entry, size)
+        heapStore<U16>(entry, 0, U16(size))
+        heapStore<U8>(entry, 2, U8(code(names[index].kind)))
+        if names[index].name.startsWith(".") { heapStore<U8>(entry, 3, U8(1)) }
+        heapStore<U16>(entry, 4, U16(length))
+        heapStore<U64>(entry, 8, names[index].identity)
+        match kernelNodeStatAt(backing, names[index].name) {
+            Ok(stat) -> {
+                heapStore<U64>(entry, 16, stat.size)
+                heapStore<U64>(entry, 24, stat.modified)
+            }
+            Error(failed) -> {
+                // Gone since the listing: the entry stays, with no size or
+                // time, as a listing is a snapshot.
+                absorb failed
+            }
+        }
+        copyBytes(heapOffset(entry, 32), names[index].name.data, length)
+        written += size
+    }
+    if written == U64(0) && stopped < names.count {
+        let needed = (U64(32) + U64(names[stopped].name.count) + U64(7)) & ~U64(7)
+        portComplete(
+            target,
+            key,
+            .Error(failureDetail(.BufferTooSmall, needed)),
+            .Namespace,
+            U64(0),
+            U64(0),
+            U64(0)
+        )
+        return .Ok
+    }
+    var next = U64(0)
+    if stopped < names.count { next = U64(stopped) }
+    portComplete(target, key, .Ok, .Namespace, written, next, U64(0))
+    return .Ok
+}
+
+// Makes a file or directory. The new Node's rights are within the
+// directory's.
+public function nodeCreate(
+    directory: Handle,
+    name: borrow String,
+    kind: CreateKind,
+    options: CreateOptions,
+    rights: Rights,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    try nameCheck(name)
+    if options.raw > U32(3) { return .Error(failure(.InvalidArgument)) }
+    let slot = try resolve(directory, .Node, Rights.create)
+    let target = try portTarget(port)
+    let granted = try rightsWithin(rights, library.handles[slot].rights)
+    let backing = try backingOf(objectOfSlot(slot))
+    let reuse = options.has(CreateOptions.openExisting)
+    let made = match kind {
+        File -> kernelMakeFile(backing, name)
+        Directory -> kernelMakeDirectory(backing, name)
+    }
+    let existed = failedWith(made, .AlreadyExists)
+    if !succeeded(made) && !(reuse && existed) {
+        portComplete(target, key, made, .Namespace, U64(0), U64(0), U64(0))
+        return .Ok
+    }
+    if existed && !library.handles[slot].rights.has(Rights.read) {
+        portComplete(
+            target,
+            key,
+            .Error(failure(.AccessDenied)),
+            .Namespace,
+            U64(0),
+            U64(0),
+            U64(0)
+        )
+        return .Ok
+    }
+    let node = match kernelNodeOpen(backing, name) {
+        Ok(value) -> value
+        Error(failed) -> {
+            portComplete(target, key, .Error(failed), .Namespace, U64(0), U64(0), U64(0))
+            return .Ok
+        }
+    }
+    match nodeMint(node, granted) {
+        Ok(handle) -> portComplete(target, key, .Ok, .Namespace, handle.raw, U64(0), U64(0))
+        Error(failed) -> portComplete(
+            target,
+            key,
+            .Error(failed),
+            .Namespace,
+            U64(0),
+            U64(0),
+            U64(0)
+        )
+    }
+    return .Ok
+}
+
+// Removes `name` and, for a directory, everything beneath it.
+function deleteTree(directory: Number, name: borrow String) -> Result<Void, TesseraError> {
+    let node = try kernelNodeOpen(directory, name)
+    let names = match kernelDirectoryList(node) {
+        Ok(value) -> value
+        Error(failed) -> {
+            kernelRelease(node)
+            return .Error(failed)
+        }
+    }
+    for index in 0..names.count {
+        var removed: Result<Void, TesseraError> = .Ok
+        if names[index].kind == .Directory {
+            removed = deleteTree(node, names[index].name)
+        } else {
+            removed = kernelRemoveFile(node, names[index].name)
+        }
+        if !succeeded(removed) {
+            kernelRelease(node)
+            return removed
+        }
+    }
+    kernelRelease(node)
+    return kernelRemoveDirectory(directory, name)
+}
+
+public function nodeDelete(
+    directory: Handle,
+    name: borrow String,
+    options: DeleteOptions,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    try nameCheck(name)
+    let recursive = options.has(DeleteOptions.recursive)
+    var needed = Rights.delete
+    if recursive { needed = needed | Rights.traverse }
+    let object = try resolveObject(directory, .Node, needed)
+    let target = try portTarget(port)
+    let backing = try backingOf(object)
+    match kernelNodeOpen(backing, name) {
+        Ok(named) -> {
+            let guarded = nodeIsProtected(named)
+            kernelRelease(named)
+            var refused: Result<Void, TesseraError> = .Ok
+            match guarded {
+                Ok(protected) -> {
+                    if protected { refused = .Error(failure(.ProtectedNode)) }
+                }
+                Error(failed) -> refused = .Error(failed)
+            }
+            if !succeeded(refused) {
+                portComplete(target, key, refused, .Namespace, U64(0), U64(0), U64(0))
+                return .Ok
+            }
+        }
+        Error(failed) -> {
+            // A name that cannot be opened is no container or root, and
+            // removing it reports what is wrong with it.
+            if failed.code != .NotFound { absorb failed }
+        }
+    }
+    var removed = kernelRemoveFile(backing, name)
+    if failedWith(removed, .IsDirectory) {
+        removed = kernelRemoveDirectory(backing, name)
+        if failedWith(removed, .NotEmpty) && recursive { removed = deleteTree(backing, name) }
+    }
+    portComplete(target, key, removed, .Namespace, U64(0), U64(0), U64(0))
+    return .Ok
+}
+
+// Atomic within a volume; across volumes `Unsupported`.
+public function nodeRename(
+    fromDirectory: Handle,
+    fromName: borrow String,
+    toDirectory: Handle,
+    toName: borrow String,
+    options: RenameOptions,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    try nameCheck(fromName)
+    try nameCheck(toName)
+    if options.raw > RenameOptions.exchange.raw { return .Error(failure(.InvalidArgument)) }
+    let from = try resolveObject(fromDirectory, .Node, Rights.delete)
+    var toRights = Rights.create
+    if options.raw != U32(0) { toRights = toRights | Rights.delete }
+    let to = try resolveObject(toDirectory, .Node, toRights)
+    let target = try portTarget(port)
+    let toBacking = try backingOf(to)
+    let fromBacking = try backingOf(from)
+    let moved = kernelRename(
+        fromBacking,
+        fromName,
+        toBacking,
+        toName,
+        options.has(RenameOptions.replace),
+        options.has(RenameOptions.exchange)
+    )
+    portComplete(target, key, moved, .Namespace, U64(0), U64(0), U64(0))
+    return .Ok
+}
+
+// A fresh `NodeInfo` in `out`; `result0` the bytes written.
+public function nodeInfo(
+    node: Handle,
+    out: borrow Buffer,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    let slot = try resolve(node, .Node, Rights.inspect)
+    let target = try portTarget(port)
+    if out.length < U64(128) { return .Error(failureDetail(.BufferTooSmall, U64(128))) }
+    zeroBytes(out.address, 128)
+    let slotBacking = try backingOf(objectOfSlot(slot))
+    let filled = nodeInfoFill(slotBacking, library.handles[slot].rights, out.address)
+    portComplete(
+        target,
+        key,
+        filled,
+        .Namespace,
+        succeeded(filled) ? U64(128) : U64(0),
+        U64(0),
+        U64(0)
+    )
+    return .Ok
+}
+
+// Times, `IMMUTABLE` and `EXECUTABLE`. There is no hidden bit: a name starting with `.`
+// is what hides a node.
+public function nodeSetAttributes(
+    node: Handle,
+    attributes: NodeAttributes,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    if attributes.mask.has(AttributeMask.hidden) { return .Error(failure(.Unsupported)) }
+    let object = try resolveObject(node, .Node, Rights.setProperty | Rights.write)
+    let target = try portTarget(port)
+    let backing = try backingOf(object)
+    var outcome: Result<Void, TesseraError> = .Ok
+    let setAccessed = attributes.mask.has(AttributeMask.accessed)
+    let setModified = attributes.mask.has(AttributeMask.modified)
+    if setAccessed || setModified {
+        outcome = kernelSetTimes(
+            backing,
+            setAccessed,
+            attributes.accessed,
+            setModified,
+            attributes.modified
+        )
+    }
+    if succeeded(outcome) && attributes.mask.has(AttributeMask.immutable) {
+        outcome = kernelSetImmutable(backing, attributes.attributes.has(AttributeMask.immutable))
+    }
+    if succeeded(outcome) && attributes.mask.has(AttributeMask.executable) {
+        outcome = kernelSetExecutable(backing, attributes.attributes.has(AttributeMask.executable))
+    }
+    portComplete(target, key, outcome, .Namespace, U64(0), U64(0), U64(0))
+    return .Ok
+}
+
+// The path to show the user, for display only.
+public function nodeDisplayPath(
+    node: Handle,
+    out: borrow Buffer,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    let object = try resolveObject(node, .Node, Rights.inspect)
+    let target = try portTarget(port)
+    let backing = try backingOf(object)
+    let path = match kernelDisplayPath(backing) {
+        Ok(value) -> value
+        Error(failed) -> {
+            portComplete(target, key, .Error(failed), .Namespace, U64(0), U64(0), U64(0))
+            return .Ok
+        }
+    }
+    let length = U64(path.count)
+    if length > out.length {
+        portComplete(
+            target,
+            key,
+            .Error(failureDetail(.BufferTooSmall, length)),
+            .Namespace,
+            U64(0),
+            U64(0),
+            U64(0)
+        )
+        return .Ok
+    }
+    copyBytes(out.address, path.data, length)
+    portComplete(target, key, .Ok, .Namespace, length, U64(0), U64(0))
+    return .Ok
+}
+
+// A shared container: `data/containers/shared/<id>` beneath the root,
+// made on first use.
+public function sharedContainerOpen(
+    id: borrow String,
+    rights: Rights,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    try nameCheck(id)
+    if !entitlementHeld("tessera.container.shared." + id) { return .Error(failure(.NotEntitled)) }
+    let target = try portTarget(port)
+    let given = match startupHandle(StartupTag.systemRoot) {
+        Some(value) -> handleSlotOf(value)
+        None -> .None
+    }
+    let root = match given {
+        Some(value) -> value
+        None -> {
+            portComplete(
+                target,
+                key,
+                .Error(failure(.NotFound)),
+                .Namespace,
+                U64(0),
+                U64(0),
+                U64(0)
+            )
+            return .Ok
+        }
+    }
+    let all = Rights.processDefault | Rights.nodeAll
+    let granted = try rightsWithin(rights, all)
+    let rootBacking = try backingOf(objectOfSlot(root))
+    var reached = kernelDuplicate(rootBacking)
+    let parts: [String] = ["data", "containers", "shared", id]
+    for index in 0..parts.count {
+        match reached {
+            Ok(here) -> {
+                // A folder there already is the one wanted, and any other
+                // failure shows when it is opened next.
+                match kernelMakeDirectory(here, parts[index]) {
+                    Ok -> {}
+                    Error(failed) -> absorb failed
+                }
+                reached = kernelNodeOpen(here, parts[index])
+                kernelRelease(here)
+            }
+            Error(failed) -> {
+                // `reached` still holds it, reported below.
+                absorb failed
+                break
+            }
+        }
+    }
+    let container = match reached {
+        Ok(value) -> value
+        Error(failed) -> {
+            portComplete(target, key, .Error(failed), .Namespace, U64(0), U64(0), U64(0))
+            return .Ok
+        }
+    }
+    match nodeMint(container, granted) {
+        Ok(handle) -> portComplete(target, key, .Ok, .Namespace, handle.raw, U64(0), U64(0))
+        Error(failed) -> portComplete(
+            target,
+            key,
+            .Error(failed),
+            .Namespace,
+            U64(0),
+            U64(0),
+            U64(0)
+        )
+    }
+    return .Ok
+}

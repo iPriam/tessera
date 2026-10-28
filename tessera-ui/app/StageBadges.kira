@@ -1,0 +1,80 @@
+//! The badges a platform draws on its stage: each live window's artwork, placed where the platform puts it.
+import Foundation
+import KiraUI
+import KCoreAnimation
+import TesseraDisplayClient
+
+/// A second column of the same committed buffer holds the badge artwork.
+/// It never overlaps menus, locks or other visible platform content.
+function platformBadgeTree(
+    main: CALayerDescription,
+    badges: borrow [DynamicPlatformBadge],
+    context: borrow BuildContext,
+    size: borrow Size
+) -> CALayerDescription {
+    var visible = move main
+    visible.layout.fixedWidth = size.width
+    visible.layout.fixedHeight = size.height
+    visible.layout.widthFill = false
+    visible.layout.heightFill = false
+    var tiles: [CALayerDescription] = []
+    for index in 0..min(badges.count, StageBadgeAtlas.slots) {
+        let icon = badges[index].icon.describe(copy context, rootModifierContext())
+        tiles.append(
+            CALayerDescription {
+                key: 3000000 + index,
+                layout: CALayoutIntent {
+                    fixedWidth: StageBadgeAtlas.tile,
+                    fixedHeight: StageBadgeAtlas.tile,
+                    widthFill: false,
+                    heightFill: false,
+                    paddingLeading: StageBadgeAtlas.padding,
+                    paddingTop: StageBadgeAtlas.padding,
+                    paddingTrailing: StageBadgeAtlas.padding,
+                    paddingBottom: StageBadgeAtlas.padding,
+                },
+                sublayers: [icon]
+            }
+        )
+    }
+    let atlas = CALayerDescription {
+        layout: CALayoutIntent {
+            axis: .Column,
+            spacing: 0,
+            alignment: Point {},
+            fixedWidth: StageBadgeAtlas.tile,
+            fixedHeight: max(size.height, StageBadgeAtlas.height),
+            widthFill: false,
+            heightFill: false,
+        },
+        sublayers: move tiles
+    }
+    return CALayerDescription {
+        layout: CALayoutIntent { axis: .Row, spacing: 0, alignment: Point {} },
+        sublayers: [move visible, atlas]
+    }
+}
+
+/// Sends the platform's badges to the display, so each window's icon is drawn where the platform places it.
+function sendPlatformBadges(
+    session: borrow Session,
+    badges: borrow [DynamicPlatformBadge]
+) -> Result<Void, SessionEnd> {
+    try session.sendMessage(
+        .SetStageBadge(DisplayStageBadge { surface: DisplaySurfaceId(0), slot: 0 })
+    )
+    for index in 0..min(badges.count, StageBadgeAtlas.slots) {
+        try session.sendMessage(
+            .SetStageBadge(
+                DisplayStageBadge {
+                    surface: badges[index].surface,
+                    slot: UNumber(index),
+                    home: copy badges[index].home,
+                    homeCorner: badges[index].homeCorner,
+                    homeScreen: badges[index].homeScreen
+                }
+            )
+        )
+    }
+    return .Ok
+}

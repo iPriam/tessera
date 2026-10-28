@@ -1,0 +1,73 @@
+import Foundation
+import LibTessera
+import PlatformKit
+import TesseraUI
+
+// Focus as Settings keeps it (roadmap/23-product-experience.md §4): its
+// schedule under `focus.schedule` (`22:00-07:00`), Control Center's choice
+// under `focus.manual` (`on 1792...`), and the applications whose banners
+// still show under `focus.allowed`, their names one after another. Read
+// again only when Settings changed; PlatformKit's `FocusChoice` decides.
+
+public namespace FocusSetting {
+    let schedule: String = "focus.schedule"
+    let manual: String = "focus.manual"
+    let allowed: String = "focus.allowed"
+    let separator: String = "|"
+}
+
+struct FocusRead {
+    var generation: Number? = .None
+    var choice: FocusChoice = FocusChoice {}
+}
+
+namespace FocusSlot {
+    let key: PersistentStateKey = PersistentStateKey { name: "platformui.focus" }
+}
+
+/// What Focus is set to, read again only when Settings changed.
+public function focusChoice() -> FocusChoice {
+    if !ambientStateHas(FocusSlot.key) {
+        ambientStatePut(FocusSlot.key, nativeUserData(nativeState(FocusRead {})))
+    }
+    var read = nativeRecover<FocusRead>(ambientStateGet(FocusSlot.key))
+    let generation = settingsGeneration()
+    if read.generation != .Some(generation) {
+        read.choice = storedFocusChoice()
+        read.generation = .Some(generation)
+    }
+    return copy read.choice
+}
+
+/// What Focus is set to, as Settings holds it now.
+public function storedFocusChoice() -> FocusChoice {
+    var allowed: [String] = []
+    for name in settingValue(FocusSetting.allowed, "").split(FocusSetting.separator) {
+        if name.count > 0 { allowed.append(copy name) }
+    }
+    return FocusChoice {
+        schedule: focusScheduleFrom(settingValue(FocusSetting.schedule, "")),
+        manual: focusOverrideFrom(settingValue(FocusSetting.manual, "")),
+        allowed: allowed
+    }
+}
+
+/// The moment `now`, milliseconds since 1970, as Focus reads it in `zone`.
+public function focusMoment(zone: borrow TimeZone, now: Number) -> FocusMoment {
+    let localMinutes = floor(zone.local(now) / FocusDay.millisPerMinute)
+    return FocusMoment { millis: now, minute: localMinutes % FocusDay.minutes }
+}
+
+/// Control Center's Focus switch, pressed at `moment`: Focus goes the other
+/// way until the schedule next starts or ends.
+public function toggleFocus(moment: borrow FocusMoment) {
+    let next = focusChoice().toggled(moment)
+    let manual = match next.manual {
+        Some(chosen) -> focusOverrideText(chosen)
+        None -> ""
+    }
+    match storeSetting(FocusSetting.manual, .Some(manual)) {
+        Ok -> log info("Focus changed", on: next.active(moment))
+        Error(failed) -> log warn("Focus could not be changed", error: errorName(failed))
+    }
+}

@@ -1,0 +1,287 @@
+import Foundation
+import Heap
+
+// Channels (§10.1, §10.2): a SEQPACKET socket pair, one datagram per message.
+//
+// `Channel.call` reads the replies that arrive while it waits; a reply to
+// another transaction, or a message that is not a reply, is kept for
+// `Channel.read` in `bufferedMessages`, ahead of what is still on the socket.
+
+struct BufferedMessage {
+    var live: Bool
+    var object: Number
+    var message: RawMessage
+}
+
+function channelHasBuffered(object: Number) -> Bool { return channelBufferedIndex(object).isSome() }
+
+function channelBufferedIndex(object: Number) -> Number? {
+    for index in 0..library.bufferedMessages.count {
+        if library.bufferedMessages[index].live && library.bufferedMessages[index].object == object {
+            return .Some(index)
+        }
+    }
+    return .None
+}
+
+function channelSignals(object: Number) -> U32 {
+    var signals = match library.objects[object].backing {
+        Some(backing) -> socketSignals(backing) & complement32(Signals.error.raw)
+        None -> U32(0)
+    }
+    if channelHasBuffered(object) { signals = signals | Signals.readable.raw }
+    return signals
+}
+
+function channelTeardown(object: Number) {
+    for index in 0..library.bufferedMessages.count {
+        if library.bufferedMessages[index].live && library.bufferedMessages[index].object == object {
+            messageDiscard(library.bufferedMessages[index].message)
+            library.bufferedMessages[index].live = false
+        }
+    }
+}
+
+// How much one end of a channel may have queued before a write answers
+// `ShouldWait`.
+let channelQueueBytes: U64 = U64(4194304)
+
+public function channelCreate() -> Result<HandlePair, TesseraError> {
+    let pair = try kernelPacketPair(channelQueueBytes)
+    let a = objectCreate(.Channel(.Plain), pair.first)
+    let b = objectCreate(.Channel(.Plain), pair.second)
+    let handleA = match handleMint(a, Rights.processDefault) {
+        Ok(value) -> value
+        Error(failed) -> {
+            objectDestroy(a)
+            objectDestroy(b)
+            return .Error(failed)
+        }
+    }
+    let handleB = match handleMint(b, Rights.processDefault) {
+        Ok(value) -> value
+        Error(failed) -> {
+            handleDrop(handleA)
+            objectDestroy(b)
+            return .Error(failed)
+        }
+    }
+    return .Ok(HandlePair { first: handleA, second: handleB })
+}
+
+// Sends one message. The handles listed leave this process whether the
+// write succeeds or not, unless one of them could not be sent at all.
+public function channelWrite(
+    channel: Handle,
+    bytes: borrow Buffer,
+    handles: borrow [Handle]
+) -> Result<Void, TesseraError> {
+    let object = try resolveObject(channel, .Channel, Rights.write)
+    try transferCheck(handles, object)
+    let backing = try backingOf(object)
+    let sent = channelSend(backing, bytes, handles)
+    transferRelease(handles)
+    return sent
+}
+
+// The next message: from what `Channel.call` kept, else from the socket.
+function channelNext(object: Number) -> Result<RawMessage, TesseraError> {
+    match channelBufferedIndex(object) {
+        Some(kept) -> {
+            library.bufferedMessages[kept].live = false
+            return .Ok(library.bufferedMessages[kept].message)
+        }
+        None -> {}
+    }
+    let backing = try backingOf(object)
+    return channelReceive(backing)
+}
+
+// Puts a message back at the front of what the channel holds.
+function channelKeepFront(object: Number, message: borrow RawMessage) {
+    var kept: [BufferedMessage] = [BufferedMessage { live: true, object: object, message: message }]
+    for index in 0..library.bufferedMessages.count {
+        if library.bufferedMessages[index].live { kept.append(library.bufferedMessages[index]) }
+    }
+    library.bufferedMessages = kept
+}
+
+// Puts a message behind what the channel holds. Messages already read stay
+// in `bufferedMessages` as dead entries until here, where they are dropped, so a
+// process that keeps messages for as long as it runs does not keep their
+// entries too.
+function channelKeepBack(object: Number, message: borrow RawMessage) {
+    var dead = 0
+    for index in 0..library.bufferedMessages.count {
+        if !library.bufferedMessages[index].live { dead = dead + 1 }
+    }
+    if dead > 0 {
+        var kept: [BufferedMessage] = []
+        for index in 0..library.bufferedMessages.count {
+            if library.bufferedMessages[index].live { kept.append(library.bufferedMessages[index]) }
+        }
+        library.bufferedMessages = kept
+    }
+    library.bufferedMessages.append(
+        BufferedMessage { live: true, object: object, message: message }
+    )
+}
+
+// Takes one whole message. A message too big for `bytes` or with more
+// handles than `handleCapacity` stays queued and answers `BufferTooSmall`
+// with the bytes needed.
+public function channelRead(
+    channel: Handle,
+    bytes: borrow Buffer,
+    handleCapacity: UNumber
+) -> Result<ReceivedMessage, TesseraError> {
+    let object = try resolveObject(channel, .Channel, Rights.read)
+    let message = try channelNext(object)
+    let payload = messagePayloadLength(message)
+    if payload > bytes.length || messageHandleCount(message) > handleCapacity {
+        channelKeepFront(object, message)
+        return .Error(failureDetail(.BufferTooSmall, payload))
+    }
+    copyBytes(
+        bytes.address,
+        heapOffset(message.block, Number(messagePayloadOffset(message))),
+        payload
+    )
+    let handles = messageHandles(message)
+    deallocate(message.block)
+    return .Ok(ReceivedMessage { bytes: payload, handles: handles })
+}
+
+public function channelPeek(channel: Handle) -> Result<MessageSize, TesseraError> {
+    let object = try resolveObject(channel, .Channel, Rights.read)
+    let message = try channelNext(object)
+    let size = MessageSize {
+        bytes: messagePayloadLength(message),
+        handles: messageHandleCount(message)
+    }
+    channelKeepFront(object, message)
+    return .Ok(size)
+}
+
+// Request and reply in one operation. The library writes a fresh
+// transaction id into the first 8 bytes of `request`, sends it, and
+// completes (`Service`) when the reply with that id arrives: `result0` the
+// reply bytes copied to `response`, `result1` the handles written as `u64`
+// values to `responseHandles`. An error reply's `Error` becomes the
+// completion's error.
+public function channelCall(
+    channel: Handle,
+    request: borrow Buffer,
+    requestHandles: borrow [Handle],
+    response: borrow Buffer,
+    responseHandles: borrow Buffer,
+    deadline: UNumber,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    if request.length < Wire.headerBytes { return .Error(failure(.InvalidArgument)) }
+    let slot = try resolve(channel, .Channel, Rights.write | Rights.read)
+    let portObject = try resolveObject(port, .Port, Rights.none)
+    let object = objectOfSlot(slot)
+    try transferCheck(requestHandles, object)
+    let txid = (kernelProcessId() << U64(32)) | library.nextTransaction
+    library.nextTransaction += U64(1)
+    if library.nextTransaction > U64(0xFFFFFFFF) { library.nextTransaction = U64(1) }
+    heapStore<U64>(request.address, 0, txid)
+    let backing = try backingOf(object)
+    let sent = channelSend(backing, request, requestHandles)
+    transferRelease(requestHandles)
+    try sent
+    let call = CallWork {
+        txid: txid,
+        deadline: deadline,
+        response: response,
+        handles: responseHandles,
+    }
+    pendingAdd(.Call(move call), .Handle(slot), portObject, key)
+    return .Ok
+}
+
+// Reads what has arrived; finishes the call when its reply is among it.
+function callStep(index: Number, call: borrow CallWork) {
+    let object = library.pending[index].object
+    let txid = call.txid
+    let backing = match backingOf(object) {
+        Ok(value) -> value
+        Error(failed) -> {
+            pendingFinish(index, .Error(failed), U64(0), U64(0), U64(0))
+            return
+        }
+    }
+    while true {
+        let next = channelReceive(backing)
+        match next {
+            Ok(message) -> {
+                let payload = messagePayloadLength(message)
+                let at = messagePayloadOffset(message)
+                var mine = false
+                if payload >= Wire.headerBytes {
+                    let flags = heapLoad<U32>(message.block, Number(at + U64(16)))
+                    mine = heapLoad<U64>(message.block, at) == txid && MessageFlags(flags).has(
+                        MessageFlags.response
+                    )
+                }
+                if mine {
+                    callAnswer(index, call, message)
+                    return
+                }
+                channelKeepBack(object, message)
+            }
+            Error(failed) -> {
+                if failed.code == .PeerClosed {
+                    pendingFinish(index, .Error(failed), U64(0), U64(0), U64(0))
+                    return
+                }
+                break
+            }
+        }
+    }
+    let deadline = call.deadline
+    if deadline != Deadline.infinite && monotonicNow() >= deadline {
+        pendingFinish(index, .Error(failure(.Timeout)), U64(0), U64(0), U64(0))
+    }
+}
+
+function callAnswer(index: Number, call: borrow CallWork, message: borrow RawMessage) {
+    let response = call.response
+    let handleSpace = call.handles
+    let payload = messagePayloadLength(message)
+    let at = messagePayloadOffset(message)
+    let count = U64(messageHandleCount(message))
+    if payload > response.length || count * U64(8) > handleSpace.length {
+        messageDiscard(message)
+        pendingFinish(
+            index,
+            .Error(failureDetail(.BufferTooSmall, payload)),
+            U64(0),
+            U64(0),
+            U64(0)
+        )
+        return
+    }
+    copyBytes(response.address, heapOffset(message.block, at), payload)
+    let handles = messageHandles(message)
+    for each in 0..handles.count {
+        heapStore<U64>(handleSpace.address, (each * 8), handles[each].raw)
+    }
+    var outcome: Result<Void, TesseraError> = .Ok
+    let flags = heapLoad<U32>(message.block, Number(at + U64(16)))
+    if MessageFlags(flags).has(MessageFlags.error) && payload >= Wire.headerBytes + U64(16) {
+        let body = heapOffset(message.block, at + Wire.headerBytes)
+        outcome = .Error(
+            TesseraError {
+                code: errorCodeFrom(heapLoad<U32>(body, 0)),
+                subsystem: subsystemFrom(heapLoad<U16>(body, 4)),
+                flags: ErrorFlags(heapLoad<U16>(body, 6)),
+                detail: heapLoad<U64>(body, 8),
+            }
+        )
+    }
+    deallocate(message.block)
+    pendingFinish(index, outcome, payload, count, U64(0))
+}

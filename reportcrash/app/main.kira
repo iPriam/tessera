@@ -1,0 +1,86 @@
+//! The reportcrash command's entry point: writes the report of a crashed process.
+import Foundation
+import LibTessera
+
+// reportcrash: the crash reporter, after macOS's ReportCrash.
+//
+//     |/bin/reportcrash %P        the kernel's core_pattern, which PID 1 sets
+//
+// The kernel starts it as a process dies of a signal, with the process's core
+// on standard input and the process kept until it exits. It writes the
+// process's report to /data/system/DiagnosticReports and says where in the
+// kernel's log. It exits 0, or 1 when there was no process to report on or the
+// report could not be written.
+
+/// The exit status of `reportcrash`: 0 when it wrote the report, 1 when it could not.
+@Derive(Copy)
+enum ReportExit: UN8 {
+    Written = 0
+    Failed = 1
+}
+
+/// The process id given as the first argument, when it is a number above zero.
+function processIdArgument(arguments: borrow [String]) -> Number? {
+    if arguments.count < 2 { return .None }
+    let pid = try arguments[1].toNumber() otherwise return .None
+    if pid <= 0 { return .None }
+    return .Some(pid)
+}
+
+/// Reads the crash of the process named on the command line, writes its report, and returns the exit status.
+function reportCrash() -> ReportExit {
+    crashStandardStreams()
+    let arguments = match processArguments() {
+        Ok(value) -> value
+        Error(failed) -> {
+            printError("reportcrash: its arguments could not be read: \(errorName(failed))")
+            return .Failed
+        }
+    }
+    let pid = match processIdArgument(arguments) {
+        Some(value) -> value
+        None -> {
+            printError("reportcrash: usage: reportcrash <pid>, as the kernel's core_pattern")
+            return .Failed
+        }
+    }
+    let crashed = trunc(unixMillis())
+    let capture = match crashCapture(pid) {
+        Ok(value) -> value
+        Error(failed) -> {
+            printError("reportcrash: process \(pid) could not be read: \(errorName(failed))")
+            return .Failed
+        }
+    }
+    // What the process wrote last is relayed to the system log by PID 1, a
+    // moment after it wrote it.
+    processSleep(ReportTiming.relayMillis)
+    let report = match crashReport(capture, crashed, lastLines(capture, crashed)) {
+        Ok(value) -> value
+        Error(failed) -> {
+            printError("reportcrash: a sender's name could not be read: \(errorName(failed))")
+            return .Failed
+        }
+    }
+    match storeReport(capture.name, crashed, report) {
+        Ok(path) -> {
+            print(
+                "reportcrash: \(capture.name)[\(capture.pid)] died of \(signalName(capture.signal)); report \(path)"
+            )
+            return .Written
+        }
+        Error(failed) -> {
+            printError(
+                "reportcrash: \(capture.name)[\(capture.pid)] report could not be completed: "
+                    + reportStoreFailureText(failed)
+            )
+            return .Failed
+        }
+    }
+}
+
+/// Runs `reportcrash` and returns its exit status to the shell.
+@Main
+function main() -> UN8 {
+    return code(reportCrash())
+}

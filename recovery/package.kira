@@ -1,0 +1,18 @@
+// Recovery: what the installer media starts, as a Mac's recovery does: install
+// Tessera, Disk Utility, Startup Disk and Terminal, in one window over the
+// wallpaper.
+//
+// Kira UI draws it and puts it on Tessera's display; it runs as the
+// platform, as Media does.
+construct RecoveryApp extends Package {
+    let version: String = "0.1.0"
+    let kind: PackageKind = .App
+    // The icons of what it offers, which CoreIcon draws when the system is
+    // built, into usr/share/recovery.
+    let assets: [String] = [
+        "Resources/Tessera.tessicon",
+        "Resources/StartupDisk.tessicon",
+        "Resources/Terminal.tessicon"
+    ]
+    let moduleRoot: String = "Recovery"
+}

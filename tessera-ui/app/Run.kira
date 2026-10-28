@@ -1,0 +1,304 @@
+//! An application's life on Tessera's display. MosaicDisplay owns frame
+//! pacing: the application asks for a frame by its serial and draws nothing
+//! until the display grants it. Between frames it waits on the display, on
+//! PID 1, on the link to the platform and on what it watches, all on one port.
+//!
+//! The graphics state outlives a session, so a display server that crashes
+//! drops only the transport: PID 1 hands the application a fresh link, and
+//! the next session redraws into the same device.
+
+import Foundation
+import KiraUI
+import KCoreAnimation
+import Ember
+import LibTessera
+import TesseraDisplayClient
+import AppKit
+
+/// What outlives a session: the renderer, and the exporter frames go out
+/// through.
+struct Drawing {
+    var renderer: Renderer
+    var exporter: MemoryExporter
+}
+
+/// Why there is nothing to draw with.
+enum DrawingFailure {
+    NoRenderer(RendererFailure)
+    NoExporter(MemoryExportFailure)
+}
+
+/// Opens what a session draws with: the renderer, and the exporter the frames are handed to.
+function openDrawing(launch: borrow LaunchTimeline) -> Result<Drawing, DrawingFailure> {
+    var renderer = match makeRenderer(launch) {
+        Ok(value) -> value
+        Error(failure) -> return .Error(.NoRenderer(failure))
+    }
+    return match makeMemoryExporter() {
+        Ok(exporter) -> .Ok(Drawing { renderer: move renderer, exporter: exporter })
+        Error(failure) -> {
+            renderer.release()
+            return .Error(.NoExporter(failure))
+        }
+    }
+}
+
+extend Drawing {
+    /// Closes the exporter, then releases the renderer.
+    function close(borrow mut self) {
+        exporter.close()
+        renderer.release()
+    }
+}
+
+/// The first display link PID 1 hands over after its greeting, taking any
+/// link to the platform that comes before it, which is said when there is
+/// none. A platform started again beside running applications is handed their
+/// platform links first, and a client started while MosaicDisplay starts again
+/// gets its display link once that one runs.
+function initialLink(bridge: borrow BridgeHandle) -> DisplayLink? {
+    match takeGreeting() {
+        Ok -> {
+            let link = nextDisplayLink(bridge)
+            if link.isNone() { log fault("no display-server channel") }
+            return link
+        }
+        Error(failed) -> log warn("no greeting from PID 1", error: errorName(failed))
+    }
+    log fault("no display-server channel")
+    return .None
+}
+
+/// The display link PID 1 hands over next, taking each link to the platform that
+/// comes before it; none once PID 1 has gone.
+function nextDisplayLink(bridge: borrow BridgeHandle) -> DisplayLink? {
+    while true {
+        let received = match takeServiceLink() {
+            Ok(value) -> value
+            Error(failure) -> {
+                log warn("a link from PID 1 could not be read", error: errorName(failure))
+                return .None
+            }
+        }
+        let link = try received otherwise return .None
+        match link {
+            Display(displayLink) -> return .Some(displayLink)
+            Platform(platformLink) -> match adoptPlatformLink(
+                copy bridge,
+                platformLink.channel,
+                platformLink.clientIndex,
+                platformLink.application
+            ) {
+                Ok -> log info("took a link to the platform", client: platformLink.clientIndex)
+                Error(failure) -> log warn("a link to the platform was not taken", failure: failure)
+            }
+        }
+    }
+    return .None
+}
+
+/// The link the next session runs on, once the session on `link` has ended:
+/// the replacement PID 1 handed over, or none when there is none.
+function nextLink(link: borrow DisplayLink, hosting: borrow mut Hosting) -> DisplayLink? {
+    closeDisplayLink(link)
+    let handed = hosting.replacement
+    hosting.replacement = .None
+    let replacement = match handed {
+        Some(value) -> value
+        None -> match nextDisplayLink(hosting.bridge) {
+            Some(value) -> value
+            None -> return .None
+        }
+    }
+    if replacement.clientIndex != link.clientIndex {
+        closeDisplayLink(replacement)
+        log fault("the replacement display link changed the client's identity")
+        return .None
+    }
+    log info("took a replacement display link", client: replacement.clientIndex)
+    return .Some(replacement)
+}
+
+/// The application `rootBuilder` builds, under `title`, on Tessera's display,
+/// until the person quits it or the display goes away for good. Its menu bar
+/// is drawn by the platform, across the top of the screen.
+public function RunTesseraApplication(
+    title: String,
+    rootBuilder: borrow () -> Any Widget,
+    options: ApplicationOptions
+) {
+    setMenuBarVisibility(.Hidden)
+    host(move title, rootBuilder, move options, .None, makeBridgeHandle())
+}
+
+/// A bridge with no links yet, for a platform that has no bridge of its own to pass `RunDynamicPlatform`.
+public function platformBridge() -> BridgeHandle {
+    return makeBridgeHandle()
+}
+
+/// The platform whose interface `rootBuilder` builds, on Tessera's display, over
+/// every application, doing what only a platform does in `hooks`.
+public function RunDynamicPlatform(
+    title: String,
+    rootBuilder: borrow () -> Any Widget,
+    options: ApplicationOptions,
+    hooks: DynamicPlatformHooks,
+    bridge: BridgeHandle
+) {
+    setMenuBarVisibility(.Hidden)
+    host(move title, rootBuilder, move options, .Some(move hooks), move bridge)
+}
+
+/// Runs an application or a platform on Tessera's display: opens the drawing and the waits, then serves the sessions until the person quits.
+function host(
+    title: String,
+    rootBuilder: borrow () -> Any Widget,
+    options: ApplicationOptions,
+    hooks: DynamicPlatformHooks?,
+    bridge: BridgeHandle
+) {
+    let launch = LaunchTimeline {}
+    launchMark(launch, "main")
+    setInterfaceMode(runningInterfaceMode())
+    // Tessera's platforms draw a Mac's and an iPad's interface, with the
+    // keyboard's GUI key as ⌘.
+    hostUsesCommandKeySet(true)
+    usePasteboardService()
+    var drawing = match openDrawing(launch) {
+        Ok(value) -> value
+        Error(failure) -> {
+            log fault("there is nothing to draw with", failure: failure)
+            return
+        }
+    }
+    launchMark(launch, "device")
+    var waits = match makeWaits(options.watches) {
+        Ok(value) -> value
+        Error(failure) -> {
+            log fault("there is no port to wait on", error: errorName(failure))
+            drawing.close()
+            return
+        }
+    }
+    let previousScope = ambientScopeCurrent()
+    let scope = ambientScopeCreate()
+    ambientScopeEnter(scope)
+    useNotificationBridge(copy bridge)
+    let platform = hooks.isSome()
+    applyAppearanceSetting()
+    if !platform { waits.watchSystem() }
+    var hosting = Hosting {
+        host: Host {
+            title: title,
+            options: options,
+            state: KiraLayerAppState { stateScope: scope },
+            platform: platform
+        },
+        drawing: move drawing,
+        waits: move waits,
+        hooks: move hooks,
+        bridge: bridge,
+        launch: launch
+    }
+    match captureRequest() {
+        Some(request) -> match captureFrames(hosting, rootBuilder, request) {
+            Ok -> {}
+            Error(failure) -> log fault("the capture wrote nothing", failure, path: request.path)
+        }
+        None -> serve(hosting, rootBuilder)
+    }
+    let lifetime = stateLifetimeCounts()
+    let layers = hosting.host.state.compositor.tree.counts()
+    let text = textEngineCounts()
+    log info(
+        "state at quit",
+        title: title,
+        slots: lifetime.slots,
+        viewSlots: lifetime.viewSlots,
+        scopes: lifetime.scopes,
+        keptKeys: lifetime.keptKeys,
+        recordings: lifetime.recordings,
+        touched: lifetime.touched,
+        viewLog: lifetime.viewLog,
+        scopesIssued: lifetime.scopesIssued,
+        frames: hosting.host.frames,
+        tapBands: tapSeqBandCount(),
+        actions: layerActionCount(),
+        menuEntries: menuExportCount(),
+        accessibilityNodes: accessibilityNodeCount(),
+        homeIcons: homeIconCount(),
+        backdrop: windowBackdropCount(),
+        flying: hosting.pipe.flying.count,
+        layers: layers.total,
+        mountedLayers: layers.mounted,
+        unmountedLayers: layers.unmounted,
+        teardowns: layers.teardowns,
+        lastLayerId: layers.lastId,
+        indexedLayers: layers.indexed,
+        transactions: layers.transactions,
+        overlays: layers.overlays,
+        fileTextures: hosting.host.state.compositor.fileTextures.count,
+        agingTextures: hosting.host.state.compositor.agingTextures.count,
+        passBatches: hosting.host.state.compositor.passBatches.count,
+        cachedTargets: hosting.host.state.compositor.cachedTargets.count,
+        registeredTargets: hosting.host.state.compositor.registeredTargets.count,
+        retiredTextures: hosting.host.state.compositor.retiredTextures.count,
+        textInstances: text.instances,
+        textAdvances: text.advances,
+        textRuns: text.runs,
+        textShapes: text.shapes,
+        textInks: text.inks,
+        textSymbols: text.symbols
+    )
+    ambientStateReset()
+    ambientScopeEnter(previousScope)
+    hosting.waits.close()
+    hosting.drawing.close()
+}
+
+/// `DeviceInfoTopic.dynamicPlatform`'s code for Adaptive Mobile.
+namespace DevicePlatformCode {
+    let adaptiveMobile: Number = 0
+}
+
+/// The interface the Dynamic Platform the machine runs draws in, as
+/// `System.info` says: Adaptive Mobile's touch interface on a machine running
+/// Adaptive Mobile, the desktop's on any other. `KIRA_UI_MODE` still fixes it
+/// for a run, and a machine that will not say keeps the host's.
+function runningInterfaceMode() -> InterfaceMode {
+    let requested = environmentValue("KIRA_UI_MODE")
+    if requested.count > 0 { return hostInterfaceMode() }
+    return match deviceDescription() {
+        Ok(device) -> device.dynamicPlatform == DevicePlatformCode.adaptiveMobile
+        ? .AdaptiveMobile
+        : .AdaptiveDesktop
+        Error(failed) -> {
+            log warn("the device would not say which platform it runs", error: errorName(failed))
+            return hostInterfaceMode()
+        }
+    }
+}
+
+/// Runs a session on each link PID 1 hands over, until the person quits or
+/// there is no next link.
+function serve(hosting: borrow mut Hosting, rootBuilder: borrow () -> Any Widget) {
+    var link = match initialLink(hosting.bridge) {
+        Some(value) -> value
+        None -> return
+    }
+    while true {
+        let ending = hostSession(link, hosting, rootBuilder)
+        match ending {
+            Quit -> {
+                closeDisplayLink(link)
+                log info("the application quit")
+                return
+            }
+            Ended(end) -> end.report(link.clientIndex)
+        }
+        link = match nextLink(link, hosting) {
+            Some(value) -> value
+            None -> return
+        }
+    }
+}

@@ -1,0 +1,29 @@
+TessIcon {
+    fill: Choice { light: .LinearGradient(Gradient { from: Color { space: .Srgb, red: 0.611, green: 0.611, blue: 0.63, alpha: 1 }, to: Color { space: .Srgb, red: 0.48, green: 0.48, blue: 0.5, alpha: 1 }, start: Point { x: 0.5, y: 0 }, stop: Point { x: 0.5, y: 1 } }), dark: .Automatic },
+    groups: [
+        Group {
+            name: "Group",
+            layers: [
+                Layer { name: "3.top.new", image: "3.top.new.svg", fill: Choice { light: .LinearGradient(Gradient { from: Color { space: .Srgb, red: 1, green: 1, blue: 1, alpha: 0.8 }, to: Color { space: .DisplayP3, red: 0.95, green: 0.95, blue: 0.95, alpha: 0.9 }, start: Point { x: 0.505, y: 0.267 }, stop: Point { x: 0.502, y: 0 } }), dark: .LinearGradient(Gradient { from: Color { space: .Srgb, red: 0.693, green: 0.692, blue: 0.714, alpha: 1 }, to: Color { space: .Srgb, red: 0.686, green: 0.686, blue: 0.714, alpha: 1 }, start: Point { x: 0.5, y: 0 }, stop: Point { x: 0.5, y: 1 } }) } }
+            ],
+            lighting: .Individual,
+            specular: .Inside,
+            translucency: Translucency { enabled: true, amount: 0.2 },
+            shadow: Shadow { kind: .Neutral, opacity: 0.85 },
+            blend: .Screen,
+            refraction: Refraction { enabled: true, depth: 0.1041, spread: 0.02184 }
+        },
+        Group {
+            name: "Group 2",
+            layers: [
+                Layer { name: "4.intersection", image: "4.intersection.svg", glass: false, opacity: Choice { light: 1, dark: 0.4 } },
+                Layer { name: "2.bottom.new", image: "2.bottom.new.svg", fill: Choice { light: .Solid(Color { space: .Gray, red: 1, green: 1, blue: 1, alpha: 0.4 }), dark: .LinearGradient(Gradient { from: Color { space: .Srgb, red: 0.611, green: 0.611, blue: 0.63, alpha: 0.8 }, to: Color { space: .Srgb, red: 0.48, green: 0.48, blue: 0.5, alpha: 0.8 }, start: Point { x: 0.5, y: 0 }, stop: Point { x: 0.5, y: 1 } }) } }
+            ],
+            lighting: .Individual,
+            specular: .Inside,
+            translucency: Translucency { enabled: true, amount: 0.1 },
+            shadow: Shadow { kind: .Neutral, opacity: 0.85 },
+            blend: .Screen
+        }
+    ]
+}

@@ -1,0 +1,130 @@
+import Foundation
+import Heap
+import LibTessera
+
+// Haptics (17 §14.4) over evdev force feedback.
+//
+// `struct ff_effect` (48 bytes): `type` @0, `id` @2, `direction` @4, the
+// trigger @6, `replay.length` @10 and `replay.delay` @12, then the union at
+// @16. A pattern is LibTessera's `AmplitudeF32AtHz`: a `u32` rate in Hz, then
+// one `f32` amplitude per period. A rumble effect carries the pattern's
+// strongest amplitude for its whole length, which is what a rumble motor can
+// play.
+
+namespace ForceFeedback {
+    // The `FF_*` effect types and settings, which are also their bits in
+    // `EVIOCGBIT(EV_FF)`.
+    let rumble: U16 = U16(0x50)
+    let periodic: U16 = U16(0x51)
+    let custom: U16 = U16(0x5D)
+    let gain: U16 = U16(0x60)
+    let bitsBytes: Number = 16
+    let effectBytes: Number = 48
+    // `id` -1 asks the kernel for a new effect.
+    let newEffect: U16 = U16(0xFFFF)
+    let longestMilliseconds: Number = 32767
+    let strongest: Number = 65535
+    let highestRate: Number = 1000
+}
+
+namespace Pattern {
+    let headerBytes: Number = 4
+    let sampleBytes: Number = 4
+}
+
+// Whether `bit` is set in the kernel's bit array at `bits`.
+function bitSet(bits: RawPtr, bit: U16) -> Bool {
+    let byte = heapLoad<U8>(bits, trunc(bit / 8))
+    return (byte & (U8(1) << U8(bit % 8))) != 0
+}
+
+public function hapticCapabilities(haptic: Ref) -> Result<HapticCapabilities, TesseraError> {
+    let object = try resolveConnection(haptic, .Haptic, RefRights.read)
+    let device = try deviceOf(object)
+    let bitsBytes = zeroedBlock(count: ForceFeedback.bitsBytes, alignment: 16)
+    let bits = bitsBytes.pointer()
+    let read = try device.control(
+        evdevGetBits(U64(code(EventType.ForceFeedback)), U64(ForceFeedback.bitsBytes)),
+        bits
+    )
+    var capabilities = HapticCapabilities.none
+    if bitSet(bits, ForceFeedback.rumble) {
+        capabilities = capabilities | HapticCapabilities.rumble
+    }
+    if bitSet(bits, ForceFeedback.periodic) {
+        capabilities = capabilities | HapticCapabilities.periodic
+    }
+    if bitSet(bits, ForceFeedback.custom) {
+        capabilities = capabilities | HapticCapabilities.customWaveform
+    }
+    if bitSet(bits, ForceFeedback.gain) { capabilities = capabilities | HapticCapabilities.gain }
+    return .Ok(capabilities)
+}
+
+// Uploads `pattern` as one rumble effect and answers its id.
+public function hapticUpload(haptic: Ref, pattern: borrow Buffer) -> Result<UN32, TesseraError> {
+    let object = try resolveConnection(haptic, .Haptic, RefRights.write)
+    if pattern.length < Pattern.headerBytes + Pattern.sampleBytes || isNull(pattern.address) {
+        return .Error(failure(.InvalidArgument))
+    }
+    let rate = Number(heapLoad<U32>(pattern.address, 0))
+    if rate == 0 || rate > ForceFeedback.highestRate { return .Error(failure(.InvalidArgument)) }
+    let samples = floor((pattern.length - Pattern.headerBytes) / Pattern.sampleBytes)
+    var strongest = F32(0.0)
+    for index in 0..samples {
+        let amplitude = heapLoad<F32>(
+            pattern.address,
+            (Pattern.headerBytes + index * Pattern.sampleBytes)
+        )
+        if amplitude > strongest { strongest = amplitude }
+    }
+    if strongest > F32(1.0) { strongest = F32(1.0) }
+    var length = floor(samples * 1000 / rate)
+    if length == 0 { length = 1 }
+    if length > ForceFeedback.longestMilliseconds { length = ForceFeedback.longestMilliseconds }
+    let device = try deviceOf(object)
+    let blockBytes = zeroedBlock(count: ForceFeedback.effectBytes, alignment: 16)
+    let block = blockBytes.pointer()
+    heapStore<U16>(block, 0, ForceFeedback.rumble)
+    heapStore<U16>(block, 2, ForceFeedback.newEffect)
+    heapStore<U16>(block, 10, U16(length))
+    let magnitude = U16(Number(strongest * F32(65535.0)))
+    // The strong and the weak motor alike.
+    heapStore<U16>(block, 16, magnitude)
+    heapStore<U16>(block, 18, magnitude)
+    let uploaded = try device.control(Evdev.setEffect, block)
+    return .Ok(U32(heapLoad<U16>(block, 2)))
+}
+
+// Plays `effect` `repeat` times; 0 plays it once.
+public function hapticPlay(
+    haptic: Ref,
+    effect: UN32,
+    repeat: Number
+) -> Result<Void, TesseraError> {
+    let object = try resolveConnection(haptic, .Haptic, RefRights.write)
+    if repeat < 0 { return .Error(failure(.InvalidArgument)) }
+    let device = try deviceOf(object)
+    return writeEvent(device, .ForceFeedback, U16(effect), U32(repeat == 0 ? 1 : repeat))
+}
+
+public function hapticStop(haptic: Ref, effect: UN32) -> Result<Void, TesseraError> {
+    let object = try resolveConnection(haptic, .Haptic, RefRights.write)
+    let device = try deviceOf(object)
+    return writeEvent(device, .ForceFeedback, U16(effect), U32(0))
+}
+
+// `FF_GAIN`, 0 to 65535, for a device whose capabilities have Gain.
+public function hapticSetGain(haptic: Ref, gain: Number) -> Result<Void, TesseraError> {
+    let object = try resolveConnection(haptic, .Haptic, RefRights.write)
+    if gain < 0 || gain > ForceFeedback.strongest { return .Error(failure(.OutOfRange)) }
+    let device = try deviceOf(object)
+    return writeEvent(device, .ForceFeedback, ForceFeedback.gain, U32(gain))
+}
+
+public function hapticErase(haptic: Ref, effect: UN32) -> Result<Void, TesseraError> {
+    let object = try resolveConnection(haptic, .Haptic, RefRights.write)
+    let device = try deviceOf(object)
+    let erased = try device.controlValue(Evdev.removeEffect, Number(effect))
+    return .Ok
+}

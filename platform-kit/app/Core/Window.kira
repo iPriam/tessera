@@ -1,0 +1,167 @@
+//! A surface's frame: whether a point lies in it, and the geometry the platform reads from it.
+import Foundation
+
+extend SurfaceFrame {
+    /// Whether the point lies in the frame: the left and top edges are inside, the right and bottom edges are not.
+    function contains(borrow self, x: Number, y: Number) -> Bool {
+        return x >= self.x && y >= self.y && x < self.x + width && y < self.y + height
+    }
+}
+
+extend PlatformState {
+    /// The z-order of the surface furthest in front; none without surfaces.
+    function highestZOrder(borrow self) -> Number? {
+        var highest: Number? = .None
+        for surface in surfaces {
+            match highest {
+                Some(value) -> if surface.zOrder > value { highest = .Some(surface.zOrder) }
+                None -> highest = .Some(surface.zOrder)
+            }
+        }
+        return highest
+    }
+
+    /// The z-order that puts a surface in front of every other.
+    function frontZOrder(borrow self) -> Number {
+        return match highestZOrder() {
+            Some(highest) -> highest + 1
+            None -> 0
+        }
+    }
+
+    /// Moves the surface's frame to a new origin.
+    function moveSurface(
+        borrow mut self,
+        target: PlatformSurfaceId,
+        x: Number,
+        y: Number,
+    ) -> Result<Void, PlatformStateFailure> {
+        let index = try surfaceIndexOrFail(self, target)
+        surfaces[index].frame.x = x
+        surfaces[index].frame.y = y
+        return .Ok
+    }
+
+    /// Moves the surface's frame by an offset.
+    function translateSurface(
+        borrow mut self,
+        target: PlatformSurfaceId,
+        deltaX: Number,
+        deltaY: Number,
+    ) -> Result<Void, PlatformStateFailure> {
+        let index = try surfaceIndexOrFail(self, target)
+        surfaces[index].frame.x += deltaX
+        surfaces[index].frame.y += deltaY
+        return .Ok
+    }
+
+    /// Resizes the surface's frame to a new size.
+    function resizeSurface(
+        borrow mut self,
+        target: PlatformSurfaceId,
+        width: UNumber,
+        height: UNumber,
+    ) -> Result<Void, PlatformStateFailure> {
+        if width == 0 || height == 0 { return .Error(.EmptySize) }
+        let index = try surfaceIndexOrFail(self, target)
+        surfaces[index].frame.width = width
+        surfaces[index].frame.height = height
+        return .Ok
+    }
+
+    /// Puts a visible surface in front of every other.
+    function raiseSurface(
+        borrow mut self,
+        target: PlatformSurfaceId,
+    ) -> Result<Void, PlatformStateFailure> {
+        let index = try surfaceIndexOrFail(self, target)
+        match surfaces[index].visible {
+            Hidden -> return .Error(.HiddenSurface(target))
+            Visible -> surfaces[index].zOrder = frontZOrder()
+        }
+        return .Ok
+    }
+
+    /// The visible surface under the point furthest in front, if any.
+    function surfaceAt(borrow self, x: Number, y: Number) -> PlatformSurfaceId? {
+        var target: PlatformSurface? = .None
+        for surface in surfaces {
+            if surface.visible == .Visible && surface.frame.contains(x, y)
+                && isAtOrAbove(surface, target) { target = .Some(surface) }
+        }
+        return idOf(target)
+    }
+
+    /// Raises a surface and gives it focus.
+    function activateSurface(
+        borrow mut self,
+        target: PlatformSurfaceId,
+    ) -> Result<Void, PlatformStateFailure> {
+        match raiseSurface(target) {
+            Ok -> setFocus(target)
+            Error(failure) -> return .Error(failure)
+        }
+        return .Ok
+    }
+
+    /// Records where a surface is, as the compositor placed it.
+    function placeSurface(
+        borrow mut self,
+        target: PlatformSurfaceId,
+        frame: SurfaceFrame,
+    ) -> Result<Void, PlatformStateFailure> {
+        if frame.width <= 0 || frame.height <= 0 { return .Error(.EmptySize) }
+        let index = try surfaceIndexOrFail(self, target)
+        surfaces[index].frame = frame
+        return .Ok
+    }
+
+    /// Where zooming a surface puts it, as a Mac's green button does: a
+    /// surface that is not zoomed fills `room`, and where it was is kept; a
+    /// zoomed one goes back there. A zoomed surface the person has moved since
+    /// is not zoomed any more, and fills the room again.
+    function zoomSurface(
+        borrow mut self,
+        target: PlatformSurfaceId,
+        room: SurfaceFrame,
+    ) -> Result<SurfaceFrame, PlatformStateFailure> {
+        let index = try surfaceIndexOrFail(self, target)
+        let frame = surfaces[index].frame
+        match surfaces[index].unzoomed {
+            Some(back) -> {
+                surfaces[index].unzoomed = .None
+                if sameFrame(frame, room) { return .Ok(back) }
+            }
+            None -> {}
+        }
+        surfaces[index].unzoomed = .Some(frame)
+        return .Ok(room)
+    }
+
+    /// The visible surface furthest in front other than `except`, if any: what
+    /// comes to the front when `except` goes.
+    function frontmostSurface(borrow self, except: PlatformSurfaceId) -> PlatformSurfaceId? {
+        var target: PlatformSurface? = .None
+        for surface in surfaces {
+            if surface.id != except && surface.visible == .Visible
+                && isAtOrAbove(surface, target) { target = .Some(surface) }
+        }
+        return idOf(target)
+    }
+}
+
+/// Whether two frames have the same origin and size.
+function sameFrame(a: borrow SurfaceFrame, b: borrow SurfaceFrame) -> Bool {
+    return a.x == b.x && a.y == b.y && a.width == b.width && a.height == b.height
+}
+
+extend PlatformState {
+    /// Whether `target` is shown, or minimized to the Dock; none for a surface
+    /// the platform does not know.
+    function visibilityOf(borrow self, target: PlatformSurfaceId) -> SurfaceVisibility? {
+        return match surfaceIndex(self, target) {
+            Some(index) -> .Some(surfaces[index].visible)
+            None -> .None
+        }
+    }
+}

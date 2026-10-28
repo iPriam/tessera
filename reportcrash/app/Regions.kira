@@ -1,0 +1,191 @@
+//! The memory regions of a crash report: the fault's mapping, the mappings around it, and the open files.
+import Foundation
+import LibTessera
+
+// The parts of a report about the process's memory and files: where a fault
+// fell among its mappings, what it had mapped, and what it held open.
+
+/// The text the crash report's memory regions are written with: the labels and the columns they are laid out in.
+namespace RegionLayout {
+    let typeWidth: Number = 28
+    let sizeWidth: Number = 12
+    let countWidth: Number = 8
+}
+
+/// What a Kira runtime trap means, by its `KLF-RT` number.
+function trapDescription(code: Number) -> String {
+    return match code {
+        1 -> "Unreachable executed"
+        2 -> "Integer overflow"
+        3 -> "Exclusivity violation"
+        4 -> "Use of deleted object"
+        5 -> "Out-of-bounds access"
+        6 -> "Raw free of a slot that is already free"
+        10 -> "Division by zero"
+        11 -> "Invalid float-to-int conversion"
+        20 -> "Exception reached a RIDL boundary"
+        21 -> "Stack overflow"
+        100 -> "Heap imbalance at exit"
+        101 -> "Reference cycle leak"
+        200 -> "RIDL link check failed"
+        else -> "Runtime trap"
+    }
+}
+
+/// Appends the region the fault address lies in, and the regions around it, as a Mac's `VM Region Info` shows them.
+function appendFaultRegion(text: borrow mut [String], capture: borrow CrashCapture) {
+    if capture.faultAddress == U64(0) && capture.signal != 11 && capture.signal != 7 { return }
+    let address = capture.faultAddress
+    match regionHolding(capture.regions, address) {
+        Some(holding) -> text.append(
+            "VM Region Info: \(hex(address)) is in \(regionLine(capture.regions[holding]))"
+        )
+        None -> {
+            if address < U64(65536) {
+                text.append(
+                    "VM Region Info: \(hex(address)) is not in any region, below the lowest mapping: a null pointer read"
+                )
+            } else {
+                appendRegionsAround(text, capture.regions, address)
+            }
+        }
+    }
+    text.append("")
+}
+
+/// The mapping `address` lies in: the last one that holds it.
+function regionHolding(regions: borrow [CrashedRegion], address: U64) -> Number? {
+    for offset in 0..regions.count {
+        let index = regions.count - 1 - offset
+        if address >= regions[index].start && address < regions[index].end { return .Some(index) }
+    }
+    return .None
+}
+
+/// The last mapping that ends at or below `address`: the nearest one before it.
+function regionBefore(regions: borrow [CrashedRegion], address: U64) -> Number? {
+    for offset in 0..regions.count {
+        let index = regions.count - 1 - offset
+        if regions[index].end <= address { return .Some(index) }
+    }
+    return .None
+}
+
+/// Appends the mappings around the fault: the nearest before it and the nearest after it, which is the first mapping when none lies before it.
+function appendRegionsAround(
+    text: borrow mut [String],
+    regions: borrow [CrashedRegion],
+    address: U64
+) {
+    text.append("VM Region Info: \(hex(address)) is not in any region")
+    let after = match regionBefore(regions, address) {
+        Some(before) -> {
+            text.append("    before it: \(regionLine(regions[before]))")
+            before + 1
+        }
+        // Nothing lies before it, so the first mapping is the one after it.
+        None -> 0
+    }
+    if after < regions.count {
+        text.append("    after it:  \(regionLine(regions[after]))")
+    }
+}
+
+/// One mapping's line in the report: its address range, its size and its kind.
+function regionLine(region: borrow CrashedRegion) -> String {
+    let name = region.path.isEmpty() ? "anonymous" : copy region.path
+    return "\(hex(region.start)) - \(hex(region.end)) [\(sizeText(region.end - region.start))] \(region.permissions) \(name)"
+}
+
+/// Where `kind` is in `kinds`, if it is there yet.
+function indexOfKind(kinds: borrow [String], kind: borrow String) -> Number? {
+    for index in 0..kinds.count {
+        if kinds[index] == kind { return .Some(index) }
+    }
+    return .None
+}
+
+/// Appends a summary of the mappings by kind, largest first.
+function appendRegionSummary(text: borrow mut [String], regions: borrow [CrashedRegion]) {
+    if regions.count == 0 { return }
+    var kinds: [String] = []
+    var sizes: [U64] = []
+    var counts: [Number] = []
+    var total = U64(0)
+    for region in regions {
+        let kind = regionKind(region)
+        let size = region.end - region.start
+        total = total + size
+        match indexOfKind(kinds, kind) {
+            Some(found) -> {
+                sizes[found] = sizes[found] + size
+                counts[found] += 1
+            }
+            None -> {
+                kinds.append(kind)
+                sizes.append(size)
+                counts.append(1)
+            }
+        }
+    }
+    var order: [Number] = []
+    for index in 0..kinds.count { order.append(index) }
+    let sorted = order.sorted({ left, right in return sizes[left] > sizes[right] })
+    text.append("VM Region Summary:")
+    text.append(
+        padRight("REGION TYPE", RegionLayout.typeWidth) + padLeft(
+            "SIZE",
+            RegionLayout.sizeWidth
+        ) + padLeft("COUNT", RegionLayout.countWidth)
+    )
+    for index in sorted {
+        text.append(
+            padRight(kinds[index], RegionLayout.typeWidth) + padLeft(
+                sizeText(sizes[index]),
+                RegionLayout.sizeWidth
+            ) + padLeft("\(counts[index])", RegionLayout.countWidth)
+        )
+    }
+    text.append(
+        padRight("TOTAL", RegionLayout.typeWidth) + padLeft(
+            sizeText(total),
+            RegionLayout.sizeWidth
+        ) + padLeft("\(regions.count)", RegionLayout.countWidth)
+    )
+    text.append("")
+}
+
+/// The kind of a mapping: `__TEXT KiraUI`, `__DATA KiraUI`, `Stack`, `Heap` or `Anonymous`.
+function regionKind(region: borrow CrashedRegion) -> String {
+    if region.path == "[stack]" { return "Stack" }
+    if region.path == "[heap]" { return "Heap" }
+    if region.path.startsWith("[") { return copy region.path }
+    if region.path.isEmpty() { return region.permissions.startsWith("---") ? "Guard" : "Anonymous" }
+    let name = lastPathPart(region.path)
+    if region.permissions.count >= 3 && region.permissions.substring(2, 3) == "x" {
+        return "__TEXT " + name
+    }
+    if region.permissions.count >= 2 && region.permissions.substring(1, 2) == "w" {
+        return "__DATA " + name
+    }
+    return "__CONST " + name
+}
+
+/// Appends the files the crashed process had open.
+function appendOpenFiles(text: borrow mut [String], files: borrow [CrashedFile]) {
+    if files.count == 0 { return }
+    text.append("Open Files:")
+    for file in files {
+        text.append("    " + padLeft("\(file.descriptor)", 4) + "  " + file.target)
+    }
+    text.append("")
+}
+
+/// A size in bytes as the report writes it: `1.5M`, `640K` or `512`.
+function sizeText(bytes: U64) -> String {
+    let count = Number(bytes)
+    if count >= 1073741824 { return "\(trunc(count * 10 / 1073741824) / 10)G" }
+    if count >= 1048576 { return "\(trunc(count * 10 / 1048576) / 10)M" }
+    if count >= 1024 { return "\(trunc(count / 1024))K" }
+    return "\(count)"
+}

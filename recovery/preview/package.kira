@@ -1,0 +1,10 @@
+// The recovery's views in a window on the host, to see them while they are
+// made. `app/Views` is the recovery's own.
+construct RecoveryPreview extends Package {
+    let version: String = "0.1.0"
+    let kind: PackageKind = .App
+    let dependencies: [Dependency] = [Dependency {
+        name: "KiraUI",
+        path: "../../kira-ui"
+    }]
+}

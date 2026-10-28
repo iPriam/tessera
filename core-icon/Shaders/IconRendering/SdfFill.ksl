@@ -1,0 +1,60 @@
+// sdfFill: the shape's coverage from its distance field, `scale` and `bias`
+// mapping r to a distance, antialiased over 5/6 of a pixel's change.
+import Stitch
+
+type SdfFillArguments {
+    let toUser: Float4
+    let toUserTranslation: Float2
+    let scale: Float
+    let bias: Float
+    let fieldInverseSize: Float2
+}
+
+type FullscreenIn {
+    @builtin(vertex_index)
+    let vid: UInt
+}
+
+type FullscreenOut {
+    @builtin(position)
+    let clip_position: Float4
+}
+
+type StitchOut {
+    let color: Float4
+}
+
+shader SdfFill {
+    group Draw {
+        uniform arguments: SdfFillArguments
+        texture field: Texture2d
+        sampler fieldSampler: Sampler
+    }
+
+    vertex {
+        input FullscreenIn
+        output FullscreenOut
+
+        function entry(input: FullscreenIn) -> FullscreenOut {
+            let out: FullscreenOut
+            out.clip_position = Stitch.fullscreen(input.vid)
+            return out
+        }
+    }
+
+    fragment {
+        input FullscreenOut
+        output StitchOut
+
+        function entry(input: FullscreenOut) -> StitchOut {
+            let a = arguments
+            let position = Stitch.userPoint(input.clip_position.xy, a.toUser, a.toUserTranslation)
+            let v = sample(field, fieldSampler, position * a.fieldInverseSize).x * a.scale + a.bias
+            let w = Stitch.changeWidth(v)
+            let covered = Stitch.smooth01((v + w * Stitch.antialiasHalfSpan) / (w * Stitch.antialiasSpan))
+            let result: StitchOut
+            result.color = Float4(covered, covered, covered, covered)
+            return result
+        }
+    }
+}

@@ -1,0 +1,204 @@
+import Foundation
+import Heap
+import LibTessera
+
+// Who made a disk image, checked before an application on it is installed or
+// opened (roadmap/12-apps.md, step 2 of installation).
+//
+// A signed image ends in one 4096-byte block: "TESSERA-SIGNED-1", the
+// signer's Ed25519 public key (32 bytes), and its signature (64 bytes) over
+// every byte before the block, the rest zeros. SquashFS reads only as far as
+// its own length, so the block rides along unseen by the mount;
+// `scripts/container.sh` appends it.
+//
+// What PID 1 does with it is macOS's Gatekeeper, without the gatekeeper:
+// - a signature that does not match the bytes is refused, because something
+//   changed behind the owner's back;
+// - an image signed by a key the owner has accepted before goes ahead;
+// - an image signed by a new key, or not signed, goes ahead when the owner
+//   asks a second time, having been told which key it is or that there is
+//   none.
+// Accepting a key is remembered in /data/system/keys. An unsigned image the
+// owner chose to open opens again without asking until the machine restarts,
+// as a Mac asks once about an application from an unidentified developer.
+// No key is required and none is privileged.
+
+let signatureBlockBytes: Number = 4096
+
+let signatureMagic: String = "TESSERA-SIGNED-1"
+
+let acceptedKeysDirectory: String = "/" + SystemDirectory.systemData + "/keys"
+
+// What the owner was asked and said about images: the request being
+// answered's refusal, the image asked about last, and the unsigned images
+// the owner chose to open. PID 1 keeps it in its `Fleet`.
+struct Consent {
+    // Why the request being handled was refused, in a sentence for the
+    // person who asked; empty when the plain answer will do.
+    var refusal: String = ""
+    // The image the owner was told about last, as "<install|open> <name>
+    // <digest>", which a second request for the same thing goes ahead with.
+    var pending: String = ""
+    // The unsigned images the owner chose to open, as "<name> <digest>".
+    var openedAnyway: [String] = []
+}
+
+struct ImageSignature {
+    // Whether the image ends in a signature block.
+    var signed: Bool
+    // Whether that signature matches the bytes before it.
+    var valid: Bool
+    var key: [UN8]
+    // The key as the owner is shown it: the first 16 hexadecimal digits of
+    // its SHA-256, in groups of four.
+    var fingerprint: String
+    // The same digits without the spaces, which name the accepted key.
+    var digits: String
+}
+
+// What the end of `image` says about who made it.
+function imageSignature(image: borrow [UN8]) -> ImageSignature {
+    var found = ImageSignature { signed: false, valid: false, key: [], fingerprint: "", digits: "" }
+    let block = signatureBlockBytes
+    if image.count < block * 2 { return found }
+    let start = image.count - block
+    let magic = signatureMagic.utf8()
+    for index in 0..magic.count {
+        if image[start + index] != magic[index] { return found }
+    }
+    found.signed = true
+    var signature: [UN8] = []
+    for index in 0..32 { found.key.append(image[start + 16 + index]) }
+    for index in 0..64 { signature.append(image[start + 48 + index]) }
+    found.digits = digestOf(found.key).substring(0, 16)
+    found.fingerprint = keyFingerprint(found.digits)
+    let bytes = zeroedBlock(count: start + 1, alignment: 16)
+    for index in 0..start { heapStore<U8>(bytes.pointer(), index, image[index]) }
+    let keyBytes = zeroedBlock(count: 32, alignment: 16)
+    for index in 0..32 { heapStore<U8>(keyBytes.pointer(), index, found.key[index]) }
+    let signatureBytes = zeroedBlock(count: 64, alignment: 16)
+    for index in 0..64 { heapStore<U8>(signatureBytes.pointer(), index, signature[index]) }
+    found.valid = signatureVerifyEd25519(
+        Buffer { address: bytes.pointer(), length: start },
+        Buffer { address: keyBytes.pointer(), length: 32 },
+        Buffer { address: signatureBytes.pointer(), length: 64 },
+    )
+    return found
+}
+
+function keyFingerprint(digits: borrow String) -> String {
+    var shown = ""
+    for group in 0..4 {
+        if group > 0 { shown.append(" ") }
+        shown.append(digits.substring(group * 4, group * 4 + 4))
+    }
+    return shown
+}
+
+function acceptedKeyName(digits: borrow String) -> String { return digits + ".ed25519" }
+
+// Whether the owner has installed something signed by the key with these
+// digits before.
+function keyAccepted(calls: Handle, digits: borrow String) -> Result<Bool, TesseraError> {
+    return pathPresent(calls, acceptedKeysDirectory + "/" + acceptedKeyName(digits))
+}
+
+function acceptKey(calls: Handle, signature: borrow ImageSignature) {
+    match ensureDirectories(calls, [directoryOf(acceptedKeysDirectory), acceptedKeysDirectory]) {
+        Ok -> {}
+        Error(failed) -> {
+            log warn("could not create the signing key directory", error: errorName(failed))
+            return
+        }
+    }
+    match atomicWriteFile(
+        calls,
+        acceptedKeysDirectory,
+        acceptedKeyName(signature.digits),
+        signature.key
+    ) {
+        Ok -> {}
+        Error(failed) -> {
+            log warn(
+                "could not remember a signing key",
+                key: signature.fingerprint,
+                error: errorName(failed)
+            )
+            return
+        }
+    }
+    log info("the owner accepted a signing key", key: signature.fingerprint)
+}
+
+enum ImagePermission {
+    Allowed
+    Refused
+}
+
+// Whether the application `name` on `image` may be installed, or opened
+// when `opening`, now. When refused, says why in `consent.refusal`.
+function imagePermitted(
+    calls: Handle,
+    name: borrow String,
+    image: borrow [UN8],
+    opening: Bool,
+    consent: borrow mut Consent
+) -> Result<ImagePermission, TesseraError> {
+    let verb = opening ? "opened" : "installed"
+    let signature = imageSignature(image)
+    if signature.signed && !signature.valid {
+        log fault(
+            "refused an image whose signature does not match it",
+            application: name,
+            key: signature.fingerprint,
+            opening
+        )
+        consent.refusal = name + " is damaged and can't be " + verb + ": it does not match its signature."
+        return .Ok(.Refused)
+    }
+    if signature.signed {
+        let accepted = try keyAccepted(calls, signature.digits)
+        if accepted {
+            log info(
+                "an image is signed by a key the owner accepted",
+                application: name,
+                key: signature.fingerprint
+            )
+            return .Ok(.Allowed)
+        }
+    }
+    let identity = name + " " + digestOf(image)
+    if opening && !signature.signed {
+        for earlier in consent.openedAnyway {
+            if earlier == identity { return .Ok(.Allowed) }
+        }
+    }
+    let pending = (opening ? "open " : "install ") + identity
+    if consent.pending == pending {
+        consent.pending = ""
+        if signature.signed { acceptKey(calls, signature) }
+        if opening && !signature.signed { consent.openedAnyway.append(identity) }
+        log info(
+            "the owner chose to go ahead with an image",
+            application: name,
+            signed: signature.signed,
+            opening
+        )
+        return .Ok(.Allowed)
+    }
+    consent.pending = pending
+    let again = opening ? "Open it again to go ahead" : "Install it again to go ahead"
+    if signature.signed {
+        consent.refusal = name + " is signed by a key not used here before (" + signature.fingerprint
+            + "). " + again + "."
+    } else {
+        consent.refusal = name + " is not signed, so nothing says who made it. " + again + " anyway."
+    }
+    log info(
+        "asked the owner about an image",
+        application: name,
+        signed: signature.signed,
+        key: signature.fingerprint
+    )
+    return .Ok(.Refused)
+}

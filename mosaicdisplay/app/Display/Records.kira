@@ -1,0 +1,156 @@
+import Foundation
+import DeviceKit
+
+// DeviceKit's records as roadmap/17-devicekit.md lays them out, each loaded
+// or stored whole.
+
+// The header of a message on the service channel PID 1 started this with.
+@FFI.Struct { layout: c }
+struct ServiceHeader {
+    var opcode: U32
+    var length: U32
+    var serial: U32
+    var detail: U32
+}
+
+// §7.4's `MatchSpec`, without property constraints.
+@FFI.Struct { layout: c }
+struct MatchSpecRecord {
+    var entryClass: EntryClass
+    var family: Family
+    var flags: U32
+    var count: U32
+}
+
+// §7's `EntryInfo`, one record of `Registry.match`'s list.
+@FFI.Struct { layout: c }
+struct EntryInfoRecord {
+    var id: U64
+    var entryClass: EntryClass
+    var family: Family
+    var parent: U64
+    var generation: U64
+    var flags: U32
+    var childCount: U32
+    var name: U64
+}
+
+// §7.3's `Property` before its key; the value follows the key at the next
+// 8-byte boundary.
+@FFI.Struct { layout: c }
+struct PropertyHeader {
+    var kind: U32
+    var keyLength: U32
+    var valueLength: U32
+    var reserved: U32
+}
+
+// §13.2's `InputEvent`.
+@FFI.Struct { layout: c }
+struct InputEventRecord {
+    var timestamp: U64
+    var kind: U16
+    var flags: U16
+    var usage: U32
+    var value: I32
+    var slot: I32
+    var tracking: I32
+    var reserved: U32
+}
+
+// What `Display.resources` writes first: the counts of connectors, CRTCs
+// and planes.
+@FFI.Struct { layout: c }
+struct ResourcesHeader {
+    var connectors: U32
+    var crtcs: U32
+    var planes: U32
+    var reserved: U32
+}
+
+// §12.2's `ConnectorInfo` before its modes and EDID.
+@FFI.Struct { layout: c }
+struct ConnectorInfoHead {
+    var id: U32
+    var kind: U32
+    var state: U32
+    var crtcMask: U32
+    var widthMm: U32
+    var heightMm: U32
+    var modeCount: U32
+    var edidLength: U32
+}
+
+// §12.2's `Mode`.
+@FFI.Struct { layout: c }
+struct ModeRecord {
+    var width: U32
+    var height: U32
+    var refreshMilliHz: U32
+    var flags: U32
+    var clockKHz: U32
+    var hTotal: U32
+    var vTotal: U32
+    var hSyncStart: U16
+    var hSyncEnd: U16
+    var vSyncStart: U16
+    var vSyncEnd: U16
+    var reserved: ModeReserved
+}
+
+// `Mode`'s reserved `u64 + u32` @36, which is not 8-byte aligned.
+@FFI.Array { element: U32, count: 3 }
+struct ModeReserved {}
+
+// §12.2's `CrtcInfo`.
+@FFI.Struct { layout: c }
+struct CrtcInfoRecord {
+    var id: U32
+    var index: U32
+    var active: U32
+    var gammaSize: U32
+}
+
+// §12.2's `PlaneInfo` before its format pairs.
+@FFI.Struct { layout: c }
+struct PlaneInfoHead {
+    var id: U32
+    var kind: U32
+    var crtcMask: U32
+    var zposMin: U16
+    var zposMax: U16
+    var capabilities: U32
+    var formatCount: U32
+}
+
+// §12.2's `CrtcState`.
+@FFI.Struct { layout: c }
+struct CrtcStateRecord {
+    var crtc: U32
+    var flags: U32
+    var connector: U32
+    var mode: U32
+    var gammaLut: U64
+    var ctm: U64
+}
+
+// §12.2's `PlaneState`.
+@FFI.Struct { layout: c }
+struct PlaneStateRecord {
+    var plane: U32
+    var crtc: U32
+    var framebuffer: U64
+    var srcX: U32
+    var srcY: U32
+    var srcW: U32
+    var srcH: U32
+    var dstX: I32
+    var dstY: I32
+    var dstW: U32
+    var dstH: U32
+    var zpos: U16
+    var alpha: U16
+    var rotation: U32
+    var inFence: U64
+    var inFenceValue: U64
+}

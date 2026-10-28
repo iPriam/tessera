@@ -1,0 +1,210 @@
+import Foundation
+import HomeLayout
+import LibTessera
+import KiraUI
+import TesseraUI
+import PlatformUI
+
+// Folders on Home: a tile showing the first of its applications small in a
+// rounded square of frosted glass, and, opened, a panel over the dimmed page
+// with its name and its applications. While Home is edited the name can be
+// changed, and each application moved along the folder or out of it onto
+// the page.
+
+namespace HomeFolderLook {
+    // How many applications the tile shows, a row of them, and the share of
+    // the icon's side each takes.
+    let shown: Number = 9
+    let across: Number = 3
+    let small: Number = 0.22
+    // The opened folder: its columns, the gap between them, and its corner.
+    let columns: Number = 3
+    let spacing: Number = 28
+    let corner: Number = 38
+    let padding: Number = 28
+    let title: Number = 28
+}
+
+let folderGlass: RGBAColor = RGBAColor { r: 1.0, g: 1.0, b: 1.0, a: 0.28 }
+let folderDim: RGBAColor = RGBAColor { r: 0.0, g: 0.0, b: 0.0, a: 0.25 }
+
+// A folder's tile: its first applications small in a square the size of an
+// icon. Pressed, it opens, edited or not.
+function homeFolderTile(
+    folder: borrow HomeFolder,
+    slot: HomeSlot,
+    applications: borrow [Application],
+    metrics: borrow LauncherMetrics,
+    editing: Bool,
+    open: (HomeSlot) -> Void
+) -> Any Widget {
+    let side = metrics.icon
+    let small = side * HomeFolderLook.small
+    var rows: [Any Widget] = []
+    var row: [Any Widget] = []
+    for index in 0..min(folder.apps.count, HomeFolderLook.shown) {
+        row.append(ApplicationIcon(name = copy folder.apps[index], side = small))
+        if row.count == HomeFolderLook.across {
+            rows.append(
+                HStack(spacing = .Length(small / 3), alignment = .Center, children = move row)
+            )
+            row = []
+        }
+    }
+    if row.count > 0 {
+        rows.append(HStack(spacing = .Length(small / 3), alignment = .Center, children = move row))
+    }
+    let picture = ZStack(alignment = .Center) {
+        RoundedRectangle(cornerRadius = side * IconShape.corner, style = .Continuous)
+        .fill(folderGlass)
+        VStack(spacing = .Length(small / 3), alignment = .Leading, children = rows)
+    }
+    .width(resolvedLength(side))
+    .height(resolvedLength(side))
+    let opening = copy open
+    let at = copy slot
+    return Button(action = { in opening(copy at) }) {
+        homeTileLabel(move picture, folder.name, metrics)
+    }
+    .buttonStyle(.Plain)
+}
+
+// What the opened folder asks of Home.
+public struct HomeFolderActions {
+    var close: () -> Void
+    var rename: (String) -> Void
+    // Moves an application along the folder, by one place either way.
+    var shift: (String, Number) -> Void
+    // Takes an application out of the folder onto the page.
+    var moveOut: (String) -> Void
+}
+
+// The opened folder over the dimmed page: its name over its applications,
+// three across. A press off the panel closes it. While Home is edited its
+// name is a field, and each application has its moves under it.
+function homeFolderPanel(
+    folder: borrow HomeFolder,
+    applications: borrow [Application],
+    metrics: borrow LauncherMetrics,
+    editing: Bool,
+    name: Binding<String>,
+    actions: borrow HomeFolderActions,
+    focused: Number?
+) -> Any Widget {
+    var tiles: [Any Widget] = []
+    for index in 0..folder.apps.count {
+        let tile = folderAppTile(
+            folder.apps[index],
+            index,
+            folder.apps.count,
+            applications,
+            metrics,
+            editing,
+            actions
+        )
+        let ringed = focused == .Some(index)
+        tiles.append(
+            ZStack(alignment = .Top) {
+                if ringed { homeFocusRing(metrics) }
+                tile
+            }
+        )
+    }
+    var rows: [Any Widget] = []
+    var start: Number = 0
+    while start < tiles.count {
+        var row: [Any Widget] = []
+        for column in 0..HomeFolderLook.columns {
+            if start + column < tiles.count {
+                row.append(tiles[start + column].width(resolvedLength(metrics.column)))
+            }
+        }
+        rows.append(
+            HStack(spacing = .Length(HomeFolderLook.spacing), alignment = .Top, children = row)
+        )
+        start += HomeFolderLook.columns
+    }
+    let close = copy actions.close
+    let rename = copy actions.rename
+    let typed = copy name
+    let title = editing
+    ? TextField(title = "Folder", text = name).onSubmit({ in rename(typed.get()) }).maxWidth(
+        resolvedLength(320)
+    )
+    : Text(copy folder.name)
+    .font(size: resolvedLength(HomeFolderLook.title), weight: .Bold)
+    .textColor(tileInk)
+    return ZStack(alignment = .Center) {
+        Rectangle()
+        .fill(folderDim)
+        .fillWidth()
+        .fillHeight()
+        .onClick(move close)
+        VStack(spacing = .Large, alignment = .Center) {
+            title
+            VStack(spacing = .Length(HomeFolderLook.spacing), alignment = .Leading, children = rows)
+            .padding(resolvedLength(HomeFolderLook.padding))
+            .background(
+                RoundedRectangle(cornerRadius = HomeFolderLook.corner, style = .Continuous).fill(
+                    folderGlass
+                )
+            )
+        }
+    }
+    .fillWidth()
+    .fillHeight()
+}
+
+// An application in the opened folder: pressed, it opens; while Home is
+// edited, its moves along the folder and out of it stand under it.
+function folderAppTile(
+    name: borrow String,
+    index: Number,
+    count: Number,
+    applications: borrow [Application],
+    metrics: borrow LauncherMetrics,
+    editing: Bool,
+    actions: borrow HomeFolderActions
+) -> Any Widget {
+    let opened = applicationNamed(applications, name)
+    let tile = Button(
+        action = { in
+            if editing { return }
+            match opened {
+                Some(application) -> openApplication(application)
+                None -> log warn("a folder names no installed application")
+            }
+        }
+    ) {
+        homeTileLabel(ApplicationIcon(name = copy name, side = metrics.icon), name, metrics)
+    }
+    .buttonStyle(.Plain)
+    if !editing { return tile }
+    let shift = copy actions.shift
+    let earlier = copy actions.shift
+    let out = copy actions.moveOut
+    let app = copy name
+    let before = copy name
+    let leaving = copy name
+    return VStack(spacing = .Small, alignment = .Center) {
+        tile
+        HStack(spacing = .Small, alignment = .Center) {
+            folderMove(.ChevronLeft, index > 0, { in earlier(copy before, -1) })
+            folderMove(.ArrowUpRight, true, { in out(copy leaving) })
+            folderMove(.ChevronRight, index < count - 1, { in shift(copy app, 1) })
+        }
+    }
+}
+
+function folderMove(symbol: Symbol, enabled: Bool, action: () -> Void) -> Any Widget {
+    return Button(action = move action) {
+        Icon(symbol = symbol)
+        .font(size: resolvedLength(15), weight: .SemiBold)
+        .textColor(tileInk)
+        .padding(resolvedLength(6))
+    }
+    .buttonStyle(.Plain)
+    .glassEffect()
+    .disabled(!enabled)
+    .opacity(enabled ? 1 : 0.35)
+}

@@ -1,0 +1,674 @@
+import Foundation
+import Heap
+import LibTessera
+
+public distinct DisplaySurfaceId = UNumber
+
+public namespace DisplaySurfaceId {
+    // No surface: the object of a message about the session itself.
+    let none: DisplaySurfaceId = DisplaySurfaceId(0)
+}
+
+// A key's state, as a `Key`, a `GrabFired` or an `InjectInput` carries it.
+@Derive(Copy)
+public enum DisplayKeyState: UN32 {
+    Released = 0
+    Pressed = 1
+    Repeated = 2
+}
+
+// What a log line calls `state`.
+public function displayKeyStateName(state: borrow DisplayKeyState) -> String {
+    return match state {
+        Released -> "released"
+        Pressed -> "pressed"
+        Repeated -> "repeated"
+    }
+}
+
+let displayKeyStates: [DisplayKeyState] = [DisplayKeyState.Released, DisplayKeyState.Pressed, DisplayKeyState.Repeated]
+
+// Where an input event came from, tagged by MosaicDisplay at the door. Only
+// events read from the keyboard are `Hardware`; injected input is tagged
+// otherwise, so the trusted path can tell a real keypress from a synthesised
+// one.
+@Derive(Copy)
+public enum DisplayProvenance: UN32 {
+    Hardware = 1
+    Agent = 2
+    System = 3
+    Synthetic = 4
+}
+
+let displayProvenances: [DisplayProvenance] = [DisplayProvenance.Hardware, DisplayProvenance.Agent, DisplayProvenance.System, DisplayProvenance.Synthetic]
+
+// A kind of input the machine has, as `InputCapability` names it.
+@Derive(Copy)
+public enum DisplayInputKind: UN32 {
+    Key = 1
+    Pointer = 2
+    Touch = 4
+    Gamepad = 8
+    Remote = 16
+}
+
+let displayInputKinds: [DisplayInputKind] = [DisplayInputKind.Key, DisplayInputKind.Pointer, DisplayInputKind.Touch, DisplayInputKind.Gamepad, DisplayInputKind.Remote]
+
+// The surface numbers a client may name, as its `Welcome` hands them out:
+// MosaicDisplay gives each client one, its own surface.
+public struct DisplayIdRange {
+    var base: UNumber
+    var count: UNumber
+}
+
+// An output MosaicDisplay drives, as its `Output` announces it: its mode, in
+// pixels, its refresh, in millihertz, and its scale, how many pixels a point
+// is along each side. Everything else the protocol carries is in points; a
+// client draws its buffers at its configured size times the scale, as an
+// application on a Mac draws at the backing scale factor.
+public struct DisplayOutput {
+    var id: UNumber
+    var width: UNumber
+    var height: UNumber
+    var refresh: UNumber
+    var scale: UNumber
+}
+
+// The DeviceKit token a frame's surface was exported under: an `Attach`
+// names the surface by it, and no handle crosses the channel.
+public struct DisplayToken {
+    var high: UNumber
+    var low: UNumber
+}
+
+// The pixels of the texture the client drew, from its top-left corner; zero
+// for the whole texture. A client that draws into the same few textures in
+// turn names each by a `slot` from 1: the token attaches the texture to its
+// slot, and a later attach of the slot with no token shows it again without
+// exporting it again. Slot 0 is a texture attached once.
+public struct DisplayAttach {
+    var surface: DisplaySurfaceId
+    var token: DisplayToken
+    var width: UNumber = 0
+    var height: UNumber = 0
+    var slot: UNumber = 0
+}
+
+// A frame of a surface, by the serial the client gave it.
+public struct DisplayFrame {
+    var surface: DisplaySurfaceId
+    var serial: UNumber
+}
+
+// Where a surface sits on the output and how large it is, and the serial its
+// acknowledgement answers with. A window dragged partly off the output's
+// leading or top edge sits at a negative position.
+public struct DisplayConfiguration {
+    var surface: DisplaySurfaceId
+    var x: Number
+    var y: Number
+    var width: UNumber
+    var height: UNumber
+    var serial: UNumber
+}
+
+// Where a surface sits on the output and how large it is, as the platform
+// places it and as MosaicDisplay tells the platform it was placed.
+public struct DisplayPlacement {
+    var surface: DisplaySurfaceId
+    var x: Number
+    var y: Number
+    var width: UNumber
+    var height: UNumber
+}
+
+// What a person asked of a window through what the application drew on it:
+// its title bar dragged, or the buttons at its leading edge. The application
+// asks; the platform decides (roadmap/11-adaptive-desktop.md, "The window
+// model").
+@Derive(Copy)
+public enum DisplayWindowAction: UN32 {
+    // The title bar is being dragged: the window follows the pointer until
+    // the button is released.
+    Move = 1
+    // The green button: the window fills the room the platform gives windows,
+    // or goes back to where it was.
+    Zoom = 2
+    // The yellow button: the window goes from the screen until it is chosen
+    // again.
+    Minimize = 3
+    // An edge or a corner of the window is being dragged: the window grows or
+    // shrinks with the pointer until the button is released. MosaicDisplay
+    // asks this itself for a press in the band along a freeform window's
+    // edge, which is outside what the application draws; an application asks
+    // it for a grip it draws inside its window.
+    Resize = 4
+    // The window was swiped up from the bottom edge of a touch screen, or
+    // its home indicator tapped: the platform goes home. MosaicDisplay asks
+    // this itself, and flies the window into its icon as it does.
+    Home = 5
+    // A window is being swiped up from the bottom edge: the platform shows
+    // what going home shows behind it, its Dock among it, as an iPad does
+    // under the finger, and puts it away again on `Unpeek` when the window
+    // is let go back. MosaicDisplay asks both itself.
+    Peek = 6
+    Unpeek = 7
+    // A window is flying out of its icon or into it, as an iPad's does: the
+    // platform keeps its Dock up and leaves the icon's place empty, the
+    // window's own picture standing in for it, until the window has `Landed`.
+    // MosaicDisplay tells both itself.
+    Fly = 8
+    Landed = 9
+}
+
+let displayWindowActions: [DisplayWindowAction] = [DisplayWindowAction.Move, DisplayWindowAction.Zoom, DisplayWindowAction.Minimize, DisplayWindowAction.Resize, DisplayWindowAction.Home, DisplayWindowAction.Peek, DisplayWindowAction.Unpeek, DisplayWindowAction.Fly, DisplayWindowAction.Landed]
+
+// Which edges of a window a resize moves: one for a side, two for a corner.
+@Derive(Copy)
+public struct DisplayEdges {
+    var top: Bool = false
+    var leading: Bool = false
+    var bottom: Bool = false
+    var trailing: Bool = false
+
+    // Whether any edge is named.
+    function any(borrow self) -> Bool {
+        return top || leading || bottom || trailing
+    }
+}
+
+// A window action and the surface it is asked for, with the edges a resize
+// moves; every other action names none.
+public struct DisplayWindowRequest {
+    var surface: DisplaySurfaceId
+    var action: DisplayWindowAction
+    var edges: DisplayEdges = DisplayEdges {}
+}
+
+// The modifier keys held, and whether Caps Lock is on, as MosaicDisplay
+// tracks them across every key and sends them with each, so that no client
+// reconstructs them (roadmap/06-devices-and-input.md).
+@Derive(Copy)
+public struct DisplayModifiers {
+    var shift: Bool = false
+    var control: Bool = false
+    var option: Bool = false
+    var command: Bool = false
+    var capsLock: Bool = false
+
+    // Whether a key pressed now is a command rather than typing: Control or
+    // Command is held.
+    function commanding(borrow self) -> Bool {
+        return control || command
+    }
+}
+
+// An interaction token (roadmap/16 §14.1): the proof that a hardware key or
+// pointer button reached a front-facing surface. MosaicDisplay mints one for
+// each hardware event and gives it to the surface the event went to. Its
+// issue instant is the event's time and its surface the event's surface. Events
+// that software sends carry no token, which is both words zero.
+public struct DisplayInteractionToken {
+    var idLow: UNumber = 0
+    var idHigh: UNumber = 0
+}
+
+// A key event: the surface it goes to, the key, its state, where it came
+// from, when it happened in milliseconds of the monotonic clock, the
+// modifiers held, and the text it types through the keymap, empty for a key
+// that types nothing. A `GrabFired` goes to the platform and names no
+// surface.
+public struct DisplayKey {
+    var surface: DisplaySurfaceId
+    var key: UNumber
+    var state: DisplayKeyState
+    var provenance: DisplayProvenance
+    var modifiers: DisplayModifiers = DisplayModifiers {}
+    var text: String = ""
+    var time: UNumber = 0
+    var token: DisplayInteractionToken = DisplayInteractionToken {}
+}
+
+// A key a client injects; MosaicDisplay tags it synthetic itself.
+public struct DisplayKeyPress {
+    var key: UNumber
+    var state: DisplayKeyState
+}
+
+// The compositor's mode. `split` applies to stack and is otherwise ignored.
+public struct DisplayMode {
+    var mode: CompositorMode
+    var split: Bool
+}
+
+public struct DisplayModeChange {
+    var surface: DisplaySurfaceId
+    var mode: DisplayMode
+}
+
+// The input the machine has, told to a client; `present` is false when the
+// kinds named have gone.
+public struct DisplayInputCapability {
+    var surface: DisplaySurfaceId
+    var kinds: [DisplayInputKind]
+    var present: Bool
+}
+
+// An application surface the platform is told of, with the role that tells an
+// ordinary application from a system surface.
+public struct DisplaySurface {
+    var surface: DisplaySurfaceId
+    var role: DisplayRole
+}
+
+// A channel value a client declares on its surface.
+public struct DisplayChannelValue {
+    var surface: DisplaySurfaceId
+    var channel: DisplayChannel
+    var value: UNumber
+}
+
+// A notification a surface posts: its id and priority, which are what the
+// platform routes and orders by.
+public struct DisplayNotification {
+    var surface: DisplaySurfaceId
+    var id: UNumber
+    var priority: UNumber
+}
+
+// Where the pointer is over a surface, in the surface's own pixels from its
+// top-leading corner, and when it got there, in milliseconds of the monotonic
+// clock. Pointer events go to the focused surface wherever the pointer is
+// (roadmap/08-display-server.md), so a position can lie outside it, and be
+// negative.
+public struct DisplayPointerMotion {
+    var surface: DisplaySurfaceId
+    var x: Number
+    var y: Number
+    var time: UNumber
+}
+
+// A pointer button pressed or released over the focused surface: the
+// button's usage on the HID button page, 1 the primary.
+public struct DisplayPointerButton {
+    var surface: DisplaySurfaceId
+    var button: UNumber
+    var state: DisplayKeyState
+    var time: UNumber
+    var token: DisplayInteractionToken = DisplayInteractionToken {}
+}
+
+// Which way a scroll goes.
+@Derive(Copy)
+public enum DisplayPointerAxisKind: UN32 {
+    Vertical = 1
+    Horizontal = 2
+}
+
+let displayPointerAxisKinds: [DisplayPointerAxisKind] = [DisplayPointerAxisKind.Vertical, DisplayPointerAxisKind.Horizontal]
+
+// A scroll over the focused surface, in the device's detents: positive is
+// down, or toward the trailing edge.
+public struct DisplayPointerAxis {
+    var surface: DisplaySurfaceId
+    var axis: DisplayPointerAxisKind
+    var value: Number
+    var time: UNumber
+}
+
+// One message of the display protocol (roadmap/08), between MosaicDisplay
+// and its clients: applications, the platform and services. This library is the
+// one place it is encoded and decoded.
+public enum DisplayMessage {
+    Hello
+    Welcome(DisplayIdRange)
+    Attach(DisplayAttach)
+    Commit(DisplayFrame)
+    Key(DisplayKey)
+    FrameDone(DisplayFrame)
+    FrameRequest(DisplayFrame)
+    FrameReady(DisplayFrame)
+    FocusIn(DisplaySurfaceId)
+    FocusOut(DisplaySurfaceId)
+    Configure(DisplayConfiguration)
+    AckConfigure(DisplayFrame)
+    // The platform asks the compositor to change mode; the compositor tells every
+    // client which mode is now in force. `SetMode` is honoured only from the
+    // platform session (S5); `ModeChanged` is broadcast so a client can lay itself
+    // out for the geometry its next `Configure` will carry.
+    SetMode(DisplayMode)
+    ModeChanged(DisplayModeChange)
+    // Tells a client what input exists, and again when that changes.
+    // Capability is a fact about the machine, not a property of the form
+    // factor, so it is broadcast to every client rather than reserved to the
+    // platform.
+    InputCapability(DisplayInputCapability)
+    // Tells the platform an application surface exists, so the platform can place
+    // and focus it.
+    SurfaceCreated(DisplaySurface)
+    // Tells the platform an application surface is gone, so it can drop it from
+    // what it tracks and move focus off it.
+    SurfaceDestroyed(DisplaySurfaceId)
+    // The platform grants focus to a surface, and MosaicDisplay routes input there
+    // and nowhere else. Focus is the platform's to decide and the server's to
+    // enforce: a client cannot take focus by asking, only the platform grants it.
+    // Honoured from the platform session alone.
+    GrantFocus(DisplaySurfaceId)
+    // The platform installs a grab: a key it wants delivered to itself before the
+    // focused surface sees it, for a global shortcut. MosaicDisplay matches the
+    // grab before routing, so the platform does not sit in the delivery path of
+    // every event.
+    InstallGrab(UNumber)
+    // A grabbed key fired: delivered to the platform rather than the focused
+    // surface.
+    GrabFired(DisplayKey)
+    // A client declares a channel value on its surface, and MosaicDisplay
+    // forwards it to the platform, which reads it without ever seeing the widget
+    // tree. Only kinds that fit a word are carried here; a string channel like
+    // the navigation title needs its own transport and is not one of these yet.
+    SetChannel(DisplayChannelValue)
+    ChannelChanged(DisplayChannelValue)
+    // The trusted path. A prompt the OS forces through the platform is presented
+    // in the system band; a service acting on it asks MosaicDisplay to verify,
+    // and the answer is yes only when a system prompt is present and the last
+    // input was real hardware. MosaicDisplay is the one authority on both, so
+    // a platform cannot assert a prompt is front-most and injected input cannot
+    // stand in for a keypress.
+    PresentSystem
+    Verify
+    VerifyResult(Bool)
+    // A client injects an input event. MosaicDisplay tags it synthetic at the
+    // door, never hardware, so it reaches the focused surface but cannot
+    // satisfy the trusted path: an agent that injects a keypress cannot make a
+    // prompt answer yes.
+    InjectInput(DisplayKeyPress)
+    // An application posts a notification; MosaicDisplay forwards it to the
+    // platform, which owns the notification surface. The text rides a string
+    // channel once one exists.
+    Notify(DisplayNotification)
+    Notification(DisplayNotification)
+    // PID 1 asked for an application that is already open to come to the
+    // front. Forwarded to the platform, which owns focus.
+    ActivateRequested(DisplaySurfaceId)
+    // The platform's system bar (roadmap/11-adaptive-desktop.md): the height of the
+    // band along the top of the output the bar takes. MosaicDisplay configures
+    // every other surface in the output less the band. The platform's own surface
+    // is the whole output, transparent but for the bar and the menus that drop
+    // from it, and is stacked above every other. Zero gives the band back.
+    // Honoured from the platform session alone.
+    SetBar(UNumber)
+    // The pointer (roadmap/08-display-server.md, "Input"): it moved, a button
+    // changed, it scrolled, and it came to or left the focused surface. Sent
+    // to the focused surface alone; the cursor is drawn by MosaicDisplay.
+    PointerMotion(DisplayPointerMotion)
+    PointerButton(DisplayPointerButton)
+    PointerAxis(DisplayPointerAxis)
+    PointerEnter(DisplaySurfaceId)
+    PointerLeave(DisplaySurfaceId)
+    // The platform's dock (roadmap/11-adaptive-desktop.md, "The dock"): the
+    // height of the band along the bottom of the output the dock takes.
+    // Windows are placed above it, and the pointer over it is the platform's.
+    // Zero gives the band back. Honoured from the platform session alone.
+    SetDock(UNumber)
+    // A button went down over a surface that does not have focus. Told to the
+    // platform and to no one else, and the press goes nowhere: the platform
+    // decides whether the surface comes to the front, as a click on a Mac's
+    // window behind brings it forward without acting on it.
+    SurfacePressed(DisplaySurfaceId)
+    // An application asks for a window action on its own surface. Honoured
+    // only from the surface's own session, and only while it has focus; a
+    // move or a resize only while a button is down.
+    RequestWindow(DisplayWindowRequest)
+    // MosaicDisplay forwards a window request to the platform, which decides.
+    WindowRequested(DisplayWindowRequest)
+    // The platform grants a move it was asked for: the surface follows the
+    // pointer until the button goes up. Honoured from the platform session
+    // alone.
+    GrantMove(DisplaySurfaceId)
+    // The platform grants a resize it was asked for: the window's
+    // edges follow the pointer until the button goes up, and the application
+    // is configured at each size it passes through as it acknowledges the
+    // last. Honoured from the platform session alone.
+    GrantResize(DisplaySurfaceId)
+    // The platform holds the keyboard and the pointer while it shows
+    // something over the applications, such as a menu dropped from its bar,
+    // and lets them go again. While held, keys and the pointer go to the
+    // platform, but focus stays where it was: the window in front stays
+    // active and draws itself so, as a Mac's does while a menu is out.
+    // Honoured from the platform session alone.
+    HoldInput(Bool)
+    // The platform places a surface. Honoured from the platform session
+    // alone; the surface is sent the frame as a `Configure`.
+    PlaceSurface(DisplayPlacement)
+    // MosaicDisplay tells the platform where a surface now is: when it is
+    // admitted, when a move ends, and when the platform placed it.
+    SurfacePlaced(DisplayPlacement)
+    // The platform takes a surface off the screen, or puts it back. Honoured
+    // from the platform session alone. A hidden surface is not drawn, takes
+    // no pointer, and cannot have focus.
+    SetHidden(DisplayVisibility)
+    // An application says how far round its window its buffers reach, for
+    // the shadow it draws there (roadmap/08-display-server.md, "Surfaces").
+    // Honoured from the surface's own session, for an application alone.
+    SetMargin(DisplayMargin)
+    // MosaicDisplay tells a surface that fills the screen under the
+    // platform's bands where they are, for it to keep clear
+    // (roadmap/08-display-server.md, "Surfaces"). Sent when they change.
+    Insets(DisplayInsets)
+    // The output the client is on, announced after `Welcome` and again when
+    // it changes (roadmap/08-display-server.md, "Connection").
+    Output(DisplayOutput)
+    // The part of the output the platform draws over the applications
+    // without holding the input, such as its notification banners
+    // (roadmap/08-display-server.md, "Input"): the pointer over it goes to
+    // the platform, as over its bar and Dock. An empty rectangle gives it
+    // back. Honoured from the platform session alone.
+    SetOverlay(DisplayOverlay)
+    // The platform sets how long the output goes without input before it
+    // dims and before it blanks (roadmap/08-display-server.md, "Input").
+    // Honoured from the platform session alone.
+    SetIdle(DisplayIdle)
+    // MosaicDisplay tells the platform the output dimmed, blanked or woke.
+    IdleChanged(DisplayIdleState)
+    // A client asks for a piece of Liquid Glass under its surface, over what
+    // is composed below it (roadmap/08-display-server.md, "Surfaces").
+    // Honoured from the surface's own session.
+    SetGlass(DisplayGlass)
+    // Platform badge atlas: surface zero clears the pending table. Applied on commit.
+    SetStageBadge(DisplayStageBadge)
+    // The home screen tells where the icon it is opening an application from
+    // is, for the application to grow out of it. Honoured from the desktop's
+    // own session.
+    SetLaunchOrigin(DisplayLaunchOrigin)
+    // MosaicDisplay tells the platform how bright the picture under its bar's
+    // band is, and under the band along the bottom, when either has moved
+    // since it last told it.
+    BarBackdrop(DisplayBackdrop)
+}
+
+// How bright the picture is under the platform's bar and under the band along
+// the bottom of the output its dock or home indicator takes, in thousandths
+// of full luminance; the bottom is 0 while the platform has no such band.
+public struct DisplayBackdrop {
+    var bar: UNumber
+    var bottom: UNumber = 0
+}
+
+// How many seconds without input the output dims after, and blanks after;
+// zero is never.
+public struct DisplayIdle {
+    var dim: UNumber = 0
+    var blank: UNumber = 0
+}
+
+// Whether the output is awake, dimmed or blanked for want of input.
+@Derive(Copy)
+public enum DisplayIdleState: UN32 {
+    Awake = 1
+    Dimmed = 2
+    Blanked = 3
+}
+
+let displayIdleStates: [DisplayIdleState] = [DisplayIdleState.Awake, DisplayIdleState.Dimmed, DisplayIdleState.Blanked]
+
+// What a log line calls `state`.
+public function displayIdleStateName(state: borrow DisplayIdleState) -> String {
+    return match state {
+        Awake -> "awake"
+        Dimmed -> "dimmed"
+        Blanked -> "blanked"
+    }
+}
+
+// The rectangle of the output the platform's overlay takes, in points.
+public struct DisplayOverlay {
+    var x: UNumber
+    var y: UNumber
+    var width: UNumber
+    var height: UNumber
+}
+
+// A piece of glass under a surface, in the surface's points from its
+// buffer's top left. No width or height takes the piece away.
+public struct DisplayGlass {
+    var surface: DisplaySurfaceId
+    // Which of the surface's pieces this is: a surface keeps as many as it asks for.
+    var piece: UNumber
+    var x: UNumber
+    var y: UNumber
+    var width: UNumber
+    var height: UNumber
+    var corner: UNumber = 0
+    var shape: DisplayGlassShape = .Arc
+    var interface: DisplayGlassInterface = .Touch
+    var recipe: DisplayGlassRecipe = .Regular
+    // How a window's backdrop is tinted: for a dark appearance or a light
+    // one, and for a window in front or one behind it.
+    var dark: Bool = false
+    var active: Bool = true
+}
+
+// The toolkit's glass a piece is made of: Regular and Clear, the platform's
+// own components' recipes, then the toolkit's others.
+@Derive(Copy)
+public enum DisplayGlassRecipe: UN32 {
+    Regular = 0
+    Clear = 1
+    Dock = 2
+    ControlCenter = 3
+    NotificationCenter = 4
+    AbuttedSidebar = 5
+    AppIcons = 6
+    AVPlayer = 7
+    Bubbles = 8
+    Camera = 9
+    CarPlayUltra = 10
+    CartouchePopover = 11
+    Control = 12
+    FaceTime = 13
+    Identity = 14
+    Inspector = 15
+    Keyboard = 16
+    Loupe = 17
+    Menu = 18
+    Monogram = 19
+    Sidebar = 20
+    Siri = 21
+    SiriSnippet = 22
+    Slider = 23
+    Text = 24
+    Widgets = 25
+    // Not Liquid Glass: what is behind a window, blurred and tinted as a
+    // Mac's sidebar is, under a hole the window leaves for it.
+    WindowBackdrop = 26
+    // The Dock's glass on a desktop: the standard glass's values without
+    // the face's tint.
+    DockRegular = 27
+}
+
+let displayGlassRecipes: [DisplayGlassRecipe] = [
+    DisplayGlassRecipe.Regular,
+    DisplayGlassRecipe.Clear,
+    DisplayGlassRecipe.Dock,
+    DisplayGlassRecipe.ControlCenter,
+    DisplayGlassRecipe.NotificationCenter,
+    DisplayGlassRecipe.AbuttedSidebar,
+    DisplayGlassRecipe.AppIcons,
+    DisplayGlassRecipe.AVPlayer,
+    DisplayGlassRecipe.Bubbles,
+    DisplayGlassRecipe.Camera,
+    DisplayGlassRecipe.CarPlayUltra,
+    DisplayGlassRecipe.CartouchePopover,
+    DisplayGlassRecipe.Control,
+    DisplayGlassRecipe.FaceTime,
+    DisplayGlassRecipe.Identity,
+    DisplayGlassRecipe.Inspector,
+    DisplayGlassRecipe.Keyboard,
+    DisplayGlassRecipe.Loupe,
+    DisplayGlassRecipe.Menu,
+    DisplayGlassRecipe.Monogram,
+    DisplayGlassRecipe.Sidebar,
+    DisplayGlassRecipe.Siri,
+    DisplayGlassRecipe.SiriSnippet,
+    DisplayGlassRecipe.Slider,
+    DisplayGlassRecipe.Text,
+    DisplayGlassRecipe.Widgets,
+    DisplayGlassRecipe.WindowBackdrop,
+    DisplayGlassRecipe.DockRegular,
+]
+
+// The interface a piece of glass belongs to, as the toolkit draws it there: a
+// touch screen's, the iOS kit's glass, or a desktop's, a Mac's.
+@Derive(Copy)
+public enum DisplayGlassInterface: UN32 {
+    Touch = 0
+    Desktop = 1
+}
+
+let displayGlassInterfaces: [DisplayGlassInterface] = [DisplayGlassInterface.Touch, DisplayGlassInterface.Desktop]
+
+// The corner of a piece of glass: a circular arc, a continuous corner, or a
+// capsule's, which is half the shorter side.
+@Derive(Copy)
+public enum DisplayGlassShape: UN32 {
+    Arc = 0
+    Continuous = 1
+    Capsule = 2
+}
+
+let displayGlassShapes: [DisplayGlassShape] = [DisplayGlassShape.Arc, DisplayGlassShape.Continuous, DisplayGlassShape.Capsule]
+
+// What a point is on the wire for a surface's glass: a layout puts a glass's
+// edge between points.
+public namespace GlassPieces {
+    let unitsPerPoint: UNumber = 64
+}
+
+// Whether the platform hides a surface.
+public struct DisplayVisibility {
+    var surface: DisplaySurfaceId
+    var hidden: Bool
+}
+
+// How far round a window its buffers reach, the same on every side, and the
+// radius its corners are rounded by, which the server clips it to.
+public struct DisplayMargin {
+    var surface: DisplaySurfaceId
+    var margin: UNumber
+    var corner: UNumber = 0
+}
+
+// How far in from each edge of a surface the platform draws over it, in its
+// pixels.
+public struct DisplayInsets {
+    var surface: DisplaySurfaceId
+    var top: UNumber = 0
+    var leading: UNumber = 0
+    var bottom: UNumber = 0
+    var trailing: UNumber = 0
+}
+
+// The widest margin a window may ask for.
+public namespace WindowMargin {
+    let limit: UNumber = 128
+}

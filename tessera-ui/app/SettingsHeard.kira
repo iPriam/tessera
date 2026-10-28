@@ -1,0 +1,38 @@
+//! The settings generation this application last heard of, so it reads a changed setting again once.
+import Foundation
+import LibTessera
+
+// How many changes to Settings this program has heard of, from the System
+// channel's `settingsChanged`: a component that keeps a value it read from
+// Settings, rather than asking the service each time it draws, reads it
+// again once this has moved on.
+
+/// The persistent slot that holds the settings generation this application last heard.
+namespace SettingsHeardSlot {
+    let key: PersistentStateKey = PersistentStateKey { name: "tesseraui.settings.heard" }
+}
+
+/// The settings generation the application last heard of.
+struct SettingsHeard {
+    var generation: Number = 0
+}
+
+/// The settings-heard state, created in the ambient state on first use.
+function settingsHeard() -> RawPtr {
+    if !ambientStateHas(SettingsHeardSlot.key) {
+        ambientStatePut(SettingsHeardSlot.key, nativeUserData(nativeState(SettingsHeard {})))
+    }
+    return ambientStateGet(SettingsHeardSlot.key)
+}
+
+/// The changes to Settings heard so far.
+public function settingsGeneration() -> Number {
+    return nativeRecover<SettingsHeard>(settingsHeard()).generation
+}
+
+/// A change to Settings was heard: an application's System channel says so
+/// itself, and a platform, which reads its own, says so here.
+public function noteSettingsChanged() {
+    var heard = nativeRecover<SettingsHeard>(settingsHeard())
+    heard.generation = heard.generation + 1
+}

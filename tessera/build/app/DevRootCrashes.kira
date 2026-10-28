@@ -1,0 +1,149 @@
+import Foundation
+import Build
+
+// `kira build devroot crashes`: the devroot service copies every crash report
+// the dev machine keeps (reportcrash) to the stick (devroot/app/Root/
+// Crashes.kira). Here they are read back off the stick's image, each frame
+// named from the components' symbols as a Mac symbolicates a report, and
+// written one a file to the log directory's `crashes`.
+
+namespace CrashReports {
+    let file: String = "crashes"
+    let marker: String = "--- report "
+}
+
+struct CrashImageLine {
+    let start: Number
+    let path: String
+}
+
+function reportCrashes(
+    host: borrow Host,
+    image: borrow String,
+    roots: borrow SampleRoots,
+    directory: borrow String
+) -> Result<Void, String> {
+    match makePathTree(directory) {
+        Ok -> {}
+        Error(failure) -> return .Error("\(directory) cannot be made: \(traceText(failure))")
+    }
+    let text = try dumpedText(host, image, CrashReports.file, "\(directory)/.copied")
+    var images: Map<String, SampledImage?> = Map {}
+    var name = ""
+    var lines: [String] = []
+    var written: Number = 0
+    for line in text.split("\n") {
+        if line.startsWith(CrashReports.marker) && line.endsWith(" ---") {
+            if !name.isEmpty() {
+                try writeCrashReport(directory, name, symbolicated(lines, roots, images))
+                written += 1
+            }
+            name = line.substring(CrashReports.marker.count, line.count - 4)
+            lines = []
+        } else {
+            lines.append(copy line)
+        }
+    }
+    if !name.isEmpty() {
+        try writeCrashReport(directory, name, symbolicated(lines, roots, images))
+        written += 1
+    }
+    log info("read back the crash reports", reports: written, directory: copy directory)
+    return .Ok
+}
+
+function writeCrashReport(
+    directory: borrow String,
+    name: borrow String,
+    text: borrow String
+) -> Result<Void, String> {
+    let path = "\(directory)/\(name)"
+    return match writeFile(path, text) {
+        Ok -> .Ok
+        Error(failure) -> .Error("\(path) cannot be written: \(traceText(failure))")
+    }
+}
+
+// The report with each frame that names an image and an offset in it named
+// by function: `3   KiraUI   0x0000ffff8a2b3c40 measureSubtree + 0x24`.
+function symbolicated(
+    lines: borrow [String],
+    roots: borrow SampleRoots,
+    images: borrow mut Map<String, SampledImage?>
+) -> String {
+    var loaded: Map<String, CrashImageLine> = Map {}
+    var inImages = false
+    for line in lines {
+        if line == "Binary Images:" {
+            inImages = true
+            continue
+        }
+        if !inImages { continue }
+        if line.trim().isEmpty() { break }
+        let words = nonEmptyWords(line)
+        let path = match line.indexOf(" /") {
+            Some(at) -> line.substring(at + 1, line.count)
+            None -> ""
+        }
+        if words.count < 5 || path.isEmpty() { continue }
+        loaded.set(copy words[3], CrashImageLine { start: hexNumber(words[0]), path: path })
+    }
+    var named: [String] = []
+    for line in lines { named.append(symbolicatedFrame(line, loaded, roots, images)) }
+    return joined(named, "\n")
+}
+
+function symbolicatedFrame(
+    line: borrow String,
+    loaded: borrow Map<String, CrashImageLine>,
+    roots: borrow SampleRoots,
+    images: borrow mut Map<String, SampledImage?>
+) -> String {
+    let words = nonEmptyWords(line)
+    if words.count != 6 || words[4] != "+" || words[1] != words[3] || words[0].toNumber().isNone() {
+        return copy line
+    }
+    let mapped = try loaded.value(words[1]) otherwise return copy line
+    let found = match images.value(mapped.path) {
+        Some(known) -> known
+        None -> {
+            let read = readSampledImage(roots, mapped.path)
+            images.set(copy mapped.path, copy read)
+            read
+        }
+    }
+    let image = try found otherwise return copy line
+    let address = hexNumber(words[2])
+    let at = image.shared ? hexNumber(words[5]) + image.lowest : address
+    let symbol = try symbolHolding(image.symbols, at) otherwise return copy line
+    let kept = match line.indexOf(words[2]) {
+        Some(index) -> line.substring(0, index + words[2].count)
+        None -> return copy line
+    }
+    return "\(kept) \(symbol.name) + \(at - symbol.start)"
+}
+
+function nonEmptyWords(line: borrow String) -> [String] {
+    var words: [String] = []
+    for word in line.split(" ") {
+        if !word.isEmpty() { words.append(copy word) }
+    }
+    return words
+}
+
+// The symbol `address` lies in, in `symbols` sorted by start.
+function symbolHolding(symbols: borrow [SampleSymbol], address: Number) -> SampleSymbol? {
+    var low = 0
+    var high = symbols.count - 1
+    while low <= high {
+        let middle = trunc((low + high) / 2)
+        if address < symbols[middle].start {
+            high = middle - 1
+        } else if address >= symbols[middle].end {
+            low = middle + 1
+        } else {
+            return .Some(copy symbols[middle])
+        }
+    }
+    return .None
+}

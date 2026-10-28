@@ -1,0 +1,92 @@
+//! The home screen's icons: the page of icons the platform draws, which the application publishes and the platform reads back.
+import Foundation
+import AppKit
+
+// The icons the home screen's page shows, which the home screen says each
+// time it is built and the window tells the platform over its link, so a
+// window going home flies into its icon on the page, as an iPad's does, and
+// into the Dock's only when the page has none.
+
+/// The persistent slot that holds the icons the home screen shows.
+namespace HomeIconsSlot {
+    let key: PersistentStateKey = PersistentStateKey { name: "tesseraui.home.icons" }
+}
+
+/// An icon the home screen shows: the application it opens and where it is.
+public struct HomeScreenIcon {
+    /// The application the icon is for.
+    let application: String
+    /// The icon's position and size on the home screen's page.
+    let icon: LaunchIcon
+}
+
+/// The icons the home screen last set, in the order it shows them.
+struct HomeIconsState {
+    var icons: [HomeScreenIcon] = []
+}
+
+/// The home screen's icon state, created in the ambient state on first use.
+function homeIconsState() -> RawPtr {
+    if !ambientStateHas(HomeIconsSlot.key) {
+        ambientStatePut(HomeIconsSlot.key, nativeUserData(nativeState(HomeIconsState {})))
+    }
+    return ambientStateGet(HomeIconsSlot.key)
+}
+
+/// How many icons the home screen shows now.
+public function homeIconCount() -> Number {
+    let state = nativeRecover<HomeIconsState>(homeIconsState())
+    return state.icons.count
+}
+
+/// Says which icons the home screen's page shows now.
+public function setHomeIcons(icons: [HomeScreenIcon]) {
+    var state = nativeRecover<HomeIconsState>(homeIconsState())
+    state.icons = move icons
+}
+
+/// Tells the platform the icons the home screen shows, when they changed.
+function publishHomeScreenIcons(bridge: borrow BridgeHandle) {
+    var bridged: [BridgeHomeIcon] = []
+    for shown in nativeRecover<HomeIconsState>(homeIconsState()).icons {
+        bridged.append(
+            BridgeHomeIcon {
+                application: copy shown.application,
+                x: shown.icon.x,
+                y: shown.icon.y,
+                width: shown.icon.width,
+                height: shown.icon.height,
+                corner: shown.icon.corner,
+            }
+        )
+    }
+    match publishHomeIcons(copy bridge, bridged) {
+        Ok -> {}
+        Error(failure) -> log warn(
+            "the home screen's icons could not be handed to the platform",
+            failure: failure
+        )
+    }
+}
+
+/// On the platform's side: where the home screen's page shows `application`'s
+/// icon; none when the page shows no icon of it.
+public function homeScreenIconOf(
+    bridge: borrow BridgeHandle,
+    application: borrow String
+) -> LaunchIcon? {
+    for shown in homeScreenIcons(copy bridge) {
+        if shown.application == application {
+            return .Some(
+                LaunchIcon {
+                    x: shown.x,
+                    y: shown.y,
+                    width: shown.width,
+                    height: shown.height,
+                    corner: shown.corner
+                }
+            )
+        }
+    }
+    return .None
+}

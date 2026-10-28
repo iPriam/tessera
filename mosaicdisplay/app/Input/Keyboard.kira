@@ -1,0 +1,131 @@
+import Foundation
+import Heap
+import LibTessera
+import DeviceKit
+import TesseraDisplayClient
+
+// The keyboard, through DeviceKit.
+//
+// The registry says which input devices have a letter row; the device manager
+// opens the first for this program; key records arrive already translated to
+// HID usages. A key is sent to clients as its usage on the keyboard page (7),
+// so `a` is 4 whatever the device's own numbering was, and anything off that
+// page keeps its whole `(page << 16) | id`.
+
+namespace Keyboard {
+    // `InputDevice.inputKinds` bit 0: a keyboard.
+    let inputKind: UNumber = UNumber(1)
+    let usagePage: UN32 = UN32(7)
+    let usageShift: UN32 = UN32(16)
+    let usageMask: UN32 = UN32(0xFFFF)
+}
+
+// A `Property` record: kind, key length @4, value length, then the key @16
+// and the value at the next 8-byte boundary.
+namespace PropertyRecord {
+    let bytes: Number = 256
+    let keyAt: Number = 16
+}
+
+namespace InputRecord {
+    let bytes: Number = 32
+    let batch: Number = 64
+    // Flag 1 is a repeat.
+    let repeat: UN16 = UN16(1)
+}
+
+let inputEventKinds: [InputEventKind] = [InputEventKind.Key, InputEventKind.Relative, InputEventKind.Absolute, InputEventKind.Switch, InputEventKind.Frame, InputEventKind.Dropped]
+
+function inputEventKindOf(raw: UN16) -> InputEventKind? {
+    for kind in inputEventKinds {
+        if kind.rawValue() == raw { return .Some(kind) }
+    }
+    return .None
+}
+
+// The registry's number for one property of `entry`.
+function numberProperty(entry: EntryId, key: borrow String) -> Result<UNumber, TesseraError> {
+    let out = zeroedBlock(count: Number(PropertyRecord.bytes), alignment: 16)
+    try registryProperty(
+        entry,
+        key,
+        Buffer { address: out.pointer(), length: PropertyRecord.bytes }
+    )
+    let header: PropertyHeader = heapLoad(out.pointer())
+    let valueAt = trunc((PropertyRecord.keyAt + header.keyLength + 7) / 8) * 8
+    return .Ok(blockLoad<U64>(out, valueAt))
+}
+
+// Whether the entry reports keys. A failure to say what it is is the caller's.
+function hasKeys(entry: EntryId) -> Result<Bool, TesseraError> {
+    let kinds = try numberProperty(entry, "inputKinds")
+    return .Ok((kinds & Keyboard.inputKind) == Keyboard.inputKind)
+}
+
+// What a key record's usage is called on the wire.
+function keyCode(usage: UN32) -> UNumber {
+    if (usage >> Keyboard.usageShift) == Keyboard.usagePage {
+        return UNumber(usage & Keyboard.usageMask)
+    }
+    return UNumber(usage)
+}
+
+// One record: a key is queued, a frame delivers what was queued, and a
+// dropped report discards it.
+function takeRecord(
+    server: borrow mut Server,
+    out: borrow ByteBlock,
+    at: Number
+) -> Result<Void, TesseraError> {
+    let record: InputEventRecord = heapLoad(out.pointer(), at)
+    let kind = match inputEventKindOf(record.kind) {
+        Some(value) -> value
+        None -> return .Ok
+    }
+    match kind {
+        // The kernel's repeats are dropped: a key held repeats from the
+        // server's own timer (Repeat.kira).
+        Key -> {
+            if (record.flags & InputRecord.repeat) == InputRecord.repeat { return .Ok }
+            server.pending.append(
+                PendingKey {
+                    code: keyCode(record.usage),
+                    state: keyStateOf(UN32(record.value)),
+                    time: UNumber(
+                        trunc(Number(record.timestamp) / KeyRepeat.nanosecondsPerMillisecond)
+                    ),
+                }
+            )
+        }
+        Frame -> return flushKeys(server)
+        Dropped -> {
+            log warn("an input sync was dropped; the pending events are discarded")
+            server.pending = []
+        }
+        Relative, Absolute, Switch -> {}
+    }
+    return .Ok
+}
+
+// Reads every record the keyboard has ready. An error other than none being
+// ready is the keyboard going: a device pulled out stops answering before the
+// registry says it went (Hotplug.kira), and the caller lets it go.
+function readKeyboard(server: borrow mut Server, keyboard: Ref) -> Result<Void, TesseraError> {
+    let length = InputRecord.batch * InputRecord.bytes
+    let out = zeroedBlock(count: length, alignment: 16)
+    while true {
+        let count = match inputRead(
+            keyboard,
+            Buffer { address: out.pointer(), length: Number(length) }
+        ) {
+            Ok(value) -> value
+            Error(reason) -> if reason.code == .ShouldWait {
+                return .Ok
+            } else {
+                return .Error(reason)
+            }
+        }
+        for index in 0..count { try takeRecord(server, out, index * InputRecord.bytes) }
+    }
+    return .Ok
+}

@@ -1,0 +1,66 @@
+import Foundation
+
+// The Tessera IPC wire format v1 (§10.3): the 24-byte header every message
+// on a service channel starts with, and the method ordinal.
+
+@Derive(Copy)
+public struct MessageHeader {
+    var txid: UNumber
+    var ordinal: UNumber
+    var flags: MessageFlags
+    var version: UNumber
+}
+
+// `MessageHeader.flags`.
+@Derive(Copy)
+public distinct MessageFlags = UNumber
+
+public namespace MessageFlags {
+    let none: MessageFlags = MessageFlags(0)
+    let response: MessageFlags = MessageFlags(1)
+    // The body is an Error.
+    let error: MessageFlags = MessageFlags(2)
+    // Server to client, with no reply.
+    let event: MessageFlags = MessageFlags(4)
+}
+
+public namespace Wire {
+    // The size of `MessageHeader`, before the body.
+    let headerBytes: UNumber = 24
+}
+
+// The ordinal of `"ServiceName/MethodName"`: FNV-1a 64 over its bytes.
+public function wireOrdinal(method: borrow String) -> UNumber {
+    var hash = U64(0xcbf29ce484222325)
+    for index in 0..method.count {
+        hash = hash ^ U64(method.charAt(index))
+        hash = wrappingMul(hash, U64(0x100000001b3))
+    }
+    return hash
+}
+
+public function wireHeaderWrite(
+    target: borrow Buffer,
+    header: borrow MessageHeader
+) -> Result<Void, TesseraError> {
+    if target.length < Wire.headerBytes {
+        return .Error(failureDetail(.BufferTooSmall, Wire.headerBytes))
+    }
+    heapStore<U64>(target.address, 0, header.txid)
+    heapStore<U64>(target.address, 8, header.ordinal)
+    heapStore<U32>(target.address, 16, header.flags.raw)
+    heapStore<U32>(target.address, 20, header.version)
+    return .Ok
+}
+
+public function wireHeaderRead(source: borrow Buffer) -> Result<MessageHeader, TesseraError> {
+    if source.length < Wire.headerBytes { return .Error(failure(.OutOfRange)) }
+    return .Ok(
+        MessageHeader {
+            txid: heapLoad<U64>(source.address, 0),
+            ordinal: heapLoad<U64>(source.address, 8),
+            flags: MessageFlags(heapLoad<U32>(source.address, 16)),
+            version: heapLoad<U32>(source.address, 20),
+        }
+    )
+}

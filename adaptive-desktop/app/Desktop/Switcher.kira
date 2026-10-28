@@ -1,0 +1,171 @@
+import Foundation
+import PlatformKit
+import TesseraDisplayClient
+import KiraUI
+
+// The switcher, which is how a person moves between what is open, as
+// Command-Tab does on a Mac, the desktop counting as one, as Finder does in a
+// Mac's. Pressing F3 opens it on the application last in front before the
+// one in front now; while F3 is held the arrows or the number keys choose
+// and Escape puts it away; letting go of F3 brings the chosen application to
+// the front. A tap goes back to the application before.
+//
+// What is open is kept in PlatformKit's state, from what the compositor
+// tells the platform. Every window of one application is one entry, by the
+// name PID 1 gave the application.
+
+// The keys the platform grabs from the compositor.
+@Derive(Copy)
+enum PlatformKey: UN32 {
+    // F2 puts the keyboard on the system bar, as Control-F2 does on a Mac.
+    MenuBar = 59
+    // F3 switches to the next application.
+    SwitchApplication = 60
+    // F4 shows the desktop.
+    ShowDesktop = 61
+    // F6 turns Stage Manager on and off, as its switch in a Mac's Control
+    // Center does.
+    StageManager = 63
+    // Pause, the lock key: the key at the top trailing corner of a PC
+    // keyboard, where a Mac's keyboard has its lock key.
+    LockScreen = 72
+    // F12, delivered to the platform before any application, so the platform
+    // owns it whatever is focused. A function key, so that no one loses a letter
+    // they type.
+    Global = 69
+}
+
+let platformKeys: [PlatformKey] = [PlatformKey.MenuBar, PlatformKey.SwitchApplication, PlatformKey.ShowDesktop, PlatformKey.StageManager, PlatformKey.LockScreen, PlatformKey.Global]
+
+// F13, which types nothing in the focused application, so the platform can
+// inject it to probe the compositor's verification.
+namespace ProbeKey {
+    let usage: Number = 104
+}
+
+extend PlatformState {
+    // Forgets a surface whose session ended.
+    function forget(borrow mut self, surface: DisplaySurfaceId) {
+        match windowClosed(PlatformSurfaceId(surface.raw)) {
+            // The window is gone, and the application with its last one.
+            Ok -> {}
+            Error(failure) -> log info(
+                "a surface went that the platform was not tracking",
+                surface: surface.raw,
+                failure
+            )
+        }
+    }
+
+    // Records that `surface` was put in front by the platform.
+    function bringForward(borrow mut self, surface: DisplaySurfaceId) {
+        match activateSurface(PlatformSurfaceId(surface.raw)) {
+            // The surface is in front and focused.
+            Ok -> {}
+            Error(failure) -> log warn(
+                "the platform could not bring a surface forward",
+                surface: surface.raw,
+                failure
+            )
+        }
+    }
+}
+
+// F3 went down or came up: down opens the switcher, or steps on when it is
+// open; up brings the chosen application to the front. A key held down
+// repeating chooses nothing, so holding F3 leaves the choice to the arrows.
+function switcherKey(desktop: borrow mut Desktop, state: DisplayKeyState) {
+    match state {
+        Pressed -> if desktop.state.switcherOpen { stepSwitcher(desktop, true) } else {
+            openSwitcher(desktop)
+        }
+        Repeated -> {}
+        Released -> commitSwitch(desktop)
+    }
+}
+
+// Opens the switcher on the application after the one in front. The
+// platform holds the input while it is open, so the arrows and Escape reach
+// it, and the application in front stays active until another is chosen.
+function openSwitcher(desktop: borrow mut Desktop) {
+    desktop.state.openSwitcher()
+    if desktop.state.selectNextApplication().isNone() {
+        desktop.state.closeSwitcher()
+        return
+    }
+    match holdInput(desktop, "open the switcher") {
+        Ok(sent) -> if !sent { return }
+        Error(failed) -> {
+            requestFailed("open the switcher", failed)
+            return
+        }
+    }
+    log info("the switcher opened")
+    redrawAfter(0)
+}
+
+// Moves the switcher's choice on, or back.
+function stepSwitcher(desktop: borrow mut Desktop, forward: Bool) {
+    if forward { desktop.state.selectNextApplication() } else {
+        desktop.state.selectPreviousApplication()
+    }
+    redrawAfter(0)
+}
+
+// Brings the chosen application's window furthest in front to the front and
+// puts the switcher away.
+function commitSwitch(desktop: borrow mut Desktop) {
+    if !desktop.state.switcherOpen { return }
+    match desktop.state.commitSwitcher() {
+        Ok(choice) -> match choice {
+            Some(chosen) -> {
+                let surface = DisplaySurfaceId(chosen.raw)
+                match focus(desktop, surface, "switch applications") {
+                    Ok(sent) -> if sent {
+                        desktop.front = .Some(surface)
+                        log info("switched to", surface: surface.raw)
+                    }
+                    Error(failed) -> requestFailed("switch applications", failed)
+                }
+                giveBackKeyboard(desktop)
+            }
+            // Nothing was chosen, or it has no window shown: what was in front
+            // has the keyboard again.
+            None -> giveBackKeyboard(desktop)
+        }
+        // The chosen window could not be brought in front; what was in front
+        // has the keyboard again.
+        Error(failure) -> {
+            log warn("the switcher could not bring its selection in front", failure)
+            giveBackKeyboard(desktop)
+        }
+    }
+    redrawAfter(0)
+}
+
+// Puts the switcher away with no switch.
+function cancelSwitcher(desktop: borrow mut Desktop) {
+    desktop.state.closeSwitcher()
+    giveBackKeyboard(desktop)
+    log info("the switcher was put away")
+    redrawAfter(0)
+}
+
+// A key came to the platform while the switcher is open: the arrows and the
+// number keys choose, Return switches and Escape puts it away. Every key is the switcher's.
+function switcherArrow(desktop: borrow mut Desktop, pressed: borrow DisplayKey) {
+    if pressed.state == .Released { return }
+    match Number(pressed.key) {
+        // Left and Right, Return and Escape, on the keyboard page.
+        80 -> stepSwitcher(desktop, false)
+        79 -> stepSwitcher(desktop, true)
+        40 -> commitSwitch(desktop)
+        41 -> cancelSwitcher(desktop)
+        // 1 to 9 choose the application at that place in the row.
+        30..39 -> {
+            desktop.state.selectApplicationAt(Number(pressed.key) - 30)
+            redrawAfter(0)
+        }
+        else -> {}
+    }
+}

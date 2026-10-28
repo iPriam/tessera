@@ -1,0 +1,69 @@
+//! Tests of the release file's `KEY="value"` parsing, as the About window reads it.
+import Foundation
+import ReleaseText
+
+@Test
+function quotedValueLosesItsQuotes() {
+    match releaseValue("VERSION=\"14.2\"\nARCH=arm64", "VERSION") {
+        Some(found) -> expect!(found == "14.2")
+        None -> expect!(false)
+    }
+}
+
+@Test
+function unquotedValueIsTakenAsWritten() {
+    match releaseValue("VERSION=14.2\nARCH=arm64", "ARCH") {
+        Some(found) -> expect!(found == "arm64")
+        None -> expect!(false)
+    }
+}
+
+@Test
+function missingKeyHasNoValue() {
+    expect!(releaseValue("VERSION=\"14.2\"", "ARCH").isSome() == false)
+}
+
+@Test
+function keyMatchesWholeNotAsPrefix() {
+    expect!(releaseValue("VERSION_CODE=\"9\"", "VERSION").isSome() == false)
+}
+
+@Test
+function emptyQuotesAreAnEmptyValue() {
+    match releaseValue("VERSION=\"\"", "VERSION") {
+        Some(found) -> expect!(found == "")
+        None -> expect!(false)
+    }
+}
+
+@Test
+function loneQuoteIsKept() {
+    match releaseValue("VERSION=\"", "VERSION") {
+        Some(found) -> expect!(found == "\"")
+        None -> expect!(false)
+    }
+}
+
+@Test
+function valueKeepsItsLaterEquals() {
+    match releaseValue("NAME=a=b", "NAME") {
+        Some(found) -> expect!(found == "a=b")
+        None -> expect!(false)
+    }
+}
+
+@Test
+function singleQuotesAreNotStripped() {
+    match releaseValue("ARCH='arm64'", "ARCH") {
+        Some(found) -> expect!(found == "'arm64'")
+        None -> expect!(false)
+    }
+}
+
+@Test
+function firstLineWithTheKeyAnswers() {
+    match releaseValue("VERSION=\"1\"\nVERSION=\"2\"", "VERSION") {
+        Some(found) -> expect!(found == "1")
+        None -> expect!(false)
+    }
+}

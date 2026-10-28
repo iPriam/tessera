@@ -1,0 +1,183 @@
+import Foundation
+import LibTessera
+import DeviceKit
+import Ember
+import TesseraDisplayClient
+
+// The output changing size while the display runs, as a virtual machine's
+// window does when it is resized: the host gives the connector a new
+// preferred mode and the kernel sends a hotplug uevent, which DeviceKit
+// answers on the display connection as `Changed`.
+//
+// The new mode is set on the next flip, the composition images are made again
+// at its size, and every surface is configured into it. The scale stays the
+// one the output started at, as a Mac's display keeps its scale when its
+// resolution changes, so no client draws at a new scale; it is only given a
+// new size.
+
+// Asks the port for one completion when the display says it changed.
+function armOutputChange(server: borrow Server) {
+    match refWaitAsync(
+        server.display.device,
+        DeviceEvents.changed,
+        .Once,
+        server.port,
+        UNumber(PortKey.output)
+    ) {
+        Ok -> {}
+        Error(failed) -> log warn(
+            "the display cannot say when its output changes",
+            error: errorName(failed)
+        )
+    }
+}
+
+// The display said it changed: when its connector now prefers another size,
+// the output takes it.
+function outputChanged(server: borrow mut Server) {
+    armOutputChange(server)
+    match findScanout(server.display.device) {
+        Ok(found) -> match found {
+            Some(scanout) -> outputScanoutChanged(server, scanout)
+            None -> {}
+        }
+        Error(reason) -> log warn("the changed display resources could not be read", error: errorName(reason))
+    }
+}
+
+function outputScanoutChanged(server: borrow mut Server, found: borrow Scanout) {
+    let old = server.display.scanout
+    if found.width == old.width && found.height == old.height { return }
+    var scanout = found
+    scanout.scale = old.scale
+    if scanout.pointWidth() < OutputMinimum.width || scanout.pointHeight() < OutputMinimum.height {
+        log info("the output is too small to lay out", width: scanout.width, height: scanout.height)
+        return
+    }
+    server.stageMotion = []
+    server.display.scanout = scanout
+    server.modesetOwed = true
+    server.blankShown = false
+    remakeTargets(server)
+    clampPointer(server)
+    keepWindowsOnOutput(server)
+    configureAllForOutput(server)
+    log info(
+        "the output changed size",
+        width: scanout.width,
+        height: scanout.height,
+        points: "\(scanout.pointWidth())x\(scanout.pointHeight())",
+        scale: scanout.scale
+    )
+    redraw(server, "the output's new size")
+}
+
+// Below this, in points, the bar, the dock and a window no longer fit.
+namespace OutputMinimum {
+    let width: Number = 320
+    let height: Number = 320
+}
+
+// Makes the composition's two images at the output's new size. The old ones
+// are kept until the first flip at the new size has replaced them, since the
+// display reads one of them until then.
+function remakeTargets(server: borrow mut Server) {
+    var held: Composer? = .None
+    held = move server.composer
+    match held {
+        Some(composer) -> {
+            var open = move composer
+            let first = makeTarget(open.device, server.display, "composed-first")
+            let second = makeTarget(open.device, server.display, "composed-second")
+            match first {
+                Some(madeFirst) -> match second {
+                    Some(madeSecond) -> {
+                        open.retired.append(copy open.first)
+                        open.retired.append(copy open.second)
+                        open.first = madeFirst
+                        open.second = madeSecond
+                    }
+                    None -> releaseTarget(open.device, madeFirst)
+                }
+                None -> match second {
+                    Some(madeSecond) -> releaseTarget(open.device, madeSecond)
+                    None -> {}
+                }
+            }
+            server.composer = .Some(move open)
+        }
+        None -> {}
+    }
+}
+
+// Lets go of the images an output change replaced, once a flip at the new
+// size is on the screen.
+function releaseRetiredTargets(server: borrow mut Server) {
+    var held: Composer? = .None
+    held = move server.composer
+    match held {
+        Some(composer) -> {
+            var open = move composer
+            for target in open.retired {
+                releaseTarget(open.device, target)
+            }
+            open.retired = []
+            server.composer = .Some(move open)
+        }
+        None -> {}
+    }
+}
+
+function clampPointer(server: borrow mut Server) {
+    server.pointerX = clamp(server.pointerX, 0, server.display.scanout.pointWidth() - 1)
+    server.pointerY = clamp(server.pointerY, 0, server.display.scanout.pointHeight() - 1)
+}
+
+// A window the person put somewhere stays where it was, moved and shrunk only
+// as far as it takes to stay on the smaller output, as a Mac keeps windows on
+// a display whose resolution changed.
+function keepWindowsOnOutput(server: borrow mut Server) {
+    let width = server.display.scanout.pointWidth()
+    let top = server.bar
+    let bottom = server.display.scanout.pointHeight() - server.dock
+    for index in 0..server.clients.count {
+        match server.clients[index].windowFrame {
+            Some(kept) -> server.clients[index].windowFrame = .Some(
+                keptOnOutput(kept, width, top, bottom)
+            )
+            None -> {}
+        }
+    }
+}
+
+function keptOnOutput(
+    frame: borrow Geometry,
+    width: Number,
+    top: Number,
+    bottom: Number
+) -> Geometry {
+    let w = min(frame.width, width)
+    let h = min(frame.height, bottom - top)
+    return Geometry {
+        x: clamp(frame.x, 0, width - w),
+        y: clamp(frame.y, top, bottom - h),
+        width: w,
+        height: h
+    }
+}
+
+// Configures the platform and the desktop at the whole output, and every
+// application into its new place.
+function configureAllForOutput(server: borrow mut Server) {
+    for index in 0..server.clients.count {
+        let client = server.clients[index]
+        if client.alive && (client.role == .Platform || client.role == .Desktop) {
+            server.clients[index].frame = geometryFor(server, index)
+            match sendConfigure(server, index, Relayout.serial) {
+                Ok -> {}
+                Error(reason) -> configurationFailed(server, index, reason)
+            }
+        }
+    }
+    relayoutAll(server)
+}

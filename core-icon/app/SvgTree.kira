@@ -1,0 +1,90 @@
+import Foundation
+
+// The element tree an SVG document's text spells.
+
+// What the reader found at a `<`.
+enum SvgMarkup {
+    // An element's start, and whether it closes itself.
+    Start(SvgElement)
+    SelfClosed(SvgElement)
+    // The end tag of the element being read.
+    End
+    // A comment, declaration or processing instruction.
+    Skipped
+}
+
+extend SvgReader {
+    // The markup that starts at the `<` the reader is on.
+    function markup(borrow mut self) -> Result<SvgMarkup, SvgFailure> {
+        let start = at
+        at += 1
+        let c = current()
+        if c == SvgMark.bang || c == SvgMark.question {
+            let marker = text.substring(at, at + 3) == "!--" ? "-->" : ">"
+            if !skipPast(marker) { return .Error(.UnclosedTag(start)) }
+            return .Ok(.Skipped)
+        }
+        if c == SvgMark.slash {
+            if !skipPast(">") { return .Error(.UnclosedTag(start)) }
+            return .Ok(.End)
+        }
+        var element = SvgElement { name: name() }
+        for _ in at..text.count {
+            skipSpace()
+            let next = current()
+            if next == SvgMark.close {
+                at += 1
+                return .Ok(.Start(element))
+            }
+            if next == SvgMark.slash {
+                if !skipPast(">") { return .Error(.UnclosedTag(start)) }
+                return .Ok(.SelfClosed(element))
+            }
+            element.attributes.append(try attribute())
+        }
+        return .Error(.UnclosedTag(start))
+    }
+
+    function attribute(borrow mut self) -> Result<SvgAttribute, SvgFailure> {
+        let named = name()
+        skipSpace()
+        if current() != SvgMark.equals { return .Ok(SvgAttribute { name: named, value: "" }) }
+        at += 1
+        skipSpace()
+        let value = try quoted()
+        return .Ok(SvgAttribute { name: named, value: value })
+    }
+
+    // The elements inside the one just started, up to its end tag.
+    function children(borrow mut self) -> Result<[SvgElement], SvgFailure> {
+        var found: [SvgElement] = []
+        for _ in at..text.count {
+            let next = try text.indexOf("<", at) otherwise return .Ok(found)
+            at = next
+            let markupFound = try markup()
+            match markupFound {
+                Start(element) -> {
+                    var opened = element
+                    opened.children = try children()
+                    found.append(opened)
+                }
+                SelfClosed(element) -> found.append(element)
+                End -> return .Ok(found)
+                // Nothing to draw.
+                Skipped -> {}
+            }
+            if ended() { return .Ok(found) }
+        }
+        return .Ok(found)
+    }
+}
+
+// The `<svg>` element `text` holds, with everything inside it.
+public function parsedSvg(text: borrow String) -> Result<SvgElement, SvgFailure> {
+    var reader = SvgReader { text: copy text }
+    let top = try reader.children()
+    for element in top {
+        if element.name == "svg" { return .Ok(element) }
+    }
+    return .Error(.NoDocument)
+}

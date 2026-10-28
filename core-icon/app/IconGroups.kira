@@ -1,0 +1,222 @@
+import Foundation
+import RenderBox
+
+// A document's groups in an appearance, each with its layers placed and
+// measured, and the pixels on the content image it covers.
+
+struct PreparedGroup {
+    let layers: [PlacedLayer]
+    // The box the layers cover on the canvas.
+    let bounds: Rect
+    let opacity: Number
+    let blend: BlendMode
+    let shadow: IconShadow
+    // How translucent its contents are toward its bottom, none when 0.
+    let translucency: Number
+    // `lighting` combined: one distance field for all its layers.
+    let combined: Bool
+    // How strongly what lies under it is frosted, none when 0.
+    let blur: Number
+    // Whether its glass catches the light. IconRendering draws an outside
+    // placement as it draws inside.
+    let specular: Bool
+}
+
+// The whole pixels of the content image, `side` across, a box on the canvas
+// covers: its edges rounded out, kept on the image.
+function pixelBox(bounds: borrow Rect, side: Number) -> Rect {
+    let scale = side / IconGeometry.canvas
+    let left = max(floor(bounds.x * scale), 0)
+    let top = max(floor(bounds.y * scale), 0)
+    let right = min(ceil((bounds.x + bounds.width) * scale), side)
+    let bottom = min(ceil((bounds.y + bounds.height) * scale), side)
+    return Rect { x: left, y: top, width: max(right - left, 0), height: max(bottom - top, 0) }
+}
+
+function unionOf(a: borrow Rect, b: borrow Rect) -> Rect {
+    var extent = Extent { covered: true, box: copy a }
+    extent.include(b)
+    return extent.box
+}
+
+// Where `a` and `b` overlap, none when they do not.
+function intersectionOf(a: borrow Rect, b: borrow Rect) -> Rect? {
+    let left = max(a.x, b.x)
+    let top = max(a.y, b.y)
+    let right = min(a.x + a.width, b.x + b.width)
+    let bottom = min(a.y + a.height, b.y + b.height)
+    if right <= left || bottom <= top { return .None }
+    return .Some(Rect { x: left, y: top, width: right - left, height: bottom - top })
+}
+
+function blurOf(group: borrow IconGroup, appearance: IconAppearance) -> Number {
+    let blur = group.blur.value(appearance)
+    return blur.enabled ? blur.amount : 0
+}
+
+function translucencyOf(group: borrow IconGroup, appearance: IconAppearance) -> Number {
+    let translucency = group.translucency.value(appearance)
+    return translucency.enabled ? translucency.amount : 0
+}
+
+function placedLayer(
+    bundle: borrow IconBundle,
+    layer: borrow IconLayer,
+    group: borrow IconGroup,
+    look: borrow GroupLook
+) -> Result<PlacedLayer?, IconRenderFailure> {
+    let fill = layer.fill.value(look.appearance)
+    if !layer.visible.value(look.appearance) || fill == .None { return .Ok(.None) }
+    let artwork = try bundle.asset(layer.image) otherwise return .Error(
+        .MissingArtwork(copy layer.image)
+    )
+    let where = placement(layer.position).concatenating(placement(group.position))
+    let (art, covered) = match artwork {
+        Vector(text) -> {
+            let document = try svgParsed(parsedSvg(text))
+            let extent = try svgMeasured(svgExtent(document, where))
+            let box = try extent otherwise return .Ok(.None)
+            (LayerArt.Vector(move document), box)
+        }
+        Bitmap(image) -> {
+            let bitmap = premultiplied(image.width, image.height, image.pixels)
+            let box = where.applying(rasterFrame(bitmap))
+            (LayerArt.Raster(move bitmap), box)
+        }
+    }
+    let drawnFill = layerFill(layer, fill, art, look)
+    return .Ok(
+        .Some(
+            PlacedLayer {
+                name: copy layer.name,
+                art: art,
+                placement: where,
+                opacity: layer.opacity.value(look.appearance),
+                blend: blendMode(layer.blend.value(look.appearance)),
+                fill: drawnFill,
+                bounds: covered,
+                glass: layer.glass.value(look.appearance)
+            }
+        )
+    )
+}
+
+// How the groups are drawn: the appearance they read, and in a dark tone,
+// the light chiclet layers adapt to.
+struct GroupLook {
+    let appearance: IconAppearance
+    let chiclet: DarkChiclet?
+}
+
+// The fill `layer` draws with, `fill` in its appearance, adapted to the
+// dark chiclet when it chooses nothing of its own for the dark.
+function layerFill(
+    layer: borrow IconLayer,
+    fill: borrow IconFill,
+    art: borrow LayerArt,
+    look: borrow GroupLook
+) -> IconFill {
+    let chiclet = try look.chiclet otherwise return copy fill
+    if choosesDark(layer) { return copy fill }
+    if look.appearance.mono() && layer.fill.mono != .None { return copy fill }
+    return adaptedFill(chiclet, layer.fill.light, art)
+}
+
+function svgParsed(
+    result: Result<SvgElement, SvgFailure>
+) -> Result<SvgElement, IconRenderFailure> {
+    return match result {
+        Ok(document) -> .Ok(document)
+        Error(failure) -> .Error(.Svg(failure))
+    }
+}
+
+function svgMeasured(result: Result<Rect?, SvgFailure>) -> Result<Rect?, IconRenderFailure> {
+    return match result {
+        Ok(box) -> .Ok(box)
+        Error(failure) -> .Error(.Svg(failure))
+    }
+}
+
+// The group's layers that draw as `look` draws them, placed on the canvas.
+function placedLayers(
+    bundle: borrow IconBundle,
+    group: borrow IconGroup,
+    look: borrow GroupLook
+) -> Result<[PlacedLayer], IconRenderFailure> {
+    var layers: [PlacedLayer] = []
+    for layer in group.layers {
+        let placed = try placedLayer(bundle, layer, group, look)
+        match placed {
+            Some(found) -> layers.append(move found)
+            None -> {}
+        }
+    }
+    return .Ok(layers)
+}
+
+function preparedGroup(
+    bundle: borrow IconBundle,
+    group: borrow IconGroup,
+    look: borrow GroupLook
+) -> Result<PreparedGroup?, IconRenderFailure> {
+    let appearance = look.appearance
+    if !group.visible.value(appearance) { return .Ok(.None) }
+    let layers = try placedLayers(bundle, group, look)
+    var bounds: Rect? = .None
+    for layer in layers {
+        bounds = .Some(
+            match bounds {
+                Some(box) -> unionOf(box, layer.bounds)
+                None -> copy layer.bounds
+            }
+        )
+    }
+    // The layers' box is kept to the canvas, as IconRendering intersects
+    // the group's bounding rect with the unit square.
+    let union = try bounds otherwise return .Ok(.None)
+    let covered = try intersectionOf(union, chicletRect()) otherwise return .Ok(.None)
+    return .Ok(.Some(groupPrepared(group, move layers, move covered, appearance)))
+}
+
+// A group none of whose layers takes part in the glass has no distance
+// field, so IconRendering draws it flat: no shadow, translucency, frost or
+// highlights.
+function groupPrepared(
+    group: borrow IconGroup,
+    layers: [PlacedLayer],
+    covered: Rect,
+    appearance: IconAppearance
+) -> PreparedGroup {
+    var glass = false
+    for layer in layers { glass = glass || layer.glass }
+    return PreparedGroup {
+        layers: layers,
+        bounds: covered,
+        opacity: group.opacity.value(appearance),
+        blend: blendMode(group.blend.value(appearance)),
+        shadow: glass ? group.shadow.value(appearance) : IconShadow { kind: .None, opacity: 0 },
+        translucency: glass ? translucencyOf(group, appearance) : 0,
+        combined: group.lighting == .Combined,
+        blur: glass ? blurOf(group, appearance) : 0,
+        specular: glass && group.specular.value(appearance) != .Off
+    }
+}
+
+// The document's groups that draw anything, back to front. A document lists
+// its groups front to back.
+function preparedGroups(
+    bundle: borrow IconBundle,
+    look: borrow GroupLook
+) -> Result<[PreparedGroup], IconRenderFailure> {
+    var groups: [PreparedGroup] = []
+    for back in 0..bundle.document.groups.count {
+        let index = bundle.document.groups.count - 1 - back
+        let prepared = try preparedGroup(bundle, bundle.document.groups[index], look)
+        match prepared {
+            Some(group) -> groups.append(move group)
+            None -> {}
+        }
+    }
+    return .Ok(groups)
+}

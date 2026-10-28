@@ -1,0 +1,46 @@
+//! The clock's readings: the seconds since 1970, the zone titles, and the times and dates as text.
+import Foundation
+import LibTessera
+
+// The time as Clock shows it: Tessera keeps the clock in Coordinated Universal
+// Time, and Clock reads it in the time zone chosen in Settings.
+
+/// The clock's time units, in milliseconds.
+namespace Millis {
+    let second: UNumber = 1000
+}
+
+/// The names of the weekdays and months as Clock prints them.
+namespace Names {
+    let weekdays: [String] = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+    let months: [String] = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
+}
+
+/// Whole seconds since 1970, as a clock in `zone` reads them.
+function secondsNow(zone: borrow TimeZone) -> UNumber {
+    return trunc(zone.local(unixMillis()) / Millis.second)
+}
+
+/// The zone `name` as a person reads it: its city, `Europe/Paris` as `Paris`, and UTC in full.
+function zoneTitle(name: borrow String) -> String {
+    if name == TimeZoneSetting.utc { return "Coordinated Universal Time" }
+    let parts = name.split("/")
+    return joined(parts[parts.count - 1].split("_"), " ")
+}
+
+/// The time of day at `seconds`, as `13:45`.
+function hourMinute(seconds: UNumber) -> String {
+    let rest = seconds % CivilTime.secondsPerDay
+    let hours = trunc(rest / CivilTime.secondsPerHour)
+    let minutes = trunc(rest % CivilTime.secondsPerHour / CivilTime.secondsPerMinute)
+    return zeroPadded(hours, 2) + ":" + zeroPadded(minutes, 2)
+}
+
+/// The date at `seconds`, as `Sunday 11 October 2026`.
+function dateText(seconds: UNumber) -> String {
+    let days = trunc(seconds / CivilTime.secondsPerDay)
+    let civil = civilDate(days)
+    return Names.weekdays[weekdayOf(days)] + " " + String(
+        civil.day
+    ) + " " + Names.months[civil.month - 1] + " " + String(civil.year)
+}

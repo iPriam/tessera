@@ -1,0 +1,96 @@
+//! Home's arrangement as Desktop writes it down, one line an entry:
+//!
+//! ```text
+//! version 2
+//! reset 1792414882134
+//! page
+//! app Notes
+//! folder Utilities
+//! member Clock
+//! page hidden
+//! widget Clock medium
+//! removed Welcome
+//! ```
+
+import Foundation
+
+// The arrangement as `text` writes it; lines it does not know are skipped.
+public function parsedArrangement(text: borrow String) -> HomeArrangement {
+    var arrangement = HomeArrangement {}
+    let lines = text.split("\n")
+    if lines.count == 0 || lines[0] != HomeFormat.version { return arrangement }
+    for line in lines {
+        if line.startsWith("reset ") {
+            arrangement.reset = line.substring(6, line.count)
+            continue
+        }
+        if line == "page" || line == "page hidden" {
+            arrangement.pages.append(HomePage { hidden: line == "page hidden" })
+            continue
+        }
+        if arrangement.pages.count == 0 && !line.startsWith("removed ") { continue }
+        let last = arrangement.pages.count - 1
+        if line.startsWith("app ") {
+            arrangement.pages[last].items.append(.App(line.substring(4, line.count)))
+        } else if line.startsWith("folder ") {
+            arrangement.pages[last].items.append(
+                .Folder(HomeFolder { name: line.substring(7, line.count) })
+            )
+        } else if line.startsWith("member ") {
+            arrangement.pages[last].items = withMember(
+                arrangement.pages[last].items,
+                line.substring(7, line.count)
+            )
+        } else if line.startsWith("removed ") {
+            arrangement.removed.append(line.substring(8, line.count))
+        } else if line.startsWith("widget ") {
+            let parts = line.substring(7, line.count).split(" ")
+            if parts.count == 2 {
+                arrangement.pages[last].widgets.append(
+                    HomeWidget { kind: copy parts[0], size: homeWidgetSizeNamed(parts[1]) }
+                )
+            }
+        }
+    }
+    return arrangement
+}
+
+// `items` with `app` added to the folder at their end, when one is there.
+function withMember(items: borrow [HomeItem], app: String) -> [HomeItem] {
+    var kept = copy items
+    if kept.count == 0 { return kept }
+    let last = kept.count - 1
+    match kept[last] {
+        Folder(folder) -> {
+            var grown = copy folder
+            grown.apps.append(move app)
+            kept[last] = .Folder(move grown)
+        }
+        // A member line after an application belongs to no folder.
+        App -> {}
+    }
+    return kept
+}
+
+// The arrangement as it is written down.
+public function arrangementText(arrangement: borrow HomeArrangement) -> String {
+    var lines: [String] = [HomeFormat.version]
+    if arrangement.reset.count > 0 { lines.append("reset " + arrangement.reset) }
+    for page in arrangement.pages {
+        lines.append(page.hidden ? "page hidden" : "page")
+        for widget in page.widgets {
+            lines.append("widget " + widget.kind + " " + widget.size.word())
+        }
+        for item in page.items {
+            match item {
+                App(app) -> lines.append("app " + app)
+                Folder(folder) -> {
+                    lines.append("folder " + folder.name)
+                    for app in folder.apps { lines.append("member " + app) }
+                }
+            }
+        }
+    }
+    for app in arrangement.removed { lines.append("removed " + app) }
+    return joined(lines, "\n") + "\n"
+}

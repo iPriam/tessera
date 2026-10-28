@@ -1,0 +1,407 @@
+import Foundation
+import Build
+import CoreIcon
+import TesseraIcons
+
+// A component's build (roadmap/18-components.md): its package compiled against
+// an SDK holding the contracts of the libraries it links, into three roots.
+// `install` holds the stripped files at the paths the machine runs them from,
+// `symbols` the debug information taken from them, and `contracts` a library's
+// `.ridl` and the link stub dependents link against.
+
+// What every build of a component reads besides its own package.
+struct BuildContext {
+    let host: Host
+    let architecture: Architecture
+    // The target's C library, which every compile links against and the
+    // release's runtime is taken from.
+    let sysroot: Sysroot
+    // The toolchain every compile runs.
+    let kira: KiraToolchain
+    // The key the build signs the system's seal with (roadmap/13, "How the
+    // system is sealed"), kept on the build host and never in a release.
+    let sealKey: SigningKeyFile
+    // The component started under Valgrind's memcheck, or `none`.
+    let valgrind: String
+    // Whether components compile in release, with KIR's O2 optimizer
+    // (`--release --optimize`).
+    let release: Bool
+    // Whether the system carries the components' debug information.
+    let symbols: SymbolPlacement
+    // Whether a dev system carries LLVM's lldb-server and lldb (Lldb.kira).
+    let lldb: Bool
+}
+
+// Where the components' debug information goes in the system.
+enum SymbolPlacement {
+    // Under System/Developer/Symbols, as a dev OS has it, where the crash
+    // reporter names frames from (SystemDirectory.developerSymbols).
+    Developer
+    // Nowhere: a shipped system carries none.
+    Omitted
+}
+
+// Where a dev OS keeps the dSYM bundles: LibTessera's
+// `SystemDirectory.developerSymbols`, which the host build cannot link.
+namespace DeveloperSymbols {
+    let directory: String = "System/Developer/Symbols"
+}
+
+// The `symbols` option's value, read once where the option is.
+function symbolPlacementOf(choice: borrow String) -> SymbolPlacement {
+    return match choice {
+        "none" -> .Omitted
+        else -> .Developer
+    }
+}
+
+// What a component's build produced.
+struct ComponentRoots {
+    let install: Artifact
+    // The stripped binary on its own, for an image that places it elsewhere
+    // than its installed path.
+    let binary: Artifact
+    let symbols: Artifact
+    // A library's contracts root.
+    let contracts: Artifact?
+}
+
+// Everything under a checkout that a compile never reads.
+function checkoutExclusions() -> [String] {
+    return [".git", ".kira-build", "Images", "docs", "examples", "Examples", "tests"]
+}
+
+// How `component` compiles against `sdk`.
+function compileSettings(
+    context: borrow BuildContext,
+    component: borrow Component,
+    sdk: Artifact
+) -> KiraSettings {
+    return KiraSettings {
+        target: context.architecture.kiraTarget(),
+        release: context.release,
+        optimize: context.release,
+        sdk: .Some(sdk),
+        sysroot: .Some(copy context.sysroot.compiled),
+        sourceRoot: "..",
+        excluding: checkoutExclusions()
+    }
+}
+
+// A built binary without its debug information, and that information alone.
+struct SplitBinary {
+    let stripped: Artifact
+    let debug: Artifact
+}
+
+function splitDebug(
+    graph: borrow mut Graph,
+    context: borrow BuildContext,
+    name: borrow String,
+    built: Artifact
+) -> SplitBinary {
+    let architecture = context.architecture.name()
+    let debug = graph.command(
+        CommandAction {
+            label: "debug information of \(name) (\(architecture))",
+            tool: context.host.llvmTool("llvm-objcopy"),
+            arguments: [.Text("--only-keep-debug"), .Input(built), .Output("debug")],
+            outputs: [Output { name: "debug" }]
+        }
+    )
+    let stripped = graph.command(
+        CommandAction {
+            label: "strip \(name) (\(architecture))",
+            tool: context.host.llvmTool("llvm-strip"),
+            arguments: [.Text("--strip-unneeded"), .Text("-o"), .Output("stripped"), .Input(built)],
+            outputs: [Output { name: "stripped" }]
+        }
+    )
+    return SplitBinary { stripped: stripped[0], debug: debug[0] }
+}
+
+// Where `component`'s binary is installed, from a release's root.
+function installedPath(component: borrow Component, facts: borrow PackageFacts) -> String {
+    return match component.kind {
+        Library -> frameworkDirectory(facts.module) + "/" + facts.module
+        Driver -> "System/Library/DriverExtensions/\(component.name).dext/\(component.name)"
+        Application -> {
+            let bundle = applicationBundle(component.name)
+            "\(bundle).app/Contents/MacOS/\(lastNameOf(bundle))"
+        }
+        Program -> match component.name {
+            "init" -> "init"
+            "installer" -> "init"
+            else -> "bin/" + component.name
+        }
+    }
+}
+
+// Builds `component` against `sdk` into its three roots.
+function buildComponent(
+    graph: borrow mut Graph,
+    context: borrow BuildContext,
+    component: borrow Component,
+    facts: borrow PackageFacts,
+    sdk: Artifact
+) -> ComponentRoots {
+    let settings = compileSettings(context, component, move sdk)
+    let (built, contract) = componentBinary(graph, context, component, settings)
+    let split = splitDebug(graph, context, component.name, move built)
+    let path = installedPath(component, facts)
+    let named = "\(context.architecture.name())/\(component.name)"
+    var install = [TreePart.Place(
+        TreePlace { path: copy path, artifact: split.stripped, mode: FileMode.program }
+    )]
+    for part in componentParts(graph, component, facts, path, named) { install.append(part) }
+    var contracts: Artifact? = .None
+    match contract {
+        Some(described) -> contracts = .Some(
+            contractTree(graph, context, component, facts, path, move described, split.stripped)
+        )
+        None -> {}
+    }
+    return ComponentRoots {
+        install: graph.tree("\(named)/install", install),
+        binary: split.stripped,
+        symbols: graph.tree("\(named)/symbols", symbolParts(component, path, split.debug)),
+        contracts: contracts
+    }
+}
+
+// What `component` compiles to, and the contract it exports when it is a
+// library.
+function componentBinary(
+    graph: borrow mut Graph,
+    context: borrow BuildContext,
+    component: borrow Component,
+    settings: borrow KiraSettings
+) -> (Artifact, Artifact?) {
+    let none: Artifact? = .None
+    return match component.kind {
+        Library -> {
+            let library = context.kira.library(graph, component.location, settings)
+            let contract: Artifact? = .Some(library.contract)
+            (library.binary, contract)
+        }
+        Program, Driver, Application -> (
+            context.kira.program(graph, component.location, settings),
+            none
+        )
+    }
+}
+
+// What is installed beside `component`'s binary at `path`: a framework's
+// assets, a driver's Info.plist, an application's Info.plist and resources,
+// a program's assets in its own directory of `usr/share`.
+function componentParts(
+    graph: borrow mut Graph,
+    component: borrow Component,
+    facts: borrow PackageFacts,
+    path: borrow String,
+    named: borrow String
+) -> [TreePart] {
+    return match component.kind {
+        Library -> assetParts(graph, component, facts, frameworkDirectory(facts.module))
+        Driver -> [
+            .Place(
+                TreePlace {
+                    path: parentOf(path) + "/Info.plist",
+                    artifact: graph.source(component.location + "/Info.plist")
+                }
+            )
+        ]
+        Application -> bundleParts(graph, component, facts, path, named)
+        Program -> assetParts(graph, component, facts, "usr/share/\(component.name)")
+    }
+}
+
+// An application's Info.plist and resources, the icon among them, in its
+// bundle's `Contents`, as a Mac's are.
+function bundleParts(
+    graph: borrow mut Graph,
+    component: borrow Component,
+    facts: borrow PackageFacts,
+    path: borrow String,
+    named: borrow String
+) -> [TreePart] {
+    let info = graph.write(
+        "\(named)/Info.plist",
+        bundleInfo(lastNameOf(applicationBundle(component.name)), applicationCategory(component.name)),
+        FileMode.data
+    )
+    let contents = parentOf(parentOf(path))
+    var parts = assetParts(graph, component, facts, contents)
+    parts.append(.Place(TreePlace { path: contents + "/Info.plist", artifact: info }))
+    return parts
+}
+
+// `component`'s assets, each at its own path under `directory`.
+function assetParts(
+    graph: borrow mut Graph,
+    component: borrow Component,
+    facts: borrow PackageFacts,
+    directory: borrow String
+) -> [TreePart] {
+    var parts: [TreePart] = []
+    for asset in facts.assets {
+        // A `.tessicon` goes in as the pictures it is drawn as, beside where
+        // it would be.
+        if asset.endsWith(IconBundleLayout.extension) {
+            parts.append(
+                .Place(
+                    TreePlace {
+                        path: directory + "/" + parentOf(asset),
+                        artifact: renderedIconTree(graph, component.name, component.location, asset)
+                    }
+                )
+            )
+            continue
+        }
+        parts.append(
+            .Place(
+                TreePlace {
+                    path: directory + "/" + asset,
+                    artifact: graph.source(component.location + "/" + asset)
+                }
+            )
+        )
+    }
+    return parts
+}
+
+// Where `component`'s debug information goes. The installer is the /init of
+// its own image, so its symbols sit under `installer/`, apart from the
+// system's init.
+function symbolParts(
+    component: borrow Component,
+    path: borrow String,
+    debug: Artifact
+) -> [TreePart] {
+    let symbolsPath = component.name == "installer" ? "installer/" + path : copy path
+    return [
+        TreePart.Place(
+            TreePlace {
+                path: "\(symbolsPath).dSYM/Contents/Resources/DWARF/\(lastNameOf(path))",
+                artifact: debug
+            }
+        )
+    ]
+}
+
+// A library's contracts: its RIDL and its interface stub.
+function contractTree(
+    graph: borrow mut Graph,
+    context: borrow BuildContext,
+    component: borrow Component,
+    facts: borrow PackageFacts,
+    path: borrow String,
+    described: Artifact,
+    stripped: Artifact
+) -> Artifact {
+    let framework = frameworkDirectory(facts.module)
+    let named = "\(context.architecture.name())/\(component.name)"
+    // The interface stub: the library's dynamic symbols and nothing else,
+    // which is all a dependent links against. An edit inside a function body
+    // leaves it byte for byte the same, so no dependent builds again; only a
+    // change to what the library exports does.
+    let stub = graph.interfaceStub("\(named)/\(facts.module)", stripped)
+    return graph.tree(
+        "\(named)/contracts",
+        [
+            .Place(
+                TreePlace {
+                    path: "\(framework)/Resources/\(facts.module).ridl",
+                    artifact: described,
+                    mode: FileMode.data
+                }
+            ),
+            .Place(TreePlace { path: copy path, artifact: stub, mode: FileMode.program })
+        ]
+    )
+}
+
+// The Info.plist of the application bundle whose executable is `name`, in
+// `category` when the application names one.
+function bundleInfo(name: borrow String, category: borrow String) -> String {
+    let identifier = name.split(" ")
+    var compact = ""
+    for part in identifier {
+        compact += part
+    }
+    var lines = [
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+        "<plist version=\"1.0\">",
+        "<dict>",
+        "\t<key>CFBundleName</key><string>\(name)</string>",
+        "\t<key>CFBundleExecutable</key><string>\(name)</string>",
+        "\t<key>CFBundleIdentifier</key><string>org.tessera.\(compact)</string>",
+        "\t<key>CFBundlePackageType</key><string>APPL</string>",
+        "\t<key>CFBundleIconFile</key><string>AppIcon</string>"
+    ]
+    if category.count > 0 {
+        lines.append("\t<key>LSApplicationCategoryType</key><string>\(category)</string>")
+    }
+    lines.append("</dict>")
+    lines.append("</plist>")
+    return textLines(lines)
+}
+
+// The SDK a component builds against: the contracts of the libraries it
+// links, and `settings`, the tree holding `SDKSettings.json`.
+function componentSdk(
+    graph: borrow mut Graph,
+    context: borrow BuildContext,
+    name: borrow String,
+    settings: Artifact,
+    contracts: borrow [Artifact]
+) -> Artifact {
+    var trees = copy contracts
+    trees.append(settings)
+    return graph.union("\(context.architecture.name())/\(name)/sdk", trees)
+}
+
+// The tree holding `SDKSettings.json`, naming the SDK and the system it builds
+// for.
+function sdkSettingsTree(graph: borrow mut Graph, context: borrow BuildContext) -> Artifact {
+    let architecture = context.architecture.name()
+    let file = graph.write(
+        "\(architecture)/SDKSettings.json",
+        sdkSettings(context, "Tessera.Internal"),
+        FileMode.data
+    )
+    return graph.tree(
+        "\(architecture)/sdk-settings",
+        [.Place(TreePlace { path: "SDKSettings.json", artifact: file })]
+    )
+}
+
+function sdkSettings(context: borrow BuildContext, name: borrow String) -> String {
+    return textLines(
+        [
+            "{",
+            "    \"Name\": \"\(name)\",",
+            "    \"Version\": \"\(Release.version)\",",
+            "    \"Architecture\": \"\(context.architecture.name())\",",
+            "    \"Triple\": \"\(context.architecture.kiraTarget())\"",
+            "}"
+        ]
+    )
+}
+
+// `lines`, each ended by a newline.
+function textLines(lines: borrow [String]) -> String {
+    var text = ""
+    for line in lines {
+        text += line + "\n"
+    }
+    return text
+}
+
+// The last name of `path`.
+function lastNameOf(path: borrow String) -> String {
+    match path.lastIndexOf("/") {
+        Some(slash) -> return path.substring(slash + 1, path.count)
+        None -> return copy path
+    }
+}

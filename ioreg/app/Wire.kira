@@ -1,0 +1,170 @@
+//! The registry's wire layout: entry, property and list records, read from the buffers DeviceKit returns.
+import Foundation
+import Heap
+import LibTessera
+import DeviceKit
+
+// The registry's records as DeviceKit writes them into a caller's buffer
+// (roadmap/17-devicekit.md §7). Only this file reads that memory; the rest
+// of ioreg sees entries and properties.
+
+/// The layout of an entry record in the registry's list: its size and where its id, class and parent sit.
+namespace EntryRecord {
+    let listHeader: Number = 8
+    let bytes: Number = 48
+    let classAt: Number = 8
+    let parentAt: Number = 16
+}
+
+/// The layout of a property record in a property list: its header, its key and value offsets, and the word size.
+namespace PropertyRecord {
+    let listHeader: Number = 8
+    let keyLengthAt: Number = 4
+    let valueLengthAt: Number = 8
+    let keyAt: Number = 16
+    let wordBytes: Number = 8
+}
+
+/// The property types this ioreg reads, in the order the registry numbers them.
+let propertyTypes: [PropertyType] = [PropertyType.Bool, PropertyType.I64, PropertyType.U64, PropertyType.String, PropertyType.Bytes, PropertyType.List]
+
+/// A property's value, read whole.
+enum PropertyValue {
+    Flag(Bool)
+    Signed(Number)
+    Unsigned(Number)
+    Text(String)
+    Bytes(ByteRun)
+    // A List counts its items, not its bytes.
+    List
+    // A word-sized value with fewer bytes than a word.
+    Short
+}
+
+/// The first bytes of a Bytes value, and how many it has.
+struct ByteRun {
+    var shown: [Number]
+    var length: Number
+}
+
+/// A property read from the registry: its key, and its value.
+struct Property {
+    var key: String
+    var value: PropertyValue
+}
+
+/// Where a property record's parts lie in its list.
+struct PropertySpan {
+    var kind: PropertyType?
+    var key: String
+    var valueAt: Number
+    var valueLength: Number
+
+    /// The offset just past the property's value.
+    function end(borrow self) -> Number { return valueAt + valueLength }
+}
+
+/// The property type `raw` names, or none when this ioreg does not know it.
+function propertyTypeOf(raw: UN32) -> PropertyType? {
+    for each in propertyTypes {
+        if each.rawValue() == raw { return .Some(each) }
+    }
+    return .None
+}
+
+/// The entry a parent id names, or none when there is no parent.
+function parentOf(raw: UNumber) -> EntryId? {
+    if raw == UNumber(0) { return .None }
+    return .Some(EntryId(raw))
+}
+
+/// The `count` entries of a `Registry.match` list.
+function entriesIn(list: borrow Buffer, count: Number) -> [Entry] {
+    var entries: [Entry] = []
+    for index in 0..count {
+        let at = EntryRecord.listHeader + index * EntryRecord.bytes
+        entries.append(
+            Entry {
+                id: EntryId(heapLoad<U64>(list.address, at)),
+                entryClass: classOf(heapLoad<U32>(list.address, at + EntryRecord.classAt)),
+                parent: parentOf(heapLoad<U64>(list.address, at + EntryRecord.parentAt)),
+            }
+        )
+    }
+    return entries
+}
+
+/// `at` rounded up to the next word boundary.
+function alignWord(at: Number) -> Number {
+    return trunc(
+        (at + PropertyRecord.wordBytes - 1) / PropertyRecord.wordBytes
+    ) * PropertyRecord.wordBytes
+}
+
+/// The property record at `at`, when its key lies within `used` bytes.
+function spanAt(base: RawPtr, at: Number, used: Number) -> PropertySpan? {
+    let keyLength = heapLoad<U32>(base, at + PropertyRecord.keyLengthAt)
+    if at + PropertyRecord.keyAt + keyLength > used { return .None }
+    return .Some(
+        PropertySpan {
+            kind: propertyTypeOf(heapLoad<U32>(base, at)),
+            key: stringFromCBytes(heapOffset(base, at + PropertyRecord.keyAt), keyLength),
+            valueAt: alignWord(at + PropertyRecord.keyAt + keyLength),
+            valueLength: heapLoad<U32>(base, at + PropertyRecord.valueLengthAt),
+        }
+    )
+}
+
+/// The value of `kind` that the `length` bytes at `value` hold.
+function valueOf(kind: borrow PropertyType, value: RawPtr, length: Number) -> PropertyValue {
+    let word = length >= PropertyRecord.wordBytes
+    return match kind {
+        Bool -> .Flag(heapLoad<U8>(value, 0) != UN8(0))
+        I64 -> word ? .Signed(registrySignedWord(value)) : .Short
+        U64 -> word ? .Unsigned(heapLoad<U64>(value, 0)) : .Short
+        String -> .Text(stringFromCBytes(value, length))
+        Bytes -> {
+            var shown: [Number] = []
+            for index in 0..min(length, Limit.shownBytes) {
+                shown.append(heapLoad<U8>(value, index))
+            }
+            .Bytes(ByteRun { shown: shown, length: length })
+        }
+        List -> .List
+    }
+}
+
+/// The properties in a list of `used` bytes; one of a type this ioreg does not know is left out, and so is the rest after a List.
+function propertiesIn(list: borrow Buffer, used: Number) -> [Property] {
+    var properties: [Property] = []
+    if used < PropertyRecord.listHeader { return properties }
+    let base = list.address
+    var at = PropertyRecord.listHeader
+    for _ in 0..heapLoad<U32>(base, 0) {
+        if at + PropertyRecord.keyAt > used { return properties }
+        let span = try spanAt(base, at, used) otherwise return properties
+        if span.end() > used { return properties }
+        match span.kind {
+            Some(kind) -> {
+                properties.append(
+                    Property {
+                        key: span.key,
+                        value: valueOf(kind, heapOffset(base, span.valueAt), span.valueLength)
+                    }
+                )
+                if kind == .List { return properties }
+            }
+            // A type this ioreg does not know: its value is skipped.
+            None -> {}
+        }
+        at = alignWord(span.end())
+    }
+    return properties
+}
+
+/// The text of the single property `Registry.property` wrote, when it is a String within `used` bytes.
+function nameIn(out: borrow Buffer, used: Number) -> String? {
+    let span = try spanAt(out.address, 0, used) otherwise return .None
+    if span.end() > used || span.kind != .Some(PropertyType.String) { return .None }
+    return .Some(stringFromCBytes(heapOffset(out.address, span.valueAt), span.valueLength))
+}

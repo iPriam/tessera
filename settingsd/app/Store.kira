@@ -1,0 +1,94 @@
+//! The settings store: the values, the settings file on the data volume, and how they are loaded and saved.
+import Foundation
+import LibTessera
+
+// Where the settings are kept: one file on the data volume, a `key=value`
+// line for each (roadmap/05-storage-and-state.md, `/data/system/`). A
+// machine with no data volume keeps them for the boot alone, in memory.
+
+/// Where the settings file is, on the data volume, and the name it is kept under.
+namespace SettingsFile {
+    let directory: String = "/" + SystemDirectory.systemData
+    let path: String = "/" + SystemFile.settings
+}
+
+/// The settings the service holds: the values by key, and whether they are kept on the data volume.
+struct Store {
+    var settings: [Setting] = []
+    // Whether there is a data volume to keep them on.
+    var kept: Bool = false
+}
+
+/// The settings the data volume holds, none on a machine without one.
+function loadStore() -> Store {
+    if !isDirectory(SettingsFile.directory) {
+        log info("there is no data volume; settings are kept for this boot")
+        return Store {}
+    }
+    match readFile(SettingsFile.path) {
+        Ok(contents) -> {
+            let settings = settingsFromLines(contents.text)
+            log info("read the settings", count: settings.count)
+            return Store { settings: settings, kept: true }
+        }
+        Error(failure) -> {
+            absorb failure
+            log info("no settings are kept yet")
+            return Store { kept: true }
+        }
+    }
+}
+
+/// The value `key` holds, if any.
+function storedValue(store: borrow Store, key: borrow String) -> String? {
+    for setting in store.settings {
+        if setting.key == key { return .Some(copy setting.value) }
+    }
+    return .None
+}
+
+/// What keeping the settings on the data volume failed on; either way the change holds for this boot, and the file keeps the settings it had.
+enum StoreFailure {
+    // The file beside the settings file could not be written; the text says why.
+    Write(String)
+    // The written file could not be put in place of the settings file.
+    Replace(String)
+}
+
+/// Sets `key` to `value`, or forgets it for none, and writes the file again.
+function storeValue(
+    store: borrow mut Store,
+    key: borrow String,
+    value: String?
+) -> Result<Void, StoreFailure> {
+    var kept: [Setting] = []
+    for setting in store.settings {
+        if setting.key != key { kept.append(setting) }
+    }
+    match value {
+        Some(text) -> kept.append(Setting { key: copy key, value: text })
+        // Forgetting the key is leaving it out of `kept`, which is done above.
+        None -> {}
+    }
+    store.settings = kept
+    return saveStore(store)
+}
+
+/// Writes the file beside itself, then over itself, so it holds either the settings before the change or those after it.
+function saveStore(store: borrow Store) -> Result<Void, StoreFailure> {
+    if !store.kept { return .Ok }
+    let written = SettingsFile.path + ".new"
+    match writeFile(written, settingsLines(store.settings)) {
+        // Written beside the file; the rename below puts it in place.
+        Ok -> {}
+        Error(failure) -> return .Error(
+            .Write("\(written) could not be written: \(traceText(failure))")
+        )
+    }
+    match renamePath(written, SettingsFile.path) {
+        Ok -> return .Ok
+        Error(failure) -> return .Error(
+            .Replace("\(SettingsFile.path) could not be replaced: \(traceText(failure))")
+        )
+    }
+}

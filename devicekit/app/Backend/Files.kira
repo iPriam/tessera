@@ -1,0 +1,278 @@
+import Foundation
+import Heap
+import LibTessera
+
+// Short files, directories and links: sysfs and `/proc`, which the registry
+// walk, power, sensors and backlights read and write (17 §20.2).
+
+namespace FileLimit {
+    // A sysfs attribute is at most a page.
+    let attribute: Number = 4096
+    let directoryChunk: Number = 16384
+    let link: Number = 4095
+}
+
+// The text of a short file such as one under `/sys`, without its trailing
+// newlines.
+function readText(path: borrow String) -> Result<String, TesseraError> {
+    let file = try openPath(path, OpenFlags.readOnly)
+    let blockBytes = zeroedBlock(count: FileLimit.attribute + 1, alignment: 16)
+    let block = blockBytes.pointer()
+    var total: Number = 0
+    while total < FileLimit.attribute {
+        let got = match file.read(heapOffset(block, total), FileLimit.attribute - total) {
+            Ok(value) -> value
+            Error(failed) -> {
+                file.close()
+                return .Error(failed)
+            }
+        }
+        if got == 0 { break }
+        total += got
+    }
+    file.close()
+    while total > 0 && heapLoad<U8>(block, total - 1) == U8(10) { total -= 1 }
+    return .Ok(stringFromCBytes(block, total))
+}
+
+// A sysfs attribute, trimmed; absent when the kernel does not offer it here.
+function attribute(path: borrow String) -> String? {
+    return match readText(path) {
+        Ok(text) -> .Some(text.trim())
+        Error(failed) -> {
+            // Attributes differ per driver: one that is missing is absent.
+            // A device unplugged while it is read is gone, not broken: the
+            // hotplug event that says so follows.
+            if failed.code != .NotFound && failed.code != .DeviceLost {
+                log warn("an attribute could not be read", path: path, error: errorName(failed))
+            }
+            return .None
+        }
+    }
+}
+
+// An attribute read as a decimal number.
+function numberAttribute(path: borrow String) -> Number? {
+    return match attribute(path) {
+        Some(text) -> text.toNumber()
+        None -> .None
+    }
+}
+
+// An attribute read as hexadecimal, with or without `0x`.
+function hexAttribute(path: borrow String) -> Number? {
+    return match attribute(path) {
+        Some(text) -> match parseHex(text) {
+            Ok(value) -> .Some(value)
+            Error(failed) -> {
+                log debug("an attribute is not hexadecimal", path, text)
+                return .None
+            }
+        }
+        None -> .None
+    }
+}
+
+// Writes `text` to a short file such as a sysfs attribute.
+function writeText(path: borrow String, text: borrow String) -> Result<Void, TesseraError> {
+    let file = try openPath(path, OpenFlags.writeOnly)
+    let bytesBytes = zeroedBlock(count: text.count + 1, alignment: 16)
+    let bytes = bytesBytes.pointer()
+    if text.count > 0 { copyBytes(bytes, text.data, text.count) }
+    let wrote = file.write(bytes, text.count)
+    file.close()
+    return match wrote {
+        Ok(count) -> .Ok
+        Error(failed) -> .Error(failed)
+    }
+}
+
+// Whether something exists at `path`: a directory, or a link to one, as
+// well as a file. Named apart from Foundation's `fileExists`, so a call
+// never reaches the other one.
+function pathPresent(path: borrow String) -> Result<Bool, TesseraError> {
+    return match openPath(path, OpenFlags.readOnly | OpenFlags.path) {
+        Ok(file) -> {
+            file.close()
+            return .Ok(true)
+        }
+        Error(reason) -> {
+            if reason.code == .NotFound { return .Ok(false) }
+            return .Error(reason)
+        }
+    }
+}
+
+// The names in a directory, without `.` and `..`.
+function directoryEntries(path: borrow String) -> Result<[String], TesseraError> {
+    var names: [String] = []
+    let directory = try openPath(path, OpenFlags.readOnly | currentMachine().directoryFlag())
+    let blockBytes = zeroedBlock(count: FileLimit.directoryChunk, alignment: 16)
+    let block = blockBytes.pointer()
+    while true {
+        let got = match directory.directoryRead(block, FileLimit.directoryChunk) {
+            Ok(value) -> value
+            Error(failed) -> {
+                directory.close()
+                return .Error(failed)
+            }
+        }
+        if got == 0 { break }
+        var at = 0
+        while at < got {
+            // `struct linux_dirent64`: the record length @16, the name @19.
+            let length = heapLoad<U16>(block, at + 16)
+            let name = stringFromCBytes(heapOffset(block, at + 19), length - 19)
+            if name != "." && name != ".." { names.append(name) }
+            at += length
+        }
+    }
+    directory.close()
+    return .Ok(names)
+}
+
+// The names in a directory, or none when it is not there: a sysfs class
+// directory exists only once a driver for it has loaded.
+function listedEntries(path: borrow String) -> [String] {
+    return match directoryEntries(path) {
+        Ok(names) -> names
+        Error(failed) -> {
+            if failed.code != .NotFound {
+                log warn("a directory could not be listed", path: path, error: errorName(failed))
+            }
+            return []
+        }
+    }
+}
+
+// Where a symbolic link points. A failure keeps its reason: NotFound when
+// nothing is there, InvalidArgument when `path` is not a link.
+function readLink(path: borrow String) -> Result<String, TesseraError> {
+    let blockBytes = zeroedBlock(count: FileLimit.link + 1, alignment: 16)
+    let block = blockBytes.pointer()
+    let length = try kernelNumber(backendReadLink(path, block, FileLimit.link))
+    return .Ok(stringFromCBytes(block, length))
+}
+
+// Missing paths and non-links have no target. Other errors must stop the
+// caller's walk rather than make an incomplete registry look complete.
+function linkTarget(path: borrow String) -> Result<String?, TesseraError> {
+    return match readLink(path) {
+        Ok(target) -> .Ok(.Some(target))
+        Error(reason) -> {
+            if reason.code == .NotFound || reason.code == .InvalidArgument { return .Ok(.None) }
+            return .Error(reason)
+        }
+    }
+}
+
+// The last component of a path.
+function lastComponent(path: borrow String) -> String {
+    return match path.lastIndexOf("/") {
+        Some(at) -> path.substring(at + 1, path.count)
+        None -> path
+    }
+}
+
+// `relative` with its `..` and `.` components resolved against `base`, for
+// the relative links sysfs is made of.
+function resolvePath(base: borrow String, relative: borrow String) -> String {
+    var whole = relative
+    if !relative.startsWith("/") { whole = base + "/" + relative }
+    var parts: [String] = []
+    for part in whole.split("/") {
+        match part {
+            "" -> {}
+            "." -> {}
+            ".." -> { parts = withoutLast(parts) }
+            else -> parts.append(part)
+        }
+    }
+    var text = ""
+    for part in parts { text += "/\(part)" }
+    return text
+}
+
+function withoutLast(parts: borrow [String]) -> [String] {
+    var kept: [String] = []
+    let keep = parts.count - 1
+    for index in 0..keep { kept.append(parts[index]) }
+    return kept
+}
+
+// Why hexadecimal text is not a number.
+enum HexFailure {
+    Empty
+    NotHex
+}
+
+// Hexadecimal text, with or without `0x`.
+function parseHex(text: borrow String) -> Result<Number, HexFailure> {
+    var digits = text
+    if text.startsWith("0x") { digits = text.substring(2, text.count) }
+    if digits.count == 0 { return .Error(HexFailure.Empty) }
+    var value: Number = 0
+    for byte in digits.utf8() {
+        match hexDigitValue(byte) {
+            Some(digit) -> value = value * 16 + digit
+            None -> return .Error(HexFailure.NotHex)
+        }
+    }
+    return .Ok(value)
+}
+
+// `value` as `digits` lowercase hexadecimal digits.
+function hexText(value: U64, digits: Number) -> String {
+    let alphabet = "0123456789abcdef"
+    var text = ""
+    for place in 0..digits {
+        let shift = (digits - 1 - place) * 4
+        let nibble = Number((value >> U64(shift)) & U64(15))
+        text += alphabet.substring(nibble, nibble + 1)
+    }
+    return text
+}
+
+// The machine this program runs on. `O_DIRECTORY` and `O_DIRECT` are
+// different numbers on aarch64 and x86-64.
+enum Machine {
+    Arm64
+    X86
+
+    function directoryFlag(borrow self) -> OpenFlags {
+        return match self {
+            Arm64 -> OpenFlags(0x4000)
+            X86 -> OpenFlags(0x10000)
+        }
+    }
+
+    function directFlag(borrow self) -> OpenFlags {
+        return match self {
+            Arm64 -> OpenFlags(0x10000)
+            X86 -> OpenFlags(0x4000)
+        }
+    }
+}
+
+// The machine, read from `System.info`, whose `MachineInfo` begins with the
+// architecture, `Arm64` 0. It is asked once and kept with the library.
+function currentMachine() -> Machine {
+    match deviceLibrary.machine {
+        Some(machine) -> return machine
+        None -> {}
+    }
+    let blockBytes = zeroedBlock(count: 64, alignment: 16)
+    let out = Buffer { address: blockBytes.pointer(), length: 64 }
+    var machine: Machine = .X86
+    match systemInfo(.Machine, 1, out) {
+        Ok(size) -> {
+            if size >= 4 && heapLoad<U32>(out.address, 0) == 0 { machine = .Arm64 }
+        }
+        Error(failed) -> log warn(
+            "the machine is not known; taking x86-64's open flags",
+            error: errorName(failed)
+        )
+    }
+    deviceLibrary.machine = .Some(machine)
+    return machine
+}

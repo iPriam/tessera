@@ -1,0 +1,206 @@
+import Foundation
+import Heap
+
+// One attempt at a pending endpoint operation. `ShouldWait` leaves it
+// pending; anything else completes it.
+
+function endpointStep(index: Number) {
+    match library.pending[index].work {
+        Accept(accept) -> acceptStep(index, accept)
+        Connect -> connectStep(index)
+        Send(transfer) -> endpointTransferStep(index, .Send, move transfer)
+        Receive(transfer) -> endpointTransferStep(index, .Receive, move transfer)
+        // Only an endpoint's operations come here.
+        WaitAsync, Timer, Wake, Stream, Call, Lock, Source, Transfer -> {}
+    }
+}
+
+function endpointTransferStep(index: Number, direction: TransferDirection, transfer: EndpointWork) {
+    match transfer.form {
+        Batched -> manyStep(index, direction, transfer)
+        Plain, Addressed -> transferStep(index, direction, move transfer)
+    }
+}
+
+function acceptStep(index: Number, accept: borrow AcceptWork) {
+    let listener = library.pending[index].object
+    let peer = match accept.peer {
+        Some(wanted) -> wanted
+        None -> nullPointer()
+    }
+    let listening = match backingOf(listener) {
+        Ok(value) -> value
+        Error(failed) -> {
+            pendingFinish(index, .Error(failed), U64(0), U64(0), U64(0))
+            return
+        }
+    }
+    let accepted = kernelEndpointAccept(listening, peer)
+    let backing = match accepted {
+        Ok(value) -> value
+        Error(failed) -> {
+            if failed.code != .ShouldWait {
+                pendingFinish(index, .Error(failed), U64(0), U64(0), U64(0))
+            }
+            return
+        }
+    }
+    let heard = match endpointPending(index) {
+        Some(value) -> value
+        None -> {
+            kernelRelease(backing)
+            return
+        }
+    }
+    var accepted = endpointFresh(heard.family, heard.protocol, .Connected)
+    accepted.timestamps = heard.timestamps
+    let object = objectCreate(.Endpoint(move accepted), backing)
+    let handle = match handleMint(object, Rights.processDefault) {
+        Ok(value) -> value
+        Error(failed) -> {
+            objectDestroy(object)
+            pendingFinish(index, .Error(failed), U64(0), U64(0), U64(0))
+            return
+        }
+    }
+    pendingFinish(index, .Ok, handle.raw, U64(0), U64(0))
+}
+
+// Connecting ends when the endpoint turns writable; the kernel says how.
+function connectStep(index: Number) {
+    let object = library.pending[index].object
+    let backing = match backingOf(object) {
+        Ok(value) -> value
+        Error(failed) -> {
+            pendingFinish(index, .Error(failed), U64(0), U64(0), U64(0))
+            return
+        }
+    }
+    if (kernelReady(backing, Ready.writable) & (Ready.writable | Ready.error | Ready.hangUp)) == 0 {
+        return
+    }
+    let result = kernelConnectResult(backing)
+    if succeeded(result) {
+        endpointSetState(object, .Connected)
+        pendingFinish(index, .Ok, U64(0), U64(0), U64(0))
+        return
+    }
+    endpointSetState(object, .Unbound)
+    pendingFinish(index, result, U64(0), U64(0), U64(0))
+}
+
+// The buffers past the bytes already moved.
+function transferStep(index: Number, direction: TransferDirection, transfer: EndpointWork) {
+    let object = library.pending[index].object
+    var total = U64(0)
+    for at in 0..transfer.buffers.count {
+        total += transfer.buffers[at].length
+    }
+    let endpoint = match endpointPending(index) {
+        Some(value) -> value
+        None -> return
+    }
+    let flags = transfer.flags
+    let address = match transfer.address {
+        Some(block) -> block
+        None -> nullPointer()
+    }
+    let backing = match backingOf(object) {
+        Ok(value) -> value
+        Error(failed) -> {
+            pendingFinish(index, .Error(failed), transfer.moved, U64(0), U64(0))
+            return
+        }
+    }
+    let tried = kernelEndpointTransfer(
+        backing,
+        endpoint.family,
+        direction,
+        transfer.buffers,
+        transfer.moved,
+        address,
+        direction == .Send && SendFlags(flags).has(SendFlags.more),
+        direction == .Receive && ReceiveFlags(flags).has(ReceiveFlags.peek),
+        endpoint.timestamps
+    )
+    let outcome = match tried {
+        Ok(value) -> value
+        Error(failed) -> {
+            if failed.code != .ShouldWait {
+                pendingFinish(index, .Error(failed), transfer.moved, U64(0), U64(0))
+            }
+            return
+        }
+    }
+    let moved = outcome.moved
+    endpointMoved(object, direction, moved)
+    if direction == .Send {
+        pendingFinish(index, .Ok, moved, U64(0), U64(0))
+        return
+    }
+    match transfer.source {
+        Some(wanted) -> {
+            if !isNull(address) { copyBytes(wanted, address, 32) }
+        }
+        None -> {}
+    }
+    let done = transfer.moved + moved
+    if ReceiveFlags(flags).has(ReceiveFlags.waitAll) && endpointStream(endpoint) && moved > U64(
+        0
+    ) && done < total {
+        var advanced = move transfer
+        advanced.moved = done
+        library.pending[index].work = match direction {
+            Send -> .Send(move advanced)
+            Receive -> .Receive(move advanced)
+        }
+        return
+    }
+    pendingFinish(
+        index,
+        .Ok,
+        done,
+        outcome.stamp,
+        outcome.truncated ? U64(DatagramFlags.truncated.raw) : U64(0)
+    )
+}
+
+// The caller's `Datagram`s, as many as go at once.
+function manyStep(index: Number, direction: TransferDirection, transfer: borrow EndpointWork) {
+    let object = library.pending[index].object
+    let messages = transfer.buffers[0].address
+    let endpoint = match endpointPending(index) {
+        Some(value) -> value
+        None -> return
+    }
+    let connected = endpoint.state == .Connected
+    let backing = match backingOf(object) {
+        Ok(value) -> value
+        Error(failed) -> {
+            pendingFinish(index, .Error(failed), U64(0), U64(0), U64(0))
+            return
+        }
+    }
+    let tried = kernelEndpointTransferMany(
+        backing,
+        endpoint.family,
+        direction,
+        messages,
+        transfer.count,
+        connected
+    )
+    let done = match tried {
+        Ok(value) -> value
+        Error(failed) -> {
+            if failed.code != .ShouldWait {
+                pendingFinish(index, .Error(failed), U64(0), U64(0), U64(0))
+            }
+            return
+        }
+    }
+    for at in 0..done {
+        let moved = heapLoad<U64>(heapOffset(messages, at * 56), 48)
+        endpointMoved(object, direction, moved)
+    }
+    pendingFinish(index, .Ok, U64(done), U64(0), U64(0))
+}

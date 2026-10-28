@@ -1,0 +1,17 @@
+//! Disk Utility's entry point: runs the volumes view as the application's only window.
+import LibTessera
+import KiraUI
+import TesseraUI
+
+/// Runs Disk Utility on Tessera's display, listing the volumes in /Volumes until the person closes it.
+@Main
+function main() {
+    RunTesseraApplication(
+        "Disk Utility",
+        {
+            in
+            return VolumesView(volumes = mountedVolumes())
+        },
+        ApplicationOptions { watches: [.Volumes] }
+    )
+}

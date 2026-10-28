@@ -1,0 +1,57 @@
+//! Notifications on Tessera, as UserNotifications posts them on Apple's
+//! platforms (roadmap/11-adaptive-desktop.md, "Notifications"): an application
+//! says what it has to say, and whichever platform is running shows it as a
+//! banner. KiraUI hands it to AppKit, which sends it to the platform over the
+//! link PID 1 made between them, as it sends the menus.
+
+import Foundation
+import KiraUI
+import AppKit
+
+/// What a notification says, as `UNMutableNotificationContent` holds it.
+public struct NotificationContent {
+    /// The notification's title.
+    var title: String = ""
+    /// The notification's body text.
+    var body: String = ""
+}
+
+/// Posts `content` to the platform, as `UNUserNotificationCenter.add(_:)` does.
+/// Posted before the platform is linked, it waits for the link.
+public function addNotificationVia(bridge: borrow BridgeHandle, content: borrow NotificationContent) {
+    match postNotification(copy bridge, content.title, content.body) {
+        Ok -> {}
+        Error(failure) -> log warn("a notification could not be posted", failure: failure)
+    }
+}
+
+namespace NotificationBridgeSlot {
+    let key: PersistentStateKey = PersistentStateKey { name: "tesseraui.notification.bridge" }
+}
+
+/// The bridge notifications go through, held in the ambient state so an
+/// application's views post without being handed it.
+struct NotificationBridge {
+    var handle: BridgeHandle = makeBridgeHandle()
+}
+
+/// Makes `bridge` the one `addNotification(_:)` posts through.
+function useNotificationBridge(bridge: BridgeHandle) {
+    ambientStatePut(
+        NotificationBridgeSlot.key,
+        nativeUserData(nativeState(NotificationBridge { handle: bridge }))
+    )
+}
+
+/// The bridge this process runs with, for a view that has to reach the platform
+/// and is not handed it. A process that has not started `host` has a bridge with no links.
+public function ambientBridge() -> BridgeHandle {
+    if !ambientStateHas(NotificationBridgeSlot.key) { return makeBridgeHandle() }
+    let held = nativeRecover<NotificationBridge>(ambientStateGet(NotificationBridgeSlot.key))
+    return copy held.handle
+}
+
+/// Posts `content` to the platform through the bridge this process runs with.
+public function addNotification(content: borrow NotificationContent) {
+    addNotificationVia(ambientBridge(), content)
+}

@@ -1,0 +1,333 @@
+import Foundation
+import Heap
+import LibTessera
+
+// Asking the Volume service, over the channel the broker hands back for
+// `tessera.volume`. No LibTessera call reaches the service yet, so its wire
+// is decoded here, once, into the types below (roadmap/16-libtessera.md
+// §25.4).
+//
+// The wire is the Devices service's: a 32-byte header, `op` @0, `code` @4
+// (an `ErrorCode` value), `a` @8, then the operation's bytes. The service
+// answers once and closes the channel, so every request is a connection of
+// its own, except `Watch`, which keeps it open (`Activity.kira`).
+//
+// `List` answers `a` records of 160 bytes: the registry entry @0, size @8,
+// logical block @16, DeviceKit `BlockInfo.flags` @20, content @24, partition
+// @28, the node's name @32 and the mount point @96, both NUL-padded to 64
+// bytes. `Mount`, `Unmount` and `Eject` carry the entry in `a`; `Mount`
+// answers the mount point after the header.
+
+enum VolumeOperation: UN32 {
+    List = 1
+    Mount = 2
+    Unmount = 3
+    Eject = 4
+    Watch = 5
+}
+
+// What a disk or partition holds, as the service names it.
+@Open enum VolumeContent: UN32 {
+    Gpt = 1
+    Mbr = 2
+    Ext4 = 3
+    Erofs = 4
+    Squashfs = 5
+    Fat = 6
+    Empty = 7
+    Btrfs = 8
+
+    // The file system's name, as `diskutil info` prints a personality.
+    function name(borrow self) -> String {
+        match self {
+            Gpt -> return "GPT"
+            Mbr -> return "MBR"
+            Ext4 -> return "ext4"
+            Erofs -> return "EROFS"
+            Squashfs -> return "SquashFS"
+            Fat -> return "FAT"
+            Empty -> return "empty"
+            Btrfs -> return "btrfs"
+            else -> return "unknown"
+        }
+    }
+
+    // What it is in the words of macOS's TYPE column.
+    function typeName(borrow self) -> String? {
+        match self {
+            Gpt -> return .Some("GUID_partition_scheme")
+            Mbr -> return .Some("FDisk_partition_scheme")
+            Empty -> return .None
+            else -> return .Some(self.name())
+        }
+    }
+}
+
+namespace VolumeWire {
+    let headerBytes: Number = 32
+    let recordBytes: Number = 160
+    let textBytes: Number = 64
+    // Room for every volume a machine has, and for the mount point `Mount`
+    // answers.
+    let answerBytes: Number = 65536
+    let alignment: Number = 16
+    // Thirty seconds: the service scans every disk before it answers anyone,
+    // which an emulated machine can take a while to do.
+    let answerWait: Number = 30000000000
+    let readyKey: Number = 1
+}
+
+// The wire's 32-byte header.
+@FFI.Struct { layout: c }
+struct WireHeader {
+    var operation: U32
+    var code: U32
+    var a: U64
+    var b: U64
+    var c: U64
+}
+
+// The head of a `List` record; the node's name and the mount point follow,
+// NUL-padded.
+@FFI.Struct { layout: c }
+struct VolumeRecordHead {
+    var entry: U64
+    var size: U64
+    var logicalBlock: U32
+    var flags: U32
+    var content: U32
+    var partition: U32
+}
+
+namespace RecordField {
+    let name: Number = 32
+    let mountPoint: Number = 96
+}
+
+namespace BlockFlag {
+    // DeviceKit's `BlockInfo.flags`.
+    let readOnly: UN32 = 1
+    let removable: UN32 = 4
+}
+
+struct Volume {
+    let entry: Number
+    let size: Number
+    let content: VolumeContent
+    let readOnly: Bool
+    let removable: Bool
+    let partition: Bool
+    // The device node's name, `vda1`.
+    let name: String
+    let mountPoint: String?
+
+    // The name a volume is reported by: where it is mounted, else its node's.
+    function shownName(borrow self) -> String {
+        match self.mountPoint {
+            Some(path) -> return lastPart(path)
+            None -> return self.name
+        }
+    }
+
+    // Whether `name` means this volume: its node's name, with or without
+    // `/dev/`, its mount point, or the mount point's last part.
+    function isNamed(borrow self, name: borrow String) -> Bool {
+        if self.name == name || "/dev/\(self.name)" == name { return true }
+        match self.mountPoint {
+            Some(path) -> return path == name || lastPart(path) == name
+            None -> return false
+        }
+    }
+}
+
+// The last part of a path: `scratch` for `/Volumes/scratch`.
+function lastPart(path: borrow String) -> String {
+    let parts = path.split("/")
+    return parts.count > 0 ? parts[parts.count - 1] : path
+}
+
+// A NUL-padded field as a string, cut at its first NUL.
+function paddedText(base: RawPtr, offset: Number, field: Number) -> String {
+    for length in 0..field {
+        if heapLoad<U8>(base, offset + length) == UN8(0) {
+            return stringFromCBytes(heapOffset(base, offset), length)
+        }
+    }
+    return stringFromCBytes(heapOffset(base, offset), field)
+}
+
+// One `List` record.
+function volumeAt(record: RawPtr) -> Volume {
+    let head: VolumeRecordHead = heapLoad(record)
+    let mountPoint = paddedText(record, RecordField.mountPoint, VolumeWire.textBytes)
+    return Volume {
+        entry: head.entry,
+        size: head.size,
+        content: fromCode<VolumeContent>(head.content),
+        readOnly: (head.flags & BlockFlag.readOnly) != UN32(0),
+        removable: (head.flags & BlockFlag.removable) != UN32(0),
+        partition: head.partition != UN32(0),
+        name: paddedText(record, RecordField.name, VolumeWire.textBytes),
+        mountPoint: mountPoint.isEmpty() ? .None : .Some(mountPoint),
+    }
+}
+
+// One answer from the service: what it refused, or the bytes it sent.
+struct Answer {
+    let block: ByteBlock
+    let bytes: Number
+
+    function header(borrow self) -> WireHeader { return heapLoad(self.block.pointer()) }
+
+    function errorCode(borrow self) -> ErrorCode { return errorCodeFrom(self.header().code) }
+
+    function a(borrow self) -> Number { return self.header().a }
+
+    // The `List` records, as many as were said and as the message holds.
+    function volumes(borrow self) -> [Volume] {
+        let held = trunc((self.bytes - VolumeWire.headerBytes) / VolumeWire.recordBytes)
+        let said = self.a()
+        var volumes: [Volume] = []
+        for index in 0.. (said < held ? said : held) {
+            volumes.append(
+                volumeAt(
+                    heapOffset(
+                        self.block.pointer(),
+                        VolumeWire.headerBytes + index * VolumeWire.recordBytes
+                    )
+                )
+            )
+        }
+        return volumes
+    }
+
+    // The text after the header: the mount point `Mount` answers.
+    function text(borrow self) -> String {
+        return paddedText(
+            self.block.pointer(),
+            VolumeWire.headerBytes,
+            self.bytes - VolumeWire.headerBytes
+        )
+    }
+}
+
+// Why the service did not do what was asked.
+enum VolumeFailure {
+    // It could not be reached, or its answer could not be read.
+    Unreachable(TesseraError)
+    // It answered, and refused.
+    Refused(ErrorCode)
+}
+
+function closeChannel(channel: Handle) {
+    match handleClose(channel) {
+        Ok -> {}
+        Error(failed) -> log warn("cannot close the Volume service's channel", failed)
+    }
+}
+
+// A connection to the Volume service, and the port its answers come on.
+struct VolumeService {
+    let port: Handle
+
+    // Sends `operation` on a new channel and answers the channel.
+    function send(
+        borrow self,
+        operation: borrow VolumeOperation,
+        a: Number
+    ) -> Result<Handle, TesseraError> {
+        let channel = match serviceConnect("tessera.volume") {
+            Ok(value) -> value
+            Error(failed) -> return .Error(failed)
+        }
+        let request = zeroedBlock(count: VolumeWire.headerBytes, alignment: VolumeWire.alignment)
+        heapStore(
+            request.pointer(),
+            WireHeader {
+                operation: code(operation),
+                code: UN32(0),
+                a: a,
+                b: UNumber(0),
+                c: UNumber(0)
+            }
+        )
+        let none: [Handle] = []
+        match channelWrite(
+            channel,
+            Buffer { address: request.pointer(), length: VolumeWire.headerBytes },
+            none
+        ) {
+            Ok -> return .Ok(channel)
+            Error(failed) -> {
+                closeChannel(channel)
+                return .Error(failed)
+            }
+        }
+    }
+
+    // Waits until `channel` has something to read or its peer has gone.
+    function awaitReadable(
+        borrow self,
+        channel: Handle,
+        deadline: Number
+    ) -> Result<Void, TesseraError> {
+        let ready = Signals.readable | Signals.peerClosed
+        match objectWaitAsync(channel, ready, .Once, self.port, VolumeWire.readyKey) {
+            Ok -> {}
+            Error(failed) -> return .Error(failed)
+        }
+        match portWait(self.port, 1, deadline) {
+            Ok -> return .Ok
+            Error(failed) -> return .Error(failed)
+        }
+    }
+
+    // One request and its answer.
+    function ask(
+        borrow self,
+        operation: borrow VolumeOperation,
+        a: Number
+    ) -> Result<Answer, VolumeFailure> {
+        let channel = match self.send(operation, a) {
+            Ok(value) -> value
+            Error(failed) -> return .Error(.Unreachable(failed))
+        }
+        let read = self.answerOn(channel)
+        closeChannel(channel)
+        let answer = match move read {
+            Ok(value) -> move value
+            Error(failed) -> return .Error(.Unreachable(failed))
+        }
+        if answer.bytes < VolumeWire.headerBytes { return .Error(.Refused(.InvalidArgument)) }
+        if answer.errorCode() != .Ok { return .Error(.Refused(answer.errorCode())) }
+        return .Ok(move answer)
+    }
+
+    // The one message the service answers on `channel`.
+    function answerOn(borrow self, channel: Handle) -> Result<Answer, TesseraError> {
+        let now = match timeRead(.Monotonic) {
+            Ok(value) -> value
+            Error(failed) -> return .Error(failed)
+        }
+        match self.awaitReadable(channel, now + VolumeWire.answerWait) {
+            Ok -> {}
+            Error(failed) -> return .Error(failed)
+        }
+        let block = zeroedBlock(count: VolumeWire.answerBytes, alignment: VolumeWire.alignment)
+        match channelRead(
+            channel,
+            Buffer { address: block.pointer(), length: VolumeWire.answerBytes },
+            UN32(0)
+        ) {
+            Ok(received) -> return .Ok(Answer { block: move block, bytes: received.bytes })
+            Error(failed) -> return .Error(failed)
+        }
+    }
+
+    function list(borrow self) -> Result<[Volume], VolumeFailure> {
+        match self.ask(.List, 0) {
+            Ok(answer) -> return .Ok(answer.volumes())
+            Error(failed) -> return .Error(failed)
+        }
+    }
+}

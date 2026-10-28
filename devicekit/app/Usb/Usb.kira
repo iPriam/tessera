@@ -1,0 +1,300 @@
+import Foundation
+import Heap
+import LibTessera
+
+// Usb (17 §17.2) over usbfs.
+//
+// The connection's descriptor is the device's `/dev/bus/usb/BBB/DDD` node.
+// Reading it from the start answers the device descriptor and every
+// configuration's; the rest are usbdevfs ioctls. A transfer runs to its end
+// or its timeout during `submit`, and its `Transfer` completion is posted at
+// once with the byte count, as a synchronous `IOUSBHostPipe` call would
+// return it.
+
+namespace Usbfs {
+    // `USBDEVFS_CONTROL`, `USBDEVFS_BULK`, `USBDEVFS_SETINTERFACE`,
+    // `USBDEVFS_CLAIMINTERFACE`, `USBDEVFS_RELEASEINTERFACE`, `USBDEVFS_RESET`,
+    // `USBDEVFS_CLEAR_HALT`.
+    let control: U64 = U64(0xC0185500) // _IOWR(0x55, 0, 24)
+    let bulk: U64 = U64(0xC0185502) // _IOWR(0x55, 2, 24)
+    let setInterface: U64 = U64(0x80085504) // _IOR(0x55, 4, 8)
+    let claim: U64 = U64(0x8004550F) // _IOR(0x55, 15, 4)
+    let release: U64 = U64(0x80045510) // _IOR(0x55, 16, 4)
+    let reset: U64 = U64(0x5514) // _IO(0x55, 20)
+    let clearHalt: U64 = U64(0x80045515) // _IOR(0x55, 21, 4)
+    // `USBDEVFS_DISCONNECT_CLAIM`, with `struct usbdevfs_disconnect_claim`:
+    // interface @0, flags @4, a driver name @8 (256 bytes). `USBDEVFS_IOCTL`,
+    // with `struct usbdevfs_ioctl`: interface @0, the ioctl @4, data @8, which
+    // carries `USBDEVFS_CONNECT` to give an interface back to the kernel.
+    let disconnectClaim: U64 = U64(0x8108551B) // _IOR(0x55, 27, 264)
+    let disconnectClaimBytes: Number = 264
+    let interfaceIoctl: U64 = U64(0xC0105512) // _IOWR(0x55, 18, 16)
+    let connect: U64 = U64(0x5517) // _IO(0x55, 23)
+    // `USBDEVFS_DISCONNECT_CLAIM_EXCEPT_DRIVER`, with "usbfs" as the driver:
+    // another program's claim is not a kernel driver's.
+    let exceptDriver: U32 = U32(2)
+    let ownDriver: String = "usbfs"
+    // The interface numbers a configuration may use.
+    let interfaces: Number = 64
+    // A device descriptor's length.
+    let deviceDescriptor: Number = 18
+}
+
+namespace UsbTimeout {
+    // usbfs counts milliseconds; no timeout is five seconds.
+    let standard: U32 = U32(5000)
+    let longest: Number = 0xFFFFFFFF
+}
+
+// What a Usb connection keeps besides its object: the interfaces it
+// claimed, released when it closes, and those of them a kernel driver was
+// detached from, which it is given back as they are released.
+struct UsbConnection {
+    var object: Number
+    var claimed: [Number]
+    var detached: [Number]
+}
+
+// A Usb connection's record, made the first time it claims.
+function usbOf(object: Number) -> Number {
+    for (index, usb) in deviceLibrary.usbs.enumerated() {
+        if usb.object == object { return index }
+    }
+    deviceLibrary.usbs.append(UsbConnection { object: object, claimed: [], detached: [] })
+    return deviceLibrary.usbs.count - 1
+}
+
+function without(items: borrow [Number], value: Number) -> [Number] {
+    var kept: [Number] = []
+    for item in items {
+        if item != value { kept.append(item) }
+    }
+    return kept
+}
+
+function checkInterface(interface: Number) -> Result<Void, TesseraError> {
+    if interface < 0 || interface >= Usbfs.interfaces { return .Error(failure(.OutOfRange)) }
+    return .Ok
+}
+
+public function usbDescriptors(usb: Ref, out: borrow Buffer) -> Result<Number, TesseraError> {
+    let object = try resolveConnection(usb, .Usb, RefRights.read)
+    try requireRoom(out, Usbfs.deviceDescriptor)
+    let device = try deviceOf(object)
+    return device.readAt(out.address, out.length, 0)
+}
+
+// Whether the manager said this connection's driver manifest may detach a
+// kernel driver (17 §18.2 `detachKernel`).
+function detachAllowed(object: Number) -> Bool {
+    return match connectionOf(object) {
+        Some(index) -> deviceLibrary.connections[index].detachAllowed
+        None -> false
+    }
+}
+
+public function usbClaimInterface(usb: Ref, interface: Number) -> Result<Void, TesseraError> {
+    let object = try resolveConnection(usb, .Usb, RefRights.write)
+    try checkInterface(interface)
+    let device = try deviceOf(object)
+    let index = usbOf(object)
+    match device.controlWord(Usbfs.claim, U32(interface)) {
+        Ok(claimed) -> {}
+        Error(failed) -> {
+            match errnoOf(failed) {
+                // A kernel driver has it.
+                Busy -> {
+                    if !detachAllowed(object) { return .Error(failure(.DeviceBusy)) }
+                    try detachClaim(device, interface)
+                    deviceLibrary.usbs[index].detached.append(interface)
+                }
+                else -> return .Error(failed)
+            }
+        }
+    }
+    deviceLibrary.usbs[index].claimed.append(interface)
+    return .Ok
+}
+
+// Takes `interface` from the kernel driver that has it and claims it, in
+// one call, so nothing else can take it in between. Another program's usbfs
+// claim is not a kernel driver and is left alone: that stays `DeviceBusy`.
+function detachClaim(device: borrow Descriptor, interface: Number) -> Result<Void, TesseraError> {
+    let blockBytes = zeroedBlock(count: Usbfs.disconnectClaimBytes, alignment: 16)
+    let block = blockBytes.pointer()
+    heapStore<U32>(block, 0, U32(interface))
+    heapStore<U32>(block, 4, Usbfs.exceptDriver)
+    copyBytes(heapOffset(block, 8), Usbfs.ownDriver.data, Usbfs.ownDriver.count)
+    let claimed = try device.control(Usbfs.disconnectClaim, block)
+    return .Ok
+}
+
+// Gives `interface` back to the kernel, which binds whichever of its drivers
+// matches it.
+function reattach(device: borrow Descriptor, interface: Number) {
+    let blockBytes = zeroedBlock(count: 16, alignment: 16)
+    let block = blockBytes.pointer()
+    heapStore<U32>(block, 0, U32(interface))
+    heapStore<U32>(block, 4, U32(Usbfs.connect))
+    match device.control(Usbfs.interfaceIoctl, block) {
+        Ok(given) -> {}
+        Error(failed) -> log warn(
+            "a USB interface was not given back to the kernel",
+            interface,
+            error: errorName(failed)
+        )
+    }
+}
+
+// Releases a claimed interface, and gives it back to the kernel driver it
+// was taken from.
+function releaseClaim(
+    device: borrow Descriptor,
+    index: Number,
+    interface: Number
+) -> Result<Void, TesseraError> {
+    deviceLibrary.usbs[index].claimed = without(deviceLibrary.usbs[index].claimed, interface)
+    let released = device.controlWord(Usbfs.release, U32(interface))
+    if arrayContains(deviceLibrary.usbs[index].detached, interface) {
+        deviceLibrary.usbs[index].detached = without(deviceLibrary.usbs[index].detached, interface)
+        reattach(device, interface)
+    }
+    return match released {
+        Ok(value) -> .Ok
+        Error(failed) -> .Error(failed)
+    }
+}
+
+public function usbReleaseInterface(usb: Ref, interface: Number) -> Result<Void, TesseraError> {
+    let object = try resolveConnection(usb, .Usb, RefRights.write)
+    try checkInterface(interface)
+    let device = try deviceOf(object)
+    return releaseClaim(device, usbOf(object), interface)
+}
+
+// `struct usbdevfs_setinterface`: the interface @0, the alternate @4.
+public function usbSetAlternate(
+    usb: Ref,
+    interface: Number,
+    alternate: Number
+) -> Result<Void, TesseraError> {
+    let object = try resolveConnection(usb, .Usb, RefRights.write)
+    try checkInterface(interface)
+    let device = try deviceOf(object)
+    let blockBytes = zeroedBlock(count: 8, alignment: 16)
+    let block = blockBytes.pointer()
+    heapStore<U32>(block, 0, U32(interface))
+    heapStore<U32>(block, 4, U32(alternate))
+    let set = try device.control(Usbfs.setInterface, block)
+    return .Ok
+}
+
+public function usbClearHalt(usb: Ref, endpoint: UN32) -> Result<Void, TesseraError> {
+    let object = try resolveConnection(usb, .Usb, RefRights.write)
+    let device = try deviceOf(object)
+    let cleared = try device.controlWord(Usbfs.clearHalt, endpoint)
+    return .Ok
+}
+
+public function usbReset(usb: Ref) -> Result<Void, TesseraError> {
+    let object = try resolveConnection(usb, .Usb, RefRights.manage)
+    let device = try deviceOf(object)
+    let reset = try device.controlValue(Usbfs.reset, 0)
+    return .Ok
+}
+
+// A timeout in nanoseconds as usbfs's milliseconds.
+function milliseconds(timeout: U64) -> U32 {
+    if timeout == U64(0) { return UsbTimeout.standard }
+    let rounded = ceil(Number(timeout) / Time.nanosecondsPerMillisecond)
+    if rounded > UsbTimeout.longest { return U32(UsbTimeout.longest) }
+    return U32(rounded)
+}
+
+// `struct usbdevfs_ctrltransfer`: the setup packet's eight bytes
+// (`bRequestType`, `bRequest`, `wValue`, `wIndex`, `wLength`, in that
+// order) @0, the timeout @8, the data @16.
+function controlTransfer(
+    device: borrow Descriptor,
+    transfer: borrow UsbTransfer
+) -> Result<Number, TesseraError> {
+    let length = Number(transfer.setup >> U64(48))
+    if length > 0 { try requireRoom(transfer.buffer, length) }
+    let blockBytes = zeroedBlock(count: 24, alignment: 16)
+    let block = blockBytes.pointer()
+    heapStore<U64>(block, 0, transfer.setup)
+    heapStore<U32>(block, 8, milliseconds(transfer.timeout))
+    heapStore<RawPtr>(block, 16, transfer.buffer.address)
+    return device.control(Usbfs.control, block)
+}
+
+// `struct usbdevfs_bulktransfer`: the endpoint @0, the length @4, the
+// timeout @8, the data @16. usbfs runs interrupt endpoints through it too.
+function bulkTransfer(
+    device: borrow Descriptor,
+    transfer: borrow UsbTransfer
+) -> Result<Number, TesseraError> {
+    if transfer.buffer.length > UsbTimeout.longest { return .Error(failure(.OutOfRange)) }
+    let blockBytes = zeroedBlock(count: 24, alignment: 16)
+    let block = blockBytes.pointer()
+    heapStore<U32>(block, 0, transfer.endpoint)
+    heapStore<U32>(block, 4, U32(transfer.buffer.length))
+    heapStore<U32>(block, 8, milliseconds(transfer.timeout))
+    heapStore<RawPtr>(block, 16, transfer.buffer.address)
+    return device.control(Usbfs.bulk, block)
+}
+
+// Runs `transfer` and posts its `Transfer` completion with the bytes moved.
+public function usbSubmit(
+    usb: Ref,
+    transfer: borrow UsbTransfer,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    let object = try resolveConnection(usb, .Usb, RefRights.write)
+    let device = try deviceOf(object)
+    let moved = match transfer.transferType {
+        Control -> controlTransfer(device, transfer)
+        Bulk -> bulkTransfer(device, transfer)
+        Interrupt -> bulkTransfer(device, transfer)
+        Isochronous -> return .Error(failure(.Unsupported))
+    }
+    let reply = Reply { port: port, key: key }
+    return match moved {
+        Ok(bytes) -> reply.post(.Ok(Answer { result0: U64(bytes), result1: U64(0) }), .Transfer)
+        Error(failed) -> reply.post(.Error(failed), .Transfer)
+    }
+}
+
+// Lets go of every interface the connection still holds.
+function usbConnectionRelease(object: Number) {
+    var index: Number? = .None
+    for (at, usb) in deviceLibrary.usbs.enumerated() {
+        if usb.object == object { index = .Some(at) }
+    }
+    // No interface record remains on a repeated release.
+    let record = match index {
+        Some(value) -> value
+        None -> return
+    }
+    match deviceLibrary.objects[object].device {
+        Some(device) -> {
+            for interface in deviceLibrary.usbs[record].claimed {
+                match releaseClaim(device, record, interface) {
+                    Ok -> {}
+                    Error(failed) -> log warn(
+                        "a USB interface was not released",
+                        interface,
+                        error: errorName(failed)
+                    )
+                }
+            }
+        }
+        None -> {}
+    }
+    var kept: [UsbConnection] = []
+    for usb in deviceLibrary.usbs {
+        if usb.object != object { kept.append(usb) }
+    }
+    deviceLibrary.usbs = kept
+}

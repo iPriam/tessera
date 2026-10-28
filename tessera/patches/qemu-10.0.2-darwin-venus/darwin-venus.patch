@@ -1,0 +1,433 @@
+Build and run QEMU's venus device on a Darwin host, and let it present.
+
+QEMU treats venus as part of its OpenGL story, and on macOS there is no
+OpenGL story to be part of: libepoxy there exposes no EGL, so QEMU decides it
+has no OpenGL, and every gate that says "virgl and opengl" closes. venus needs
+none of it — it forwards Vulkan to a host driver and hands back buffers, and
+never makes a GL context.
+
+Building it:
+
+- the virtio-gpu-gl device and its PCI variant are built when virglrenderer is
+  present, without also demanding OpenGL, on Darwin;
+- the renderer's EGL references — a display callback handed to virglrenderer
+  when a GL display exists — compile out with CONFIG_OPENGL;
+- realize no longer refuses a venus device for want of a GL-capable display,
+  which would make it unusable on macOS and refuse a headless run everywhere;
+- and a venus device without a GL display initializes the Vulkan renderer
+  alone. On a host with OpenGL that is asked of `display_opengl`, which
+  system/system.h declares. Asking virglrenderer for the GL renderer as well ends in an assertion
+  the moment it calls back to create a context.
+
+Showing what it renders:
+
+- the device stops telling the console it needs a GL context. That flag is what
+  the GL renderer needs, not what virgl means: a venus device on a host without
+  OpenGL renders through Vulkan and presents a mappable blob, and a display
+  backend shows that as an ordinary surface. Advertising the requirement
+  refuses, before anything is drawn, a device that would have worked.
+- a blob scanout no longer requires a dmabuf. A dmabuf is how a Linux host
+  shares the rendered image with the display backend; a host that has none can
+  still show it, because the resource is mappable and its pixels are in memory
+  this process can address. That is the same path the 2D device already takes
+  for a blob — reached here because the renderer's memory arrives as shared
+  memory rather than as a descriptor, which is what a host whose Vulkan driver
+  imports pointers rather than exporting them gives back. A blob is shown
+  through its mapping whenever the console has no GL, since only a GL console
+  imports a dmabuf; one the guest mapped is read through that mapping, and a
+  scanout showing it is disabled before the mapping goes.
+- 2D resources, which the renderer cannot make without its GL renderer, are
+  made, filled and shown by the device as the 2D device does, so a guest's
+  dumb buffers (the boot splash) reach the display. They are answered at
+  once, fence and all: without its GL renderer virglrenderer signals no fence
+  on context 0. A virgl SET_SCANOUT that turns a scanout off also forgets
+  the surface a 2D resource was shown in, which the console has just freed.
+  Otherwise the next 2D SET_SCANOUT reads freed memory and crashes the
+  emulator, which the restart boot did when it killed the display server and
+  started another.
+
+Also needs --disable-pvg at configure time on macOS 27, where Apple's own
+ParavirtualizedGraphics device does not compile: PGTask_t is obsoleted there.
+That is unrelated to this stack and is a configure flag rather than a patch.
+
+--- a/hw/display/meson.build	2025-05-29 00:05:46
++++ b/hw/display/meson.build	2026-09-06 19:58:49
+@@ -76,9 +76,15 @@
+   virtio_gpu_ss.add(when: 'CONFIG_VHOST_USER_GPU', if_true: files('vhost-user-gpu.c'))
+   hw_display_modules += {'virtio-gpu': virtio_gpu_ss}
+ 
+-  if virgl.found() and opengl.found()
++  # venus forwards Vulkan and never makes a GL context, so the device it arrives
++  # through needs virglrenderer but not OpenGL. On a host that has both,
++  # requiring both costs nothing; on Darwin there is no EGL for epoxy to expose,
++  # so requiring it means no venus device at all.
++  if virgl.found() and (opengl.found() or host_os == 'darwin')
+     virtio_gpu_gl_ss = ss.source_set()
+-    virtio_gpu_gl_ss.add(when: ['CONFIG_VIRTIO_GPU', virgl, opengl],
++    virtio_gpu_gl_deps = host_os == 'darwin' ? ['CONFIG_VIRTIO_GPU', virgl] \
++                                             : ['CONFIG_VIRTIO_GPU', virgl, opengl]
++    virtio_gpu_gl_ss.add(when: virtio_gpu_gl_deps,
+                          if_true: [files('virtio-gpu-gl.c', 'virtio-gpu-virgl.c'), pixman, virgl])
+     hw_display_modules += {'virtio-gpu-gl': virtio_gpu_gl_ss}
+   endif
+@@ -99,9 +105,12 @@
+                         if_true: files('vhost-user-gpu-pci.c'))
+   hw_display_modules += {'virtio-gpu-pci': virtio_gpu_pci_ss}
+ 
+-  if virgl.found() and opengl.found()
++  if virgl.found() and (opengl.found() or host_os == 'darwin')
+     virtio_gpu_pci_gl_ss = ss.source_set()
+-    virtio_gpu_pci_gl_ss.add(when: ['CONFIG_VIRTIO_GPU', 'CONFIG_VIRTIO_PCI', virgl, opengl],
++    virtio_gpu_pci_gl_deps = host_os == 'darwin' \
++      ? ['CONFIG_VIRTIO_GPU', 'CONFIG_VIRTIO_PCI', virgl] \
++      : ['CONFIG_VIRTIO_GPU', 'CONFIG_VIRTIO_PCI', virgl, opengl]
++    virtio_gpu_pci_gl_ss.add(when: virtio_gpu_pci_gl_deps,
+                              if_true: [files('virtio-gpu-pci-gl.c'), pixman])
+     hw_display_modules += {'virtio-gpu-pci-gl': virtio_gpu_pci_gl_ss}
+   endif
+--- a/hw/display/virtio-gpu-gl.c	2025-05-29 00:05:46
++++ b/hw/display/virtio-gpu-gl.c	2026-09-06 19:59:32
+@@ -133,7 +133,16 @@
+         return;
+     }
+ 
+-    if (!display_opengl) {
++    /*
++     * A venus device renders nothing through the display backend: the guest's
++     * Vulkan is forwarded to a host Vulkan driver, and what comes back is a
++     * buffer, not a scanout. Requiring a GL-capable display for it makes the
++     * device unusable on a host that has no EGL to give one -- macOS -- and
++     * refuses a headless run everywhere else for a capability it never uses.
++     * The GL renderer still needs it, so the check stands for everything but
++     * venus.
++     */
++    if (!display_opengl && !virtio_gpu_venus_enabled(g->parent_obj.conf)) {
+         error_setg(errp,
+                    "The display backend does not have OpenGL support enabled");
+         error_append_hint(errp,
+--- a/hw/display/virtio-gpu-virgl.c	2025-05-29 00:05:46
++++ b/hw/display/virtio-gpu-virgl.c	2026-10-16 00:00:00
+@@ -19,8 +19,11 @@
+ #include "hw/virtio/virtio-gpu.h"
+ #include "hw/virtio/virtio-gpu-bswap.h"
+ #include "hw/virtio/virtio-gpu-pixman.h"
++#include "system/system.h"
+ 
++#ifdef CONFIG_OPENGL
+ #include "ui/egl-helpers.h"
++#endif
+ 
+ #include <virglrenderer.h>
+ 
+@@ -35,14 +38,68 @@
+     struct virtio_gpu_simple_resource *res;
+ 
+     res = virtio_gpu_find_resource(g, resource_id);
+-    if (!res) {
++    /*
++     * A resource with an image is a 2D one the device keeps itself (see
++     * virgl_cmd_is_2d), allocated without the fields that follow the base.
++     */
++    if (!res || res->image) {
+         return NULL;
+     }
+ 
+     return container_of(res, struct virtio_gpu_virgl_resource, base);
+ }
+ 
+-#if VIRGL_RENDERER_CALLBACKS_VERSION >= 4
++/*
++ * Whether a command is for a 2D resource the device keeps itself rather than
++ * the renderer. A venus device starts virglrenderer without its GL renderer,
++ * which cannot create a 2D resource, so a guest's dumb buffers (a boot splash,
++ * a console) are made, filled and shown the way the 2D device does it, in
++ * guest memory and a pixman image.
++ */
++static bool virgl_cmd_is_2d(VirtIOGPU *g, struct virtio_gpu_ctrl_command *cmd)
++{
++    struct virtio_gpu_simple_resource *res;
++    uint32_t resource_id;
++    size_t offset;
++
++    if (!virtio_gpu_venus_enabled(g->parent_obj.conf)) {
++        return false;
++    }
++    switch (cmd->cmd_hdr.type) {
++    case VIRTIO_GPU_CMD_RESOURCE_CREATE_2D:
++        return true;
++    case VIRTIO_GPU_CMD_RESOURCE_UNREF:
++        offset = offsetof(struct virtio_gpu_resource_unref, resource_id);
++        break;
++    case VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING:
++        offset = offsetof(struct virtio_gpu_resource_attach_backing,
++                          resource_id);
++        break;
++    case VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING:
++        offset = offsetof(struct virtio_gpu_resource_detach_backing,
++                          resource_id);
++        break;
++    case VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D:
++        offset = offsetof(struct virtio_gpu_transfer_to_host_2d, resource_id);
++        break;
++    case VIRTIO_GPU_CMD_SET_SCANOUT:
++        offset = offsetof(struct virtio_gpu_set_scanout, resource_id);
++        break;
++    case VIRTIO_GPU_CMD_RESOURCE_FLUSH:
++        offset = offsetof(struct virtio_gpu_resource_flush, resource_id);
++        break;
++    default:
++        return false;
++    }
++    if (iov_to_buf(cmd->elem.out_sg, cmd->elem.out_num, offset,
++                   &resource_id, sizeof(resource_id)) != sizeof(resource_id)) {
++        return false;
++    }
++    res = virtio_gpu_find_resource(g, le32_to_cpu(resource_id));
++    return res && res->image;
++}
++
++#if defined(CONFIG_OPENGL) && VIRGL_RENDERER_CALLBACKS_VERSION >= 4
+ static void *
+ virgl_get_egl_display(G_GNUC_UNUSED void *cookie)
+ {
+@@ -174,6 +231,17 @@
+             return ret;
+         }
+     } else {
++        /*
++         * A scanout shown from the mapping would read it after it goes, so
++         * it is let go first.
++         */
++        for (uint32_t i = 0; i < b->conf.max_outputs; i++) {
++            if (b->scanout[i].resource_id == res->base.resource_id) {
++                virtio_gpu_disable_scanout(g, i);
++            }
++        }
++        res->base.blob = NULL;
++
+         *cmd_suspended = true;
+ 
+         /* render will be unblocked once MR is freed */
+@@ -371,11 +439,22 @@
+ static void virtio_gpu_rect_update(VirtIOGPU *g, int idx, int x, int y,
+                                 int width, int height)
+ {
+-    if (!g->parent_obj.scanout[idx].con) {
++    QemuConsole *con = g->parent_obj.scanout[idx].con;
++    if (!con) {
+         return;
+     }
+ 
+-    dpy_gl_update(g->parent_obj.scanout[idx].con, x, y, width, height);
++    /* A venus device on a host without OpenGL scans a mappable blob out through
++     * a pixman display surface, not a GL texture: virtio_gpu_do_set_scanout
++     * replaces the surface for a blob when the console has no GL. So its flush
++     * is a 2D update, and dpy_gl_update — which asserts the console has GL —
++     * would abort the moment the guest presented. Update the way the surface
++     * was created. */
++    if (console_has_gl(con)) {
++        dpy_gl_update(con, x, y, width, height);
++    } else {
++        dpy_gfx_update(con, x, y, width, height);
++    }
+ }
+ 
+ static void virgl_cmd_resource_flush(VirtIOGPU *g,
+@@ -448,6 +527,11 @@
+         dpy_gfx_replace_surface(
+             g->parent_obj.scanout[ss.scanout_id].con, NULL);
+         dpy_gl_scanout_disable(g->parent_obj.scanout[ss.scanout_id].con);
++        /*
++         * The console freed the surface a 2D resource was shown in; the next
++         * 2D SET_SCANOUT would otherwise read it.
++         */
++        g->parent_obj.scanout[ss.scanout_id].ds = NULL;
+     }
+     g->parent_obj.scanout[ss.scanout_id].resource_id = ss.resource_id;
+ }
+@@ -844,10 +928,55 @@
+         cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
+         return;
+     }
+-    if (res->base.dmabuf_fd < 0) {
+-        qemu_log_mask(LOG_GUEST_ERROR, "%s: resource not backed by dmabuf %d\n",
+-                      __func__, ss.resource_id);
+-        cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
++    /*
++     * A dmabuf is how a Linux host shares the rendered image with the display
++     * backend, and a host that has none can still show it: the resource is
++     * mappable, so its pixels are in memory this process can address, and a
++     * surface over them is exactly what a display backend without GL wants.
++     * That is the same path the 2D device takes for a blob, reached here
++     * because the renderer's memory arrived as shared memory rather than as a
++     * dmabuf — which is what a host whose Vulkan driver imports pointers rather
++     * than exporting descriptors gives back. A descriptor the renderer does
++     * return is shared memory, not a dmabuf, and only a GL console imports a
++     * dmabuf anyway: without GL the mapping is the one way to show it.
++     */
++    if (res->base.dmabuf_fd < 0 ||
++        !console_has_gl(g->parent_obj.scanout[ss.scanout_id].con)) {
++        void *data = NULL;
++        uint64_t size = 0;
++
++        /*
++         * virglrenderer maps a resource once. A blob the guest mapped, or one
++         * shown before, is read through the mapping it already has.
++         */
++        if (res->mr) {
++            data = memory_region_get_ram_ptr(res->mr);
++            size = memory_region_size(res->mr);
++        } else if (res->base.blob) {
++            data = res->base.blob;
++            size = res->base.blob_size;
++        } else if (virgl_renderer_resource_map(res->base.resource_id,
++                                               &data, &size)) {
++            qemu_log_mask(LOG_GUEST_ERROR,
++                          "%s: resource %d is neither a dmabuf nor mappable\n",
++                          __func__, ss.resource_id);
++            cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
++            return;
++        }
++
++        if (!virtio_gpu_scanout_blob_to_fb(&fb, &ss, size)) {
++            cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
++            return;
++        }
++
++        res->base.blob = data;
++        res->base.blob_size = size;
++
++        g->parent_obj.enable = 1;
++        if (!virtio_gpu_do_set_scanout(g, ss.scanout_id, &fb, &res->base,
++                                       &ss.r, &cmd->error)) {
++            return;
++        }
+         return;
+     }
+ 
+@@ -876,6 +1005,16 @@
+     VIRTIO_GPU_FILL_CMD(cmd->cmd_hdr);
+ 
+     virgl_renderer_force_ctx_0();
++    if (virgl_cmd_is_2d(g, cmd)) {
++        /*
++         * Answered at once, fence and all, as the 2D device answers it:
++         * without its GL renderer virglrenderer has no fence on context 0 to
++         * wait for, and one asked of it is never signalled.
++         */
++        virtio_gpu_simple_process_cmd(g, cmd);
++        return;
++    }
++
+     switch (cmd->cmd_hdr.type) {
+     case VIRTIO_GPU_CMD_CTX_CREATE:
+         virgl_cmd_context_create(g, cmd);
+@@ -1097,13 +1236,19 @@
+     uint32_t flags = 0;
+     VirtIOGPUGL *gl = VIRTIO_GPU_GL(g);
+ 
+-#if VIRGL_RENDERER_CALLBACKS_VERSION >= 4
+-    if (qemu_egl_display) {
++#if defined(CONFIG_OPENGL) && VIRGL_RENDERER_CALLBACKS_VERSION >= 4
++    /*
++     * Not for venus: virglrenderer initializes its GL window system from an
++     * EGL display it is handed even when told VIRGL_RENDERER_NO_VIRGL, and the
++     * one built for venus has no GL platform to initialize, so offering the
++     * display fails the whole device.
++     */
++    if (qemu_egl_display && !virtio_gpu_venus_enabled(g->parent_obj.conf)) {
+         virtio_gpu_3d_cbs.version = 4;
+         virtio_gpu_3d_cbs.get_egl_display = virgl_get_egl_display;
+     }
+ #endif
+-#ifdef VIRGL_RENDERER_D3D11_SHARE_TEXTURE
++#if defined(CONFIG_OPENGL) && defined(VIRGL_RENDERER_D3D11_SHARE_TEXTURE)
+     if (qemu_egl_angle_d3d) {
+         flags |= VIRGL_RENDERER_D3D11_SHARE_TEXTURE;
+     }
+@@ -1111,6 +1256,17 @@
+ #if VIRGL_VERSION_MAJOR >= 1
+     if (virtio_gpu_venus_enabled(g->parent_obj.conf)) {
+         flags |= VIRGL_RENDERER_VENUS | VIRGL_RENDERER_RENDER_SERVER;
++
++        /*
++         * A venus device initializes the Vulkan renderer alone, with or
++         * without a GL-capable display. The guest speaks Vulkan and never the
++         * virgl GL protocol, and the virglrenderer built for it has no GL
++         * platform: asking for the GL renderer fails to initialize under a GL
++         * display (egl-headless) and asserts without one. The display still
++         * shows the guest's frames, by importing the dma-bufs its blob
++         * scanouts export, which needs no GL renderer here.
++         */
++        flags |= VIRGL_RENDERER_NO_VIRGL;
+     }
+ #endif
+ 
+--- a/hw/display/virtio-gpu.c	2025-05-29 00:05:46
++++ b/hw/display/virtio-gpu.c	2026-09-07 20:47:45
+@@ -603,12 +603,12 @@
+     scanout->fb = *fb;
+ }
+ 
+-static bool virtio_gpu_do_set_scanout(VirtIOGPU *g,
+-                                      uint32_t scanout_id,
+-                                      struct virtio_gpu_framebuffer *fb,
+-                                      struct virtio_gpu_simple_resource *res,
+-                                      struct virtio_gpu_rect *r,
+-                                      uint32_t *error)
++bool virtio_gpu_do_set_scanout(VirtIOGPU *g,
++                               uint32_t scanout_id,
++                               struct virtio_gpu_framebuffer *fb,
++                               struct virtio_gpu_simple_resource *res,
++                               struct virtio_gpu_rect *r,
++                               uint32_t *error)
+ {
+     struct virtio_gpu_scanout *scanout;
+     uint8_t *data;
+--- a/hw/display/virtio-gpu-base.c	2025-05-29 00:05:46
++++ b/hw/display/virtio-gpu-base.c	2026-09-07 20:49:26
+@@ -148,7 +148,20 @@
+     int flags = GRAPHIC_FLAGS_NONE;
+ 
+     if (virtio_gpu_virgl_enabled(g->conf)) {
++        /*
++         * A GL console is what the GL renderer needs, not what virgl means. A
++         * venus device on a host with no OpenGL renders through Vulkan and
++         * presents a mappable blob, which a display backend shows as an
++         * ordinary surface — so asking for a GL context there refuses a device
++         * that would work, and refuses it before anything has been drawn.
++         */
++#ifdef CONFIG_OPENGL
+         flags |= GRAPHIC_FLAGS_GL;
++#else
++        if (!virtio_gpu_venus_enabled(g->conf)) {
++            flags |= GRAPHIC_FLAGS_GL;
++        }
++#endif
+     }
+ 
+     if (virtio_gpu_dmabuf_enabled(g->conf)) {
+--- a/include/hw/virtio/virtio-gpu.h	2025-05-29 00:05:46
++++ b/include/hw/virtio/virtio-gpu.h	2026-09-07 20:47:45
+@@ -361,6 +361,21 @@
+                              struct virtio_gpu_framebuffer *fb,
+                              struct virtio_gpu_rect *r);
+ 
++/*
++ * Points a scanout at a resource, building a surface over its pixels.
++ *
++ * The 2D device's own path, and the one a blob resource takes on a host with no
++ * GL: the pixels are already in memory this process can address, so a surface
++ * over them is what the display backend needs and no texture is involved.
++ * Exported because the virgl device needs the same thing on such a host.
++ */
++bool virtio_gpu_do_set_scanout(VirtIOGPU *g,
++                               uint32_t scanout_id,
++                               struct virtio_gpu_framebuffer *fb,
++                               struct virtio_gpu_simple_resource *res,
++                               struct virtio_gpu_rect *r,
++                               uint32_t *error);
++
+ void virtio_gpu_update_scanout(VirtIOGPU *g,
+                                uint32_t scanout_id,
+                                struct virtio_gpu_simple_resource *res,

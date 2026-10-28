@@ -1,0 +1,9 @@
+import Foundation
+
+// Runtime entry points keep their exact callback ABI here; application code
+// uses Number after crossing that boundary.
+@AtExit
+function crashOnTrap(reason: Int, detail: Int) {
+    if reason != 1 { return }
+    kernelCrashOnTrap(Number(detail))
+}

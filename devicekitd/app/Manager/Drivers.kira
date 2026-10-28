@@ -1,0 +1,568 @@
+import Foundation
+import Heap
+import LibTessera
+import DeviceKit
+
+// User-space drivers (17 §18): which program serves which device, starting
+// it, and the claim it starts with.
+//
+// The manifests are the personalities of the driver extensions, read from
+// their bundles when the manager starts (Bundles.kira). Once a second the
+// registry is matched against them; an entry a driver matches and
+// that has none yet gets one, as IOKit matches a new nub against every
+// personality. The driver is started with `--claim=` and a 128-bit token in
+// hex; redeeming it (op 4) lets that connection open the entry for Hid or
+// Usb. A driver is started once per appearance of its entry: one that exits
+// is not started again until the device is unplugged and comes back, so a
+// driver that crashes costs its device and does not spin.
+//
+// When several manifests match one entry, the highest `score` wins, as the
+// highest probe score does in IOKit. A manifest with `detachKernel` may take
+// an interface from the kernel driver that has it (17 §17.2); the manager
+// says so in the answer to the driver's Usb open, and DeviceKit's
+// `Usb.claimInterface` detaches only then.
+
+struct Driver {
+    var name: String
+    var program: String
+    var entryClass: EntryClass
+    var vendorId: U64
+    var productId: U64
+    // The interface class, subclass and protocol it asks for, if any. A
+    // manifest that names any matches a USB device with such an interface.
+    var interfaceKind: [Constraint]
+    var score: Number
+    var detachKernel: Bool
+}
+
+// One property a match requires, and its value.
+struct Constraint {
+    var key: String
+    var value: U64
+}
+
+// A claim not yet redeemed.
+struct Claim {
+    var token: Token
+    var entry: U64
+    var program: String
+    var expiry: Number
+    var detachKernel: Bool
+}
+
+// A claim redeemed: the client connection that holds the entry.
+struct Holding {
+    var client: Descriptor
+    var entry: U64
+    var detachKernel: Bool
+}
+
+// A driver this manager started: its process, and the key its end
+// completes under.
+struct Running {
+    var process: Handle
+    var key: Number
+    var name: String
+    var entry: U64
+}
+
+namespace Claims {
+    // A claim lives a minute: long enough for a driver to start under
+    // emulation.
+    let lifetime: Number = 60000000000
+}
+
+// The keys of the waits made on the launch port.
+namespace LaunchKey {
+    let lookup: Number = 1
+    let launch: Number = 2
+}
+
+// `ProcessInfo`: the exit code @32 and how the process ended @80.
+namespace ProcessInfo {
+    let bytes: Number = 96
+    let version: Number = 1
+    let codeAt: Number = 32
+    let reasonAt: Number = 80
+}
+
+// How a process ended, as `ProcessInfo` says.
+@Derive(Copy)
+@Derive(CaseIterable)
+enum Ending: U32 {
+    Exited = 0
+    Killed = 1
+    Crashed = 2
+}
+
+// The registry match a manifest makes: the class @0, two constraints @12,
+// then each U64 constraint as kind 3, the key's length, the value's length
+// 8, the key @+16 and the value at the next 8-byte boundary.
+namespace MatchSpec {
+    let bytes: Number = 256
+    let countAt: Number = 12
+    let constraintsAt: Number = 16
+    let keyAt: Number = 16
+    let unsignedKind: U32 = U32(3)
+    let valueBytes: U32 = U32(8)
+    // The answer: one 48-byte record per entry, after an 8-byte count.
+    let outBytes: Number = 4096
+    let recordsAt: Number = 8
+    let recordBytes: Number = 48
+}
+
+function hexWord(value: U64) -> String {
+    let digits = "0123456789abcdef"
+    var text = ""
+    // The most significant nibble comes first, so nibble `index` sits
+    // `60 - 4 * index` bits up.
+    for index in 0..16 {
+        let shift = 60 - index * 4
+        let digit = Number((value >> U64(shift)) & U64(15))
+        text += digits.substring(digit, digit + 1)
+    }
+    return text
+}
+
+// The completion of a call just made on the launch port, which the main
+// loop never waits on.
+function awaitLaunch(manager: borrow Manager) -> Result<Completion, TesseraError> {
+    let waited = try portWait(manager.launchPort, 1, Number(Deadline.infinite))
+    if waited.count == 0 { return .Error(failure(.Internal)) }
+    let done = waited[0]
+    if done.error.code != .Ok { return .Error(done.error) }
+    return .Ok(done)
+}
+
+// This process's standard streams, a copy of each for the driver, so what
+// it prints reaches the console as the manager's does.
+function streams() -> [StartupEntry] {
+    var entries: [StartupEntry] = []
+    for tag in [StartupTag.stdIn, StartupTag.stdOut, StartupTag.stdErr] {
+        match startupHandle(tag) {
+            Some(own) -> match handleDuplicate(own, Rights.same) {
+                Ok(copied) -> entries.append(
+                    StartupEntry { tag: tag, rights: .None, handle: copied }
+                )
+                Error(failed) -> log warn(
+                    "a stream could not be copied for a driver",
+                    error: errorName(failed)
+                )
+            }
+            // This process was started without that stream, so the driver gets none.
+            None -> {}
+        }
+    }
+    return entries
+}
+
+// The path below the system root, which lookups start from.
+function beneathRoot(program: borrow String) -> String {
+    var beneath = copy program
+    while beneath.startsWith("/") { beneath = beneath.substring(1, beneath.count) }
+    return beneath
+}
+
+// The last component of `path`.
+function lastComponent(path: borrow String) -> String {
+    var start = 0
+    for index in 0..path.count {
+        if path.charAt(index) == Character.slash { start = index + 1 }
+    }
+    return path.substring(start, path.count)
+}
+
+function launchWith(
+    manager: borrow Manager,
+    executable: Handle,
+    program: borrow String,
+    claim: borrow String
+) -> Result<Handle, TesseraError> {
+    let info = try launchInfoCreate(.Helper, [copy program, "--claim=" + claim])
+    // The launch name is diagnostic and at most 64 bytes, which a bundle's
+    // path can pass: the executable's own name is enough.
+    let options = LaunchOptions {
+        name: lastComponent(program),
+        arguments: .Some(info),
+        initialHandles: streams(),
+        flags: LaunchFlags.none,
+        job: .None,
+        stackSize: 0,
+    }
+    let launched = match processLaunch(executable, options, manager.launchPort, LaunchKey.launch) {
+        Ok -> awaitLaunch(manager)
+        Error(failed) -> .Error(failed)
+    }
+    closeHandle(info)
+    let done = try launched
+    // The driver speaks to the manager on its socket, not on the channel a
+    // launch makes to its parent.
+    let parent = Handle(done.result1)
+    if parent != Handle.invalid { closeHandle(parent) }
+    return .Ok(Handle(done.result0))
+}
+
+// Starts `program` with `--claim=<token>`; the driver's process.
+function spawn(
+    manager: borrow Manager,
+    program: borrow String,
+    claim: borrow String
+) -> Result<Handle, TesseraError> {
+    let rights = Rights(Rights.read.raw | Rights.execute.raw | Rights.inspect.raw)
+    let root = try startupHandle(StartupTag.systemRoot) otherwise return .Error(failure(.NotFound))
+    try nodeLookup(root, beneathRoot(program), rights, manager.launchPort, LaunchKey.lookup)
+    let found = try awaitLaunch(manager)
+    let executable = Handle(found.result0)
+    let launched = launchWith(manager, executable, program, claim)
+    closeHandle(executable)
+    return launched
+}
+
+function contains(list: borrow [U64], entry: U64) -> Bool {
+    for known in list {
+        if known == entry { return true }
+    }
+    return false
+}
+
+// Stores `constraint` at `offset`, and answers where the next one goes.
+function storeConstraint(
+    spec: borrow ByteBlock,
+    offset: Number,
+    constraint: borrow Constraint
+) -> Number {
+    let key = constraint.key
+    blockStore<U32>(spec, offset, MatchSpec.unsignedKind)
+    blockStore<U32>(spec, offset + 4, U32(key.count))
+    blockStore<U32>(spec, offset + 8, MatchSpec.valueBytes)
+    copyBytes(heapOffset(spec.pointer(), offset + MatchSpec.keyAt), key.data, key.count)
+    let valueAt = aligned8(offset + MatchSpec.keyAt + key.count)
+    blockStore<U64>(spec, valueAt, constraint.value)
+    return valueAt + 8
+}
+
+// The entries of `entryClass` with every one of `constraints`.
+function matchingEntries(
+    entryClass: EntryClass,
+    constraints: borrow [Constraint]
+) -> Result<[U64], TesseraError> {
+    let spec = zeroedBlock(count: MatchSpec.bytes, alignment: 16)
+    blockStore<U32>(spec, 0, entryClass.rawValue())
+    blockStore<U32>(spec, MatchSpec.countAt, U32(constraints.count))
+    var offset = MatchSpec.constraintsAt
+    for constraint in constraints { offset = storeConstraint(spec, offset, constraint) }
+    let out = zeroedBlock(count: MatchSpec.outBytes, alignment: 16)
+    let count = match registryMatch(
+        Buffer { address: spec.pointer(), length: MatchSpec.bytes },
+        Buffer { address: out.pointer(), length: MatchSpec.outBytes }
+    ) {
+        Ok(value) -> value
+        Error(failed) -> return .Error(failed)
+    }
+    var found: [U64] = []
+    for index in 0..count {
+        found.append(blockLoad<U64>(out, MatchSpec.recordsAt + index * MatchSpec.recordBytes))
+    }
+    return .Ok(found)
+}
+
+// The entries of `driver`'s class with its vendor and product. A manifest
+// that names an interface kind matches the interfaces of that kind and
+// answers the USB devices they belong to, since a driver opens the device.
+// The entries `driver` matches. A failed read is a failure, not an empty
+// match: the caller would otherwise take the entries it held for gone.
+function matching(driver: borrow Driver) -> Result<[U64], TesseraError> {
+    var constraints = [
+        Constraint { key: "vendorId", value: driver.vendorId },
+        Constraint { key: "productId", value: driver.productId },
+    ]
+    if driver.interfaceKind.count == 0 || driver.entryClass != .UsbDevice {
+        return matchingEntries(driver.entryClass, constraints)
+    }
+    for constraint in driver.interfaceKind { constraints.append(copy constraint) }
+    var devices: [U64] = []
+    let interfaces = try matchingEntries(.UsbInterface, constraints)
+    for interface in interfaces {
+        let device = try registryParent(EntryId(interface), .Service)
+        if device.raw != U64(0) && !contains(devices, device.raw) {
+            devices.append(device.raw)
+        }
+    }
+    return .Ok(devices)
+}
+
+// An entry some manifest matches, and the manifest that serves it.
+struct Candidate {
+    var entry: U64
+    var driver: Number
+}
+
+// The position in `chosen` of the candidate for `entry`, if there is one.
+function candidateIndex(chosen: borrow [Candidate], entry: U64) -> Number? {
+    for (index, candidate) in chosen.enumerated() {
+        if candidate.entry == entry { return .Some(index) }
+    }
+    return .None
+}
+
+// Every entry matched, each with the highest-scoring manifest.
+function candidates(manager: borrow Manager) -> Result<[Candidate], TesseraError> {
+    var chosen: [Candidate] = []
+    for (index, driver) in manager.drivers.enumerated() {
+        let entries = try matching(driver)
+        for entry in entries {
+            match candidateIndex(chosen, entry) {
+                Some(position) -> {
+                    if driver.score > manager.drivers[chosen[position].driver].score {
+                        chosen[position].driver = index
+                    }
+                }
+                None -> chosen.append(Candidate { entry: entry, driver: index })
+            }
+        }
+    }
+    return .Ok(chosen)
+}
+
+// Matches the registry against every manifest and starts a driver for each
+// entry newly matched. A match that fails changes nothing this sweep: the
+// entries already bound stay bound.
+function matchDrivers(manager: borrow mut Manager) {
+    match candidates(manager) {
+        Ok(chosen) -> bindMatched(manager, chosen)
+        Error(failed) -> log warn("drivers are not matched this sweep", error: errorName(failed))
+    }
+}
+
+// Binds every entry `chosen` matches and lets go of those that went.
+function bindMatched(manager: borrow mut Manager, chosen: borrow [Candidate]) {
+    var present: [U64] = []
+    for candidate in chosen {
+        present.append(candidate.entry)
+        if !contains(manager.bound, candidate.entry) {
+            manager.bound.append(candidate.entry)
+            launch(manager, manager.drivers[candidate.driver], candidate.entry)
+        }
+    }
+    // An entry that went may come back, and gets a driver again then.
+    var kept: [U64] = []
+    for entry in manager.bound {
+        if contains(present, entry) { kept.append(entry) }
+    }
+    manager.bound = kept
+}
+
+// The claim token for `driver`, or none once the reason it could not be made
+// is logged.
+function driverToken(driver: borrow Driver) -> Token? {
+    match tokenBits() {
+        Ok(value) -> return .Some(value)
+        Error(failed) -> log warn(
+            "a driver's claim could not be made",
+            driver: driver.name,
+            error: errorName(failed)
+        )
+    }
+    return .None
+}
+
+// The moment `driver`'s claim starts, or none once the reason it cannot be
+// timed is logged.
+function driverMoment(driver: borrow Driver) -> Number? {
+    match now() {
+        Ok(value) -> return .Some(value)
+        Error(failed) -> log warn(
+            "a driver's claim could not be timed",
+            driver: driver.name,
+            error: errorName(failed)
+        )
+    }
+    return .None
+}
+
+// Why a driver's program did not start.
+function reportSpawn(driver: borrow Driver, entry: U64, failed: borrow TesseraError) {
+    if failed.code == .NotFound {
+        log warn("a driver's program is missing", program: driver.program, entry: entry)
+    } else {
+        log warn("a driver could not start", driver: driver.name, error: errorName(failed))
+    }
+}
+
+// The started driver, or none once the reason it could not start is logged.
+function startedProcess(
+    manager: borrow mut Manager,
+    driver: borrow Driver,
+    token: borrow Token,
+    entry: U64
+) -> Handle? {
+    match spawn(manager, driver.program, hexWord(token.high) + hexWord(token.low)) {
+        Ok(value) -> return .Some(value)
+        Error(failed) -> reportSpawn(driver, entry, failed)
+    }
+    return .None
+}
+
+function launch(manager: borrow mut Manager, driver: borrow Driver, entry: U64) {
+    let token = match driverToken(driver) {
+        Some(value) -> value
+        None -> return
+    }
+    let moment = match driverMoment(driver) {
+        Some(value) -> value
+        None -> return
+    }
+    let process = match startedProcess(manager, driver, token, entry) {
+        Some(value) -> value
+        None -> return
+    }
+    let key = manager.nextDriverKey
+    manager.nextDriverKey += 1
+    match objectWaitAsync(process, Signals.terminated, .Once, manager.port, key) {
+        // The end of the driver arrives on the port under `key`.
+        Ok -> {}
+        Error(failed) -> log warn(
+            "a driver's end cannot be heard",
+            driver: driver.name,
+            error: errorName(failed)
+        )
+    }
+    manager.claims.append(
+        Claim {
+            token: token,
+            entry: entry,
+            program: driver.program,
+            expiry: moment + Claims.lifetime,
+            detachKernel: driver.detachKernel
+        }
+    )
+    manager.running.append(Running { process: process, key: key, name: driver.name, entry: entry })
+    log info("started a driver", driver: driver.name, entry: entry)
+}
+
+// Logs how the driver `running` ended, as `ProcessInfo` says.
+function logEnding(running: borrow Running) {
+    let info = zeroedBlock(count: ProcessInfo.bytes, alignment: 16)
+    match objectInfo(
+        running.process,
+        .Process,
+        ProcessInfo.version,
+        Buffer { address: info.pointer(), length: ProcessInfo.bytes }
+    ) {
+        Ok -> {
+            let code = blockLoad<U64>(info, ProcessInfo.codeAt)
+            match caseWithCode(allCases_Ending(), blockLoad<U32>(info, ProcessInfo.reasonAt)) {
+                Some(ending) -> log info(
+                    "a driver ended",
+                    driver: running.name,
+                    code: code,
+                    ending: ending
+                )
+                None -> log info("a driver ended", driver: running.name, code: code)
+            }
+        }
+        Error(failed) -> log warn(
+            "a driver ended; how is unknown",
+            driver: running.name,
+            error: errorName(failed)
+        )
+    }
+}
+
+// The driver under `key` ended.
+function driverEnded(manager: borrow mut Manager, key: Number) {
+    var kept: [Running] = []
+    for running in manager.running {
+        if running.key == key {
+            logEnding(running)
+            closeHandle(running.process)
+        } else {
+            kept.append(running)
+        }
+    }
+    manager.running = kept
+}
+
+// Lets go of every claim no driver redeemed in time.
+function expireClaims(manager: borrow mut Manager) {
+    match now() {
+        Ok(moment) -> expireAt(manager, moment)
+        Error(failed) -> log warn("claims are not expired; the clock cannot be read", error: errorName(failed))
+    }
+}
+
+// Lets go of every claim `moment` found past its expiry.
+function expireAt(manager: borrow mut Manager, moment: Number) {
+    var kept: [Claim] = []
+    for claim in manager.claims {
+        if claim.expiry > moment { kept.append(claim) }
+    }
+    manager.claims = kept
+}
+
+function claimIndex(manager: borrow Manager, token: borrow Token) -> Number? {
+    for (index, claim) in manager.claims.enumerated() {
+        if sameToken(claim.token, token) { return .Some(index) }
+    }
+    return .None
+}
+
+function removeClaim(manager: borrow mut Manager, index: Number) {
+    var kept: [Claim] = []
+    for (position, claim) in manager.claims.enumerated() {
+        if position != index { kept.append(claim) }
+    }
+    manager.claims = kept
+}
+
+// Op 4, `Driver.claim`: the token, once, by the program it was made for.
+function claim(
+    manager: borrow mut Manager,
+    client: borrow Client,
+    request: borrow Request
+) -> Answer {
+    let index = try claimIndex(manager, request.token) otherwise return refuse(.TokenSpent, U64(0))
+    let claimed = manager.claims[index]
+    removeClaim(manager, index)
+    let moment = match now() {
+        Ok(value) -> value
+        Error(failed) -> return refuse(failed.code, failed.detail)
+    }
+    if claimed.expiry <= moment { return refuse(.TokenExpired, U64(0)) }
+    if client.program != .Some(claimed.program) { return refuse(.NotEntitled, U64(0)) }
+    manager.holdings.append(
+        Holding { client: client.socket, entry: claimed.entry, detachKernel: claimed.detachKernel }
+    )
+    let reply = replyBlock()
+    blockStore<U64>(reply, ReplyAt.entry, claimed.entry)
+    return answered(move reply)
+}
+
+function holding(manager: borrow Manager, client: borrow Descriptor, entry: U64) -> Holding? {
+    for held in manager.holdings {
+        if held.client.number == client.number && held.entry == entry { return .Some(held) }
+    }
+    return .None
+}
+
+function holds(manager: borrow Manager, client: borrow Descriptor, entry: U64) -> Bool {
+    return holding(manager, client, entry).isSome()
+}
+
+// Whether the manifest `client` claimed `entry` under may detach a kernel
+// driver.
+function holdsDetach(manager: borrow Manager, client: borrow Descriptor, entry: U64) -> Bool {
+    return match holding(manager, client, entry) {
+        Some(held) -> held.detachKernel
+        None -> false
+    }
+}
+
+// A client that closed lets go of what it claimed.
+function dropHoldings(manager: borrow mut Manager, client: borrow Descriptor) {
+    var kept: [Holding] = []
+    for held in manager.holdings {
+        if held.client.number != client.number { kept.append(held) }
+    }
+    manager.holdings = kept
+}

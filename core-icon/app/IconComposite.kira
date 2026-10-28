@@ -1,0 +1,456 @@
+import Foundation
+import RenderBox
+
+// `FUN_1ccad3d20` and `FUN_1ccad8ac0`: the icon composited from its groups'
+// images. The chiclet casts its shadow and clips what follows; over the
+// background each group draws its shadow, its contents and its highlights,
+// back to front; then the chiclet's edge highlights and its hairline.
+
+// A group's rendered images: its contents and the content image's pixels
+// they cover, its distance field and its shadow when it casts one.
+struct GroupImages {
+    let contents: TextureImage
+    let box: Rect
+    let field: TextureImage
+    let shadow: TextureImage?
+    let shadowOpacity: Number
+    let neutralShadow: Bool
+    // The box its layers cover on the canvas, and how translucent it is.
+    let bounds: Rect
+    let translucency: Number
+    let opacity: Number
+    let blend: BlendMode
+    let blur: Number
+    let specular: Bool
+}
+
+// The background's two ends, top and bottom, and the space they are in.
+struct Background {
+    let top: RGBAColor
+    let bottom: RGBAColor
+    let space: ColorSpace
+    let start: Point
+    let end: Point
+}
+
+extend Background {
+    // Its luminance, the mean of its ends'.
+    function luminance(borrow self) -> Number {
+        let ends = [copy top, copy bottom]
+        var sum: Number = 0
+        for color in ends { sum += 0.2126 * color.r + 0.7152 * color.g + 0.0722 * color.b }
+        return sum / 2
+    }
+}
+
+function drawBackground(list: borrow DisplayList, background: borrow Background) {
+    var everywhere = Shape()
+    everywhere.setInfinite()
+    var fill = Fill()
+    fill.setGradient(
+        Gradient {
+            geometry: .Axial(
+                AxialGradient { startPoint: copy background.start, endPoint: copy background.end }
+            ),
+            stops: [
+                GradientStop { color: copy background.top, location: 0 },
+                GradientStop { color: copy background.bottom, location: 1 }
+            ],
+            colorSpace: background.space,
+            edgeMode: .Clamp,
+            interpolation: .Linear
+        }
+    )
+    list.drawShape(everywhere, fill, 1, .Normal)
+}
+
+function imageFill(image: borrow TextureImage, frame: borrow Rect) -> Fill {
+    return tintedImageFill(image, frame, .None)
+}
+
+// `image` stretched over `frame`, painted `tint` where it covers when given.
+function tintedImageFill(image: borrow TextureImage, frame: borrow Rect, tint: RGBAColor?) -> Fill {
+    var fill = Fill()
+    fill.setImage(
+        ImageFill {
+            image: .Texture(copy image),
+            transform: AffineTransform {
+                a: frame.width,
+                d: frame.height,
+                tx: frame.x,
+                ty: frame.y
+            },
+            interpolation: .Linear,
+            tint: tint,
+            colorSpace: .Device
+        }
+    )
+    return fill
+}
+
+function rectShape(rect: borrow Rect) -> Shape {
+    var shape = Shape()
+    shape.setRect(copy rect)
+    return shape
+}
+
+// The group's shadow: in its contents' colours, multiplied in unless the
+// chiclet is dim, or black.
+function drawGroupShadow(
+    list: borrow DisplayList,
+    group: borrow GroupImages,
+    shadow: borrow TextureImage,
+    context: borrow GlassContext
+) {
+    let size = context.size
+    if group.neutralShadow {
+        let alpha = group.shadowOpacity * GroupShadowDefaults.neutralOpacity.at(size)
+        let fill = tintedImageFill(shadow, canvasRect(), .Some(black()))
+        list.drawShape(rectShape(canvasRect()), fill, alpha, .Multiply)
+        return
+    }
+    let alpha = group.shadowOpacity * GroupShadowDefaults.vibrantOpacity.at(size)
+    list.drawShape(
+        rectShape(canvasRect()),
+        imageFill(shadow, canvasRect()),
+        alpha,
+        context.dim ? .Normal : .Multiply
+    )
+}
+
+// What a mask's contents add: some of their luminance to the red, and no
+// darkening to the green.
+function maskContentMatrix() -> [Number] {
+    let lightening = ClearModeDefaults.contentLighteningStrength
+    return [lightening, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0]
+}
+
+// The group's contents, through the mask's matrix in a mask, where they
+// are tagged with a headroom of their own.
+function drawGroupContents(
+    list: borrow DisplayList,
+    group: borrow GroupImages,
+    context: borrow GlassContext,
+    alpha: Number,
+    blend: BlendMode
+) -> Result<Void, IconRenderFailure> {
+    let scale = IconGeometry.canvas / context.side
+    let frame = Rect {
+        x: group.box.x * scale,
+        y: group.box.y * scale,
+        width: group.box.width * scale,
+        height: group.box.height * scale
+    }
+    list.save()
+    if context.drawsMask() { list.addColorMatrixFilter(maskContentMatrix(), ColorFilterFlags.none) }
+    var fill = imageFill(group.contents, frame)
+    if context.masked { fill.setHeadroom(ClearModeDefaults.contentsHeadroom) }
+    list.drawShape(rectShape(frame), fill, alpha, blend)
+    return listDrawn(list.restore())
+}
+
+namespace Translucency {
+    // The fade's stops down the group, evenly spaced.
+    let stops: Number = 17
+}
+
+// `smoothstep` from 0 to 1.
+function smoothStep(t: Number) -> Number {
+    return t * t * (3 - 2 * t)
+}
+
+// The fade a translucent group's contents are seen through: opaque at its
+// top, and down the group losing the smoothstep of the translucency times
+// how far down it is, so a full translucency fades along the whole
+// smoothstep and a lesser one along its start.
+function translucencyFade(group: borrow GroupImages) -> Gradient {
+    let middle = group.bounds.x + group.bounds.width / 2
+    var stops: [GradientStop] = []
+    for index in 0..Translucency.stops {
+        let t = index / (Translucency.stops - 1)
+        stops.append(
+            GradientStop {
+                color: RGBAColor { r: 0, g: 0, b: 0, a: 1 - smoothStep(group.translucency * t) },
+                location: t
+            }
+        )
+    }
+    return Gradient {
+        geometry: .Axial(
+            AxialGradient {
+                startPoint: Point { x: middle, y: group.bounds.y },
+                endPoint: Point { x: middle, y: group.bounds.y + group.bounds.height }
+            }
+        ),
+        stops: stops,
+        colorSpace: .StandardRgb,
+        edgeMode: .Clamp,
+        interpolation: .Smooth
+    }
+}
+
+// How much of a neutral shadow is drawn again over translucent contents.
+function overdrawOpacity(group: borrow GroupImages, size: IconSizeClass) -> Number {
+    let share = min(group.translucency / ShadowOverdraw.translucencyForMax, 1)
+    let most = group.neutralShadow ? ShadowOverdraw.maxNeutral : ShadowOverdraw.maxVibrant
+    return most.at(size) * share
+}
+
+// A translucent group's contents, faded toward its bottom, its shadow drawn
+// again where they are, as much as they are translucent.
+function drawTranslucentContents(
+    list: borrow DisplayList,
+    group: borrow GroupImages,
+    context: borrow GlassContext
+) -> Result<Void, IconRenderFailure> {
+    list.save()
+    list.beginLayer(LayerFlags.none)
+    var everywhere = Shape()
+    everywhere.setInfinite()
+    var fade = Fill()
+    fade.setGradient(translucencyFade(group))
+    list.drawShape(everywhere, fade, 1, .Normal)
+    try listDrawn(list.clipLayer(1, .Normal))
+    try drawGroupContents(list, group, context, group.opacity, group.blend)
+    match group.shadow {
+        Some(shadow) -> {
+            list.beginLayer(LayerFlags.none)
+            try drawGroupContents(list, group, context, 1, .Normal)
+            try listDrawn(list.clipLayer(overdrawOpacity(group, context.size), .Normal))
+            drawGroupShadow(list, group, shadow, context)
+        }
+        None -> {}
+    }
+    return listDrawn(list.restore())
+}
+
+// What lies under the group's shapes, frosted: the background blurred
+// `blurStrengthMax` times its strength, opaque, inside the field's
+// half-way level, within the group's bounds and a field pixel round them.
+function drawGroupBlur(
+    list: borrow DisplayList,
+    group: borrow GroupImages,
+    context: borrow GlassContext
+) -> Result<Void, IconRenderFailure> {
+    let pixel = IconGeometry.canvas / context.side
+    list.save()
+    list.clipShape(rectShape(outsetRect(group.bounds, pixel)), 1, .Normal)
+    list.beginLayer(LayerFlags.none)
+    list.save()
+    list.addColorThreshold(.Red, 0.5, .None, black())
+    try drawField(list, group.field, context.side)
+    try listDrawn(list.restore())
+    try listDrawn(list.clipLayer(1, .Normal))
+    list.addBlurFilter(group.blur * GroupShadowDefaults.blurStrengthMax, BlurFlags.opaque)
+    list.beginLayer(LayerFlags.needsBackground)
+    try listDrawn(list.drawLayer(1, .Normal))
+    return listDrawn(list.restore())
+}
+
+function outsetRect(rect: borrow Rect, by: Number) -> Rect {
+    return Rect {
+        x: rect.x - by,
+        y: rect.y - by,
+        width: rect.width + 2 * by,
+        height: rect.height + 2 * by
+    }
+}
+
+// The group's shadow, contents and highlights inside its shapes.
+function drawGroup(
+    list: borrow DisplayList,
+    group: borrow GroupImages,
+    context: borrow GlassContext
+) -> Result<Void, IconRenderFailure> {
+    match group.shadow {
+        Some(shadow) -> drawGroupShadow(list, group, shadow, context)
+        None -> {}
+    }
+    if group.blur > 0 { try drawGroupBlur(list, group, context) }
+    if group.translucency > 0 {
+        try drawTranslucentContents(list, group, context)
+    } else {
+        try drawGroupContents(list, group, context, group.opacity, group.blend)
+    }
+    list.save()
+    if group.specular { try drawGlassHighlights(list, context, group.field, false) }
+    return listDrawn(list.restore())
+}
+
+// Everything under the darklights up to group `last`.
+function drawUnderDarklights(
+    list: borrow DisplayList,
+    groups: borrow [GroupImages],
+    last: Number,
+    background: borrow Background,
+    context: borrow GlassContext
+) -> Result<Void, IconRenderFailure> {
+    drawBackground(list, background)
+    for index in 0..(last + 1) { try drawGroup(list, groups[index], context) }
+    return .Ok
+}
+
+// `shouldPreventDarklightCompounding`: each group's darklights outside its
+// shapes are drawn over all that is under them, and once a group under it
+// has drawn its own, kept only where they darken it more than those
+// already drawn. A group whose glass does not catch the light draws none.
+function drawGroups(
+    list: borrow DisplayList,
+    groups: borrow [GroupImages],
+    background: borrow Background,
+    context: borrow GlassContext
+) -> Result<Void, IconRenderFailure> {
+    drawBackground(list, background)
+    var darkened = false
+    for (index, group) in groups.enumerated() {
+        try drawGroup(list, group, context)
+        if !group.specular { continue }
+        if !darkened {
+            try drawGlassHighlights(list, context, group.field, true)
+            darkened = true
+            continue
+        }
+        list.beginLayer(LayerFlags.none)
+        try drawUnderDarklights(list, groups, index, background, context)
+        try drawGlassHighlights(list, context, group.field, true)
+        try listDrawn(list.drawLayer(1, .Minimum))
+    }
+    return .Ok
+}
+
+// Where the icon sits in the image: its side, and the side of the chiclet
+// inside it.
+struct IconFrame {
+    let side: Number
+    let body: Number
+    let chicletShadow: Bool
+    // The side of the image given back, in pixels: `side` drawn smaller when
+    // the icon is drawn larger than it is shown (`IconSupersample`).
+    var shown: Number = 0
+}
+
+// The icon's place in the image: centred, the canvas scaled to the chiclet.
+function placeIcon(list: borrow DisplayList, frame: borrow IconFrame) {
+    list.translateBy(frame.side / 2, frame.side / 2)
+    let scale = frame.body / IconGeometry.canvas
+    list.scaleBy(scale, scale)
+    list.translateBy(-IconGeometry.canvas / 2, -IconGeometry.canvas / 2)
+}
+
+// A dark tinted icon's screen: the glass it is screened over, and the tint
+// its contents are coloured with.
+struct ScreenedTint {
+    let glass: RGBAColor
+    let tint: IconColor
+}
+
+function compositeList(
+    groups: borrow [GroupImages],
+    background: borrow Background,
+    context: borrow GlassContext,
+    frame: borrow IconFrame,
+    screen: borrow ScreenedTint?
+) -> Result<LayerContents, IconRenderFailure> {
+    let list = DisplayList()
+    list.save()
+    placeIcon(list, frame)
+    list.addContentHeadroom(IconGeometry.headroom)
+    if frame.chicletShadow { try listDrawn(drawChicletShadow(list, context.size)) }
+    list.clipShape(chicletShape(), 1, .Normal)
+    list.beginLayer(LayerFlags.none)
+    match screen {
+        Some(screened) -> try drawScreened(list, groups, background, context, screened)
+        None -> {
+            try drawClamped(list, groups, background, context, .None)
+            let scale = frame.body / IconGeometry.canvas
+            try listDrawn(drawOutline(list, context.size, scale, frame.chicletShadow))
+        }
+    }
+    try listDrawn(list.drawLayer(1, .Normal))
+    try listDrawn(list.restore())
+    return .Ok(list.moveContents())
+}
+
+// The groups and the chiclet's edge in a layer clamped to the composite's
+// headroom in linear Display P3, coloured by `tint` when given.
+function drawClamped(
+    list: borrow DisplayList,
+    groups: borrow [GroupImages],
+    background: borrow Background,
+    context: borrow GlassContext,
+    tint: IconColor?
+) -> Result<Void, IconRenderFailure> {
+    list.save()
+    list.addContentHeadroom(IconGeometry.headroom)
+    let ceiling = IconGeometry.headroom
+    list.addColorClampFilter(
+        RGBAColor { r: 0, g: 0, b: 0, a: 0 },
+        RGBAColor { r: ceiling, g: ceiling, b: ceiling, a: 1 },
+        .LinearDisplayP3
+    )
+    list.beginLayer(LayerFlags.none)
+    match tint {
+        Some(color) -> try drawTinted(list, groups, background, context, color)
+        None -> try drawLit(list, groups, background, context, .Standard)
+    }
+    try listDrawn(list.drawLayer(1, .Normal))
+    return listDrawn(list.restore())
+}
+
+function drawLit(
+    list: borrow DisplayList,
+    groups: borrow [GroupImages],
+    background: borrow Background,
+    context: borrow GlassContext,
+    edges: EdgeSet
+) -> Result<Void, IconRenderFailure> {
+    try drawGroups(list, groups, background, context)
+    return listDrawn(drawEdgeHighlights(list, context.size, edges))
+}
+
+// `FUN_1ccad9118` for a dark tinted icon: the glass, then the icon in colour
+// screened over it.
+function drawScreened(
+    list: borrow DisplayList,
+    groups: borrow [GroupImages],
+    background: borrow Background,
+    context: borrow GlassContext,
+    screen: borrow ScreenedTint
+) -> Result<Void, IconRenderFailure> {
+    var everywhere = Shape()
+    everywhere.setInfinite()
+    list.drawShape(everywhere, colorFill(copy screen.glass, .DisplayP3), 1, .Normal)
+    list.beginLayer(LayerFlags.none)
+    try drawClamped(list, groups, background, context, .Some(copy screen.tint))
+    return listDrawn(list.drawLayer(1, .Screen))
+}
+
+// The icon desaturated by the tint's saturation (`RenderingMode.tinted(with:)`
+// takes the colour's alpha as the saturation and an opaque colour), its
+// black kept and its white carried to the tint; `darkTintHighlightsBlendWithContent` puts the
+// edge highlights inside, tinted with the groups.
+function drawTinted(
+    list: borrow DisplayList,
+    groups: borrow [GroupImages],
+    background: borrow Background,
+    context: borrow GlassContext,
+    tint: borrow IconColor
+) -> Result<Void, IconRenderFailure> {
+    list.save()
+    list.addSaturationFilter(tint.alpha, ColorFilterFlags.none)
+    let white = RGBAColor { r: tint.red, g: tint.green, b: tint.blue, a: 1 }
+    list.addColorMatrixFilter(duotoneMatrix(black(), white), ColorFilterFlags.none)
+    list.beginLayer(LayerFlags.none)
+    try drawLit(list, groups, background, context, .Screened)
+    try listDrawn(list.drawLayer(1, .Normal))
+    return listDrawn(list.restore())
+}
+
+// `FUN_1ccb43c58`: the matrix carrying black to `low` and white to `high`,
+// channel by channel, keeping alpha.
+function duotoneMatrix(low: borrow RGBAColor, high: borrow RGBAColor) -> [Number] {
+    return [
+        high.r - low.r, 0, 0, 0, low.r, 0, high.g - low.g, 0, 0, low.g, 0, 0, high.b - low.b, 0,
+        low.b, 0, 0, 0, 1, 0
+    ]
+}

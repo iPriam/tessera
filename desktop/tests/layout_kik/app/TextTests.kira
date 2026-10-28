@@ -1,0 +1,36 @@
+import Foundation
+import HomeLayout
+
+@Test
+function anArrangementReadsBackAsWritten() {
+    var arrangement = HomeArrangement { reset: "17", removed: ["Welcome"] }
+    arrangement.pages.append(
+        HomePage {
+            items: [.App("Notes"), .Folder(
+                HomeFolder { name: "Utilities", apps: ["Clock", "About"] }
+            )],
+            widgets: [HomeWidget { kind: "Clock", size: .Medium }]
+        }
+    )
+    arrangement.pages.append(HomePage { items: [.App("Settings")], hidden: true })
+    let text = arrangementText(arrangement)
+    let again = arrangementText(parsedArrangement(text))
+    expect!(again == text)
+    let read = parsedArrangement(text)
+    expect!(read.pages.count == 2)
+    expect!(read.pages[1].hidden)
+    expect!(read.reset == "17")
+    let folder = folderAt(read, 0, 1) == ["Clock", "About"]
+    expect!(folder)
+    let medium = match read.pages[0].widgets[0].size {
+        Medium -> true
+        Small -> false
+    }
+    expect!(medium)
+}
+
+@Test
+function anOldArrangementIsReadAsNone() {
+    let read = parsedArrangement("version 1\npage\napp Notes\n")
+    expect!(read.pages.count == 0)
+}

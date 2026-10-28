@@ -1,0 +1,147 @@
+import Foundation
+import LibTessera
+import KiraUI
+
+// What Inlay's window shows is the navigation path: the place chosen in the
+// sidebar, the applications installed from disk images, one opened disk
+// image, as a Mac's Finder shows a mounted .dmg, or a folder.
+
+// A place Inlay shows: the applications installed from disk images, the
+// opened disk image a name names, or the folder at a path.
+enum InlayPlace {
+    Applications
+    Image(String)
+    Folder(String)
+    Trash
+}
+
+namespace InlayRouteKey {
+    let applications: String = "applications"
+    let imagePrefix: String = "image/"
+    let folderPrefix: String = "folder:"
+    let trash: String = "trash"
+}
+
+// The installed applications, as a value of the navigation path. The split
+// view's detail draws the place, so the route's own page is empty.
+construct ApplicationsRoute() extends NavigationRoute {
+    function routeKey() -> String {
+        return InlayRouteKey.applications
+    }
+
+    function destination() -> Any Widget {
+        return EmptyView()
+    }
+}
+
+// One opened disk image, by name, as a value of the navigation path.
+construct ImageRoute(name: String) extends NavigationRoute {
+    function routeKey() -> String {
+        return InlayRouteKey.imagePrefix + name
+    }
+
+    function destination() -> Any Widget {
+        return EmptyView()
+    }
+}
+
+// One folder, by path, as a value of the navigation path.
+construct FolderRoute(path: String) extends NavigationRoute {
+    function routeKey() -> String {
+        return InlayRouteKey.folderPrefix + path
+    }
+
+    function destination() -> Any Widget {
+        return EmptyView()
+    }
+}
+
+// The Trash, as a value of the navigation path.
+construct TrashRoute() extends NavigationRoute {
+    function routeKey() -> String {
+        return InlayRouteKey.trash
+    }
+
+    function destination() -> Any Widget {
+        return EmptyView()
+    }
+}
+
+// The place a route's key names, if it names one of Inlay's.
+function placeOf(key: borrow String) -> InlayPlace? {
+    if key == InlayRouteKey.applications { return .Some(.Applications) }
+    if key == InlayRouteKey.trash { return .Some(.Trash) }
+    if key.startsWith(InlayRouteKey.imagePrefix) {
+        return .Some(.Image(key.substring(InlayRouteKey.imagePrefix.count, key.count)))
+    }
+    if key.startsWith(InlayRouteKey.folderPrefix) {
+        return .Some(.Folder(key.substring(InlayRouteKey.folderPrefix.count, key.count)))
+    }
+    return .None
+}
+
+// The route that shows `place`.
+function routeOf(place: borrow InlayPlace) -> Any NavigationRoute {
+    return match place {
+        Applications -> ApplicationsRoute()
+        Image(name) -> ImageRoute(name: copy name)
+        Folder(path) -> FolderRoute(path: copy path)
+        Trash -> TrashRoute()
+    }
+}
+
+// Shows the folder at `path` in place of the place shown now.
+function showFolder(path: borrow String) {
+    let route: Any NavigationRoute = FolderRoute(path: copy path)
+    navigationStore([route])
+}
+
+// What the sidebar chose, or what Inlay opens on when nothing is: the first
+// disk image that holds an application, else the installed applications. A
+// disk image ejected since it was chosen leaves the installed applications.
+function chosenPlace(images: borrow [DiskImage]) -> InlayPlace {
+    let path = NavigationPath {}
+    for value in path.values() {
+        match placeOf(value.routeKey()) {
+            Some(place) -> if placeExists(images, place) { return place }
+            None -> {}
+        }
+    }
+    for image in images {
+        if image.applications.count > 0 { return .Image(copy image.name) }
+    }
+    return .Applications
+}
+
+// Makes the place Inlay shows the one its path names, so that the sidebar
+// selects its row, as a Mac's Finder opens with a place selected. A path that
+// already names it is left alone; one that does not is replaced in place,
+// without the change a chosen row makes.
+function selectChosenPlace(images: borrow [DiskImage]) {
+    let chosen = routeOf(chosenPlace(images))
+    let path = NavigationPath {}
+    if path.startsWith(chosen) { return }
+    navigationStore([chosen])
+}
+
+// Whether `place` is still there to show: an opened image, a folder that is
+// still a folder, or the installed applications.
+function placeExists(images: borrow [DiskImage], place: borrow InlayPlace) -> Bool {
+    return match place {
+        Applications, Trash -> true
+        Image -> chosenImage(images, place).isSome()
+        Folder(path) -> isDirectory(path)
+    }
+}
+
+// The opened disk image `place` names, if it is one.
+function chosenImage(images: borrow [DiskImage], place: borrow InlayPlace) -> DiskImage? {
+    let name = match place {
+        Image(named) -> copy named
+        Applications, Folder, Trash -> return .None
+    }
+    for image in images {
+        if image.name == name { return .Some(copy image) }
+    }
+    return .None
+}

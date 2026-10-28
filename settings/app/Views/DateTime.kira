@@ -1,0 +1,103 @@
+import Foundation
+import KiraUI
+import LibTessera
+
+// Date & Time: the time zone every clock reads in, the region's while it is
+// set automatically. The clock itself is set by the system, never here
+// (16 §14.6).
+construct DateTimePane(choices: SettingsChoices) extends Widget {
+    body {
+        let automatic = choices.zone == TimeZoneSetting.automatic
+        let name = automatic ? regionTimeZoneName() : copy choices.zone
+        let now = loadTimeZone(name).local(unixMillis())
+        Form {
+            Section {
+                Toggle(
+                    title = "Set Automatically",
+                    isOn = automatic,
+                    onChange = { on in
+                        // Turned off, the zone stays the region's until another is chosen.
+                        let next = on ? TimeZoneSetting.automatic : regionTimeZoneName()
+                        choices.zone = copy next
+                        changeSetting(TimeZoneSetting.key, .Some(copy next))
+                        return
+                    }
+                )
+                NavigationLink(value = TimeZoneRoute(choices = choices)) {
+                    LabeledContent(label = "Time Zone") {
+                        Text(timeZoneCity(name))
+                    }
+                }
+                .disabled(automatic)
+                LabeledContent(label = "Now") {
+                    Text(localClockText(now))
+                }
+            } footer: {
+                Text(
+                    "The clock is kept in Coordinated Universal Time and shown in this time zone. Set automatically, it is the time zone of the region the machine started in."
+                )
+            }
+        }
+        .navigationTitle("Date & Time")
+    }
+}
+
+// Time Zone: the regions of the tz database, each opening its zones, with
+// UTC first.
+construct TimeZonePane(choices: SettingsChoices) extends Widget {
+    body {
+        var rows: [Any Widget] = []
+        for region in timeZoneRegions(timeZoneNames()) {
+            rows.append(
+                NavigationLink(
+                    value = TimeZoneRegionRoute(region = copy region, choices = choices)
+                ) {
+                    Text(copy region)
+                }
+            )
+        }
+        Form(children: [Section(children: rows)])
+        .navigationTitle("Time Zone")
+    }
+}
+
+// The zones of `region`, a checked list; choosing one writes it.
+construct TimeZoneRegionPane(region: String, choices: SettingsChoices) extends Widget {
+    @State var chosen: String = copy choices.zone
+
+    body {
+        var rows: [Any Widget] = []
+        for name in timeZoneNames() {
+            if timeZoneRegion(name) != region { continue }
+            let target = copy name
+            rows.append(
+                Button(
+                    action = { in
+                        chosen = copy target
+                        choices.zone = copy target
+                        changeSetting(TimeZoneSetting.key, .Some(copy target))
+                        return
+                    }
+                ) {
+                    HStack(spacing = .Medium, alignment = .Center) {
+                        Text(timeZoneCity(name))
+                        Spacer()
+                        Icon(symbol = .Checkmark)
+                        .foregroundColor(chosen == name ? .Accent : .Clear)
+                    }
+                }.buttonStyle(.Plain)
+            )
+        }
+        Form(children: [Section(children: rows)])
+        .navigationTitle(copy region)
+    }
+}
+
+// `17:42`, from milliseconds counted as though the zone's clock were UTC.
+function localClockText(local: Number) -> String {
+    let seconds = floor(local / 1000)
+    let rest = seconds % CivilTime.secondsPerDay
+    let hour = floor(rest / CivilTime.secondsPerHour)
+    let minute = floor(rest % CivilTime.secondsPerHour / CivilTime.secondsPerMinute)
+    return zeroPadded(hour, 2) + ":" + zeroPadded(minute, 2)
+}

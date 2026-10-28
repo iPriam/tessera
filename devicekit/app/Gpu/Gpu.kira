@@ -1,0 +1,301 @@
+import Foundation
+import Heap
+import LibTessera
+
+// Gpu (17 §11): which adapter is which, its formats, its memory and its
+// priority. DeviceKit submits no GPU work; the Vulkan driver does.
+
+// What a Gpu connection keeps besides its object.
+struct GpuRecord {
+    var object: Number
+    var priority: GpuPriority
+    // The adapter's DRM file has timeline syncobjs.
+    var timelines: Bool
+}
+
+namespace GpuRecordSize {
+    let info: Number = 96
+    let formatModifier: Number = 16
+}
+
+// A format and the layout it is laid out in, as `FormatModifier` lists them.
+@Derive(Copy)
+struct FormatPair {
+    var format: FourCc
+    var modifier: Modifier
+}
+
+function samePair(left: borrow FormatPair, right: borrow FormatPair) -> Bool {
+    return left.format == right.format && left.modifier == right.modifier
+}
+
+// A device node's major and minor numbers.
+@Derive(Copy)
+struct DeviceNumbers {
+    var major: U32
+    var minor: U32
+}
+
+// `226:128`, from the `dev` file of a node's sysfs directory.
+function deviceNumbers(directory: borrow String) -> DeviceNumbers? {
+    let text = try attribute(directory + "/dev") otherwise return .None
+    let parts = text.split(":")
+    if parts.count != 2 { return .None }
+    let major = try parts[0].toNumber() otherwise return .None
+    let minor = try parts[1].toNumber() otherwise return .None
+    return .Some(DeviceNumbers { major: U32(major), minor: U32(minor) })
+}
+
+// A `/dev/dri` node's numbers, from its sysfs directory.
+function nodeNumbers(node: borrow String) -> DeviceNumbers? {
+    return deviceNumbers("/sys/class/drm/" + lastComponent(node))
+}
+
+// `DRM_IOCTL_GET_CAP`: the capability @0, its value @8.
+function drmCapability(card: borrow Descriptor, capability: U64) -> Result<U64, TesseraError> {
+    let blockBytes = zeroedBlock(count: 16, alignment: 16)
+    let block = blockBytes.pointer()
+    heapStore<U64>(block, 0, capability)
+    let asked = try card.control(Drm.getCap, block)
+    return .Ok(heapLoad<U64>(block, 8))
+}
+
+function gpuOf(object: Number) -> Result<Number, TesseraError> {
+    for (index, gpu) in deviceLibrary.gpus.enumerated() {
+        if gpu.object == object { return .Ok(index) }
+    }
+    return .Error(failure(.InvalidHandle))
+}
+
+// A Gpu connection starts at Normal priority, and learns whether its DRM
+// file has timeline syncobjs. A kernel without the capability answers
+// `EINVAL`, which is a no.
+function gpuPrepare(object: Number) -> Result<Void, TesseraError> {
+    let card = try deviceOf(object)
+    let timelines = match drmCapability(card, Drm.capSyncobjTimeline) {
+        Ok(value) -> value != U64(0)
+        Error(failed) -> {
+            match errnoOf(failed) {
+                Invalid -> false
+                else -> return .Error(failed)
+            }
+        }
+    }
+    deviceLibrary.gpus.append(GpuRecord { object: object, priority: .Normal, timelines: timelines })
+    return .Ok
+}
+
+function gpuRelease(object: Number) {
+    var kept: [GpuRecord] = []
+    for gpu in deviceLibrary.gpus {
+        if gpu.object != object { kept.append(gpu) }
+    }
+    deviceLibrary.gpus = kept
+}
+
+// Whether this process holds a Gpu connection on `entry` that has timeline
+// syncobjs.
+function hasTimelines(entry: EntryId) -> Bool {
+    for gpu in deviceLibrary.gpus {
+        if deviceLibrary.objects[gpu.object].entry == entry && gpu.timelines { return true }
+    }
+    return false
+}
+
+// System memory in bytes, from `/proc/meminfo`'s `MemTotal`, in KiB there.
+function memoryTotal() -> Result<Number, TesseraError> {
+    let text = try readText("/proc/meminfo")
+    for line in text.split("\n") {
+        if !line.startsWith("MemTotal:") { continue }
+        let fields = line.substring(9, line.count).trim().split(" ")
+        return match fields[0].toNumber() {
+            Some(kibibytes) -> .Ok(kibibytes * 1024)
+            None -> .Error(failure(.Internal))
+        }
+    }
+    return .Error(failure(.NotFound))
+}
+
+// The `GpuInfo` record of one adapter.
+function writeGpuInfo(out: RawPtr, at: Number, entry: borrow Entry, shared: Number) {
+    zeroBytes(heapOffset(out, at), GpuRecordSize.info)
+    heapStore<U64>(out, at, entry.id.raw)
+    heapStore<U32>(out, at + 8, U32(entry.word("vendorId").or(U64(0))))
+    heapStore<U32>(out, at + 12, U32(entry.word("productId").or(U64(0))))
+    var capabilities = GpuCapabilities.none
+    match entry.node {
+        Some(node) -> match nodeNumbers(node) {
+            Some(render) -> {
+                heapStore<U32>(out, at + 16, render.major)
+                heapStore<U32>(out, at + 20, render.minor)
+            }
+            None -> {}
+        }
+        None -> {}
+    }
+    match entry.text("vendor.tessera.primary") {
+        Some(primary) -> {
+            match nodeNumbers(primary) {
+                Some(numbers) -> {
+                    heapStore<U32>(out, at + 24, numbers.major)
+                    heapStore<U32>(out, at + 28, numbers.minor)
+                }
+                None -> {}
+            }
+            capabilities = capabilities | GpuCapabilities.scanout
+        }
+        None -> {}
+    }
+    if hasTimelines(entry.id) {
+        capabilities = capabilities | GpuCapabilities.timelineFences | GpuCapabilities.explicitSync
+    }
+    if entry.path.contains("virtio") || entry.name.startsWith("virtio") {
+        capabilities = capabilities | GpuCapabilities.virtual
+    }
+    heapStore<U64>(out, at + 32, capabilities.raw)
+    // Unified memory: no device-local bytes, half the system's shared.
+    heapStore<U64>(out, at + 48, U64(shared))
+    var length = entry.name.count
+    if length > 31 { length = 31 }
+    copyBytes(heapOffset(out, at + 56), entry.name.data, length)
+}
+
+public function gpuList(out: borrow Buffer) -> Result<Number, TesseraError> {
+    var adapters: [Entry] = []
+    let entries = try scan()
+    for entry in entries {
+        if entry.entryClass == .GpuAdapter { adapters.append(entry) }
+    }
+    try requireRoom(out, Number(8 + adapters.count * GpuRecordSize.info))
+    let total = try memoryTotal()
+    let shared = floor(total / 2)
+    writeListHeader(out.address, adapters.count, GpuRecordSize.info)
+    for (item, entry) in adapters.enumerated() {
+        writeGpuInfo(out.address, 8 + item * GpuRecordSize.info, entry, shared)
+    }
+    return .Ok(Number(adapters.count))
+}
+
+// The linear 8-bit RGBA formats every driver renders to and samples.
+function renderPairs() -> [FormatPair] {
+    var pairs: [FormatPair] = []
+    for name in ["XR24", "AR24", "XB24", "AB24"] {
+        pairs.append(FormatPair { format: fourCc(name), modifier: Modifier(0) })
+    }
+    return pairs
+}
+
+// The pairs in both lists.
+function commonPairs(left: borrow [FormatPair], right: borrow [FormatPair]) -> [FormatPair] {
+    var both: [FormatPair] = []
+    for pair in left {
+        for other in right {
+            if samePair(pair, other) { both.append(pair) }
+        }
+    }
+    return both
+}
+
+// The pairs a usage allows. Scanout comes from the primary planes of a
+// display this process drives; rendering and sampling, which the Vulkan
+// driver decides, are reported as the linear 8-bit RGBA formats every driver
+// takes, and Ember asks Vulkan for the rest.
+public function gpuFormats(
+    gpu: Ref,
+    usage: SurfaceUsage,
+    out: borrow Buffer
+) -> Result<Number, TesseraError> {
+    let object = try resolveConnection(gpu, .Gpu, RefRights.read)
+    var pairs = renderPairs()
+    if usage.has(SurfaceUsage.scanout) {
+        let scanout = try scanoutPairs()
+        // With rendering asked for too, only the pairs both allow.
+        if usage == SurfaceUsage.scanout { pairs = scanout } else {
+            pairs = commonPairs(scanout, pairs)
+        }
+    }
+    try requireRoom(out, Number(8 + pairs.count * GpuRecordSize.formatModifier))
+    writeListHeader(out.address, pairs.count, GpuRecordSize.formatModifier)
+    for (item, pair) in pairs.enumerated() {
+        let at = 8 + item * GpuRecordSize.formatModifier
+        heapStore<U32>(out.address, at, pair.format.raw)
+        heapStore<U32>(out.address, at + 4, U32(1))
+        heapStore<U64>(out.address, at + 8, pair.modifier.raw)
+    }
+    return .Ok(Number(pairs.count))
+}
+
+// The bytes a `drm-total-` or `drm-memory-` value names: a count and a unit.
+function fdinfoBytes(value: borrow String) -> Number? {
+    let fields = value.trim().split(" ")
+    let amount = try fields[0].toNumber() otherwise return .None
+    if fields.count < 2 { return .Some(amount) }
+    return match fields[1] {
+        "KiB" -> .Some(amount * 1024)
+        "MiB" -> .Some(amount * 1048576)
+        "GiB" -> .Some(amount * 1073741824)
+        else -> .Some(amount)
+    }
+}
+
+// The connection's `drm-total-*` and `drm-memory-*` lines in its fdinfo:
+// VRAM and local regions are device memory, the rest is shared.
+public function gpuMemoryUsage(gpu: Ref) -> Result<GpuMemory, TesseraError> {
+    let object = try resolveConnection(gpu, .Gpu, RefRights.read)
+    let card = try deviceOf(object)
+    let text = try readText("/proc/self/fdinfo/\(card.number)")
+    var local: Number = 0
+    var shared: Number = 0
+    for line in text.split("\n") {
+        if !line.startsWith("drm-total-") && !line.startsWith("drm-memory-") { continue }
+        let colon = match line.indexOf(":") {
+            Some(at) -> at
+            None -> continue
+        }
+        let region = line.substring(0, colon)
+        let bytes = match fdinfoBytes(line.substring(colon + 1, line.count)) {
+            Some(value) -> value
+            None -> {
+                log debug("an fdinfo memory line is not a size", line)
+                continue
+            }
+        }
+        if region.contains("vram") || region.contains("local") { local += bytes } else {
+            shared += bytes
+        }
+    }
+    let total = try memoryTotal()
+    return .Ok(
+        GpuMemory {
+            localUsed: U64(local),
+            localBudget: U64(0),
+            sharedUsed: U64(shared),
+            sharedBudget: U64(floor(total / 2))
+        }
+    )
+}
+
+// High and Realtime are for the display server: a process that holds a
+// display connection may ask for them.
+public function gpuSetPriority(
+    gpu: Ref,
+    priority: borrow GpuPriority
+) -> Result<Void, TesseraError> {
+    let object = try resolveConnection(gpu, .Gpu, RefRights.manage)
+    let index = try gpuOf(object)
+    let elevated = match priority {
+        Low -> false
+        Normal -> false
+        High -> true
+        Realtime -> true
+    }
+    if elevated && deviceLibrary.displays.count == 0 { return .Error(failure(.NotEntitled)) }
+    deviceLibrary.gpus[index].priority = priority
+    return .Ok
+}
+
+public function gpuPriority(gpu: Ref) -> Result<GpuPriority, TesseraError> {
+    let object = try resolveConnection(gpu, .Gpu, RefRights.inspect)
+    let index = try gpuOf(object)
+    return .Ok(deviceLibrary.gpus[index].priority)
+}

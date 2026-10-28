@@ -1,0 +1,58 @@
+import Foundation
+
+// Everything this library holds for its process.
+//
+// DeviceKit's calls are free functions over Refs (17 §3), with no context a
+// caller passes in, as IOKit's are; the objects a Ref names have to outlive
+// any one call. So the process's DeviceKit state is this one value, and
+// nothing else in the library is mutable at the top level.
+struct Library {
+    var objects: [Object]
+    var refs: [RefSlot]
+    var nextObjectId: U64
+    var machine: Machine?
+    var manager: Descriptor?
+    var registry: RegistryState
+    var connections: [Connection]
+    var surfaces: [SurfaceRecord]
+    var fences: [FenceRecord]
+    var fenceWaits: [FenceWait]
+    var syncDevice: Descriptor?
+    var gpus: [GpuRecord]
+    var displays: [DisplayRecord]
+    var framebuffers: [FramebufferRecord]
+    var inputs: [InputConnection]
+    var usbs: [UsbConnection]
+    var audios: [AudioConnection]
+    var cameras: [CameraConnection]
+    var sensors: [SensorConnection]
+    var wakeSources: [WakeSourceRecord]
+    var blocks: [BlockConnection]
+    var mappers: [MapperRecord]
+}
+
+// The process's DeviceKit state (see `Library`).
+var deviceLibrary: Library = Library {
+    objects: [],
+    refs: [],
+    nextObjectId: U64(1),
+    machine: .None,
+    manager: .None,
+    registry: emptyRegistry(),
+    connections: [],
+    surfaces: [],
+    fences: [],
+    fenceWaits: [],
+    syncDevice: .None,
+    gpus: [],
+    displays: [],
+    framebuffers: [],
+    inputs: [],
+    usbs: [],
+    audios: [],
+    cameras: [],
+    sensors: [],
+    wakeSources: [],
+    blocks: [],
+    mappers: [],
+}

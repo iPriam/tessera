@@ -1,0 +1,9 @@
+import KiraUI
+import TesseraUI
+
+// Welcome: the first-run setup, which PID 1 opens over the desktop until it
+// is completed, and which can be opened again from App Library.
+@Main
+function main() {
+    RunTesseraApplication("Welcome", { in return SetupView() }, ApplicationOptions {})
+}

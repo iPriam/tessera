@@ -1,0 +1,304 @@
+import Foundation
+
+// A test boot: QEMU started with its serial line in the boot log and its
+// own messages beside it, waited on with a clock, and judged on what the log
+// says. QEMU writes to its standard error whenever a device's host side has
+// something to say, and a line landing inside a guest event would cut it in
+// two, so the two never share a file.
+
+// A machine a test boot is running.
+struct TestMachine {
+    let child: ChildProcess
+    let logPath: String
+    let monitor: Monitor
+    // The USB stick a boot plugs in through the monitor.
+    let stick: String
+    // Every wait polls the log each tenth of a second up to a count of polls,
+    // stretched by this much where the guest runs slower.
+    let pollScale: Number
+    // When it was started, and how many seconds it may run.
+    let started: Number
+    let timeout: Number
+    var exit: ChildExit? = .None
+    var timedOut: Bool = false
+}
+
+extend TestMachine {
+    // Whether QEMU still runs. One past its time is stopped, as a timeout
+    // stops it.
+    function running(borrow mut self) -> Bool {
+        if exit != .None { return false }
+        match child.waitUpTo(0) {
+            Ok(ended) -> match ended {
+                Some(status) -> {
+                    exit = .Some(status)
+                    return false
+                }
+                None -> {}
+            }
+            Error(failure) -> {
+                absorb failure
+                return false
+            }
+        }
+        if unixMillis() - started < timeout * 1000 { return true }
+        end()
+        timedOut = true
+        return false
+    }
+
+    // Ends QEMU, if it runs, and waits for it.
+    function end(borrow mut self) {
+        if exit != .None { return }
+        match child.signal(.Terminate) {
+            Ok -> {}
+            Error(failure) -> absorb failure
+        }
+        match child.wait() {
+            Ok(status) -> exit = .Some(status)
+            Error(failure) -> absorb failure
+        }
+    }
+
+    // The exit status as a shell reports it, 124 for a timeout.
+    function status(borrow self) -> Number {
+        if timedOut { return 124 }
+        return match exit {
+            Some(ended) -> exitStatus(ended)
+            None -> 1
+        }
+    }
+
+    function read(borrow self) -> BootLog {
+        return readBootLog(logPath)
+    }
+
+    // Polls the log until `holds` answers yes, QEMU ends, or `polls` tenths
+    // of a second times the scale pass. What is asked of the log after is
+    // the check; the wait only gives it time.
+    function await(borrow mut self, polls: Number, holds: (BootLog) -> Bool) {
+        for poll in 0..(polls * pollScale) {
+            if holds(read()) || !running() { return }
+            processSleep(100)
+        }
+    }
+
+    // Forgets QEMU's process, which has ended.
+    function release(borrow self) {
+        match child.release() {
+            Ok -> {}
+            Error(failure) -> log warn("QEMU's process was not released", traceText(failure))
+        }
+    }
+
+    // Waits for QEMU to end by itself, up to its time.
+    function awaitEnd(borrow mut self) {
+        while running() { processSleep(100) }
+    }
+
+    // Ends a services boot as a machine is stopped: Ctrl-Alt-Del reaches PID
+    // 1 as SIGINT, which asks every service to stop, waits out its deadline
+    // and powers off.
+    function stop(borrow mut self) {
+        monitor.send("sendkey ctrl-alt-delete")
+        for poll in 0..(100 * pollScale) {
+            if !running() { break }
+            processSleep(100)
+        }
+        end()
+        match removePath(monitor.path) {
+            Ok -> {}
+            Error(failure) -> absorb failure
+        }
+    }
+
+    // Ends the boot on a failed check: says what failed, with the log's
+    // last `lines` lines when there are any to show.
+    function fail(borrow mut self, what: borrow String, lines: Number) -> Bool {
+        end()
+        match removePath(monitor.path) {
+            Ok -> {}
+            Error(failure) -> absorb failure
+        }
+        // The log's lines are printed whole: a log field shows only its
+        // first hundred or so characters.
+        if lines > 0 { print(read().tail(lines)) }
+        log fault("the boot test failed", what: what)
+        return false
+    }
+}
+
+// Runs a test boot of `command` and judges it.
+function testBoot(
+    host: borrow Host,
+    architecture: Architecture,
+    mode: borrow BootMode,
+    options: borrow BootOptions,
+    outputSize: borrow String,
+    monitor: borrow Monitor,
+    command: borrow ProcessCommand
+) -> Number {
+    let logs = host.logDirectory()
+    let name = architecture.name()
+    let logPath = "\(logs)/boot-\(name).log"
+    let qemuLog = "\(logs)/qemu-\(name).log"
+    // An aarch64 guest away from Apple silicon is translated instruction by
+    // instruction, and once the UI renders through venus the same boot takes
+    // three times as long.
+    let translated = options.emulate || architecture == .Aarch64 && !(
+        host.darwin && host.architecture == .Aarch64
+    )
+    var pollScale = translated ? 3 : 1
+    if options.pollScale > 0 { pollScale = options.pollScale }
+    var timeout = architecture == .Aarch64 ? 300 : 120
+    if options.emulate { timeout = timeout * 3 }
+    // A services boot has nothing that ends it but this.
+    if mode.services { timeout = 20 }
+    // The restart boot also waits out init's eight quiet seconds; the multi
+    // boot drives two applications in turn; the mobile boot waits out twenty
+    // seconds of display sleep.
+    if mode.restart || mode.multi { timeout = 40 }
+    if mode.mobile { timeout = 50 }
+    if mode.browser { timeout = 90 }
+    if mode.services { timeout = timeout * pollScale }
+    var started = copy command
+    started.input = .Null
+    started.output = .File(copy logPath)
+    started.errors = .File(copy qemuLog)
+    log info("boot test", name)
+    let child = match started.start() {
+        Ok(running) -> running
+        Error(failure) -> {
+            log fault("QEMU did not start", traceText(failure))
+            return 1
+        }
+    }
+    var machine = TestMachine {
+        child: child,
+        logPath: logPath,
+        monitor: copy monitor,
+        stick: "\(host.machineDirectory(architecture))/\(VolumeLayout.stick)",
+        pollScale: pollScale,
+        started: unixMillis(),
+        timeout: timeout
+    }
+    let passed = mode.services
+    ? servicesScenario(machine, mode, architecture, outputSize, "\(logs)/screen-\(name).ppm")
+    : true
+    if !passed {
+        machine.release()
+        return 1
+    }
+    if mode.services { machine.stop() } else { machine.awaitEnd() }
+    machine.release()
+    let status = machine.status()
+    let written = machine.read()
+    let expected = expectedLine(mode)
+    if mode.services && written.seen(expected) {
+        match missingServiceLine(written, mode) {
+            Some(problem) -> {
+                print(written.tail(80))
+                log fault("services device services failed", problem: problem)
+                return 1
+            }
+            None -> {}
+        }
+    }
+    if mode.update { return updateVerdict(written, mode, logPath) }
+    // PID 1 refuses the tampered system, and a volume whose install was
+    // stopped, before any program of the system runs.
+    if mode.tampered || mode.interrupted {
+        let what = mode.tampered ? "the tampered system" : "the interrupted install"
+        if written.seen(expected) && written.shows("Boot]: refusing to boot") && !written.shows(
+            BootBanners.system
+        ) {
+            log info("refused to boot", what: what, log: logPath)
+            return 0
+        }
+        print(written.tail(80))
+        log fault("PID 1 did not refuse to boot", what: what, log: logPath)
+        return 1
+    }
+    // Display Check, wherever it runs, runs confined: it writes its data
+    // folder and cannot name the other applications, the system's state or
+    // /etc, nor write the platform's runtime it reads, and cannot name a
+    // disk or another process's root, nor keep a capability (roadmap/12-apps.md).
+    let view = "DisplayCheck.main]: checked the application's view|applications: false|systemState: false|settings: false|frameworks: true|wroteData: true|wroteRuntime: false|disk: false|initRoot: false|capabilities: false|rootGiven: false|everyEntitlement: false|defaultEntitlements: true"
+    if !mode.desktop && !mode.recovery && written.seen(expected) && !written.has(view) {
+        print(written.tail(80))
+        log fault("Display Check did not run confined")
+        return 1
+    }
+    // A sealed boot mounts the system only once the signature over its
+    // composefs image's digest checks, under `verity=require` (roadmap/13).
+    let sealed = "Volume.System]: mounted the system sealed"
+    if !mode.dev && !mode.recovery && written.seen(expected) && !written.has(sealed) {
+        print(written.tail(80))
+        log fault("the system was not mounted sealed")
+        return 1
+    }
+    let target = mode.services ? "services" : "system"
+    if written.seen(expected) {
+        log info("booted to the userland", target: target, log: logPath)
+        return 0
+    }
+    var why = "exited with status \(status) without reaching userland"
+    if status == 124 {
+        why = mode.services
+        ? "ran the services for \(timeout)s without the display taking the card"
+        : "timed out after \(timeout)s without reaching userland"
+    }
+    var report = "\(name) \(why)\n--- last 40 lines of \(logPath) ---\n\(written.tail(40))"
+    let emulator = readBootLog(qemuLog)
+    if emulator.lines.count > 1 {
+        report = report + "--- last 20 lines of \(qemuLog) ---\n" + emulator.tail(20)
+    }
+    print(report)
+    log fault("the boot test failed", why: why)
+    return 1
+}
+
+// What the boot has to reach, as `BootLog.seen` takes it.
+function expectedLine(mode: borrow BootMode) -> String {
+    // PID 1's refusal, which names the system and the digest it read.
+    if mode.tampered { return "s image is not the one signed: the signature does not" }
+    if mode.interrupted { return "the system could not be mounted: " }
+    if !mode.services { return BootBanners.system }
+    if mode.restart { return "log:TesseraUI.Run]: took a replacement display link" }
+    if mode.multi {
+        return "log:TesseraUI.DisplayCheck]: a key arrived|client: 3|key: 4|state: \"pressed\""
+    }
+    if mode.recoveryTest { return "Recovery.main]: listed the disks" }
+    if mode.media { return "Media.main]: running" }
+    if mode.browser { return "log:the browser shows a page|" }
+    if mode.mobile { return "AdaptiveMobile.main]: running" }
+    return "log:TesseraUI.DisplayCheck]: a key arrived|key: 4|state: \"pressed\""
+}
+
+// Drives a services boot through its scenario; answers whether every check
+// on the way held.
+function servicesScenario(
+    machine: borrow mut TestMachine,
+    mode: borrow BootMode,
+    architecture: Architecture,
+    outputSize: borrow String,
+    screen: borrow String
+) -> Bool {
+    if mode.restart { return restartScenario(machine) }
+    if mode.multi { return multiScenario(machine) }
+    if mode.recoveryTest {
+        machine.await(
+            200,
+            { written in
+                return written.shows("Recovery.main]: listed the disks") && written.has(
+                    "composed a picture|surfaces: 1"
+                )
+            }
+        )
+        return true
+    }
+    if mode.media { return mediaScenario(machine) }
+    if mode.browser { return browserScenario(machine) }
+    if mode.mobile { return mobileScenario(machine) }
+    return plainScenario(machine, architecture, outputSize, screen)
+}

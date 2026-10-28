@@ -1,0 +1,168 @@
+import Foundation
+import RenderBox
+
+// An SVG document recorded into a RenderBox display list as CoreSVG draws
+// one through Core Graphics: each element's transform concatenated onto the
+// state, its shapes filled and stroked with their colours and gradients in
+// the order the document lists them, an element less than opaque drawn into
+// a layer of its own at that opacity, and a clip path clipping what it
+// encloses.
+
+// The paint properties an element passes to what is inside it.
+struct SvgStyle {
+    var fill: String = "black"
+    var fillOpacity: Number = 1
+    var fillRule: FillRule = .NonZero
+    var stroke: String = "none"
+    var strokeOpacity: Number = 1
+    var strokeWidth: Number = 1
+    var lineCap: LineCap = .Butt
+    var lineJoin: LineJoin = .Miter
+    var miterLimit: Number = 4
+}
+
+// A drawing in progress: the list, and the elements an `id` names.
+class SvgPainter {
+    var list: DisplayList
+    var named: [(String, SvgElement)] = []
+}
+
+// Elements that hold no drawing of their own.
+function definesOnly(name: borrow String) -> Bool {
+    return match name {
+        "defs", "clipPath", "mask", "title", "desc", "style", "metadata", "linearGradient", "radialGradient", "symbol", "filter", "pattern" -> true
+        else -> false
+    }
+}
+
+function opacityAttribute(element: borrow SvgElement, name: borrow String) -> Number? {
+    let written = try element.attribute(name) otherwise return .None
+    let trimmed = written.trim()
+    let percent = trimmed.endsWith("%")
+    let number = try parseNumber(
+        percent ? trimmed.substring(0, trimmed.count - 1) : trimmed
+    ) otherwise return .None
+    return .Some(clamp(percent ? number / 100 : number, 0, 1))
+}
+
+// `inherited` with what `element` sets itself.
+function styleOf(element: borrow SvgElement, inherited: borrow SvgStyle) -> SvgStyle {
+    var style = copy inherited
+    style.fill = try element.attribute("fill") otherwise style.fill
+    style.stroke = try element.attribute("stroke") otherwise style.stroke
+    style.fillOpacity = try opacityAttribute(element, "fill-opacity") otherwise style.fillOpacity
+    style.strokeOpacity = try opacityAttribute(
+        element,
+        "stroke-opacity"
+    ) otherwise style.strokeOpacity
+    style.strokeWidth = try svgLength(element.attribute("stroke-width")) otherwise style.strokeWidth
+    style.miterLimit = try svgLength(
+        element.attribute("stroke-miterlimit")
+    ) otherwise style.miterLimit
+    match element.attribute("fill-rule") {
+        Some(rule) -> style.fillRule = rule.trim() == "evenodd" ? .EvenOdd : .NonZero
+        // The rule is inherited.
+        None -> {}
+    }
+    style.lineCap = match element.attribute("stroke-linecap") {
+        Some(cap) -> cap.trim() == "round" ? .Round : (cap.trim() == "square" ? .Square : .Butt)
+        None -> style.lineCap
+    }
+    style.lineJoin = match element.attribute("stroke-linejoin") {
+        Some(join) -> join.trim() == "round" ? .Round : (join.trim() == "bevel" ? .Bevel : .Miter)
+        None -> style.lineJoin
+    }
+    return style
+}
+
+extend SvgPainter {
+    // Every element with an `id`, anywhere in the tree.
+    function collectNamed(element: borrow SvgElement) {
+        match element.attribute("id") {
+            Some(id) -> named.append((id, copy element))
+            // Only named elements are referred to.
+            None -> {}
+        }
+        for child in element.children { collectNamed(child) }
+    }
+
+    function element(id: borrow String) -> SvgElement? {
+        for (name, found) in named {
+            if name == id { return .Some(copy found) }
+        }
+        return .None
+    }
+
+    // The element a `url(#id)` or `#id` reference names.
+    function referenced(text: borrow String) -> SvgElement? {
+        let start = try text.indexOf("#") otherwise return .None
+        let end = try text.indexOf(")") otherwise text.count
+        return element(text.substring(start + 1, max(end, start + 1)).trim())
+    }
+
+    // Draws `element` and what is inside it, through its transform, clip and
+    // opacity.
+    function draw(
+        element: borrow SvgElement,
+        inherited: borrow SvgStyle
+    ) -> Result<Void, SvgFailure> {
+        if definesOnly(element.name) { return .Ok }
+        let opacity = try opacityAttribute(element, "opacity") otherwise 1
+        if opacity <= 0 { return .Ok }
+        let style = styleOf(element, inherited)
+        list.save()
+        match element.attribute("transform") {
+            Some(written) -> list.concat(svgTransform(written))
+            // The element draws in its parent's units.
+            None -> {}
+        }
+        try clipped(element)
+        if opacity < 1 {
+            list.beginLayer(LayerFlags.none)
+        }
+        try drawContents(element, style)
+        if opacity < 1 {
+            try drawn(list.drawLayer(opacity, .Normal))
+        }
+        return drawn(list.restore())
+    }
+
+    function drawContents(
+        element: borrow SvgElement,
+        style: borrow SvgStyle
+    ) -> Result<Void, SvgFailure> {
+        if element.name == "use" {
+            return drawUse(element, style)
+        }
+        try drawShape(element, style)
+        for child in element.children { try draw(child, style) }
+        return .Ok
+    }
+
+    // A `use`: the element it names, moved by its `x` and `y`.
+    function drawUse(
+        element: borrow SvgElement,
+        style: borrow SvgStyle
+    ) -> Result<Void, SvgFailure> {
+        let reference = try element.attribute("href") otherwise(
+            try element.attribute("xlink:href") otherwise return .Ok
+        )
+        let target = try referenced(reference) otherwise return .Ok
+        list.save()
+        list.translateBy(lengthAttribute(element, "x"), lengthAttribute(element, "y"))
+        if target.name == "symbol" {
+            for child in target.children { try draw(child, style) }
+        } else {
+            try draw(target, style)
+        }
+        return drawn(list.restore())
+    }
+}
+
+// A display list's answer as the painter's.
+function drawn(result: Result<Void, DisplayListFailure>) -> Result<Void, SvgFailure> {
+    return match result {
+        Ok -> .Ok
+        Error(failure) -> .Error(.Drawing(failure))
+    }
+}

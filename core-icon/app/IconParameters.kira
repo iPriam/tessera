@@ -1,0 +1,174 @@
+import Foundation
+
+// IconRendering's rendering parameters, `ICRRenderingParameters.default` as
+// iOS 27 and macOS 27 ship it, for the parts of the renderer CoreIcon
+// ports. A `SizeBased` value holds one number per size class.
+
+// The size class an icon draws at, chosen by its side in points:
+// `thresholds.minMediumSize` 25, `minLargeSize` 60, `minDisplaySize` 256.
+enum IconSizeClass {
+    Display
+    Large
+    Medium
+    Small
+}
+
+function sizeClassFor(points: Number) -> IconSizeClass {
+    if points >= 256 { return .Display }
+    if points >= 60 { return .Large }
+    if points >= 25 { return .Medium }
+    return .Small
+}
+
+// A `SizeBasedValue`: the display, large, medium and small values.
+struct SizeBased {
+    let display: Number
+    let large: Number
+    let medium: Number
+    let small: Number
+}
+
+extend SizeBased {
+    function at(borrow self, size: IconSizeClass) -> Number {
+        return match size {
+            Display -> display
+            Large -> large
+            Medium -> medium
+            Small -> small
+        }
+    }
+}
+
+function sameSizes(a: borrow SizeBased, b: borrow SizeBased) -> Bool {
+    return a.display == b.display && a.large == b.large && a.medium == b.medium &&
+        a.small == b.small
+}
+
+// One value at every size.
+function everySize(value: Number) -> SizeBased {
+    return SizeBased { display: value, large: value, medium: value, small: value }
+}
+
+namespace IconGeometry {
+    // The canvas a document is drawn on, in points, and the share of an
+    // image's side the chiclet takes on macOS: 824 of 1024.
+    let canvas: Number = 1024
+    let bodyShare: Number = 0.8046875
+    // `defaultChicletCornerRadius`, drawn as a continuous rounded rect.
+    let cornerRadius: Number = 266.24
+    // The headroom the composite allows, and the colour clamp's ceiling.
+    let headroom: Number = 1.2
+    // The background's axial gradient runs from a tenth of the canvas to
+    // nine tenths.
+    let backgroundStart: Number = 0.1
+    let backgroundEnd: Number = 0.9
+}
+
+namespace ChicletShadowDefaults {
+    let opacity: SizeBased = SizeBased { display: 0.25, large: 0.25, medium: 0.25, small: 0.35 }
+    let radius: SizeBased = SizeBased { display: 20, large: 25, medium: 40, small: 50 }
+    let offsetX: SizeBased = everySize(0)
+    let offsetY: SizeBased = SizeBased { display: 10, large: 15, medium: 25, small: 25 }
+}
+
+// `_shadow`: the shadow a group casts on what is under it.
+namespace GroupShadowDefaults {
+    let offsetX: Number = 0
+    let offsetY: Number = 32
+    // `radius` is a share of `blurStrengthMax`.
+    let radius: SizeBased = everySize(0.3)
+    let blurStrengthMax: Number = 64
+    let vibrantOpacity: SizeBased = everySize(0.75)
+    let neutralOpacity: SizeBased = everySize(0.375)
+    let vibrantBrightness: Number = 0.75
+}
+
+// `sdfGeneration` and the distance field's reach, a fifth of the content
+// image's side.
+namespace DistanceDefaults {
+    let clampThreshold: Number = 0.002
+    let maxRelativeSmoothing: Number = 0.005
+    // The smoothing radius's ceiling, the double 0x4013cc8a99af5453.
+    let maxSmoothing: Number = 4.94974746830583
+    let reach: Number = 0.2
+    // How far past a layer's bounds its distance field is drawn, in pixels.
+    let margin: Number = 8
+}
+
+// `_outlines`: the hairline drawn just inside the chiclet's edge.
+namespace OutlineDefaults {
+    let lineWidth: SizeBased = SizeBased {
+        display: 1.33333,
+        large: 1,
+        medium: 0.666667,
+        small: 0.666667
+    }
+    let opacityOnBright: SizeBased = everySize(0.12)
+    let opacityOnDim: SizeBased = everySize(0.15)
+    let rangeOnBright: Number = 0.1
+    let rangeOnDim: Number = 0.1
+    let allowDespiteShadow: Bool = false
+}
+
+// A `VCM`: luminance mapped from black to white, chroma scaled by the
+// saturation, the result kept under the headroom.
+struct Vcm {
+    let black: Number
+    let white: Number
+    let saturation: Number
+    let headroom: Number = 0
+}
+
+// The colour matrices glyph highlights brighten and darken what is under
+// them with.
+namespace HighlightMatrices {
+    let light: Vcm = Vcm { black: 0.2, white: 1.2, saturation: 1.25 }
+    let dark: Vcm = Vcm { black: -0.15, white: 0.7, saturation: 1.25 }
+}
+
+// `_shadow`'s overdraw: a shadow drawn again over translucent contents,
+// fully once the translucency reaches `translucencyForMax`.
+namespace ShadowOverdraw {
+    let translucencyForMax: Number = 0.3
+    let maxNeutral: SizeBased = everySize(0.2)
+    let maxVibrant: SizeBased = everySize(0.5)
+}
+
+// `clearMode`: a clear or tinted icon is drawn as a mask, how much each
+// place lightens (red), darkens (green) and is highlighted (blue), laid
+// over the system's glass through these.
+namespace ClearModeDefaults {
+    let totalLighteningStrength: Number = 1
+    let totalDarkeningStrength: Number = 0.3
+    let totalHighlightsStrength: Number = 1
+    let contentLighteningStrength: Number = 0.85
+    let highlightsVcm: Vcm = Vcm { black: 0.2, white: 1.35, saturation: 1.4, headroom: 1.2 }
+    let lighteningVcm: Vcm = Vcm { black: 0.9, white: 2.5, saturation: 2, headroom: 1.2 }
+    // The headroom a clear or tinted icon's group images are drawn with.
+    let contentsHeadroom: Number = 1
+}
+
+// `mitigatedChiclet*`: the glass a clear icon is shown on when rendered by
+// itself, and the gray a tinted icon's tint is mixed with, in linear light,
+// keeping `factor` of the tint.
+namespace MitigatedChiclet {
+    let lightClear: Number = 0.5
+    let darkClear: Number = 0.17
+    let lightTint: Number = 0.5
+    let lightTintFactor: Number = 0.9
+    let darkTint: Number = 0.1
+    let darkTintFactor: Number = 0
+}
+
+// `contourGradients.darkTint*Brightness`: the gray background a dark tinted
+// icon's contents are drawn over, top and bottom.
+namespace ContourGradients {
+    let darkTintStart: Number = 0.15
+    let darkTintEnd: Number = 0
+}
+
+// `_highlights.maxDimChicletLuminance`: a chiclet this dark or darker is
+// dim, and its glyphs' darklights fall outside them.
+namespace ChicletLuminance {
+    let maxDim: Number = 0.2
+}

@@ -1,0 +1,435 @@
+import Foundation
+import Kten
+
+// A choice in Kten: its light value alone when it has no other, else
+// `Choice { light: …, dark: …, mono: … }` with the appearances it sets.
+
+namespace ChoiceTag {
+    let name: String = "Choice"
+}
+
+// The light, dark and mono values a choice is written with.
+function choiceParts(value: borrow Kten) -> Result<(Kten, Kten?, Kten?), IconReadFailure> {
+    let tagged = match value {
+        Object(object) -> match object.tag {
+            Some(tag) -> tag == ChoiceTag.name
+            None -> false
+        }
+        // A value that is not an object is the light value alone.
+        Null, Bool, Number, Text, Bytes, List, Case -> false
+    }
+    if !tagged { return .Ok((copy value, .None, .None)) }
+    let light = match try fieldIn(value, "light") {
+        Some(light) -> light
+        None -> return .Error(.Shape(.Absent("light")))
+    }
+    return .Ok((light, try fieldIn(value, "dark"), try fieldIn(value, "mono")))
+}
+
+function choiceKten(light: Kten, dark: Kten?, mono: Kten?) -> Kten {
+    if dark.isNone() && mono.isNone() { return light }
+    var fields = [ktenField("light", move light)]
+    match dark {
+        Some(value) -> fields.append(ktenField("dark", move value))
+        // The dark appearance takes the light value.
+        None -> {}
+    }
+    match mono {
+        Some(value) -> fields.append(ktenField("mono", move value))
+        // The mono appearance takes the dark or light value.
+        None -> {}
+    }
+    return ktenObject(ChoiceTag.name, move fields)
+}
+
+function boolKten(flag: Bool) -> Kten {
+    return .Bool(flag)
+}
+
+function numberKten(number: Number) -> Kten {
+    return .Number(number)
+}
+
+function optionalBoolChoiceValue(value: borrow Kten?) -> Result<Bool?, IconReadFailure> {
+    return match value {
+        Some(present) -> .Ok(.Some(try boolIn(present)))
+        None -> .Ok(.None)
+    }
+}
+
+function boolChoiceIn(value: borrow Kten) -> Result<BoolChoice, IconReadFailure> {
+    let (light, dark, mono) = try choiceParts(value)
+    return .Ok(
+        BoolChoice {
+            light: try boolIn(light),
+            dark: try optionalBoolChoiceValue(dark),
+            mono: try optionalBoolChoiceValue(mono)
+        }
+    )
+}
+
+function boolChoiceKten(choice: borrow BoolChoice) -> Kten {
+    let dark: Kten? = match choice.dark {
+        Some(value) -> .Some(boolKten(value))
+        None -> .None
+    }
+    let mono: Kten? = match choice.mono {
+        Some(value) -> .Some(boolKten(value))
+        None -> .None
+    }
+    return choiceKten(boolKten(choice.light), move dark, move mono)
+}
+
+// The choice in `object`'s field `name`, or `fallback` when it is left out.
+function boolChoiceField(
+    object: borrow Kten,
+    name: borrow String,
+    fallback: borrow BoolChoice
+) -> Result<BoolChoice, IconReadFailure> {
+    return match try fieldIn(object, name) {
+        Some(value) -> boolChoiceIn(value)
+        None -> .Ok(copy fallback)
+    }
+}
+
+function optionalNumberChoiceValue(value: borrow Kten?) -> Result<Number?, IconReadFailure> {
+    return match value {
+        Some(present) -> .Ok(.Some(try numberIn(present)))
+        None -> .Ok(.None)
+    }
+}
+
+function numberChoiceIn(value: borrow Kten) -> Result<NumberChoice, IconReadFailure> {
+    let (light, dark, mono) = try choiceParts(value)
+    return .Ok(
+        NumberChoice {
+            light: try numberIn(light),
+            dark: try optionalNumberChoiceValue(dark),
+            mono: try optionalNumberChoiceValue(mono)
+        }
+    )
+}
+
+function numberChoiceKten(choice: borrow NumberChoice) -> Kten {
+    let dark: Kten? = match choice.dark {
+        Some(value) -> .Some(numberKten(value))
+        None -> .None
+    }
+    let mono: Kten? = match choice.mono {
+        Some(value) -> .Some(numberKten(value))
+        None -> .None
+    }
+    return choiceKten(numberKten(choice.light), move dark, move mono)
+}
+
+// The choice in `object`'s field `name`, or `fallback` when it is left out.
+function numberChoiceField(
+    object: borrow Kten,
+    name: borrow String,
+    fallback: borrow NumberChoice
+) -> Result<NumberChoice, IconReadFailure> {
+    return match try fieldIn(object, name) {
+        Some(value) -> numberChoiceIn(value)
+        None -> .Ok(copy fallback)
+    }
+}
+
+function optionalBlendChoiceValue(value: borrow Kten?) -> Result<IconBlendMode?, IconReadFailure> {
+    return match value {
+        Some(present) -> .Ok(.Some(try blendIn(present)))
+        None -> .Ok(.None)
+    }
+}
+
+function blendChoiceIn(value: borrow Kten) -> Result<BlendChoice, IconReadFailure> {
+    let (light, dark, mono) = try choiceParts(value)
+    return .Ok(
+        BlendChoice {
+            light: try blendIn(light),
+            dark: try optionalBlendChoiceValue(dark),
+            mono: try optionalBlendChoiceValue(mono)
+        }
+    )
+}
+
+function blendChoiceKten(choice: borrow BlendChoice) -> Kten {
+    let dark: Kten? = match choice.dark {
+        Some(value) -> .Some(blendKten(value))
+        None -> .None
+    }
+    let mono: Kten? = match choice.mono {
+        Some(value) -> .Some(blendKten(value))
+        None -> .None
+    }
+    return choiceKten(blendKten(choice.light), move dark, move mono)
+}
+
+// The choice in `object`'s field `name`, or `fallback` when it is left out.
+function blendChoiceField(
+    object: borrow Kten,
+    name: borrow String,
+    fallback: borrow BlendChoice
+) -> Result<BlendChoice, IconReadFailure> {
+    return match try fieldIn(object, name) {
+        Some(value) -> blendChoiceIn(value)
+        None -> .Ok(copy fallback)
+    }
+}
+
+function optionalFillChoiceValue(value: borrow Kten?) -> Result<IconFill?, IconReadFailure> {
+    return match value {
+        Some(present) -> .Ok(.Some(try fillIn(present)))
+        None -> .Ok(.None)
+    }
+}
+
+function fillChoiceIn(value: borrow Kten) -> Result<FillChoice, IconReadFailure> {
+    let (light, dark, mono) = try choiceParts(value)
+    return .Ok(
+        FillChoice {
+            light: try fillIn(light),
+            dark: try optionalFillChoiceValue(dark),
+            mono: try optionalFillChoiceValue(mono)
+        }
+    )
+}
+
+function fillChoiceKten(choice: borrow FillChoice) -> Kten {
+    let dark: Kten? = match choice.dark {
+        Some(value) -> .Some(fillKten(value))
+        None -> .None
+    }
+    let mono: Kten? = match choice.mono {
+        Some(value) -> .Some(fillKten(value))
+        None -> .None
+    }
+    return choiceKten(fillKten(choice.light), move dark, move mono)
+}
+
+// The choice in `object`'s field `name`, or `fallback` when it is left out.
+function fillChoiceField(
+    object: borrow Kten,
+    name: borrow String,
+    fallback: borrow FillChoice
+) -> Result<FillChoice, IconReadFailure> {
+    return match try fieldIn(object, name) {
+        Some(value) -> fillChoiceIn(value)
+        None -> .Ok(copy fallback)
+    }
+}
+
+function optionalSpecularChoiceValue(
+    value: borrow Kten?
+) -> Result<IconSpecular?, IconReadFailure> {
+    return match value {
+        Some(present) -> .Ok(.Some(try specularIn(present)))
+        None -> .Ok(.None)
+    }
+}
+
+function specularChoiceIn(value: borrow Kten) -> Result<SpecularChoice, IconReadFailure> {
+    let (light, dark, mono) = try choiceParts(value)
+    return .Ok(
+        SpecularChoice {
+            light: try specularIn(light),
+            dark: try optionalSpecularChoiceValue(dark),
+            mono: try optionalSpecularChoiceValue(mono)
+        }
+    )
+}
+
+function specularChoiceKten(choice: borrow SpecularChoice) -> Kten {
+    let dark: Kten? = match choice.dark {
+        Some(value) -> .Some(specularKten(value))
+        None -> .None
+    }
+    let mono: Kten? = match choice.mono {
+        Some(value) -> .Some(specularKten(value))
+        None -> .None
+    }
+    return choiceKten(specularKten(choice.light), move dark, move mono)
+}
+
+// The choice in `object`'s field `name`, or `fallback` when it is left out.
+function specularChoiceField(
+    object: borrow Kten,
+    name: borrow String,
+    fallback: borrow SpecularChoice
+) -> Result<SpecularChoice, IconReadFailure> {
+    return match try fieldIn(object, name) {
+        Some(value) -> specularChoiceIn(value)
+        None -> .Ok(copy fallback)
+    }
+}
+
+function optionalBlurChoiceValue(value: borrow Kten?) -> Result<IconBlur?, IconReadFailure> {
+    return match value {
+        Some(present) -> .Ok(.Some(try blurIn(present)))
+        None -> .Ok(.None)
+    }
+}
+
+function blurChoiceIn(value: borrow Kten) -> Result<BlurChoice, IconReadFailure> {
+    let (light, dark, mono) = try choiceParts(value)
+    return .Ok(
+        BlurChoice {
+            light: try blurIn(light),
+            dark: try optionalBlurChoiceValue(dark),
+            mono: try optionalBlurChoiceValue(mono)
+        }
+    )
+}
+
+function blurChoiceKten(choice: borrow BlurChoice) -> Kten {
+    let dark: Kten? = match choice.dark {
+        Some(value) -> .Some(blurKten(value))
+        None -> .None
+    }
+    let mono: Kten? = match choice.mono {
+        Some(value) -> .Some(blurKten(value))
+        None -> .None
+    }
+    return choiceKten(blurKten(choice.light), move dark, move mono)
+}
+
+// The choice in `object`'s field `name`, or `fallback` when it is left out.
+function blurChoiceField(
+    object: borrow Kten,
+    name: borrow String,
+    fallback: borrow BlurChoice
+) -> Result<BlurChoice, IconReadFailure> {
+    return match try fieldIn(object, name) {
+        Some(value) -> blurChoiceIn(value)
+        None -> .Ok(copy fallback)
+    }
+}
+
+function optionalRefractionChoiceValue(
+    value: borrow Kten?
+) -> Result<IconRefraction?, IconReadFailure> {
+    return match value {
+        Some(present) -> .Ok(.Some(try refractionIn(present)))
+        None -> .Ok(.None)
+    }
+}
+
+function refractionChoiceIn(value: borrow Kten) -> Result<RefractionChoice, IconReadFailure> {
+    let (light, dark, mono) = try choiceParts(value)
+    return .Ok(
+        RefractionChoice {
+            light: try refractionIn(light),
+            dark: try optionalRefractionChoiceValue(dark),
+            mono: try optionalRefractionChoiceValue(mono)
+        }
+    )
+}
+
+function refractionChoiceKten(choice: borrow RefractionChoice) -> Kten {
+    let dark: Kten? = match choice.dark {
+        Some(value) -> .Some(refractionKten(value))
+        None -> .None
+    }
+    let mono: Kten? = match choice.mono {
+        Some(value) -> .Some(refractionKten(value))
+        None -> .None
+    }
+    return choiceKten(refractionKten(choice.light), move dark, move mono)
+}
+
+// The choice in `object`'s field `name`, or `fallback` when it is left out.
+function refractionChoiceField(
+    object: borrow Kten,
+    name: borrow String,
+    fallback: borrow RefractionChoice
+) -> Result<RefractionChoice, IconReadFailure> {
+    return match try fieldIn(object, name) {
+        Some(value) -> refractionChoiceIn(value)
+        None -> .Ok(copy fallback)
+    }
+}
+
+function optionalTranslucencyChoiceValue(
+    value: borrow Kten?
+) -> Result<IconTranslucency?, IconReadFailure> {
+    return match value {
+        Some(present) -> .Ok(.Some(try translucencyIn(present)))
+        None -> .Ok(.None)
+    }
+}
+
+function translucencyChoiceIn(value: borrow Kten) -> Result<TranslucencyChoice, IconReadFailure> {
+    let (light, dark, mono) = try choiceParts(value)
+    return .Ok(
+        TranslucencyChoice {
+            light: try translucencyIn(light),
+            dark: try optionalTranslucencyChoiceValue(dark),
+            mono: try optionalTranslucencyChoiceValue(mono)
+        }
+    )
+}
+
+function translucencyChoiceKten(choice: borrow TranslucencyChoice) -> Kten {
+    let dark: Kten? = match choice.dark {
+        Some(value) -> .Some(translucencyKten(value))
+        None -> .None
+    }
+    let mono: Kten? = match choice.mono {
+        Some(value) -> .Some(translucencyKten(value))
+        None -> .None
+    }
+    return choiceKten(translucencyKten(choice.light), move dark, move mono)
+}
+
+// The choice in `object`'s field `name`, or `fallback` when it is left out.
+function translucencyChoiceField(
+    object: borrow Kten,
+    name: borrow String,
+    fallback: borrow TranslucencyChoice
+) -> Result<TranslucencyChoice, IconReadFailure> {
+    return match try fieldIn(object, name) {
+        Some(value) -> translucencyChoiceIn(value)
+        None -> .Ok(copy fallback)
+    }
+}
+
+function optionalShadowChoiceValue(value: borrow Kten?) -> Result<IconShadow?, IconReadFailure> {
+    return match value {
+        Some(present) -> .Ok(.Some(try shadowIn(present)))
+        None -> .Ok(.None)
+    }
+}
+
+function shadowChoiceIn(value: borrow Kten) -> Result<ShadowChoice, IconReadFailure> {
+    let (light, dark, mono) = try choiceParts(value)
+    return .Ok(
+        ShadowChoice {
+            light: try shadowIn(light),
+            dark: try optionalShadowChoiceValue(dark),
+            mono: try optionalShadowChoiceValue(mono)
+        }
+    )
+}
+
+function shadowChoiceKten(choice: borrow ShadowChoice) -> Kten {
+    let dark: Kten? = match choice.dark {
+        Some(value) -> .Some(shadowKten(value))
+        None -> .None
+    }
+    let mono: Kten? = match choice.mono {
+        Some(value) -> .Some(shadowKten(value))
+        None -> .None
+    }
+    return choiceKten(shadowKten(choice.light), move dark, move mono)
+}
+
+// The choice in `object`'s field `name`, or `fallback` when it is left out.
+function shadowChoiceField(
+    object: borrow Kten,
+    name: borrow String,
+    fallback: borrow ShadowChoice
+) -> Result<ShadowChoice, IconReadFailure> {
+    return match try fieldIn(object, name) {
+        Some(value) -> shadowChoiceIn(value)
+        None -> .Ok(copy fallback)
+    }
+}

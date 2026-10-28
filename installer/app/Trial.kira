@@ -1,0 +1,64 @@
+//! Trial boots: which system the next boot tries, and the record of trials and installs.
+import Foundation
+import LibTessera
+
+// An update tried before it is trusted (roadmap/13-security-and-updates.md,
+// "Updates"). Installed with `tessera.update` onto a volume that has a
+// current system, the new system is recorded in `boot/trial` and not in
+// `boot/current`. PID 1 boots it once; the system's init makes it current
+// once its services are up, and a trial that never gets there is rolled
+// back at the next boot. The current system is kept until then.
+
+/// Whether the kernel command line asks for an update.
+function requestedUpdate() -> Bool {
+    match processArguments() {
+        Ok(given) -> return given.contains(InstallerFlag.update)
+        Error(failed) -> {
+            absorb failed
+            return false
+        }
+    }
+}
+
+/// Records `version` as the system to try when `update` asks for it and the volume's current system is another one; otherwise as the current system.
+function recordInstalled(
+    installation: borrow Installation,
+    version: borrow String,
+    update: Bool
+) -> Result<Void, String> {
+    if update {
+        match currentVersion(installation) {
+            Some(current) -> {
+                if current != version { return recordTrial(installation, version) }
+            }
+            None -> {}
+        }
+    }
+    return recordCurrent(installation, version)
+}
+
+/// Writes `boot/trial`, and clears a `boot/tried` an earlier trial left.
+function recordTrial(
+    installation: borrow Installation,
+    version: borrow String
+) -> Result<Void, String> {
+    let tried = onVolume(installation, VolumeLayout.tried)
+    if fileExists(tried) {
+        match removePath(tried) {
+            Ok -> {}
+            Error(failure) -> return .Error("\(tried) could not be removed: \(traceText(failure))")
+        }
+    }
+    let record = onVolume(installation, VolumeLayout.trial)
+    let written = record + ".new"
+    match writeFile(written, version + "\n") {
+        Ok -> {}
+        Error(failure) -> return .Error("\(written) could not be written: \(traceText(failure))")
+    }
+    match renamePath(written, record) {
+        Ok -> {}
+        Error(failure) -> return .Error("\(record) could not be replaced: \(traceText(failure))")
+    }
+    log info("recorded a trial system", version)
+    return .Ok
+}

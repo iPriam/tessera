@@ -1,0 +1,13 @@
+# The repository is edited on Windows and built inside Linux, so line endings
+# are decided here rather than left to whatever core.autocrlf happens to be on
+# a given machine. A shell script that arrives with CRLF endings fails with
+# "bad interpreter", which is a confusing way to learn about a checkout setting.
+
+* text=auto eol=lf
+
+*.ps1 text eol=crlf
+
+*.img binary
+*.gz binary
+*.xz binary
+*.cpio binary

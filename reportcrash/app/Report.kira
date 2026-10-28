@@ -1,0 +1,375 @@
+//! The crash report's text: its frames, registers, exception and the names of signals and their codes.
+import Foundation
+import LibTessera
+
+// A crash report's text, laid out as a Mac's: the process, the exception,
+// what the process last said, each thread's frames, the crashed thread's
+// registers, the binary images, and the process's status.
+
+/// The layout of the crash report: its labels and the columns its lines are written in.
+namespace ReportLayout {
+    let labelWidth: Number = 23
+    let imageWidth: Number = 30
+    let version: String = "1"
+    let releasePath: String = "/" + SystemFile.release
+}
+
+/// The crash report's text for `capture`: the process, its exception, its threads and its memory.
+function crashReport(
+    capture: borrow CrashCapture,
+    crashed: Number,
+    lines: borrow [String]
+) -> Result<String, TesseraError> {
+    var text: [String] = []
+    let parent = capture.parentName.or("???")
+    let crashedThread = capture.threads.count > 0 ? copy capture.threads[0].name : ""
+    text.append(field("Process:", "\(capture.name) [\(capture.pid)]"))
+    text.append(field("Path:", capture.path))
+    text.append(field("Arguments:", joined(capture.arguments, " ")))
+    text.append(field("Parent Process:", "\(parent) [\(capture.parentPid)]"))
+    text.append(field("User ID:", "\(capture.userId)"))
+    text.append("")
+    text.append(field("Date/Time:", "\(logStampOf(crashed)) +0000"))
+    text.append(field("Launch Time:", "\(logStampOf(launchMillis(capture, crashed))) +0000"))
+    text.append(field("OS Version:", systemVersion()))
+    text.append(field("Architecture:", capture.architecture == .Arm64 ? "ARM-64" : "X86-64"))
+    text.append(field("Report Version:", ReportLayout.version))
+    text.append("")
+    text.append(field("Time Awake Since Boot:", "\(capture.uptime) seconds"))
+    text.append("")
+    text.append(field("Crashed Thread:", "0  \(crashedThread)"))
+    text.append("")
+    text.append(
+        field("Exception Type:", "\(exceptionType(capture.signal)) (\(signalName(capture.signal)))")
+    )
+    text.append(field("Exception Codes:", try exceptionCodes(capture)))
+    if capture.trapCode > 0 {
+        let code = "KLF-RT-\(zeroPadded(capture.trapCode, 4))"
+        text.append(
+            field(
+                "Termination Reason:",
+                "Namespace KIRA, Code \(code), \(trapDescription(capture.trapCode))"
+            )
+        )
+        text.append("")
+        text.append("Kira runtime trap \(code): \(trapDescription(capture.trapCode)).")
+    } else {
+        text.append(
+            field(
+                "Termination Reason:",
+                "Namespace SIGNAL, Code \(capture.signal), \(signalDescription(capture.signal))"
+            )
+        )
+    }
+    text.append("")
+    appendFaultRegion(text, capture)
+    if lines.count > 0 {
+        text.append("Application Specific Information:")
+        for line in lines { text.append(copy line) }
+        text.append("")
+    }
+    for index in 0..capture.threads.count {
+        let thread = capture.threads[index]
+        let mark = index == 0 ? " Crashed" : ""
+        text.append("Thread \(index)\(mark):: \(thread.name)  tid \(thread.id)")
+        for frameIndex in 0..thread.frames.count {
+            let symbol = frameSymbol(thread.symbols, frameIndex)
+            text.append(
+                frameLine(capture.images, frameIndex, thread.frames[frameIndex], move symbol)
+            )
+        }
+        text.append("")
+    }
+    for index in 0..capture.threads.count {
+        appendRegisters(text, capture.architecture, index, capture.threads[index].registers)
+        text.append("")
+    }
+    text.append("Binary Images:")
+    for image in capture.images {
+        let identifier = match image.identifier {
+            Some(value) -> "<\(value)>"
+            None -> "<no build id>"
+        }
+        text.append(
+            "\(padLeft(hex(image.start), 18)) - \(padLeft(hex(image.end - U64(1)), 18)) \(lastPathPart(image.path)) \(identifier) \(image.path)"
+        )
+    }
+    text.append("")
+    appendRegionSummary(text, capture.regions)
+    appendOpenFiles(text, capture.files)
+    text.append("Process Status:")
+    for line in capture.status.split("\n") {
+        if !line.isEmpty() { text.append("    " + line) }
+    }
+    if capture.problems.count > 0 {
+        text.append("")
+        text.append("Not Read:")
+        for problem in capture.problems { text.append("    " + problem) }
+    }
+    text.append("")
+    return .Ok(joined(text, "\n"))
+}
+
+/// A report line with its `label` and `value`.
+function field(label: borrow String, value: borrow String) -> String {
+    return padRight(label, ReportLayout.labelWidth) + value
+}
+
+/// The name of frame `index` from the process's symbols, when one names it.
+function frameSymbol(symbols: borrow [String?], index: Number) -> String? {
+    if index >= symbols.count { return .None }
+    return symbols[index]
+}
+
+/// A stack frame's line: its symbol, or the image and offset where the image names no function there.
+function frameLine(
+    images: borrow [CrashedImage],
+    index: Number,
+    address: U64,
+    symbol: String?
+) -> String {
+    let number = padRight("\(index)", 4)
+    match crashImageOf(images, address) {
+        Some(image) -> {
+            let name = lastPathPart(image.path)
+            let place = match symbol {
+                Some(known) -> known
+                None -> "\(name) + \(hex(address - image.start))"
+            }
+            return "\(number)\(padRight(name, ReportLayout.imageWidth)) \(hex(address)) \(place)"
+        }
+        None -> return "\(number)\(padRight("???", ReportLayout.imageWidth)) \(hex(address)) ???"
+    }
+}
+
+/// Appends the crashed thread's registers.
+function appendRegisters(
+    text: borrow mut [String],
+    architecture: Architecture,
+    thread: Number,
+    registers: borrow [U64]
+) {
+    var names: [String] = []
+    var order: [Number] = []
+    let how = thread == 0 ? "crashed with" : "had"
+    if architecture == .Arm64 {
+        text.append("Thread \(thread) \(how) ARM Thread State (64-bit):")
+        for index in 0..29 {
+            names.append("x\(index)")
+            order.append(index)
+        }
+        for name in ["fp", "lr", "sp", "pc", "cpsr"] { names.append(name) }
+        for index in 29..34 { order.append(index) }
+    } else {
+        text.append("Thread \(thread) \(how) X86 Thread State (64-bit):")
+        names = ["rax", "rbx", "rcx", "rdx", "rdi", "rsi", "rbp", "rsp", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rip", "rfl", "cs", "fs", "gs"]
+        order = [10, 5, 11, 12, 14, 13, 4, 19, 9, 8, 7, 6, 3, 2, 1, 0, 16, 18, 17, 21, 22]
+    }
+    var row = ""
+    for index in 0..names.count {
+        if order[index] >= registers.count { continue }
+        row += padLeft(names[index], 6) + ": " + hex(registers[order[index]])
+        if index % 4 == 3 {
+            text.append(row)
+            row = ""
+        }
+    }
+    if !row.isEmpty() { text.append(row) }
+}
+
+/// The exception's codes as the report writes them.
+function exceptionCodes(capture: borrow CrashCapture) -> Result<String, TesseraError> {
+    let codeText = "code \(capture.signalCode) (\(signalCodeName(capture.signal, capture.signalCode)))"
+    if capture.faultAddress != U64(0) { return .Ok("\(codeText) at \(hex(capture.faultAddress))") }
+    if capture.signalCode <= 0 && capture.senderPid > 0 {
+        let name = try senderName(capture.senderPid)
+        return .Ok("\(codeText), sent by \(name) [\(capture.senderPid)]")
+    }
+    return .Ok(codeText)
+}
+
+/// The name of a process that may still be running.
+function senderName(pid: Number) -> Result<String, TesseraError> {
+    if pid <= 0 { return .Ok("kernel") }
+    let name = try crashProcessName(pid)
+    return .Ok(name.or("???"))
+}
+
+/// The system's name and version, as `Tessera 0.1.0`, from the release file's `NAME` and `VERSION`.
+function systemVersion() -> String {
+    let contents = try readFile(ReportLayout.releasePath) otherwise return "unknown"
+    let text = copy contents.text
+    var name = ""
+    var version = ""
+    for line in text.split("\n") {
+        let parts = line.split("=")
+        if parts.count != 2 { continue }
+        let value = parts[1].trim().split("\"")
+        let unquoted = value.count == 3 ? copy value[1] : parts[1].trim()
+        match parts[0] {
+            "NAME" -> name = unquoted
+            "VERSION" -> version = unquoted
+            // The release file's other keys are not part of the name.
+            else -> {}
+        }
+    }
+    return "\(name) \(version)".trim()
+}
+
+/// The exception type a signal is reported as.
+function exceptionType(signal: Number) -> String {
+    return match signal {
+        4 -> "EXC_BAD_INSTRUCTION"
+        5 -> "EXC_BREAKPOINT"
+        7, 11 -> "EXC_BAD_ACCESS"
+        8 -> "EXC_ARITHMETIC"
+        else -> "EXC_CRASH"
+    }
+}
+
+/// The name of a signal, as the report writes it.
+function signalName(signal: Number) -> String {
+    return match signal {
+        1 -> "SIGHUP"
+        2 -> "SIGINT"
+        3 -> "SIGQUIT"
+        4 -> "SIGILL"
+        5 -> "SIGTRAP"
+        6 -> "SIGABRT"
+        7 -> "SIGBUS"
+        8 -> "SIGFPE"
+        9 -> "SIGKILL"
+        11 -> "SIGSEGV"
+        13 -> "SIGPIPE"
+        15 -> "SIGTERM"
+        24 -> "SIGXCPU"
+        25 -> "SIGXFSZ"
+        31 -> "SIGSYS"
+        else -> "signal \(signal)"
+    }
+}
+
+/// What a signal means, in a sentence.
+function signalDescription(signal: Number) -> String {
+    return match signal {
+        3 -> "Quit: 3"
+        4 -> "Illegal instruction: 4"
+        5 -> "Trace/BPT trap: 5"
+        6 -> "Abort trap: 6"
+        7 -> "Bus error: 7"
+        8 -> "Floating point exception: 8"
+        11 -> "Segmentation fault: 11"
+        31 -> "Bad system call: 31"
+        else -> signalName(signal)
+    }
+}
+
+/// The name of a signal's `si_code`: who sent the signal, or which fault it was.
+function signalCodeName(signal: Number, code: Number) -> String {
+    match code {
+        0 -> return "SI_USER"
+            - 1 -> return "SI_QUEUE"
+            - 6 -> return "SI_TKILL"
+        128 -> return "SI_KERNEL"
+        // Any other code is a fault's, named by the signal that came with it.
+        else -> {}
+    }
+    return match signal {
+        11 -> segvCodeName(code)
+        7 -> busCodeName(code)
+        4 -> illCodeName(code)
+        5 -> trapCodeName(code)
+        8 -> fpeCodeName(code)
+        else -> "\(code)"
+    }
+}
+
+/// The name of a SIGSEGV `si_code`.
+function segvCodeName(code: Number) -> String {
+    return match code {
+        1 -> "SEGV_MAPERR"
+        2 -> "SEGV_ACCERR"
+        else -> "SEGV \(code)"
+    }
+}
+
+/// The name of a SIGBUS `si_code`.
+function busCodeName(code: Number) -> String {
+    return match code {
+        1 -> "BUS_ADRALN"
+        2 -> "BUS_ADRERR"
+        else -> "BUS \(code)"
+    }
+}
+
+/// The name of a SIGILL `si_code`.
+function illCodeName(code: Number) -> String {
+    return match code {
+        1 -> "ILL_ILLOPC"
+        2 -> "ILL_ILLOPN"
+        else -> "ILL \(code)"
+    }
+}
+
+/// The name of a SIGTRAP `si_code`.
+function trapCodeName(code: Number) -> String {
+    return match code {
+        1 -> "TRAP_BRKPT"
+        else -> "TRAP \(code)"
+    }
+}
+
+/// The name of a SIGFPE `si_code`.
+function fpeCodeName(code: Number) -> String {
+    return match code {
+        1 -> "FPE_INTDIV"
+        3 -> "FPE_FLTDIV"
+        else -> "FPE \(code)"
+    }
+}
+
+/// The hexadecimal text of `value`, as the report writes addresses: `0x0000ffff8a2b3c40`.
+function hex(value: U64) -> String {
+    let digits = "0123456789abcdef"
+    var text = "0x"
+    // Sixteen hexadecimal digits, from the most significant down.
+    for index in 0..16 {
+        let shift = U64(60 - index * 4)
+        let digit = Number((value >> shift) & U64(15))
+        text += digits.substring(digit, digit + 1)
+    }
+    return text
+}
+
+/// `text` padded with spaces on the right to `width` columns.
+function padRight(text: borrow String, width: Number) -> String {
+    var padded = copy text
+    let missing = width - text.count
+    for _ in 0..missing { padded += " " }
+    return padded
+}
+
+/// `text` padded with spaces on the left to `width` columns.
+function padLeft(text: borrow String, width: Number) -> String {
+    var padded = copy text
+    let missing = width - text.count
+    for _ in 0..missing { padded = " " + padded }
+    return padded
+}
+
+/// The time as the system log stamps its lines: `2026-10-19 11:30:01.250`, in UTC.
+function logStampOf(millis: Number) -> String {
+    let seconds = trunc(millis / 1000)
+    let rest = seconds % CivilTime.secondsPerDay
+    let date = civilDate(trunc(seconds / CivilTime.secondsPerDay))
+    let day = "\(date.year)-\(zeroPadded(date.month, 2))-\(zeroPadded(date.day, 2))"
+    let time = "\(zeroPadded(trunc(rest / CivilTime.secondsPerHour), 2)):\(zeroPadded(trunc(rest % CivilTime.secondsPerHour / CivilTime.secondsPerMinute), 2)):\(zeroPadded(rest % CivilTime.secondsPerMinute, 2))"
+    return "\(day) \(time).\(zeroPadded(millis - seconds * 1000, 3))"
+}
+
+/// The time as a file name holds it: `2026-10-19-113001`.
+function fileStamp(millis: Number) -> String {
+    let stamp = logStampOf(millis)
+    let parts = stamp.substring(0, 19).split(" ")
+    return parts[0] + "-" + joined(parts[1].split(":"), "")
+}

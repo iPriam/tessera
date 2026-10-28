@@ -1,0 +1,36 @@
+The virgl device rejects every guest blob it successfully mapped.
+
+virtio_gpu_create_mapping_iov returns 0 on success and -1 on failure, and every
+other caller tests it that way, including the 2D device's identical call in
+virtio-gpu.c. The virgl device's copy tests `!ret`, so it takes success for
+failure and failure for success: a VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB whose
+pages mapped is answered VIRTIO_GPU_RESP_ERR_UNSPEC, and one whose pages did not
+is passed to virglrenderer with a null iov.
+
+No VIRTIO_GPU_BLOB_MEM_GUEST or VIRTIO_GPU_BLOB_MEM_HOST3D_GUEST resource can
+exist on an accelerated device. The kernel does not wait for the answer to a
+create, so the guest's ioctl succeeds, the DRM framebuffer is made, the modeset
+is accepted, and the first sign of trouble is the next command:
+
+    virtio_gpu_virgl_process_cmd: ctrl 0x10c, error 0x1200
+    virgl_cmd_set_scanout_blob: resource does not exist 3
+    virtio_gpu_virgl_process_cmd: ctrl 0x10d, error 0x1203
+
+which reads as a scanout problem and is a create problem. Neither line names the
+mapping: this branch is the one path in the function with no qemu_log_mask
+beside it.
+
+Not Darwin-specific and not venus-specific. It affects every accelerated device
+on every host, which is why it is applied unconditionally.
+
+--- a/hw/display/virtio-gpu-virgl.c
++++ b/hw/display/virtio-gpu-virgl.c
+@@ -703,7 +703,7 @@
+         ret = virtio_gpu_create_mapping_iov(g, cblob.nr_entries, sizeof(cblob),
+                                             cmd, &res->base.addrs,
+                                             &res->base.iov, &res->base.iov_cnt);
+-        if (!ret) {
++        if (ret != 0) {
+             cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
+             return;
+         }

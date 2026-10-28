@@ -1,0 +1,17 @@
+// About: the system's version and the machine it runs on.
+//
+// Kira UI draws it and puts it on Tessera's display.
+construct AboutApp extends Package {
+    let version: String = "0.1.0"
+    let kind: PackageKind = .App
+    // Its icon, light and dark, which the platform shows wherever the
+    // application is.
+    let assets: [String] = ["Resources/AppIcon.tessicon"]
+    let moduleRoot: String = "About"
+    let dependencies: [Dependency] = [
+        Dependency { name: "KiraUI", path: "../kira-ui" },
+        Dependency { name: "TesseraUI", path: "../tessera-ui" },
+        Dependency { name: "LibTessera", path: "../libtessera" },
+        Dependency { name: "ReleaseText", path: "ReleaseText" }
+    ]
+}

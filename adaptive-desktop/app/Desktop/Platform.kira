@@ -1,0 +1,132 @@
+import Foundation
+import LibTessera
+import PlatformKit
+import TesseraDisplayClient
+import KiraUI
+import TesseraUI
+import PlatformUI
+import AppKit
+
+// What the platform holds across its sessions with MosaicDisplay, and its
+// answer to each thing MosaicDisplay tells a platform (DisplayPlatform).
+construct Desktop() extends DisplayPlatform {
+    // What is open, as PlatformKit keeps it.
+    var state: PlatformState
+    // The session's channel to MosaicDisplay, once one began.
+    var channel: Handle? = .None
+    // The platform's own surface, once a session began.
+    var own: DisplaySurfaceId? = .None
+    // The desktop's surface, once the compositor has said which it is.
+    var desktop: DisplaySurfaceId? = .None
+    // Whether the trusted path was probed.
+    var probed: Bool = false
+    // The lock screen, closed over the output at start.
+    var lock: LockState = LockState {}
+    // The surface that takes the keyboard when the lock screen opens.
+    var front: DisplaySurfaceId? = .None
+    // The menus, notifications and Dock links the application shares with AppKit.
+    var bridge: BridgeHandle = makeBridgeHandle()
+    // The System channel and the devices heard of on it.
+    var watch: Watch
+    // Where the keyboard rests on the system bar.
+    var bar: SystemBarSelection = SystemBarSelection {}
+    // The output the session drew on, and the band the Dock takes along its
+    // bottom.
+    var output: SurfaceFrame = SurfaceFrame { x: 0, y: 0, width: 0, height: 0 }
+    var dock: Number = 0
+    // What is installed, which the Dock keeps and opens, and the windows
+    // whose application has not been named to the platform yet.
+    var installed: [Application] = []
+    var unnamed: [DisplaySurfaceId] = []
+    // The mode the platform last asked the compositor for: freeform, or
+    // Stage Manager while it is on.
+    var mode: CompositorMode = .Freeform
+    // The notification banners on screen, newest first.
+    var banners: [ShownNotification] = []
+    // The part of the output the banners took when the compositor was last
+    // told, which the pointer over goes to the platform.
+    var overlay: SurfaceFrame = SurfaceFrame { x: 0, y: 0, width: 0, height: 0 }
+    // Where the compositor was last asked to draw each piece of the
+    // platform's glass: the Dock's and the banners'.
+    var glass: PlatformGlassClaim = PlatformGlassClaim {}
+    // Control Center: whether it is out, and Focus.
+    var controls: ControlCenterState = ControlCenterState {}
+    // The time zone the clocks read in, Settings' `time.zone`.
+    var zone: TimeZone = utcTimeZone()
+
+    function onConfigure(borrow mut self, configuration: borrow DisplayConfiguration) {
+        if own == .Some(configuration.surface) {
+            output.width = Number(configuration.width)
+            output.height = Number(configuration.height)
+        }
+    }
+
+    function onSurfaceCreated(borrow mut self, surface: borrow DisplaySurface) {
+        surfaceCreated(self, surface)
+    }
+
+    function onSurfaceDestroyed(borrow mut self, surface: DisplaySurfaceId) {
+        windowGone(self, surface)
+    }
+
+    function onGrabFired(borrow mut self, key: borrow DisplayKey) {
+        grabFired(self, key)
+    }
+
+    function onSurfacePressed(borrow mut self, surface: DisplaySurfaceId) {
+        surfacePressed(self, surface)
+    }
+
+    function onIdleChanged(borrow mut self, state: borrow DisplayIdleState) {
+        idleChanged(self, state)
+    }
+
+    // The bar reads its ink from the picture under it only on a phone.
+    function onBarBackdrop(borrow mut self, backdrop: borrow DisplayBackdrop) {}
+
+    function onWindowRequested(borrow mut self, request: borrow DisplayWindowRequest) {
+        windowRequested(self, request)
+    }
+
+    // Opening an application that is open already brings it to the front, as
+    // on a Mac.
+    function onActivateRequested(borrow mut self, surface: DisplaySurfaceId) {
+        front = .Some(surface)
+        if !lock.locked { match focus(self, surface, "bring an application forward") {
+            Ok(sent) -> if sent {
+                log info("brought an open application forward", surface: surface.raw)
+            }
+            Error(failed) -> requestFailed("bring an application forward", failed)
+        } }
+    }
+
+    function onChannelChanged(borrow mut self, declared: borrow DisplayChannelValue) {
+        match declared.channel {
+            Badge -> log info(
+                "a surface set its badge",
+                surface: declared.surface.raw,
+                badge: declared.value
+            )
+            // The system bar is a Mac's menu bar, which an application in
+            // front does not hide.
+            StatusBarHidden -> {}
+            HomeEditing -> {}
+        }
+    }
+
+    function onSurfacePlaced(borrow mut self, placement: borrow DisplayPlacement) {
+        surfacePlaced(self, placement)
+    }
+
+    function onNotification(borrow mut self, notification: borrow DisplayNotification) {
+        log info(
+            "a notification arrived",
+            notification: notification.id,
+            priority: notification.priority
+        )
+    }
+
+    function onVerifyResult(borrow mut self, trusted: Bool) {
+        log info("the compositor verified the prompt", ok: trusted)
+    }
+}

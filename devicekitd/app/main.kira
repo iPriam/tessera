@@ -1,0 +1,35 @@
+import Foundation
+import LibTessera
+
+// devicekitd: the DeviceKit device manager (roadmap/17-devicekit.md §20).
+//
+// One thread and one port: the listening socket and every client, as
+// backend sources (17 §6.3), every driver it started, and the request to
+// stop. A request is answered before the next is read, which is what lets a
+// client take the next reply as the answer to the request it just sent.
+// Once a second the token table is swept for expired tokens and the
+// registry is matched against the driver manifests.
+
+// The manager, or none once the reason it could not start is logged. This is
+// the one place a start failure is handled.
+function startedManager() -> Manager? {
+    match startManager() {
+        Ok(value) -> return .Some(value)
+        Error(failed) -> log fault(
+            "the manager could not start",
+            service: Wire.address,
+            error: errorName(failed)
+        )
+    }
+    return .None
+}
+
+@Main
+function main() {
+    var manager = match startedManager() {
+        Some(value) -> value
+        None -> return
+    }
+    log info("listening", drivers: manager.drivers.count)
+    run(manager)
+}

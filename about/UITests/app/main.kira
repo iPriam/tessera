@@ -1,0 +1,8 @@
+//! The entry point of the About app's UI tests, which the `ui test` runner expands around.
+import Foundation
+import KiraUI
+import KiraUITesting
+
+/// The UI tests have no entry of their own; the runner calls each `@Test` function.
+@Main
+function main() {}

@@ -1,0 +1,110 @@
+import Foundation
+import KiraUI
+import LibTessera
+import PlatformKit
+import PlatformUI
+
+// Focus (roadmap/23-product-experience.md §4): a schedule that turns it on
+// and off at local times, and the applications whose banners still show
+// while it is on. Control Center's switch holds over the schedule until the
+// schedule next starts or ends.
+
+namespace FocusTimes {
+    // The times the schedule offers, every half hour.
+    let step: Number = 30
+    let defaultStart: Number = 22 * 60
+    let defaultEnd: Number = 7 * 60
+}
+
+construct FocusPane() extends Widget {
+    body {
+        let choice = storedFocusChoice()
+        let scheduled = choice.schedule.isSome()
+        let schedule = match choice.schedule {
+            Some(times) -> times
+            None -> FocusSchedule { start: FocusTimes.defaultStart, end: FocusTimes.defaultEnd }
+        }
+        Form(children: [scheduleSection(scheduled, move schedule), allowedSection(choice.allowed)])
+        .navigationTitle("Focus")
+    }
+}
+
+// The schedule: whether there is one, and its start and end.
+function scheduleSection(scheduled: Bool, schedule: FocusSchedule) -> Any Widget {
+    let start = schedule.start
+    let end = schedule.end
+    var rows: [Any Widget] = [
+        Toggle(
+            title = "Scheduled",
+            isOn = scheduled,
+            onChange = { on in
+                let text: String? = on ? .Some(
+                    focusScheduleText(FocusSchedule { start : start, end: end })
+                ): .None
+                changeSetting(FocusSetting.schedule, move text)
+                return
+            }
+        )
+    ]
+    if scheduled {
+        rows.append(timeChoice("From", start, { minute in keepSchedule(minute, end) }))
+        rows.append(timeChoice("To", end, { minute in keepSchedule(start, minute) }))
+    }
+    return Section(
+        children: rows,
+        header: Text("Schedule"),
+        footer: Text(
+            "Focus turns on and off at these times each day. Control Center's switch holds until the schedule next changes."
+        )
+    )
+}
+
+function keepSchedule(start: Number, end: Number) {
+    changeSetting(
+        FocusSetting.schedule,
+        .Some(focusScheduleText(FocusSchedule { start: start, end: end }))
+    )
+}
+
+// A menu of the day's half hours, `minute` chosen; choosing one calls
+// `chosen` with it.
+function timeChoice(title: String, minute: Number, chosen: (Number) -> Void) -> Any Widget {
+    var options: [Any Widget] = []
+    for slot in 0..trunc(FocusDay.minutes / FocusTimes.step) {
+        let at = slot * FocusTimes.step
+        let pick = copy chosen
+        options.append(Button(action = { in pick(at) }) { Text(halfHourText(at)) })
+    }
+    return LabeledContent(label = title) {
+        Menu(title = halfHourText(minute), children = options)
+    }
+}
+
+// `minute` of the day as Settings writes a time: `22:30`.
+function halfHourText(minute: Number) -> String {
+    return focusScheduleText(FocusSchedule { start: minute, end: minute }).split("-")[0]
+}
+
+// The applications allowed through Focus, each with its switch.
+function allowedSection(allowed: borrow [String]) -> Any Widget {
+    var rows: [Any Widget] = []
+    for application in installedApplications() {
+        let name = copy application.name
+        let kept = copy allowed
+        rows.append(
+            Toggle(
+                title = copy name,
+                isOn = allowed.contains(name),
+                onChange = { on in
+                    changeSetting(FocusSetting.allowed, .Some(namesWith(kept, name, on)))
+                    return
+                }
+            )
+        )
+    }
+    return Section(
+        children: rows,
+        header: Text("Allowed Notifications"),
+        footer: Text("While Focus is on, only these applications show banners.")
+    )
+}

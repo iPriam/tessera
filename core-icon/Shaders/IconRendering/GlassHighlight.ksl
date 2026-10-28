@@ -1,0 +1,86 @@
+// glassHighlight: a highlight band along the inside of the edge, `inset`
+// points in from the outline, `height` points wide, lit where the edge faces
+// `lightDirection`.
+import Stitch
+
+type GlassHighlightArguments {
+    let toUser: Float4
+    let toUserTranslation: Float2
+    let height: Float
+    let inset: Float
+    let spread: Float
+    let biasAmount: Float
+    let curvature: Float
+    let lightDirection: Float2
+    let color: Float4
+    let sdfScale: Float
+    let sdfZero: Float
+    let fieldInverseSize: Float2
+}
+
+type FullscreenIn {
+    @builtin(vertex_index)
+    let vid: UInt
+}
+
+type FullscreenOut {
+    @builtin(position)
+    let clip_position: Float4
+}
+
+type StitchOut {
+    let color: Float4
+}
+
+// Curvature rounds the band's profile, fully once it is three points wide.
+const roundingStart: Float = 1.0
+const roundingRate: Float = 0.5
+
+function glassBand(d: Float, normal: Float2, a: GlassHighlightArguments) -> Float4 {
+    let across = Stitch.saturate(d / a.height)
+    let w = Stitch.changeWidth(d) * Stitch.antialiasSpan
+    let rounding = clamp((a.height - roundingStart) * roundingRate, 0.0, 1.0)
+    rounding = rounding * rounding * a.curvature * (3.0 - 2.0 * rounding)
+    let profile = mix(1.0, 1.0 - across, rounding)
+    let outer = Stitch.saturate((a.height - d) / w + 0.5)
+    let inner = Stitch.saturate(d / w + 0.5)
+    let band = inner * outer
+    let facing = dot(a.lightDirection, normal)
+    let lit = Stitch.saturate((facing - a.spread) / max(1.0 - a.spread, Stitch.smallestWidth)) * profile
+    let falloff = max((1.0 - lit) * a.biasAmount + 1.0, Stitch.smallestWidth)
+    return a.color * (band * lit / falloff)
+}
+
+shader GlassHighlight {
+    group Draw {
+        uniform arguments: GlassHighlightArguments
+        texture field: Texture2d
+        sampler fieldSampler: Sampler
+    }
+
+    vertex {
+        input FullscreenIn
+        output FullscreenOut
+
+        function entry(input: FullscreenIn) -> FullscreenOut {
+            let out: FullscreenOut
+            out.clip_position = Stitch.fullscreen(input.vid)
+            return out
+        }
+    }
+
+    fragment {
+        input FullscreenOut
+        output StitchOut
+
+        function entry(input: FullscreenOut) -> StitchOut {
+            let a = arguments
+            let position = Stitch.userPoint(input.clip_position.xy, a.toUser, a.toUserTranslation)
+            let texel = sample(field, fieldSampler, position * a.fieldInverseSize)
+            let d = Stitch.insideDistance(texel, a.sdfScale, a.sdfZero) - a.inset
+            let result: StitchOut
+            result.color = glassBand(d, Stitch.outwardNormal(texel), a)
+            return result
+        }
+    }
+}

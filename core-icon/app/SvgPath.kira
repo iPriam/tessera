@@ -1,0 +1,213 @@
+import Foundation
+import RenderBox
+
+// A path's `d` as the RenderBox path Core Graphics builds from it: every
+// command SVG 1.1 has, quadratics and cubics kept as curves, smooth ones
+// with their reflected control point, and each arc as the cubics
+// CGPathAddArc cuts it into, a quarter turn at most.
+
+// What a path is walking: where it is, where its subpath started, the control
+// point a smooth curve reflects, and the path so far.
+struct PathPen {
+    var at: Point = Point {}
+    var start: Point = Point {}
+    var control: Point = Point {}
+    // The last command, so `S` and `T` know whether to reflect.
+    var last: String = ""
+    var path: Path = Path()
+    var open: Bool = false
+}
+
+extend PathPen {
+    function moveTo(borrow mut self, point: Point) {
+        path = path.move (copy point)
+        at = copy point
+        start = point
+        open = true
+    }
+
+    // A drawing command with no subpath begun starts one where the pen is.
+    function begun(borrow mut self) {
+        if !open {
+            path = path.move (copy at)
+            open = true
+        }
+    }
+
+    function lineTo(borrow mut self, point: Point) {
+        begun()
+        path = path.line(copy point)
+        at = point
+    }
+
+    function cubicTo(borrow mut self, first: Point, second: Point, end: Point) {
+        begun()
+        path = path.cubic(copy end, move first, copy second)
+        control = second
+        at = end
+    }
+
+    function quadraticTo(borrow mut self, middle: Point, end: Point) {
+        begun()
+        path = path.quadratic(copy end, copy middle)
+        control = middle
+        at = end
+    }
+
+    function close(borrow mut self) {
+        if open {
+            path = path.closed()
+        }
+        open = false
+        at = copy start
+    }
+
+    // The control point a smooth curve starts with: the last one reflected
+    // through the pen when the last command was one of `kinds`, else the pen.
+    function reflected(borrow self, kinds: borrow String) -> Point {
+        if last.count == 1 && kinds.contains(last.lowercased()) {
+            return Point { x: 2 * at.x - control.x, y: 2 * at.y - control.y }
+        }
+        return copy at
+    }
+}
+
+// The commands and their operands, in order: a letter, then the numbers up to
+// the next. Arc flags may run into the numbers after them, `a1 1 0 01 2 3`.
+struct PathToken {
+    let letter: String
+    let values: [Number]
+}
+
+namespace PathLetters {
+    let all: String = "MmLlHhVvCcSsQqTtAaZz"
+}
+
+function isCommandLetter(data: borrow String, at: Number) -> Bool {
+    return PathLetters.all.contains(data.substring(at, at + 1))
+}
+
+function pathTokens(data: borrow String) -> [PathToken] {
+    var tokens: [PathToken] = []
+    var at = 0
+    for _ in 0..data.count {
+        if at >= data.count { break }
+        if !isCommandLetter(data, at) {
+            at += 1
+            continue
+        }
+        let letter = data.substring(at, at + 1)
+        var end = at + 1
+        for _ in end..data.count {
+            if isCommandLetter(data, end) { break }
+            end += 1
+        }
+        let operands = data.substring(at + 1, end)
+        let values = letter == "a" || letter == "A" ? arcNumbers(operands) : svgNumbers(operands)
+        tokens.append(PathToken { letter: letter, values: values })
+        at = end
+    }
+    return tokens
+}
+
+// An arc's numbers: seven to an arc, the fourth and fifth single-digit flags
+// that may touch what follows.
+function arcNumbers(text: borrow String) -> [Number] {
+    var numbers: [Number] = []
+    var at = 0
+    for _ in 0..text.count {
+        if at >= text.count { break }
+        let c = text.charAt(at)
+        let slot = numbers.count % 7
+        if (slot == 3 || slot == 4) && (c == NumberMark.zero || c == NumberMark.zero + 1) {
+            numbers.append(c - NumberMark.zero)
+            at += 1
+            continue
+        }
+        if !startsNumber(c) {
+            at += 1
+            continue
+        }
+        let end = numberEnd(text, at)
+        if end == at {
+            at += 1
+            continue
+        }
+        numbers.append(try parseNumber(text.substring(at, end)) otherwise 0)
+        at = end
+    }
+    return numbers
+}
+
+// How many operands a command takes each time it repeats.
+function operandCount(letter: borrow String) -> Number {
+    return match letter.lowercased() {
+        "m", "l", "t" -> 2
+        "h", "v" -> 1
+        "c" -> 6
+        "s", "q" -> 4
+        "a" -> 7
+        else -> 0
+    }
+}
+
+// The path data `data` draws.
+public function svgPath(data: borrow String) -> Path {
+    var pen = PathPen {}
+    for token in pathTokens(data) {
+        let count = operandCount(token.letter)
+        if count == 0 {
+            pen.close()
+            pen.last = copy token.letter
+            continue
+        }
+        let rounds = trunc(token.values.count / count)
+        for round in 0..rounds {
+            // A move's later pairs are lines.
+            let letter = round > 0 && token.letter == "M" ? "L" : (
+                round > 0 && token.letter == "m" ? "l" : copy token.letter
+            )
+            pen.command(letter, sliceOf(token.values, round * count, count))
+            pen.last = letter
+        }
+    }
+    return pen.path
+}
+
+function sliceOf(values: borrow [Number], start: Number, count: Number) -> [Number] {
+    var slice: [Number] = []
+    for index in start..(start + count) { slice.append(values[index]) }
+    return slice
+}
+
+extend PathPen {
+    // The point `x`, `y`, from the pen when `relative`.
+    function point(borrow self, x: Number, y: Number, relative: Bool) -> Point {
+        return relative ? Point { x : at.x + x, y: at.y + y }: Point { x: x, y: y }
+    }
+
+    function command(borrow mut self, letter: borrow String, v: borrow [Number]) {
+        let relative = letter == letter.lowercased()
+        match letter.lowercased() {
+            "m" -> moveTo(point(v[0], v[1], relative))
+            "l" -> lineTo(point(v[0], v[1], relative))
+            "h" -> lineTo(Point { x: relative ? at.x + v[0] : v[0], y: at.y })
+            "v" -> lineTo(Point { x: at.x, y: relative ? at.y + v[0] : v[0] })
+            "c" -> cubicTo(
+                point(v[0], v[1], relative),
+                point(v[2], v[3], relative),
+                point(v[4], v[5], relative)
+            )
+            "s" -> cubicTo(
+                reflected("cs"),
+                point(v[0], v[1], relative),
+                point(v[2], v[3], relative)
+            )
+            "q" -> quadraticTo(point(v[0], v[1], relative), point(v[2], v[3], relative))
+            "t" -> quadraticTo(reflected("qt"), point(v[0], v[1], relative))
+            "a" -> arcTo(v, point(v[5], v[6], relative))
+            // `operandCount` names no other letter.
+            else -> {}
+        }
+    }
+}

@@ -1,0 +1,651 @@
+//! The Adaptive Mobile platform's entry point: the one Dynamic Platform for phone, tablet and fold, its root view,
+//! the Dock and the home screen it hands to, and the root closures MosaicDisplay calls.
+import Foundation
+import LibTessera
+import PlatformKit
+import TesseraDisplayClient
+import KiraUI
+import TesseraUI
+import PlatformUI
+import AppKit
+
+// The Adaptive Mobile platform: one Dynamic Platform covering phone, tablet, and
+// fold as size classes, running Stack everywhere (D1). The application in
+// front fills the screen, as on an iPad.
+//
+// Kira UI runs its session with MosaicDisplay and draws its interface over
+// every application. It starts on its lock screen
+// (roadmap/13-security-and-updates.md), which covers everything and holds the
+// keyboard until it is opened; what came to the front meanwhile is given the
+// keyboard as the lock screen leaves.
+
+/// The Dock's order on Adaptive Mobile: what it keeps first, and how many recently used applications follow.
+namespace DockOrder {
+    // What the Dock keeps first, as an iPad's keeps Files.
+    let first: [String] = ["Inlay", "Notes"]
+    // How many applications used last it shows after what it keeps.
+    let recent: Number = 3
+}
+
+/// What the Dock shows: what it keeps and the applications used last after
+/// them. The home screen draws it (`publishPlatformDock`), and the icons
+/// windows fly into are read from it, so the two stand in one place.
+function shownDockItems(mobile: borrow Mobile) -> [DockItem] {
+    return dockItems(
+        mobile.state,
+        { name in },
+        mobile.output.width,
+        recent = .Some(DockOrder.recent)
+    )
+}
+
+/// Tells the home screen what the Dock holds, when that changed.
+function publishDock(mobile: borrow Mobile) {
+    var entries: [PlatformDockEntry] = []
+    for item in shownDockItems(mobile) {
+        entries.append(
+            PlatformDockEntry {
+                application: copy item.name,
+                running: item.running,
+                kept: item.kept
+            }
+        )
+    }
+    publishPlatformDock(mobile.bridge, entries)
+}
+
+/// Touch navigates Adaptive Mobile, as it does an iPhone
+/// (`DynamicPlatform.presentationPolicy`).
+function navigation() -> NavigationModel {
+    return DynamicPlatform.AdaptiveMobile.presentationPolicy().navigation
+}
+
+/// A session began on `opened`: the platform registers its own surface, brings
+/// it forward and asks the compositor for a stack, one application filling
+/// the screen.
+function began(mobile: borrow mut Mobile, opened: borrow DynamicPlatformSession) {
+    log info("configured", x: 0, y: 0, width: opened.size.width, height: opened.size.height)
+    let channel = copy opened.channel
+    mobile.channel = .Some(copy channel)
+    mobile.own = .Some(copy opened.surface)
+    // A new display server holds no glass for the platform: ask for all of it again.
+    mobile.glass = PlatformGlassClaim {}
+    mobile.output = SurfaceFrame {
+        x: 0,
+        y: 0,
+        width: opened.size.width,
+        height: opened.size.height
+    }
+    mobile.mode = .Stack
+    mobile.state = emptyPlatformState(.AdaptiveMobile)
+    log info("arranged", arrangement: mobile.state.platform.arrangement().name())
+    let ownApplication = PlatformApplicationId(1)
+    let ownSurface = PlatformSurfaceId(opened.surface.raw)
+    let frame = SurfaceFrame { x: 0, y: 0, width: opened.size.width, height: opened.size.height, }
+    mobile.state.registerApplication(ownApplication, "Adaptive Mobile", .Platform)
+    mobile.state.registerSurface(ownSurface, ownApplication, move frame, 0)
+    match mobile.state.activateSurface(ownSurface) {
+        // The platform's own surface is in front and focused.
+        Ok -> {}
+        Error(failure) -> log warn("the platform could not bring its own surface forward", failure)
+    }
+    match sendSetMode(copy channel, .Stack, false) {
+        Ok -> log info(
+            "asked the compositor for its mode",
+            mode: CompositorMode.Stack,
+            split: false
+        )
+        Error(failed) -> log warn(
+            "could not ask the compositor for a mode",
+            mode: CompositorMode.Stack,
+            split: false,
+            error: errorName(failed)
+        )
+    }
+    mobile.home = .None
+    mobile.front = .None
+    // Not yet said on this session: the compositor may hold the band an
+    // earlier platform asked for, so the first is said even when it is none.
+    mobile.dock = -1
+    mobile.unnamed = []
+    for key in mobileKeys {
+        match sendInstallGrab(copy channel, code(key)) {
+            Ok -> log info("grabbed a key", key: code(key))
+            Error(failed) -> log warn("could not grab a key", error: errorName(failed))
+        }
+    }
+    mobile.bar = 0
+    keepBar(mobile)
+    mobile.installed = keepFavouritesInDock(mobile.state, DockOrder.first)
+    keepDock(mobile)
+    keepIdleTimes(copy channel)
+    // The lock screen takes every press and key while it is up, so none
+    // reaches the application behind it or swipes it home.
+    if mobile.lock.locked {
+        match holdInput(mobile, true) {
+            Ok(_) -> {}
+            Error(failed) -> log warn(
+                "could not hold the input",
+                held: true,
+                error: errorName(failed)
+            )
+        }
+    }
+    log info("running", locked: mobile.lock.locked)
+}
+
+/// Whether the home screen is in front: nothing else is open, or the home
+/// screen itself was brought forward.
+function atHome(mobile: borrow Mobile) -> Bool {
+    return match mobile.front {
+        Some(surface) -> mobile.home == .Some(surface)
+        None -> true
+    }
+}
+
+/// The band along the bottom the platform takes, whose presses MosaicDisplay
+/// sends it: the home indicator's in an application, and none over the home
+/// screen, whose Dock is its own and takes its own presses.
+function homeBand(mobile: borrow Mobile) -> Number {
+    return atHome(mobile) ? 0 : homeIndicatorBand()
+}
+
+/// The home indicator is over an application, but not while its window is
+/// swiped up or flies out of its icon or into it: the home screen and its
+/// Dock show then.
+function indicatorShown(mobile: borrow Mobile) -> Bool {
+    return !atHome(mobile) && !mobile.peeking && mobile.flying.isNone()
+}
+
+/// A window about to grow out of its icon, in the stack: the home indicator
+/// stays away until MosaicDisplay says it has landed.
+function awaitFlight(mobile: borrow mut Mobile, surface: DisplaySurfaceId) {
+    if mobile.mode == .Stack { mobile.flying = .Some(surface) }
+}
+
+/// Keeps the band along the bottom the platform takes (`homeBand`): the home
+/// indicator's while an application fills the screen, none over the home
+/// screen.
+function keepDock(mobile: borrow mut Mobile) {
+    keepBar(mobile)
+    let band = homeBand(mobile)
+    if band == mobile.dock { return }
+    let channel = match mobile.channel {
+        Some(value) -> value
+        None -> return
+    }
+    match sendSetDock(channel, UNumber(band)) {
+        Ok -> {
+            mobile.dock = band
+            log info("the platform takes the bottom of the output", height: band)
+        }
+        Error(failed) -> log warn("could not keep the Dock's band", error: errorName(failed))
+    }
+}
+
+/// The person chose `name` in the Dock. Open, its window comes to the front;
+/// not open, PID 1 is asked to open it.
+function dockChose(mobile: borrow mut Mobile, name: borrow String) {
+    if mobile.lock.locked { return }
+    if !mobile.fromDock.contains(name) { mobile.fromDock.append(copy name) }
+    let application = match mobile.state.applicationNamed(name) {
+        Some(value) -> value
+        None -> {
+            match openInstalled(mobile.installed, name) {
+                Ok -> {}
+                Error(failure) -> match failure {
+                    NotInstalled(missing) -> log warn(
+                        "an application that is not installed was chosen",
+                        application: missing
+                    )
+                }
+            }
+            return
+        }
+    }
+    match mobile.state.topmostSurfaceOf(application) {
+        Some(surface) -> {
+            let shown = DisplaySurfaceId(surface.raw)
+            mobile.front = .Some(shown)
+            focus(mobile, shown)
+            match mobile.state.activateSurface(surface) {
+                // The window is in front and focused.
+                Ok -> {}
+                Error(failure) -> log warn("the Dock could not bring a window forward", failure)
+            }
+            keepDock(mobile)
+        }
+        None -> match mobile.state.minimizedSurfaceOf(application) {
+            Some(surface) -> resume(mobile, surface)
+            None -> log warn("an open application has no window", application: name)
+        }
+    }
+}
+
+/// The keys the platform grabs from the compositor.
+@Derive(Copy)
+enum MobileKey: UN32 {
+    // F4 goes home, as it shows the desktop on Adaptive Desktop and as
+    // Command-H does on an iPad's keyboard.
+    Home = 61
+    // F6 turns Stage Manager on and off, as on Adaptive Desktop.
+    StageManager = 63
+    // Pause, the lock key, as on Adaptive Desktop: what an iPhone's side
+    // button does.
+    LockScreen = 72
+}
+
+/// The keys Adaptive Mobile answers to by name: Home, Stage Manager and the lock screen.
+let mobileKeys: [MobileKey] = [MobileKey.Home, MobileKey.StageManager, MobileKey.LockScreen]
+
+/// Goes home, as an iPad does: every application on screen is put away, and
+/// the home screen comes to the front with the Dock over it.
+function goHome(mobile: borrow mut Mobile) {
+    if mobile.lock.locked { return }
+    let channel = match mobile.channel {
+        Some(value) -> value
+        None -> return
+    }
+    for surface in mobile.state.shownApplicationSurfaces() {
+        match sendSetHidden(copy channel, DisplaySurfaceId(surface.raw), true) {
+            Ok -> {}
+            Error(failed) -> log warn("could not put an application away", error: errorName(failed))
+        }
+        match mobile.state.setSurfaceVisibility(surface, .Hidden) {
+            Ok -> {}
+            Error(failure) -> log warn("the platform lost track of a window", failure)
+        }
+    }
+    mobile.front = copy mobile.home
+    mobile.peeking = false
+    match mobile.home {
+        Some(home) -> focus(mobile, home)
+        None -> {}
+    }
+    keepDock(mobile)
+    log info("went home")
+}
+
+/// Brings back an application that was put away when the person went home.
+function resume(mobile: borrow mut Mobile, surface: PlatformSurfaceId) {
+    let channel = match mobile.channel {
+        Some(value) -> value
+        None -> return
+    }
+    match stripPutAway(mobile, surface) {
+        Ok -> {}
+        Error(failure) -> {
+            reportStripPutAwayFailure(failure)
+            return
+        }
+    }
+    let shown = DisplaySurfaceId(surface.raw)
+    match sendSetHidden(channel, shown, false) {
+        Ok -> {}
+        Error(failed) -> {
+            log warn("could not bring an application back", error: errorName(failed))
+            return
+        }
+    }
+    match mobile.state.setSurfaceVisibility(surface, .Visible) {
+        Ok -> {}
+        Error(failure) -> log warn("the platform lost track of a window", failure)
+    }
+    match mobile.state.activateSurface(surface) {
+        Ok -> {}
+        Error(failure) -> log warn("the Dock could not bring a window forward", failure)
+    }
+    awaitFlight(mobile, shown)
+    mobile.front = .Some(shown)
+    focus(mobile, shown)
+    keepDock(mobile)
+    log info("an application came back", surface: surface.raw)
+}
+
+/// A key the platform grabbed went down, came up or repeated. Only a press
+/// acts: F4 goes home, F6 turns Stage Manager on and off, and the lock key
+/// closes the lock screen. On the lock screen any of them but the lock key
+/// opens it, as any other key does.
+function grabFired(mobile: borrow mut Mobile, fired: borrow DisplayKey) {
+    if fired.state != .Pressed { return }
+    if mobile.lock.locked {
+        if fired.key != code(MobileKey.LockScreen) { unlock(mobile) }
+        return
+    }
+    match caseWithCode(mobileKeys, fired.key) {
+        Some(key) -> match key {
+            Home -> goHome(mobile)
+            StageManager -> toggleStage(mobile)
+            LockScreen -> lockScreen(mobile)
+        }
+        None -> log warn("a key the platform did not grab fired", key: fired.key)
+    }
+}
+
+/// Gives `surface` the keyboard.
+function focus(mobile: borrow Mobile, surface: DisplaySurfaceId) {
+    let channel = match mobile.channel {
+        Some(value) -> value
+        None -> return
+    }
+    match sendGrantFocus(channel, surface) {
+        Ok -> log info("granting focus", surface: surface.raw)
+        Error(failed) -> log warn(
+            "could not grant focus",
+            surface: surface.raw,
+            error: errorName(failed)
+        )
+    }
+}
+
+/// A key came to the platform's own surface. While the lock screen is up it
+/// takes every key, and a press opens it.
+function key(mobile: borrow mut Mobile, pressed: borrow DisplayKey) -> Bool {
+    // While Control Center is down it holds the keyboard; Escape puts it away.
+    if mobile.controls.open {
+        if pressed.state == .Pressed && Number(pressed.key) == 41 {
+            controlCenterAct(mobile, .Close)
+        }
+        return true
+    }
+    if !mobile.lock.locked { return false }
+    if pressed.state == .Pressed { unlock(mobile) }
+    return true
+}
+
+/// A click on the lock screen opens it, as a key does; on touch the lock screen
+/// takes the finger itself and opens when it is swiped up. Anywhere else the
+/// press is the interface's.
+function press(mobile: borrow mut Mobile, button: borrow DisplayPointerButton) -> Bool {
+    if !mobile.lock.locked || navigation() == .Touch { return false }
+    if button.state == .Pressed { unlock(mobile) }
+    return true
+}
+
+/// Closes the lock screen over the screen at once, as the lock key does.
+/// Control Center goes away first; the application in front stays in front
+/// behind the lock screen, and takes the keyboard back when it opens.
+function lockScreen(mobile: borrow mut Mobile) {
+    if mobile.lock.locked { return }
+    if mobile.controls.open { controlCenterAct(mobile, .Close) }
+    mobile.lock.lock()
+    keepBar(mobile)
+    match holdInput(mobile, true) {
+        Ok(_) -> {}
+        Error(failed) -> log warn("could not hold the input", held: true, error: errorName(failed))
+    }
+    match mobile.own {
+        Some(own) -> focus(mobile, own)
+        None -> {}
+    }
+    redrawAfter(0)
+    log info("the lock screen closed")
+}
+
+/// Opens the lock screen: it leaves on its transition, and what is in front
+/// takes the keyboard.
+/// A notification chosen in the lock screen's list: the lock screen opens and
+/// the application that posted it comes forward or opens.
+function openFromHistory(mobile: borrow mut Mobile, name: borrow String) {
+    unlock(mobile)
+    dockChose(mobile, name)
+}
+
+/// Opens the lock screen: it lifts away once it has opened, and the keyboard goes to the window at the front.
+function unlock(mobile: borrow mut Mobile) {
+    let seconds = lockScreenOpeningSeconds(navigation())
+    mobile.lock.open(unixMillis(), seconds)
+    keepBar(mobile)
+    // The lock screen is taken away once it has opened.
+    redrawAfter(seconds)
+    match holdInput(mobile, mobile.controls.open) {
+        Ok(_) -> {}
+        Error(failed) -> log warn(
+            "could not hold the input",
+            held: mobile.controls.open,
+            error: errorName(failed)
+        )
+    }
+    log info("the lock screen opened")
+    match mobile.front {
+        Some(surface) -> focus(mobile, surface)
+        // Nothing is open; the platform keeps the keyboard.
+        None -> {}
+    }
+}
+
+/// The platform's interface over the whole screen: the status bar along the
+/// top, the strip's icons down the leading edge while Stage Manager is on, the
+/// home indicator over an application, a
+/// notification's banner at the top, Control Center while it is down, and the
+/// lock screen while it covers everything. Nothing else is drawn, so the
+/// application in front shows through.
+function platformRoot(
+    mobile: borrow Mobile,
+    home: () -> Void,
+    open: (Number) -> Void,
+    act: (ControlCenterAction) -> Void,
+    unlocked: () -> Void,
+    pulled: (StatusBarEdge) -> Void,
+    following: (StatusBarEdge, StatusBarDrag) -> Void,
+    history: NotificationListActions
+) -> Any Widget {
+    let now = unixMillis()
+    let close = copy act
+    let phase = lockScreenPhaseOf(mobile.lock, now)
+    // Pulled down by a finger, the lock screen comes in where the finger has
+    // it, not from the top on its own.
+    let transition = mobile.lock.pulled(now) ? identityTransition() : lockScreenTransition(
+        navigation()
+    )
+    let status = statusItems(mobile.controls.focus)
+    return ZStack(alignment = .Top) {
+        // It fades in as an application comes forward, and out as it goes.
+        if indicatorShown(mobile) {
+            HomeIndicator(home = move home, ink = mobile.indicatorTone.ink(now))
+            .transition(opacityTransition(), animation: .Smooth)
+        }
+        NotificationBanners(
+            items = notificationBannerItems(mobile.banners, now, move open),
+            top = barHeight(mobile),
+            ownGlass = false
+        )
+        ControlCenter(
+            controls = controlCenterControls(mobile.controls, arrangementOf(mobile), move act),
+            open = mobile.controls.open,
+            top = barHeight(mobile),
+            ownGlass = false,
+            dismiss = { in close(.Close) }
+        )
+        if mobile.lock.covers(now) {
+            LockScreen(
+                time = clockTime(mobile.zone.local(now)),
+                date = clockDate(mobile.zone.local(now)),
+                navigation = navigation(),
+                phase = phase,
+                status = copy status,
+                open = move unlocked,
+                notifications = notificationHistory().groups(),
+                notificationActions = move history
+            )
+            .transition(move transition, lockScreenAnimation(navigation()))
+        }
+        // Over everything, the lock screen and Control Center too, unless
+        // the application in front hid it.
+        if statusBarShown(mobile) {
+            StatusBar(
+                realtime = mobile.zone.local(now),
+                items = copy status,
+                ink = mobile.lock.covers(
+                    now
+                ) || mobile.controls.open ? statusBarLightInk : mobile.tone.ink(now),
+                clock = !mobile.lock.covers(now),
+                pulled = move pulled,
+                following = move following
+            )
+        }
+    }
+    .fillWidth()
+    .fillHeight()
+}
+
+/// Where the lock screen is at `now`: opening, following a finger pulling it
+/// down over the open screen or going back up from one, or shown.
+function lockScreenPhaseOf(lock: borrow LockState, now: Number) -> LockScreenPhase {
+    if lock.opening(now) { return .Opening }
+    if lock.locked { return .Shown }
+    return match lock.pull {
+        Following(down) -> .Following(down)
+        Resting, Retracting -> .Retracting
+    }
+}
+
+/// Turns the status bar's ink, and the home indicator's, when the picture
+/// under it has stayed on the other side long enough, and asks to be drawn
+/// again while either turns.
+function keepTone(mobile: borrow mut Mobile) {
+    let now = unixMillis()
+    mobile.tone.settle(now)
+    mobile.indicatorTone.settle(now)
+    var soonest: Number? = .None
+    for wait in [mobile.tone.redrawIn(now), mobile.indicatorTone.redrawIn(now)] {
+        match wait {
+            Some(seconds) -> soonest = match soonest {
+                Some(earlier) -> .Some(min(earlier, seconds))
+                None -> .Some(seconds)
+            }
+            None -> {}
+        }
+    }
+    match soonest {
+        Some(seconds) -> redrawAfter(seconds)
+        None -> {}
+    }
+}
+
+/// The platform's glass: each banner's. The Dock's is the home screen's,
+/// which draws the Dock.
+function glassOf(mobile: borrow Mobile) -> [PlatformGlass] {
+    let areas = PlatformGlassAreas {
+        banners: notificationBannerFrames(
+            mobile.banners,
+            unixMillis(),
+            barHeight(mobile),
+            mobile.output.width
+        ),
+    }
+    return platformGlass(areas)
+}
+
+/// Starts Adaptive Mobile: reads the start-up settings and the time zone, then runs the platform until the person quits.
+@Main
+function main() {
+    log info("starting", desktop: "Adaptive Mobile")
+    let bridge = makeBridgeHandle()
+    var mobile = Mobile(state: emptyPlatformState(.AdaptiveMobile))
+    mobile.bridge = copy bridge
+    // Switched in by a person at the machine: they are past the lock screen.
+    if startsUnlocked() { mobile.lock.locked = false }
+    mobile.zone = currentTimeZone()
+    log info(
+        "the clocks read in",
+        zone: mobile.zone.name,
+        setting: settingValue(TimeZoneSetting.key, TimeZoneSetting.automatic),
+        region: regionTimeZoneName()
+    )
+    RunDynamicPlatform(
+        "Adaptive Mobile",
+        { in
+            // A link PID 1 handed over marks the interface stale, so a window
+            // named since the last frame is named before this one.
+            mobile.unnamed = nameWindows(mobile.bridge, mobile.state, mobile.unnamed)
+            keepTone(mobile)
+            // An application installed or uninstalled joins or leaves the
+            // Dock and the home screen as it happens.
+            if takeApplicationsChange() {
+                mobile.installed = keepFavouritesInDock(mobile.state, DockOrder.first)
+            }
+            // What the person chose in the home screen's Dock comes forward
+            // or opens, and the home screen hears what the Dock holds now.
+            for name in takePlatformDockChoices(mobile.bridge) {
+                log info("the home screen's Dock chose an application", application: name)
+                dockChose(mobile, name)
+            }
+            publishDock(mobile)
+            let moment = focusMoment(mobile.zone, unixMillis())
+            let focus = focusChoice()
+            mobile.controls.focus = focus.active(moment)
+            mobile.banners = followFocusedNotifications(mobile.bridge, mobile.banners, unixMillis(), focus, moment)
+            match mobile.channel {
+                Some(channel) -> {
+                    claimOverlay(
+                        mobile.overlay,
+                        copy channel,
+                        notificationBannerArea(
+                            mobile.banners,
+                            unixMillis(),
+                            barHeight(mobile),
+                            mobile.output.width
+                        )
+                    )
+                    match mobile.own {
+                        Some(own) -> claimGlass(mobile.glass, channel, own, glassOf(mobile))
+                        None -> {}
+                    }
+                }
+                None -> {}
+            }
+            return platformRoot(
+                mobile,
+                { in goHome(mobile) },
+                { client in bannerChose(mobile, client) },
+                { action in controlCenterAct(mobile, move action) },
+                { in unlock(mobile) },
+                { edge in statusBarPulled(mobile, move edge) },
+                { edge, drag in statusBarFollowing(mobile, move edge, move drag) },
+                NotificationListActions {
+                    open: { name in openFromHistory(mobile, name) },
+                    clear: { id in
+                        clearNotification(id)
+                        redrawAfter(0)
+                    },
+                    clearApplication: { name in
+                        clearApplicationNotifications(name)
+                        redrawAfter(0)
+                    }
+                }
+            )
+        },
+        ApplicationOptions { watches: [.Minute, .Applications] },
+        DynamicPlatformHooks {
+            badges: { in return stageBadgesOf(mobile) },
+            began: { opened in began(mobile, opened) },
+            message: { arrived in mobile.deliver(arrived) },
+            key: { pressed in return key(mobile, pressed) },
+            press: { button in return press(mobile, button) },
+            arm: { port in
+                armPlatformSettingWatch(mobile.settings, port, UNumber(DynamicPlatformWaitKey.base))
+            },
+            woke: { waited in
+                if waited == DynamicPlatformWaitKey.base {
+                    platformSettingWoke(mobile.settings, PlatformSetting.adaptiveMobile)
+                    if mobile.settings.changed.count > 0 { noteSettingsChanged() }
+                    if mobile.settings.changed.contains(DockFavouritesSetting.key) {
+                        mobile.installed = keepFavouritesInDock(mobile.state, DockOrder.first)
+                    }
+                    if mobile.settings.changed.contains(TimeZoneSetting.key) {
+                        mobile.zone = currentTimeZone()
+                    }
+                    if mobile.settings.changed.contains(IdleSetting.key) {
+                        match mobile.channel {
+                            Some(channel) -> keepIdleTimes(copy channel)
+                            None -> {}
+                        }
+                    }
+                    mobile.settings.changed = []
+                }
+            },
+        },
+        move bridge
+    )
+}

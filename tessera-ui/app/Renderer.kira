@@ -1,0 +1,245 @@
+//! What draws: a Vulkan device with no window, and the three textures frames
+//! take turns in, and the batch frames are encoded into. The retained tree
+//! belongs to whoever draws: KiraUI's own state for an application.
+//!
+//! # Why there is no window
+//!
+//! Ember opens a window on Linux by being a Wayland client. Tessera has no
+//! Wayland compositor to be a client of, and will not have one: it is the thing
+//! that composites. So this takes the path headless graphics exists for: a
+//! device with no swapchain, rendering into a texture whose pixels belong to
+//! another process, MosaicDisplay (roadmap/08-display-server.md).
+//!
+//! The device that draws each texture also allocates it and exports its
+//! memory as the dma-buf MosaicDisplay receives. Keeping allocation and
+//! rendering on one VkDevice avoids cross-context external-memory import on
+//! venus. The textures are the size MosaicDisplay configured the surface at,
+//! and are made again when it configures another (see `FrameTextures`).
+
+import Foundation
+import KiraUI
+import KCoreAnimation
+import Ember
+import LibTessera
+
+/// The renderer: the headless device frames are drawn on, the batch they are encoded with, and the frame textures once made.
+struct Renderer {
+    var device: GraphicsHeadless
+    // The glyph atlas and pipelines every frame is encoded with.
+    var batch: UiBatch
+    // None until the first frame's size is known.
+    var textures: FrameTextures? = .None
+    // How many times textures were made: each set is attached afresh.
+    var generations: Number = 0
+}
+
+/// The three textures frames take turns in, so one can be drawn while the
+/// display still shows one and flips to another; the size all are, and the
+/// part of them the last frame drew, from the top-left corner. While a window
+/// is resized they are made the size of the screen, so each size on the way is
+/// drawn into them rather than into textures made for it; once a size has
+/// been drawn `FrameRoom.steady` frames running, they are made that size again.
+struct FrameTextures {
+    var first: ExportedTexture
+    var second: ExportedTexture
+    var third: ExportedTexture
+    var size: Size
+    var drawn: Size = Size {}
+    var steady: Number = 0
+    var generation: Number = 0
+}
+
+/// How many frame textures the renderer keeps: the steady count the frames rotate through.
+namespace FrameRoom {
+    let steady: Number = 3
+}
+
+/// Why the renderer could not be made, or could not draw at a size.
+enum RendererFailure {
+    NoDevice(HeadlessFailure)
+    // Ember's account of why it could not export a texture.
+    NoTexture(ExportFailure)
+}
+
+/// Opens the device. The textures wait for the size of the first frame.
+function makeRenderer(launch: borrow LaunchTimeline) -> Result<Renderer, RendererFailure> {
+    let device = match openHeadlessGraphicsWithBackend(.Vulkan) {
+        Ok(value) -> value
+        Error(failure) -> return .Error(.NoDevice(failure))
+    }
+    log info("opened a Vulkan device, with no window")
+    launchMark(launch, "vulkan")
+    let batch = makeUiBatch(device.graphics())
+    launchMark(launch, "batch")
+    return .Ok(Renderer { device: move device, batch: move batch })
+}
+
+/// One of the two textures frames are drawn into, `size` big.
+function frameTexture(label: String, size: borrow Size) -> ExportedTextureDescriptor {
+    return ExportedTextureDescriptor {
+        label: label,
+        width: UN32(size.width),
+        height: UN32(size.height)
+    }
+}
+
+extend Renderer {
+    /// Releases the frame textures and then the device.
+    function release(borrow mut self) {
+        dropTextures()
+        device.close()
+    }
+
+    /// Destroys the exported frame textures, if any were made.
+    function dropTextures(borrow mut self) {
+        match textures {
+            Some(pair) -> {
+                device.graphics().destroyExportedTexture(pair.third)
+                device.graphics().destroyExportedTexture(pair.second)
+                device.graphics().destroyExportedTexture(pair.first)
+            }
+            // Nothing was drawn yet.
+            None -> {}
+        }
+        textures = .None
+    }
+
+    /// Textures to draw `size` pixels into: the ones there are when they hold
+    /// it, else three made for it, `room` big when the size changed. MosaicDisplay
+    /// holds what it was handed of the old ones, so they can go while it still
+    /// shows one.
+    function fit(
+        borrow mut self,
+        size: borrow Size,
+        room: borrow Size
+    ) -> Result<FrameTextures, RendererFailure> {
+        var made = copy size
+        match textures {
+            Some(pair) -> {
+                let exact = pair.size.width == size.width && pair.size.height == size.height
+                let holds = pair.size.width >= size.width && pair.size.height >= size.height
+                let resting = pair.drawn.width == size.width && pair.drawn.height == size.height
+                if exact || holds && !(resting && pair.steady >= FrameRoom.steady) {
+                    var kept = copy pair
+                    kept.steady = resting ? pair.steady + 1 : 0
+                    kept.drawn = copy size
+                    textures = .Some(copy kept)
+                    return .Ok(kept)
+                }
+                if !holds {
+                    made = Size {
+                        width: max(size.width, room.width),
+                        height: max(size.height, room.height)
+                    }
+                }
+            }
+            None -> {}
+        }
+        dropTextures()
+        let first = match device.graphics().createExportedTexture(
+            frameTexture("frame-first", made)
+        ) {
+            Ok(value) -> value
+            Error(failure) -> return .Error(.NoTexture(failure))
+        }
+        let second = match device.graphics().createExportedTexture(
+            frameTexture("frame-second", made)
+        ) {
+            Ok(value) -> value
+            Error(failure) -> {
+                device.graphics().destroyExportedTexture(first)
+                return .Error(.NoTexture(failure))
+            }
+        }
+        let third = match device.graphics().createExportedTexture(
+            frameTexture("frame-third", made)
+        ) {
+            Ok(value) -> value
+            Error(failure) -> {
+                device.graphics().destroyExportedTexture(second)
+                device.graphics().destroyExportedTexture(first)
+                return .Error(.NoTexture(failure))
+            }
+        }
+        log info(
+            "made the frame textures",
+            width: first.memory.width,
+            height: first.memory.height,
+            stride: first.memory.stride
+        )
+        generations += 1
+        let pair = FrameTextures {
+            first: first,
+            second: second,
+            third: third,
+            size: move made,
+            drawn: copy size,
+            generation: generations
+        }
+        textures = .Some(copy pair)
+        return .Ok(pair)
+    }
+
+    /// Encodes the retained tree `compositor` holds into the batch on
+    /// `frame`, laid out at `size` points and drawn `scale` pixels a point;
+    /// how many commands it drew.
+    function encode(
+        borrow self,
+        compositor: borrow mut Compositor,
+        frame: borrow mut RenderFrame,
+        size: borrow Size,
+        scale: Number
+    ) -> Number {
+        return compositor.encode(
+            frame,
+            device.graphics(),
+            batch,
+            size.width,
+            size.height,
+            scale,
+            false
+        )
+    }
+
+    /// Puts what the batch holds into `texture` over `clear`, and submits it.
+    function present(
+        borrow mut self,
+        frame: borrow mut RenderFrame,
+        texture: borrow GraphicsTexture,
+        clear: borrow RGBAColor
+    ) {
+        batch.presentBatchIntoTexture(
+            frame,
+            device.graphics(),
+            texture,
+            clear.r,
+            clear.g,
+            clear.b,
+            clear.a
+        )
+        device.submit()
+        device.tick()
+    }
+}
+
+extend FrameTextures {
+    /// The texture frame `serial` is drawn into, in turn, so the display never
+    /// reads a texture being drawn: frame n + 3 reuses frame n's, which the
+    /// display let go of once frame n + 1 reached the screen.
+    function textureFor(borrow self, serial: FrameSerial) -> GraphicsTexture {
+        return match serial.raw % 3 {
+            1 -> first.texture
+            2 -> second.texture
+            else -> third.texture
+        }
+    }
+
+    /// The memory of the same texture, as the display is handed it.
+    function memoryFor(borrow self, serial: FrameSerial) -> ExportedMemory {
+        return match serial.raw % 3 {
+            1 -> first.memory
+            2 -> second.memory
+            else -> third.memory
+        }
+    }
+}

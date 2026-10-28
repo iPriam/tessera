@@ -1,0 +1,7 @@
+//! The Trash store package: the Trash's folders, its records and the moves.
+/// The Trash store package: the Trash's folders, its records and the moves.
+construct TrashStore extends Package {
+    let version: String = "0.1.0"
+    let kind: PackageKind = .Library
+    let dependencies: [Dependency] = [Dependency { name: "LibTessera", path: "../../libtessera" }]
+}

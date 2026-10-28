@@ -1,0 +1,45 @@
+//! The init inside Tessera's system volume, in Kira.
+//!
+//! This is the program the machine belongs to once PID 1 in the initramfs has
+//! mounted the system volume, made it the root, and executed what is here. It is
+//! still PID 1 — the handover replaced the image, not the process — so everything
+//! true of an init is true of it: returning is a kernel panic, and whatever the
+//! machine reparents onto it is its to reap.
+//!
+//! What it does not do yet is take over the boot options. The kernel's command
+//! line reaches the initramfs, and the handover passes no arguments on, so this
+//! program cannot be told anything by whoever booted the machine. Powering off at
+//! the end is that gap standing in for a decision: it makes a boot that reached
+//! the system volume end on its own, the way `tessera.autoexit` does one stage
+//! earlier, and it is the first thing to go when the handover learns to carry
+//! arguments.
+
+import Foundation
+import LibTessera
+
+/// Runs the system init: announces the boot, then powers off, idling if the platform refuses, and never returns.
+@Main
+function main() {
+    print("")
+    // The line a boot test greps for when it boots with a system volume.
+    // Changing its wording means changing scripts/run-qemu.sh with it.
+    print("tessera: system volume is the root, pid 1 is the system's own init")
+    print("tessera: this init came off a read-only volume, not out of the initramfs")
+    print("")
+
+    // Only answered if the platform refuses to power off.
+    match machineStop(.PowerOff) {
+        Ok -> log fault("power off answered without powering off; idling instead")
+        Error(failed) -> log fault(
+            "power off was refused; idling instead",
+            error: errorName(failed)
+        )
+    }
+    while true {
+        match threadSleep(Deadline.infinite) {
+            Ok -> {}
+            // Woken early; sleep again.
+            Error(failed) -> absorb failed
+        }
+    }
+}

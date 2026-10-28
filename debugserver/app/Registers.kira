@@ -1,0 +1,152 @@
+import Foundation
+import LibTessera
+
+// The registers the debugger is told of with `qRegisterInfo`, in the order
+// `g` sends them, each with where libtessera's register words hold it. On
+// arm64 the words are x0 to x30, sp, pc and pstate, sent as the 32-bit cpsr
+// lldb reads; on x86-64 they are Linux's `user_regs_struct`, r15 first.
+
+struct RegisterSpec {
+    let name: String
+    // Its index in `debugRegisters`' words.
+    let word: Number
+    let bits: Number
+    // Its DWARF number; none for a register DWARF does not number.
+    let dwarf: Number?
+    // The role lldb knows it by, `pc`, `sp`, `fp`, `ra` or `flags`; empty for
+    // none.
+    let generic: String
+}
+
+function registerTable(architecture: Architecture) -> [RegisterSpec] {
+    return match architecture {
+        Arm64 -> arm64Registers()
+        X64 -> x64Registers()
+        // Tessera does not run on RISC-V; there is nothing to describe.
+        RiscV64 -> []
+    }
+}
+
+function arm64Registers() -> [RegisterSpec] {
+    var table: [RegisterSpec] = []
+    for index in 0..29 {
+        table.append(
+            RegisterSpec {
+                name: "x\(index)",
+                word: index,
+                bits: 64,
+                dwarf: .Some(index),
+                generic: ""
+            }
+        )
+    }
+    table.append(RegisterSpec { name: "fp", word: 29, bits: 64, dwarf: .Some(29), generic: "fp" })
+    table.append(RegisterSpec { name: "lr", word: 30, bits: 64, dwarf: .Some(30), generic: "ra" })
+    table.append(RegisterSpec { name: "sp", word: 31, bits: 64, dwarf: .Some(31), generic: "sp" })
+    table.append(RegisterSpec { name: "pc", word: 32, bits: 64, dwarf: .Some(32), generic: "pc" })
+    table.append(RegisterSpec { name: "cpsr", word: 33, bits: 32, dwarf: .None, generic: "flags" })
+    return table
+}
+
+function x64Registers() -> [RegisterSpec] {
+    // `user_regs_struct`'s order, and each register's DWARF number.
+    let names = [
+        "r15", "r14", "r13", "r12", "rbp", "rbx", "r11", "r10", "r9", "r8", "rax", "rcx", "rdx", "rsi",
+        "rdi", "orig_rax", "rip", "cs", "rflags", "rsp", "ss", "fs_base", "gs_base", "ds", "es", "fs", "gs"
+    ]
+    let dwarf = [15, 14, 13, 12, 6, 3, 11, 10, 9, 8, 0, 2, 1, 4, 5, -1, 16, 51, 49, 7, 52, -1, -1, 53, 50, 54, 55]
+    var table: [RegisterSpec] = []
+    for (index, name) in names.enumerated() {
+        let generic = match name {
+            "rip" -> "pc"
+            "rsp" -> "sp"
+            "rbp" -> "fp"
+            "rflags" -> "flags"
+            else -> ""
+        }
+        let number: Number? = dwarf[index] < 0 ? .None : .Some(dwarf[index])
+        table.append(
+            RegisterSpec { name: copy name, word: index, bits: 64, dwarf: number, generic: generic }
+        )
+    }
+    return table
+}
+
+// `qRegisterInfo<n>`'s answer for register `number`.
+function registerInfo(table: borrow [RegisterSpec], number: Number) -> String {
+    if number < 0 || number >= table.count { return "E45" }
+    var offset = 0
+    for index in 0..number { offset += trunc(table[index].bits / 8) }
+    let spec = table[number]
+    var fields = [
+        "name:\(spec.name)", "bitsize:\(spec.bits)", "offset:\(offset)", "encoding:uint", "format:hex",
+        "set:General Purpose Registers"
+    ]
+    match spec.dwarf {
+        Some(value) -> {
+            fields.append("ehframe:\(value)")
+            fields.append("dwarf:\(value)")
+        }
+        // lldb takes the register by name alone.
+        None -> {}
+    }
+    if !spec.generic.isEmpty() { fields.append("generic:\(spec.generic)") }
+    return joined(fields, ";") + ";"
+}
+
+function registerHex(spec: borrow RegisterSpec, words: borrow [U64]) -> String {
+    if spec.word >= words.count { return hexLittleEndian(U64(0), trunc(spec.bits / 8)) }
+    return hexLittleEndian(words[spec.word], trunc(spec.bits / 8))
+}
+
+// `g`'s answer: every register, in the table's order.
+function allRegistersHex(table: borrow [RegisterSpec], words: borrow [U64]) -> String {
+    var parts: [String] = []
+    for spec in table { parts.append(registerHex(spec, words)) }
+    return joined(parts, "")
+}
+
+// Why `G`'s text is not the registers it asks to write.
+enum RegisterTextFailure {
+    NotAValue
+    InvalidHex(HexFailure)
+}
+
+// `G`'s registers written over `words`; a failure when the text is not one
+// value for each.
+function setAllRegisters(
+    table: borrow [RegisterSpec],
+    words: borrow mut [U64],
+    text: borrow String
+) -> Result<Void, RegisterTextFailure> {
+    var at = 0
+    for spec in table {
+        let digits = trunc(spec.bits / 4)
+        if at + digits > text.count { return .Error(RegisterTextFailure.NotAValue) }
+        let value = match parseLittleEndian(text.substring(at, at + digits)) {
+            Ok(value) -> value
+            Error(reason) -> return .Error(RegisterTextFailure.InvalidHex(reason))
+        }
+        setRegisterWord(spec, words, value)
+        at += digits
+    }
+    return .Ok
+}
+
+// A 32-bit register keeps the word's upper half, which on arm64 is pstate's.
+function setRegisterWord(spec: borrow RegisterSpec, words: borrow mut [U64], value: U64) {
+    if spec.word >= words.count { return }
+    if spec.bits == 32 {
+        words[spec.word] = (words[spec.word] & U64(0xFFFFFFFF00000000)) | (value & U64(0xFFFFFFFF))
+    } else {
+        words[spec.word] = value
+    }
+}
+
+// The program counter's word.
+function programCounterWord(table: borrow [RegisterSpec]) -> Number? {
+    for spec in table {
+        if spec.generic == "pc" { return .Some(spec.word) }
+    }
+    return .None
+}

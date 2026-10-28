@@ -1,0 +1,189 @@
+import Foundation
+import Build
+
+// `kira build setup`: what the build calls and neither knvm nor the graph
+// provides, installed through the host's package manager, on each host the
+// build knows. Fedora is the WSL distribution, Debian and Ubuntu what an
+// arm64 cloud machine runs, and macOS on Apple silicon builds and boots
+// aarch64 natively. A compiler or a linker is never among them: those come
+// from the LLVM bundle knvm installs. The step also makes the Python
+// environment meson runs on. It builds nothing: the guest GPU stack in the
+// sysroot is built with the meson it installs, so `kira build sysroot`
+// follows it. Running it again is a no-op once everything is there.
+
+namespace SetupPackages {
+    // The GNU build tools the kernel's Makefiles assume, the emulator, and
+    // meson, ninja and cmake, which the guest and host GPU stacks are built
+    // with. e2fsprogs makes the boot's ext4 disks.
+    let darwin: [String] = [
+        "make", "coreutils", "findutils", "gnu-sed", "bc", "xz", "lz4", "pkgconf", "openssl@3",
+        "qemu", "meson", "ninja", "cmake", "e2fsprogs",
+        // KosmicKrisp compiles its shaders' CL with LLVM to SPIR-V.
+        "llvm", "libclc", "spirv-llvm-translator"
+    ]
+    let fedora: [String] = [
+        // Building the kernel. lz4 compresses the x86_64 bzImage.
+        "make", "flex", "bison", "bc", "dwarves", "perl", "python3", "rsync", "lz4",
+        "ncurses-devel", "elfutils-libelf-devel", "openssl-devel",
+        "cpio", "xz", "zstd", "e2fsprogs",
+        // The guest graphics stack: Mesa and libdrm are meson projects, zlib
+        // and expat CMake ones.
+        "meson", "ninja-build", "cmake", "pkgconf",
+        // The emulators, and the virtio-gpu device Fedora's modular QEMU
+        // ships apart.
+        "qemu-system-x86-core", "qemu-system-aarch64-core", "edk2-aarch64", "qemu-user",
+        "qemu-device-display-virtio-gpu-pci",
+        // What the host GPU stack's QEMU and virglrenderer build against, and
+        // EGL and gbm for the egl-headless display.
+        "libepoxy-devel", "glib2-devel", "pixman-devel", "libslirp-devel", "libdrm-devel",
+        "vulkan-loader-devel", "mesa-libEGL-devel", "mesa-libgbm-devel"
+    ]
+    let debian: [String] = [
+        "make", "flex", "bison", "bc", "dwarves", "perl", "python3", "python3-venv", "rsync", "lz4",
+        "libncurses-dev", "libelf-dev", "libssl-dev",
+        "cpio", "xz-utils", "zstd", "e2fsprogs",
+        "meson", "ninja-build", "cmake", "pkgconf",
+        "qemu-system-arm", "qemu-system-x86", "qemu-efi-aarch64", "qemu-user",
+        "libepoxy-dev", "libglib2.0-dev", "libpixman-1-dev", "libslirp-dev", "libdrm-dev",
+        "libvulkan-dev", "libegl-dev", "libgbm-dev"
+    ]
+    // What the build runs, checked once the packages are in.
+    let linuxTools: [String] = [
+        "make", "flex", "bison", "bc", "cpio", "rsync", "meson", "ninja", "cmake", "pkg-config",
+        "mkfs.ext4", "qemu-system-x86_64", "qemu-system-aarch64"
+    ]
+    // What the guest GPU stack's build runs on Python, pinned: meson, and
+    // Mako, which Mesa generates its code with and looks for in the Python
+    // meson runs on, so both go into one environment of the build's.
+    // QEMU's configure makes an environment of its own with distlib.
+    let python: [String] = [
+        "meson==1.12.1", "mako==1.4.3", "pyyaml==6.0.3", "packaging==26.3", "distlib==0.4.3",
+        "setuptools==84.0.0"
+    ]
+    // Homebrew's keg-only tools, which are not on `PATH` and are not meant
+    // to be: Host.kira's PATH puts them there.
+    let darwinTools: [String] = [
+        "/opt/homebrew/opt/make/libexec/gnubin/make",
+        "/opt/homebrew/opt/coreutils/libexec/gnubin/nproc",
+        "/opt/homebrew/opt/findutils/libexec/gnubin/find",
+        "/opt/homebrew/opt/gnu-sed/libexec/gnubin/sed",
+        "/opt/homebrew/opt/bc/bin/bc",
+        "/opt/homebrew/opt/e2fsprogs/sbin/mkfs.ext4",
+        "/opt/homebrew/bin/qemu-system-aarch64"
+    ]
+}
+
+// The `setup` step.
+function describeSetup(graph: borrow mut Graph, host: borrow Host) {
+    let machine = copy host
+    graph.step(
+        Step {
+            name: "setup",
+            summary: "install what the build calls through the host's package manager, and meson's Python",
+            run: .Some({ run in return setUpHost(machine) })
+        }
+    )
+}
+
+function setUpHost(host: borrow Host) -> Number {
+    let installed = host.darwin ? setUpDarwin(host) : setUpLinux(host)
+    match installed {
+        Ok -> {}
+        Error(problem) -> {
+            log fault("the host is not set up", problem)
+            return 1
+        }
+    }
+    match setUpPython(host) {
+        Ok -> {}
+        Error(problem) -> {
+            log fault("the build's Python environment is not set up", problem)
+            return 1
+        }
+    }
+    log info("the host is ready; kira build sysroot stages the sysroot", buildRoot: host.buildRoot)
+    return 0
+}
+
+function setUpDarwin(host: borrow Host) -> Result<Void, String> {
+    if host.architecture != .Aarch64 { return .Error("Tessera builds on Apple silicon") }
+    let brew = host.find("brew")
+    if !fileExists(brew) { return .Error("no Homebrew: see https://brew.sh, then run this again") }
+    var arguments = ["install", "--quiet"]
+    for package in SetupPackages.darwin { arguments.append(copy package) }
+    match hostCommand(brew, arguments) {
+        Ok -> {}
+        Error(problem) -> return .Error(problem)
+    }
+    // The macOS SDK, which the kernel's host tools compile against.
+    match hostCommand(host.find("xcrun"), ["--show-sdk-path"]) {
+        Ok -> {}
+        Error(problem) -> return .Error(
+            "no macOS SDK: install the Xcode command line tools with xcode-select --install"
+        )
+    }
+    for tool in SetupPackages.darwinTools {
+        if !fileExists(tool) { return .Error("still missing after brew install: \(tool)") }
+    }
+    return .Ok
+}
+
+function setUpLinux(host: borrow Host) -> Result<Void, String> {
+    let release = match readFile("/etc/os-release") {
+        Ok(contents) -> contents.text
+        Error(failure) -> return .Error("cannot read /etc/os-release: \(traceText(failure))")
+    }
+    var id = ""
+    for line in release.split("\n") {
+        if line.startsWith("ID=") { id = line.substring(3, line.count).trim() }
+    }
+    if id.startsWith("\"") { id = id.substring(1, id.count - 1) }
+    var program = ""
+    var arguments: [String] = []
+    if id == "debian" || id == "ubuntu" {
+        program = host.find("sudo")
+        arguments = ["apt-get", "install", "-y"]
+        for package in SetupPackages.debian { arguments.append(copy package) }
+    } else if id == "fedora" {
+        program = host.find("dnf")
+        arguments = ["-y", "install"]
+        for package in SetupPackages.fedora { arguments.append(copy package) }
+    } else {
+        return .Error("the build knows Fedora, Debian, Ubuntu and macOS hosts, not \(id)")
+    }
+    match hostCommand(program, arguments) {
+        Ok -> {}
+        Error(problem) -> return .Error(problem)
+    }
+    for tool in SetupPackages.linuxTools {
+        if !fileExists(host.find(tool)) {
+            return .Error("still missing after the install: \(tool)")
+        }
+    }
+    return .Ok
+}
+
+// The environment at `Host.pythonBin`, made once, with the pinned packages.
+function setUpPython(host: borrow Host) -> Result<Void, String> {
+    let bin = host.pythonBin()
+    if !fileExists("\(bin)/python") {
+        match hostCommand(host.find("python3"), ["-m", "venv", parentOf(bin)]) {
+            Ok -> {}
+            Error(problem) -> return .Error(problem)
+        }
+    }
+    var arguments = ["install", "--quiet"]
+    for package in SetupPackages.python { arguments.append(copy package) }
+    return hostCommand("\(bin)/pip", arguments)
+}
+
+// Runs `program` with `arguments`, its output on the build's own.
+function hostCommand(program: borrow String, arguments: borrow [String]) -> Result<Void, String> {
+    let command = ProcessCommand { program: copy program, arguments: copy arguments, input: .Null }
+    return match runProgram(command) {
+        Ok(status) -> status == 0 ? .Ok : .Error(
+            "\(program) \(joined(arguments, " ")) failed with \(status)"
+        )
+        Error(problem) -> .Error(problem)
+    }
+}

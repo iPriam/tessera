@@ -1,0 +1,11 @@
+//! The ioreg package: prints the registry of devices.
+/// The Tessera ioreg package: the device registry command.
+construct TesseraIoreg extends Package {
+    let version: String = "0.1.0"
+    let kind: PackageKind = .App
+    let moduleRoot: String = "TesseraIoreg"
+    let dependencies: [Dependency] = [Dependency {
+        name: "ArgumentParser",
+        path: "../argument-parser"
+    }]
+}

@@ -1,0 +1,27 @@
+//! Clock's entry point: the time, the stopwatch and the timers in one window.
+import KiraUI
+import LibTessera
+import TesseraUI
+
+/// Runs Clock on Tessera's display until the person closes it.
+@Main
+function main() {
+    let timer = ClockTimer {}
+    let stopwatch = ClockStopwatch {}
+    let zone = currentTimeZone()
+    RunTesseraApplication(
+        "Clock",
+        { in
+            var held = timer
+            held.follow(unixMillis())
+            stopwatch.follow()
+            return ClockView(
+                seconds = secondsNow(zone),
+                zone = copy zone.name,
+                timer = timer,
+                stopwatch = stopwatch
+            )
+        },
+        ApplicationOptions { watches: [.Minute] }
+    )
+}

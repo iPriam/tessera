@@ -1,0 +1,270 @@
+import Foundation
+import KiraUI
+import LibTessera
+import TesseraUI
+
+// The background picture (roadmap/24-home-and-personalisation.md, "Wallpaper
+// and appearance"): what the lock screen stands on and what the desktop and
+// Home show between applications. Home and the lock screen each have their
+// own, chosen in Settings or from Home while it is edited: one of the
+// pictures PlatformUI keeps, or an image file, with how it is cropped to the
+// screen. Each is kept in Settings as `name|x|y|zoom`, under
+// `wallpaper.home` and `wallpaper.lock`, and read again when Settings
+// changes rather than each time it is drawn. The colours under a picture are
+// what show while its file is read, or if it cannot be.
+
+namespace WallpaperColors {
+    let picture: String = "/System/Library/PrivateFrameworks/PlatformUI.framework/Resources/Wallpaper.png"
+    let darkPicture: String = "/System/Library/PrivateFrameworks/PlatformUI.framework/Resources/WallpaperDark.png"
+    // The light picture's colours, averaged over its top and bottom thirds.
+    let top: RGBAColor = RGBAColor { r: 0.608, g: 0.529, b: 0.459, a: 1.0 }
+    let bottom: RGBAColor = RGBAColor { r: 0.494, g: 0.49, b: 0.51, a: 1.0 }
+    // The dark picture's, likewise.
+    let darkTop: RGBAColor = RGBAColor { r: 0.125, g: 0.133, b: 0.208, a: 1.0 }
+    let darkBottom: RGBAColor = RGBAColor { r: 0.137, g: 0.145, b: 0.22, a: 1.0 }
+}
+
+public namespace WallpaperSetting {
+    let home: String = "wallpaper.home"
+    let lock: String = "wallpaper.lock"
+}
+
+// Where a picture is shown.
+public enum WallpaperPlace {
+    Home
+    Lock
+}
+
+// The pictures PlatformUI keeps: the flowing sheets of gold and blue-grey,
+// with a night version in indigo the dark appearance shows, as a Mac's
+// dynamic desktop pictures follow the appearance, and plain gradients, each
+// with the colours it is drawn in.
+public struct WallpaperPicture {
+    let name: String
+    let file: String = ""
+    let top: RGBAColor
+    let bottom: RGBAColor
+    // The picture and its colours in the dark appearance; none when it has
+    // no night version.
+    let dark: WallpaperNight? = .None
+}
+
+public struct WallpaperNight {
+    let file: String
+    let top: RGBAColor
+    let bottom: RGBAColor
+}
+
+extend WallpaperPicture {
+    // The picture as the interface is drawn now: its night version while
+    // the interface is dark and it has one.
+    function shown(borrow self) -> WallpaperPicture {
+        let night = try dark otherwise return copy self
+        if !interfaceDrawnDark() { return copy self }
+        return WallpaperPicture {
+            name: copy name,
+            file: copy night.file,
+            top: night.top,
+            bottom: night.bottom
+        }
+    }
+}
+
+public function bundledWallpapers() -> [WallpaperPicture] {
+    return [
+        WallpaperPicture {
+            name: "Flow",
+            file: WallpaperColors.picture,
+            top: WallpaperColors.top,
+            bottom: WallpaperColors.bottom,
+            dark: .Some(
+                WallpaperNight {
+                    file: WallpaperColors.darkPicture,
+                    top: WallpaperColors.darkTop,
+                    bottom: WallpaperColors.darkBottom
+                }
+            )
+        },
+        WallpaperPicture {
+            name: "Ocean",
+            top: RGBAColor { r: 0.02, g: 0.16, b: 0.36, a: 1.0 },
+            bottom: RGBAColor { r: 0.09, g: 0.62, b: 0.74, a: 1.0 }
+        },
+        WallpaperPicture {
+            name: "Sunset",
+            top: RGBAColor { r: 0.36, g: 0.13, b: 0.42, a: 1.0 },
+            bottom: RGBAColor { r: 0.98, g: 0.55, b: 0.33, a: 1.0 }
+        },
+        WallpaperPicture {
+            name: "Meadow",
+            top: RGBAColor { r: 0.07, g: 0.33, b: 0.2, a: 1.0 },
+            bottom: RGBAColor { r: 0.62, g: 0.8, b: 0.38, a: 1.0 }
+        },
+        WallpaperPicture {
+            name: "Graphite",
+            top: RGBAColor { r: 0.08, g: 0.08, b: 0.1, a: 1.0 },
+            bottom: RGBAColor { r: 0.36, g: 0.37, b: 0.41, a: 1.0 }
+        },
+    ]
+}
+
+// A chosen picture: a bundled one's name or an image file's path, how far it
+// is zoomed past filling the screen, and where the screen sits in the part
+// the zoom leaves off, as shares across and down: 0 its leading or top edge,
+// 0.5 its middle.
+public struct WallpaperChoice {
+    var picture: String = "Flow"
+    var x: Number = 0.5
+    var y: Number = 0.5
+    var zoom: Number = 1
+}
+
+// The choice as Settings keeps it.
+public function wallpaperText(choice: borrow WallpaperChoice) -> String {
+    return choice.picture + "|" + String(choice.x) + "|" + String(choice.y) + "|" + String(
+        choice.zoom
+    )
+}
+
+// The choice `text` keeps, or the first bundled picture when it keeps none.
+public function wallpaperChoiceFrom(text: borrow String) -> WallpaperChoice {
+    let parts = text.split("|")
+    if parts.count != 4 || parts[0].count == 0 { return WallpaperChoice {} }
+    return WallpaperChoice {
+        picture: copy parts[0],
+        x: wallpaperShare(parts[1], 0.5, 0, 1),
+        y: wallpaperShare(parts[2], 0.5, 0, 1),
+        zoom: wallpaperShare(parts[3], 1, 1, 4)
+    }
+}
+
+// The number `text` spells, kept between `low` and `high`, or `fallback`.
+function wallpaperShare(
+    text: borrow String,
+    fallback: Number,
+    low: Number,
+    high: Number
+) -> Number {
+    let value = try parseNumber(text) otherwise return fallback
+    return min(max(value, low), high)
+}
+
+// The choices read from Settings, and how many changes to Settings had been
+// heard when they were.
+struct WallpaperRead {
+    var generation: Number? = .None
+    var home: WallpaperChoice = WallpaperChoice {}
+    var lock: WallpaperChoice = WallpaperChoice {}
+}
+
+namespace WallpaperSlot {
+    let key: PersistentStateKey = PersistentStateKey { name: "platformui.wallpaper" }
+}
+
+// The picture chosen for `place`.
+public function wallpaperChoice(place: WallpaperPlace) -> WallpaperChoice {
+    if !ambientStateHas(WallpaperSlot.key) {
+        ambientStatePut(WallpaperSlot.key, nativeUserData(nativeState(WallpaperRead {})))
+    }
+    var read = nativeRecover<WallpaperRead>(ambientStateGet(WallpaperSlot.key))
+    let generation = settingsGeneration()
+    if read.generation != .Some(generation) {
+        read.home = wallpaperChoiceFrom(settingValue(WallpaperSetting.home, ""))
+        read.lock = wallpaperChoiceFrom(settingValue(WallpaperSetting.lock, ""))
+        read.generation = .Some(generation)
+    }
+    return match place {
+        Home -> copy read.home
+        Lock -> copy read.lock
+    }
+}
+
+// Keeps `choice` for `place`, or for both.
+public function chooseWallpaper(choice: borrow WallpaperChoice, home: Bool, lock: Bool) {
+    if home { saveWallpaper(WallpaperSetting.home, choice) }
+    if lock { saveWallpaper(WallpaperSetting.lock, choice) }
+}
+
+function saveWallpaper(key: borrow String, choice: borrow WallpaperChoice) {
+    let channel = match settingsConnect() {
+        Ok(found) -> found
+        Error(failed) -> {
+            log warn("the Settings service cannot be reached", key: key, error: errorName(failed))
+            return
+        }
+    }
+    match settingsWrite(channel, key, wallpaperText(choice)) {
+        Ok -> {}
+        Error(failed) -> log warn(
+            "the wallpaper could not be kept",
+            key: key,
+            error: errorName(failed)
+        )
+    }
+    match handleClose(channel) {
+        Ok -> {}
+        Error(failed) -> log warn(
+            "the Settings channel could not be closed",
+            error: errorName(failed)
+        )
+    }
+}
+
+// The bundled picture `name` names, if one does.
+function bundledWallpaper(name: borrow String) -> WallpaperPicture? {
+    for picture in bundledWallpapers() {
+        if picture.name == name { return .Some(picture.shown()) }
+    }
+    return .None
+}
+
+// The picture chosen for `place`, or `choice` when one is given, as a
+// wallpaper picker previews it, cropped to the space it fills: the screen,
+// or a preview `width` by `height`.
+public construct Wallpaper(
+    place: WallpaperPlace = .Home,
+    preview: WallpaperChoice? = .None,
+    width: Number = 0,
+    height: Number = 0,
+) extends Widget {
+    body {
+        let choice = match preview {
+            Some(value) -> value
+            None -> wallpaperChoice(place)
+        }
+        let bundled = bundledWallpaper(choice.picture)
+        let file = match bundled {
+            Some(picture) -> copy picture.file
+            None -> copy choice.picture
+        }
+        let top = match bundled {
+            Some(picture) -> picture.top
+            None -> WallpaperColors.top
+        }
+        let bottom = match bundled {
+            Some(picture) -> picture.bottom
+            None -> WallpaperColors.bottom
+        }
+        // Zoomed about the screen's middle, then moved at most to an edge of
+        // the picture.
+        let across = width > 0 ? width : viewportWidth()
+        let down = height > 0 ? height : viewportHeight()
+        let shiftX = (0.5 - choice.x) * across * (choice.zoom - 1)
+        let shiftY = (0.5 - choice.y) * down * (choice.zoom - 1)
+        return ZStack(alignment = .Center) {
+            LinearGradient(start = top, end = bottom, direction = .Diagonal)
+            .fillWidth()
+            .fillHeight()
+            if file.count > 0 {
+                ImageFile(path = file)
+                .fillWidth()
+                .fillHeight()
+                .scaleEffect(choice.zoom)
+                .offset(x = resolvedLength(shiftX), y = resolvedLength(shiftY))
+            }
+        }
+        .fillWidth()
+        .fillHeight()
+        .clipShape(.Rect)
+    }
+}

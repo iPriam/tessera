@@ -1,0 +1,351 @@
+import Foundation
+import Heap
+import LibTessera
+
+// The manager's state: its ports and socket, its clients, the tokens
+// waiting to be redeemed, the driver manifests and what they started, and
+// the entries drivers published. `main` makes it and lends it to
+// everything that runs.
+
+struct Manager {
+    var port: Handle
+    // Launches and namespace lookups wait here, so no other completion is
+    // taken in their place.
+    var launchPort: Handle
+    var listener: Descriptor
+    var clients: [Client]
+    var tokens: [Pending]
+    // Every personality of every driver extension, read once at the start.
+    var drivers: [Driver]
+    var claims: [Claim]
+    var holdings: [Holding]
+    // The entries a driver was started for, while they last.
+    var bound: [U64]
+    var running: [Running]
+    var nextDriverKey: Number
+    var published: [Published]
+    var generation: U64
+    var serial: U64
+}
+
+// A connected client and the program it runs.
+struct Client {
+    var socket: Descriptor
+    var program: String?
+
+    // The program, for a log: its path, or that it is not known.
+    function programName(borrow self) -> String {
+        return program.or("an unknown program")
+    }
+}
+
+// The keys this manager's waits are made under. A client's key is its
+// descriptor's number above the drivers' range; a driver's is the next
+// free one from `drivers`.
+namespace PortKey {
+    let listener: Number = 1
+    let stop: Number = 2
+    let drivers: Number = 16
+    let clients: Number = 0x100000000
+    // The most completions taken in one wait.
+    let batch: Number = 64
+    // The token sweep's and the driver match's period.
+    let sweep: Number = 1000000000
+}
+
+// What a completion key names.
+enum Waker {
+    Listener
+    Stop
+    Client(Descriptor)
+    Driver(Number)
+}
+
+function wakerOf(key: Number) -> Waker {
+    if key == PortKey.listener { return .Listener }
+    if key == PortKey.stop { return .Stop }
+    if key >= PortKey.clients { return .Client(Descriptor { number: key - PortKey.clients }) }
+    return .Driver(key)
+}
+
+function failure(code: borrow ErrorCode) -> TesseraError {
+    return TesseraError {
+        code: code,
+        subsystem: .DeviceKit,
+        flags: ErrorFlags.none,
+        detail: U64(0)
+    }
+}
+
+function startManager() -> Result<Manager, TesseraError> {
+    let port = try portCreate(.None)
+    let launchPort = try portCreate(.None)
+    let listener = try listen()
+    // Without the extensions the manager still serves the drivers it has none
+    // of; the listing failure is logged here, where that is decided.
+    var drivers: [Driver] = []
+    match loadExtensions() {
+        Ok(value) -> drivers = value
+        Error(failed) -> log warn("the driver extensions cannot be listed", error: errorName(failed))
+    }
+    var manager = Manager {
+        port: port,
+        launchPort: launchPort,
+        listener: listener,
+        clients: [],
+        tokens: [],
+        drivers: drivers,
+        claims: [],
+        holdings: [],
+        bound: [],
+        running: [],
+        nextDriverKey: PortKey.drivers,
+        published: [],
+        generation: U64(1),
+        serial: U64(1),
+    }
+    // DeviceKit in this process reads the published list from here, not by
+    // asking the manager, which is this process.
+    publishedChanged(manager)
+    match processWatchTermination(port, PortKey.stop) {
+        // The watch is set, and its completion arrives on the port when asked to stop.
+        Ok -> {}
+        Error(failed) -> log warn("cannot hear a request to stop", error: errorName(failed))
+    }
+    arm(manager, listener, PortKey.listener)
+    return .Ok(manager)
+}
+
+// Takes completions until asked to stop; once a second sweeps the tokens
+// and claims and matches the drivers.
+function run(manager: borrow mut Manager) {
+    var sweep = nextSweep()
+    while true {
+        match portWait(manager.port, PortKey.batch, sweep.or(Number(Deadline.infinite))) {
+            Ok(completions) -> {
+                for completion in completions {
+                    match wakerOf(Number(completion.key)) {
+                        Stop -> {
+                            log info("asked to stop")
+                            stopDrivers(manager)
+                            return
+                        }
+                        Listener -> {
+                            accept(manager)
+                            arm(manager, manager.listener, PortKey.listener)
+                        }
+                        Client(socket) -> ready(manager, socket)
+                        Driver(key) -> driverEnded(manager, key)
+                    }
+                }
+            }
+            Error(failed) -> reportPortFailure(failed)
+        }
+        if sweepDue(sweep) {
+            sweepTokens(manager)
+            expireClaims(manager)
+            matchDrivers(manager)
+            sweep = nextSweep()
+        }
+    }
+}
+
+// When the next sweep is due, on the monotonic clock. None when the clock
+// cannot be read: the sweep then waits for the next wake, and the port waits
+// without a deadline until then.
+function nextSweep() -> Number? {
+    match now() {
+        Ok(moment) -> return .Some(moment + PortKey.sweep)
+        Error(failed) -> log warn("the sweep cannot be timed", error: errorName(failed))
+    }
+    return .None
+}
+
+// Whether a sweep is due: no time set yet, a clock that cannot be read, or
+// the time reached.
+function sweepDue(sweep: borrow Number?) -> Bool {
+    match sweep {
+        Some(at) -> {
+            match now() {
+                Ok(moment) -> return moment >= at
+                Error(failed) -> log warn("the sweep is due; the clock cannot be read", error: errorName(failed))
+            }
+        }
+        None -> {}
+    }
+    return true
+}
+
+// Waits once more for `socket` to read or hang up, under `key`.
+function arm(manager: borrow Manager, socket: borrow Descriptor, key: Number) {
+    let completion = Completion {
+        key: U64(key),
+        error: failure(.Ok),
+        kind: .Device,
+        flags: CompletionFlags.none,
+        result0: U64(0),
+        result1: U64(0),
+        aux: U64(0),
+        timestamp: U64(0),
+    }
+    let spec = SourceSpec {
+        kind: .Readiness,
+        events: SourceEvents.readable,
+        source: socket.number,
+        offset: 0,
+        buffer: Buffer { address: nullPointer(), length: 0 },
+    }
+    match portAttachSource(
+        manager.port,
+        spec,
+        completion,
+        SourceOptions { mode: .Once, fillEvents: false }
+    ) {
+        // The wait is attached, and its completion arrives on the port.
+        Ok -> {}
+        Error(failed) -> log warn("cannot wait on a connection", error: errorName(failed))
+    }
+}
+
+// The executable the process at the other end of `socket` runs, read from
+// `/proc/<pid>/exe`, or why it is unknown.
+function programOf(socket: borrow Descriptor) -> Result<String, TesseraError> {
+    let pid = try peerPid(socket)
+    return readLink("/proc/" + String(pid) + "/exe")
+}
+
+// The port's failure, logged where the loop decides to go on. A timeout is
+// the loop waking with nothing to do, not a failure.
+function reportPortFailure(failed: borrow TesseraError) {
+    if failed.code != .Timeout { log warn("the port failed", error: errorName(failed)) }
+}
+
+// The accepted connection's number, or none once the reason there is none is
+// logged. Nothing waiting is the listener waking with no connection, not a
+// failure.
+function acceptedNumber(listener: borrow Descriptor) -> Number? {
+    match backendAccept(listener.number, (LinuxOpen.closeOnExec | LinuxOpen.nonBlock).raw) {
+        Ok(value) -> return .Some(value)
+        Error(failed) -> reportAcceptFailure(failed)
+    }
+    return .None
+}
+
+// Whether a connection that could not be taken is worth a word: nothing
+// waiting is the listener waking with no connection, not a failure.
+function reportAcceptFailure(failed: borrow TesseraError) {
+    if !wouldBlock(failed) {
+        log warn("a connection could not be taken", error: errorName(failed))
+    }
+}
+
+// The program at the other end of `socket`, or none once the reason it is
+// unknown is logged.
+function knownProgram(socket: borrow Descriptor) -> String? {
+    match programOf(socket) {
+        Ok(name) -> return .Some(name)
+        Error(failed) -> log warn("a client's program is unknown", error: errorName(failed))
+    }
+    return .None
+}
+
+function accept(manager: borrow mut Manager) {
+    while true {
+        let number = match acceptedNumber(manager.listener) {
+            Some(value) -> value
+            None -> return
+        }
+        let socket = Descriptor { number: number }
+        // A client whose program is unknown is kept, and is not entitled to any
+        // family.
+        let program: String? = knownProgram(socket)
+        manager.clients.append(Client { socket: socket, program: program })
+        arm(manager, socket, PortKey.clients + socket.number)
+    }
+}
+
+// Why a client's session ended.
+enum ServeFailure {
+    Unreadable(TesseraError)
+    Unanswerable(TesseraError)
+}
+
+// A read that failed: Ok(true) while nothing is ready yet, and the reason the
+// session ended otherwise.
+function readFailure(failed: borrow TesseraError) -> Result<Bool, ServeFailure> {
+    if wouldBlock(failed) { return .Ok(true) }
+    return .Error(.Unreadable(failed))
+}
+
+// Answers every request waiting on `client`. Ok(true) while the client is
+// still there, Ok(false) once it went, and the reason its session ended.
+function serve(manager: borrow mut Manager, client: borrow Client) -> Result<Bool, ServeFailure> {
+    let message = zeroedBlock(count: Wire.bytes, alignment: 16)
+    while true {
+        zeroBytes(message.pointer(), Wire.bytes)
+        let received = match receive(client.socket, message) {
+            Ok(value) -> value
+            Error(failed) -> return readFailure(failed)
+        }
+        if received.bytes == 0 { return .Ok(false) }
+        let answer = answerRequest(manager, client, decodeRequest(message), received.passed)
+        let sent = send(client.socket, answer.reply, answer.passing)
+        closePassed(answer.passing)
+        match sent {
+            // The reply is on its way, so there is nothing to undo.
+            Ok -> {}
+            Error(failed) -> return .Error(.Unanswerable(failed))
+        }
+    }
+    return .Ok(true)
+}
+
+// The client went: what it held is let go, and its socket is closed.
+function clientGone(manager: borrow mut Manager, socket: borrow Descriptor) {
+    dropHoldings(manager, socket)
+    dropPublished(manager, socket)
+    closeDescriptor(socket)
+}
+
+// The client's session ended: its end is logged, and it is let go.
+function clientLeft(
+    manager: borrow mut Manager,
+    socket: borrow Descriptor,
+    client: borrow Client,
+    failed: borrow ServeFailure
+) {
+    match failed {
+        Unreadable(cause) -> log warn(
+            "a client could not be read",
+            program: client.programName(),
+            error: errorName(cause)
+        )
+        Unanswerable(cause) -> log warn(
+            "a client could not be answered",
+            program: client.programName(),
+            error: errorName(cause)
+        )
+    }
+    clientGone(manager, socket)
+}
+
+// The client on `socket` has something to read, or has gone.
+function ready(manager: borrow mut Manager, socket: borrow Descriptor) {
+    var staying: [Client] = []
+    for client in manager.clients {
+        if client.socket.number != socket.number {
+            staying.append(client)
+            continue
+        }
+        match serve(manager, client) {
+            Ok(staying_) -> if staying_ {
+                staying.append(client)
+                arm(manager, socket, PortKey.clients + socket.number)
+            } else {
+                clientGone(manager, socket)
+            }
+            Error(failed) -> clientLeft(manager, socket, client, failed)
+        }
+    }
+    manager.clients = staying
+}

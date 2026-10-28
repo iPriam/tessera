@@ -1,0 +1,48 @@
+import Foundation
+
+// How system search ranks a name against what was typed
+// (roadmap/26-system-search.md, "The experience"): names that are the query
+// first, then names it begins, then names with a word it begins, then names
+// holding it anywhere, and among equals the order they were found in, so the
+// list stays put while the query grows.
+
+/// How well a name matches a query, best first.
+public enum SearchMatch: UN8 {
+    Exact = 0
+    Prefix = 1
+    WordPrefix = 2
+    Inside = 3
+}
+
+/// How `name` matches `wanted`, which is lower case; none when it does not.
+public function nameMatch(name: borrow String, wanted: borrow String) -> SearchMatch? {
+    let lower = name.lowercased()
+    if lower == wanted { return .Some(.Exact) }
+    if lower.startsWith(wanted) { return .Some(.Prefix) }
+    for word in lower.split(" ") {
+        if word.startsWith(wanted) { return .Some(.WordPrefix) }
+    }
+    if lower.contains(wanted) { return .Some(.Inside) }
+    return .None
+}
+
+/// How the words a thing is looked for by match `wanted`: no better than a
+/// name holding it.
+public function keywordMatch(keywords: borrow [String], wanted: borrow String) -> SearchMatch? {
+    for keyword in keywords {
+        if keyword.startsWith(wanted) || wanted.startsWith(keyword) { return .Some(.Inside) }
+    }
+    return .None
+}
+
+/// The places of `matches` in the order their things are listed: best match
+/// first, the order found among equals.
+public function rankedOrder(matches: borrow [SearchMatch]) -> [Number] {
+    var order: [Number] = []
+    for quality in [SearchMatch.Exact, SearchMatch.Prefix, SearchMatch.WordPrefix, SearchMatch.Inside] {
+        for (index, matched) in matches.enumerated() {
+            if matched == quality { order.append(index) }
+        }
+    }
+    return order
+}

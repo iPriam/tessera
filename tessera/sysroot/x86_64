@@ -1,0 +1,14 @@
+# The packages the x86_64 sysroot is staged from: Debian 13.7 (trixie), as
+# snapshot.debian.org served it on the date in the URL below, which it keeps
+# for good. Each line is a package's SHA-256 and its path under the archive.
+# A newer point release is a new date and the lines its Packages index has
+# for the same packages.
+https://snapshot.debian.org/archive/debian/20261016T000000Z
+967aa62605721081c3eb2a17650611a792aa802d76a6511d1840242623d204c9 pool/main/g/glibc/libc6_2.41-12+deb13u4_amd64.deb
+1fda734dabcd80b77266a09ab62b0f1e3e16d8091db62899890b2200745632a2 pool/main/g/glibc/libc6-dev_2.41-12+deb13u4_amd64.deb
+0123a767a462c59d75e1bd56c4a0f7192c389f600e4743e807d3d33c679dbcf7 pool/main/g/glibc/libc6-dbg_2.41-12+deb13u4_amd64.deb
+dc68dd53c7356598d005866da0d19d7bd33af2a62971aced624cdf04492902b4 pool/main/l/linux/linux-libc-dev_6.12.107-1_all.deb
+ca6f2d36d96b19b3eb71405b0b80134d8c89380b02204a2512e5c58ceb090628 pool/main/g/gcc-14/libgcc-14-dev_14.2.0-19_amd64.deb
+3c71917b490d1a17aed43196a2787a256ecf060526cdb20216a74bedc061b150 pool/main/g/gcc-14/libgcc-s1_14.2.0-19_amd64.deb
+4b962fac5f1af0bd8b1b3f97e0f47b9d8e9a79e88802143f00ebfbd78ad87a7b pool/main/g/gcc-14/libstdc++-14-dev_14.2.0-19_amd64.deb
+ab1fa05837aa7a92aae748fd07a18a35f7d18bb4a71c4724fe2bbf0e32089de0 pool/main/g/gcc-14/libstdc++6_14.2.0-19_amd64.deb

@@ -1,0 +1,662 @@
+import Foundation
+import LibTessera
+import DeviceKit
+import Ember
+import KCoreAnimation
+import KiraUI
+
+// Putting what the clients drew on the screen together
+// (roadmap/07-graphics.md, "Composition").
+//
+// Two ways, chosen by `routeFor` alone. When the topmost surface covers the
+// output exactly, its own buffer is scanned out and nothing is drawn: no pass,
+// no buffer. Otherwise every surface that has drawn is drawn again as a quad,
+// bottom first, into an image of this program's, and that image is scanned
+// out.
+//
+// A client's frame is its surface's dma-buf, taken in by Ember as a texture on
+// this program's Vulkan device. The composed picture is drawn into one of two
+// images Ember exports; each is adopted by DeviceKit and made a framebuffer
+// once, when the composer is made. They alternate, so the display reads one
+// while the next picture is drawn into the other, and Ember's submit returns
+// only once the GPU has finished, so a flip never shows a picture half drawn.
+
+// A client's last frame: its surface, held while the frame may be drawn or
+// scanned out, and the same memory as a texture this program's device
+// samples. No texture when there is no composer, or the device would not take
+// the memory in; such a frame can still be scanned out on its own.
+// `width` and `height` are the pixels the client drew, from the top-left
+// corner of a texture that may be larger, as one resized on the screen is.
+struct Content {
+    var surface: Ref
+    var texture: GraphicsTexture?
+    var width: Number
+    var height: Number
+    var textureWidth: Number
+    var textureHeight: Number
+    // Whether the display can scan the surface out as it is: a buffer the
+    // output's size, drawn whole, rows at least a pixel wide.
+    var scanable: Bool
+    // Whether its rows are at least a pixel wide each, as scanning out needs.
+    var rowsFit: Bool = true
+    // The client's texture slot that keeps it, from 1; 0 for none (Slots.kira).
+    var slot: Number = 0
+}
+
+extend Content {
+    // How much of the texture across and down was drawn.
+    function extentX(borrow self) -> Number {
+        return textureWidth > 0 ? width / textureWidth : 1
+    }
+
+    function extentY(borrow self) -> Number {
+        return textureHeight > 0 ? height / textureHeight : 1
+    }
+}
+
+// One of the two images a composed picture is drawn into, and the surface and
+// framebuffer the display knows it by.
+struct Target {
+    var exported: ExportedTexture
+    var surface: Ref
+    var framebuffer: Ref
+}
+
+struct Composer {
+    var device: GraphicsHeadless
+    var batch: UiBatch
+    var first: Target
+    var second: Target
+    // A slot for each of the cursor's shapes, on a display with no cursor
+    // plane, filled when the shape is first drawn (ComposedCursor.kira); none
+    // on one that has.
+    var cursors: [GraphicsTexture?] = []
+    // The images an output change replaced, let go of after the first flip
+    // at the new size (Resolution.kira).
+    var retired: [Target] = []
+}
+
+// How the next picture reaches the screen.
+enum Route {
+    // The client at this index covers the output alone; its buffer is shown.
+    Direct(Number)
+    Composed
+    // Nothing that can be shown has changed.
+    Unchanged
+}
+
+// The layouts the display scans out, as DRM spells them: XR24 is the memory
+// order B, G, R, X and XB24 is R, G, B, X. Modifier 0 is
+// DRM_FORMAT_MOD_LINEAR.
+namespace ComposedLayout {
+    let xb24: FourCc = FourCc(0x34324258)
+    let linear: Modifier = Modifier(0)
+}
+
+// The byte order of a surface in `format`, or nothing for a format Ember
+// cannot sample.
+function pixelFormatOf(format: FourCc) -> ExportedPixelFormat? {
+    if format == PixelFormat.xrgb8888 { return .Some(.Bgra8Unorm) }
+    if format == ComposedLayout.xb24 { return .Some(.Rgba8Unorm) }
+    return .None
+}
+
+function fourCcOf(format: ExportedPixelFormat) -> FourCc {
+    return match format {
+        Bgra8Unorm -> PixelFormat.xrgb8888
+        Rgba8Unorm -> ComposedLayout.xb24
+    }
+}
+
+// Opens the device the composition is drawn with, and both images. None,
+// said, when the machine has no device for it: the display still shows a
+// surface that covers it.
+function makeComposer(display: borrow Display) -> Composer? {
+    var device = match openHeadlessGraphicsWithBackend(.Vulkan) {
+        Ok(value) -> value
+        Error(failure) -> {
+            log warn("no device to composite with; only full-screen surfaces will show", failure)
+            return .None
+        }
+    }
+    let first = match makeTarget(device, display, "composed-first") {
+        Some(value) -> value
+        None -> {
+            device.close()
+            return .None
+        }
+    }
+    let second = match makeTarget(device, display, "composed-second") {
+        Some(value) -> value
+        None -> {
+            releaseTarget(device, first)
+            device.close()
+            return .None
+        }
+    }
+    let batch = makeUiBatch(device.graphics())
+    // No backdrop is bound here, and the background pass does not run without
+    // one, so a surface that fills the output stays an ordinary quad.
+    batch.setBackgroundPromotable(false)
+    log info("compositing on the GPU", width: display.scanout.width, height: display.scanout.height)
+    let cursors = makeComposedCursor(display)
+    return .Some(
+        Composer {
+            device: move device,
+            batch: batch,
+            first: first,
+            second: second,
+            cursors: cursors
+        }
+    )
+}
+
+// An exported image the output's size, adopted as a surface and made a
+// framebuffer.
+function makeTarget(
+    device: borrow GraphicsHeadless,
+    display: borrow Display,
+    label: String
+) -> Target? {
+    let descriptor = ExportedTextureDescriptor {
+        label: label,
+        width: UN32(display.scanout.width),
+        height: UN32(display.scanout.height)
+    }
+    let exported = match device.graphics().createExportedTexture(descriptor) {
+        Ok(value) -> value
+        Error(failure) -> {
+            log warn("the composition has no image to draw into", failure)
+            return .None
+        }
+    }
+    let native = NativeHandle { kind: .DmaBufFd, value: U64(exported.memory.handle) }
+    let surface = match surfaceAdopt(native, targetInfo(exported.memory)) {
+        Ok(value) -> value
+        Error(reason) -> return noTargetSurface(device, move exported, reason)
+    }
+    let framebuffer = match displayFramebuffer(display.device, surface) {
+        Ok(value) -> value
+        Error(reason) -> return noTargetFramebuffer(device, move exported, surface, reason)
+    }
+    return .Some(Target { exported: exported, surface: surface, framebuffer: framebuffer })
+}
+
+function noTargetSurface(device: borrow GraphicsHeadless, exported: ExportedTexture, reason: borrow TesseraError) -> Target? {
+    log warn("the composition's image would not become a surface", error: errorName(reason))
+    device.graphics().destroyExportedTexture(exported)
+    return .None
+}
+
+function noTargetFramebuffer(device: borrow GraphicsHeadless, exported: ExportedTexture, surface: Ref, reason: borrow TesseraError) -> Target? {
+    log warn("the composition's image would not become a framebuffer", error: errorName(reason))
+    closeRef(surface)
+    device.graphics().destroyExportedTexture(exported)
+    return .None
+}
+
+// How an exported image's memory is laid out: one linear plane.
+function targetInfo(memory: borrow ExportedMemory) -> SurfaceInfo {
+    let plane = SurfacePlane {
+        offset: memory.offset,
+        stride: memory.stride,
+        size: memory.stride * memory.height,
+    }
+    let unused = SurfacePlane { offset: 0, stride: 0, size: 0 }
+    return SurfaceInfo {
+        width: memory.width,
+        height: memory.height,
+        format: fourCcOf(memory.format),
+        usage: SurfaceUsage.scanout,
+        modifier: ComposedLayout.linear,
+        planeCount: 1,
+        flags: SurfaceFlags.none,
+        plane0: plane,
+        plane1: unused,
+        plane2: unused,
+        plane3: unused,
+    }
+}
+
+function releaseTarget(device: borrow GraphicsHeadless, target: borrow Target) {
+    closeRef(target.framebuffer)
+    closeRef(target.surface)
+    device.graphics().destroyExportedTexture(target.exported)
+}
+
+// A client's frame, taken from its surface. The texture is made where there
+// is a composer to sample it; a frame without one is still a frame.
+function contentOf(
+    composer: borrow Composer?,
+    display: borrow Display,
+    surface: Ref,
+    drawnWidth: Number = 0,
+    drawnHeight: Number = 0
+) -> Result<Content, TesseraError> {
+    let info = try surfaceInfo(surface)
+    let textureWidth = Number(info.width)
+    let textureHeight = Number(info.height)
+    let drawn = drawnWidth > 0 && drawnHeight > 0 && drawnWidth <= textureWidth && drawnHeight <= textureHeight
+    let width = drawn ? drawnWidth : textureWidth
+    let height = drawn ? drawnHeight : textureHeight
+    let scanable = width == display.scanout.width
+        && height == display.scanout.height
+        && width == textureWidth && height == textureHeight
+        && Number(info.plane0.stride) >= width * PixelFormat.bytesPerPixel
+    let texture = match composer {
+        Some(held) -> textureOf(held, surface, info)
+        None -> .None
+    }
+    return .Ok(
+        Content {
+            surface: surface,
+            texture: texture,
+            width: width,
+            height: height,
+            textureWidth: textureWidth,
+            textureHeight: textureHeight,
+            scanable: scanable,
+            rowsFit: Number(info.plane0.stride) >= textureWidth * PixelFormat.bytesPerPixel
+        }
+    )
+}
+
+// The surface's memory as a texture this program samples, or nothing, said.
+function textureOf(
+    composer: borrow Composer,
+    surface: Ref,
+    info: borrow SurfaceInfo
+) -> GraphicsTexture? {
+    let format = match pixelFormatOf(info.format) {
+        Some(value) -> value
+        None -> {
+            log warn("a surface is in a format the composition cannot sample", format: info.format)
+            return .None
+        }
+    }
+    if info.modifier != ComposedLayout.linear || info.planeCount != 1 {
+        log warn("a surface is not one linear plane, and cannot be sampled")
+        return .None
+    }
+    let native = match surfaceNativeHandle(surface, 0) {
+        Ok(value) -> value
+        Error(reason) -> return noTextureMemory(reason)
+    }
+    let memory = ExportedMemory {
+        kind: .DmaBuf,
+        handle: UN32(native.value),
+        width: info.width,
+        height: info.height,
+        stride: info.plane0.stride,
+        offset: UN32(info.plane0.offset),
+        format: format
+    }
+    return match composer.device.graphics().importTexture(memory) {
+        Ok(texture) -> .Some(texture)
+        Error(failure) -> {
+            // The descriptor is still this program's when the import fails.
+            match backendClose(UNumber(native.value)) {
+                Ok -> {}
+                Error(failed) -> log warn(
+                    "a surface's descriptor would not close",
+                    error: errorName(failed)
+                )
+            }
+            log warn("the composition could not take a surface's memory in", failure)
+            .None
+        }
+    }
+}
+
+function noTextureMemory(reason: borrow TesseraError) -> GraphicsTexture? {
+    log warn("a surface would not name its memory", error: errorName(reason))
+    return .None
+}
+
+// Lets a frame go. Only once nothing on the screen or in flight reads it.
+function releaseContent(composer: borrow Composer?, content: borrow Content) {
+    match content.texture {
+        Some(texture) -> match composer {
+            Some(held) -> held.device.graphics().destroyTexture(texture)
+            None -> {}
+        }
+        None -> {}
+    }
+    closeRef(content.surface)
+}
+
+// The clients that have a frame to show, bottom first. The platform's bar is
+// above every application, whichever has focus (roadmap/08-display-server.md),
+// and the desktop under every one, focused or not (roadmap/11-adaptive-desktop.md).
+function stackingOrder(server: borrow Server) -> [Number] {
+    var order: [Number] = []
+    var bars: [Number] = []
+    var desktops: [Number] = []
+    for index in 0..server.clients.count {
+        let client = server.clients[index]
+        if client.alive && !client.hidden && client.content.isSome() {
+            match client.role {
+                Platform -> bars.append(index)
+                Desktop -> desktops.append(index)
+                None, Application, Presence -> order.append(index)
+            }
+        }
+    }
+    for placed in 1..order.count {
+        var at = placed
+        while at > 0 && server.clients[order[at - 1]].zOrder > server.clients[order[at]].zOrder {
+            let below = order[at - 1]
+            order[at - 1] = order[at]
+            order[at] = below
+            at -= 1
+        }
+    }
+    for index in order { desktops.append(index) }
+    for bar in bars { desktops.append(bar) }
+    return desktops
+}
+
+// The surfaces in `order`, bottom first, as their ids between spaces.
+function stackText(server: borrow Server, order: borrow [Number]) -> String {
+    var text = ""
+    for index in order {
+        text = text.count == 0 ? "\(server.clients[index].surface.raw)" : "\(text) \(server.clients[index].surface.raw)"
+    }
+    return text
+}
+
+// Whether the platform has a frame to show, or no session left to draw one,
+// which ends the wait for it.
+function platformDrew(server: borrow Server) -> Bool {
+    for client in server.clients {
+        if client.role == .Platform && client.alive && client.content.isNone() { return false }
+    }
+    return true
+}
+
+// Whether the client at `index` covers the output alone: placed at its
+// origin, the output's size, in a buffer the display can scan out.
+function coversOutput(server: borrow Server, index: Number) -> Bool {
+    let client = server.clients[index]
+    let frame = client.frame
+    let placed = frame.x == 0 && frame.y == 0
+        && frame.width == server.display.scanout.pointWidth()
+        && frame.height == server.display.scanout.pointHeight()
+    return match client.content {
+        Some(content) -> placed && content.scanable
+        None -> false
+    }
+}
+
+// The one rule for how a picture reaches the screen: the topmost surface's
+// own buffer when it covers the output alone and the cursor is on its own
+// plane, a composed picture otherwise.
+// The platform's surface covers the output and is transparent but for its bar,
+// so it is never scanned out alone over others.
+function routeFor(server: borrow Server) -> Route {
+    let order = stackingOrder(server)
+    if order.count == 0 { return .Unchanged }
+    let top = order[order.count - 1]
+    let alone = server.clients[top].role != .Platform || order.count == 1
+    // A dimmed or blanked output shows a composed picture: no client's
+    // buffer is dimmed or blanked itself.
+    let awake = server.idleState == .Awake
+    // The flip that sets a new mode is composed, at the new size, as no
+    // client has drawn at it yet.
+    let settled = !server.modesetOwed && server.homeFlight.isNone()
+    if awake && alone && settled && coversOutput(server, top) && !cursorComposed(server) {
+        return .Direct(top)
+    }
+    if server.composer.isNone() {
+        log warn("no surface covers the output, and there is no device to composite with")
+        return .Unchanged
+    }
+    return .Composed
+}
+
+// Puts the picture `routeFor` chose on the screen. What the screen showed
+// before is let go of once the flip has replaced it. At boot the splash stays
+// until the platform has drawn, so the first picture after it is the
+// platform's lock screen over what is open, never an application alone for
+// a frame.
+function showClients(server: borrow mut Server) -> Result<Void, TesseraError> {
+    if server.splashHeld {
+        if !platformDrew(server) { return .Ok }
+        server.splashHeld = false
+        log info("the platform has drawn; the splash gives way")
+    }
+    // A blanked output is composed black once, and not again until it wakes.
+    if server.idleState == .Blanked && server.blankShown { return .Ok }
+    return match routeFor(server) {
+        Direct(index) -> showDirect(server, index)
+        Composed -> showComposed(server)
+        Unchanged -> .Ok
+    }
+}
+
+function showDirect(server: borrow mut Server, index: Number) -> Result<Void, TesseraError> {
+    let surface = match server.clients[index].content {
+        Some(content) -> content.surface
+        None -> return .Ok
+    }
+    let framebuffer = try displayFramebuffer(server.display.device, surface)
+    // The surface is the client's content, and is let go of with it. A
+    // failed commit may still have reached the screen; what it used is kept
+    // rather than release storage the display could be reading.
+    return flipTo(server.display, framebuffer, .None, false, server.port)
+}
+
+function showComposed(server: borrow mut Server) -> Result<Void, TesseraError> {
+    let began = try nowMillis()
+    paintComposedCursor(server)
+    let order = stackingOrder(server)
+    let useFirst = server.composed % 2 == 0
+    let framebuffer = match server.composer {
+        Some(composer) -> {
+            let target = useFirst ? composer.first : composer.second
+            match drawComposition(composer, server, order, target) {
+                Ok -> target.framebuffer
+                Error(reason) -> return renderFailed(reason)
+            }
+        }
+        None -> return .Ok
+    }
+    let drawn = try nowMillis()
+    // The image is the composer's, and outlives what is shown in it; its
+    // framebuffer is too.
+    try flipTo(server.display, framebuffer, .None, server.modesetOwed, server.port)
+    server.display.shown = .None
+    if server.modesetOwed {
+        server.modesetOwed = false
+        server.modesetFlipping = true
+    }
+    server.composed += 1
+    try noteComposedBackdrop(server)
+    server.blankShown = server.idleState == .Blanked
+    let stack = stackText(server, order)
+    // The order is logged when it changes; a picture's own event repeats too
+    // often for the log to keep every one.
+    if stack != server.shownStack {
+        log info("the stacking order changed", stack: stack)
+        server.shownStack = stack
+    }
+    log info(
+        "composed a picture",
+        surfaces: order.count,
+        stack: stack,
+        picture: server.composed,
+        drawing: drawn - began,
+        committing: try nowMillis() - drawn
+    )
+    return .Ok
+}
+
+function renderFailed(reason: borrow HeadlessFailure) -> Result<Void, TesseraError> {
+    log warn("the composition could not begin or submit a frame", reason)
+    return .Error(failure(.Internal))
+}
+
+// Draws every frame in `order` into `target`, bottom first, over the
+// background, and waits for the GPU to finish.
+function drawComposition(
+    composer: borrow Composer,
+    server: borrow Server,
+    order: borrow [Number],
+    target: borrow Target
+) -> Result<Void, HeadlessFailure> {
+    var frame = match composer.device.frame() {
+        Ok(value) -> value
+        Error(reason) -> return .Error(reason)
+    }
+    // Laid out in points, drawn in pixels.
+    let scanout = server.display.scanout
+    composer.batch.beginBatch(
+        scanout.pointWidth(),
+        scanout.pointHeight(),
+        scanout.scale,
+        scanout.width,
+        scanout.height
+    )
+    composer.batch.beginFrameSlots(composer.device.graphics())
+    let blanked = server.idleState == .Blanked
+    let drawn: [Number] = blanked ? [] : copy order
+    let progress = stageProgress(server)
+    for index in drawn {
+        if underHomeFlight(server, index) { continue }
+        let client = server.clients[index]
+        match client.content {
+            Some(content) -> match content.texture {
+                Some(texture) -> match placedFrame(
+                    server,
+                    index,
+                    client,
+                    content,
+                    scanout.scale,
+                    progress
+                ) {
+                    Some(frame) -> {
+                        let window = windowIn(frame, client, content, scanout.scale)
+                        if client.corner > 0 {
+                            drawWindowShadow(
+                                composer,
+                                window,
+                                client.corner,
+                                server.focus == .Some(index),
+                                windowShrink(window, client)
+                            )
+                        }
+                        drawClientGlass(
+                            composer,
+                            client,
+                            frame,
+                            content.width / scanout.scale,
+                            content.height / scanout.scale,
+                            GlassWindowClip {
+                                window: copy window,
+                                radius: client.corner * windowShrink(window, client)
+                            }
+                        )
+                        drawClient(composer, server, client, texture, frame, content, window)
+                        drawStageBadge(composer, server, index, progress)
+                    }
+                    None -> {}
+                }
+                None -> log warn(
+                    "a surface without a texture is left out of the picture",
+                    surface: client.surface.raw
+                )
+            }
+            None -> {}
+        }
+    }
+    if !blanked {
+        drawHomeFlight(composer, server)
+        drawPlatformBarOverFlight(composer, server, progress)
+        drawComposedCursor(composer, server)
+    }
+    if server.idleState == .Dimmed { drawShade(composer, scanout) }
+    let ground = blanked ? 0.0 : Number(Background.level) / 255.0
+    composer.batch.presentBatchIntoTexture(
+        frame,
+        composer.device.graphics(),
+        target.exported.texture,
+        ground,
+        ground,
+        ground,
+        1.0
+    )
+    composer.device.submit()
+    traceComposedGpu(frame, composer.batch)
+    return .Ok
+}
+
+// The composition's GPU time, pass by pass, as trace counters in
+// nanoseconds while the kernel tracer records, as each application's are.
+function traceComposedGpu(frame: borrow RenderFrame, batch: borrow UiBatch) {
+    let stats = frame.statistics()
+    if stats.hasGpuSeconds {
+        traceCounter("gpu", "frame", trunc(stats.gpuSeconds * 1000000000))
+        for pass in stats.gpuPasses {
+            traceCounter("gpu", pass.label, pass.nanos)
+            traceCounter("draws", pass.label, pass.draws)
+        }
+        let glass = batch.glassFrameStats()
+        traceCounter("glass", "blur-horizontal-texels", glass.blurHorizontalTexels)
+        traceCounter("glass", "blur-vertical-texels", glass.blurVerticalTexels)
+        traceCounter("glass", "blur-cache-hits", glass.blurCacheHits)
+        traceCounter("glass", "blur-cache-misses", glass.blurCacheMisses)
+        traceCounter("glass", "static-backdrop-layers", glass.staticBackdropLayers)
+    }
+    frame.measureGpu(traceEnabled("gpu"))
+}
+
+// A client's picture: a platform's cut to its frame, an application's to its
+// window with the window's corners (`WindowFrame.kira`), and the platform's
+// or the home screen's with the place of an icon a window flies out of or
+// into left out.
+function drawClient(
+    composer: borrow Composer,
+    server: borrow Server,
+    client: borrow Client,
+    texture: borrow GraphicsTexture,
+    frame: borrow Geometry,
+    content: borrow Content,
+    window: borrow Geometry
+) {
+    match vacatedSlot(server, client.role) {
+        Some(hole) -> drawSurfaceAround(
+            composer,
+            texture,
+            frame,
+            client.frame,
+            hole,
+            content.extentX(),
+            content.extentY()
+        )
+        None -> {
+            if client.role == .Platform {
+                drawSurface(
+                    composer,
+                    texture,
+                    frame,
+                    .Some(copy client.frame),
+                    1,
+                    content.extentX(),
+                    content.extentY()
+                )
+                return
+            }
+            drawSurface(
+                composer,
+                texture,
+                frame,
+                .Some(copy window),
+                1,
+                content.extentX(),
+                content.extentY(),
+                client.corner * windowShrink(window, client),
+                WindowShape.continuous
+            )
+        }
+    }
+}

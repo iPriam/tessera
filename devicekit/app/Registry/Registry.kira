@@ -1,0 +1,270 @@
+import Foundation
+import Heap
+import LibTessera
+
+// Registry calls (17 §7.4, §7.5): matching, lookups and property reads, all
+// synchronous reads of the kept tree.
+
+// A `MatchSpec`: an entry of the class and family when they are given, with
+// every constraint holding.
+struct Match {
+    var entryClass: EntryClass?
+    var family: Family?
+    // `MATCH_DEFAULT_ONLY`: the first of the class is its default.
+    var defaultOnly: Bool
+    var constraints: [Property]
+
+    function admits(borrow self, entry: borrow Entry) -> Bool {
+        match self.entryClass {
+            Some(wanted) -> { if entry.entryClass != wanted { return false } }
+            None -> {}
+        }
+        match self.family {
+            Some(wanted) -> { if entry.family != wanted { return false } }
+            None -> {}
+        }
+        for wanted in self.constraints {
+            if !holds(entry, wanted) { return false }
+        }
+        return true
+    }
+}
+
+function holds(entry: borrow Entry, wanted: borrow Property) -> Bool {
+    for property in entry.properties {
+        if property.satisfies(wanted) { return true }
+    }
+    return false
+}
+
+namespace MatchFlags {
+    let defaultOnly: U32 = U32(1)
+}
+
+let families: [Family] = [Family.None, Family.Gpu, Family.Display, Family.Input, Family.Audio, Family.Camera, Family.Sensor, Family.Haptic, Family.PowerSource, Family.Thermal, Family.Backlight, Family.Block, Family.Hid, Family.Usb, Family.Rtc,]
+
+function knownFamily(raw: U32) -> Family? { return caseWithCode(families, raw) }
+
+// A `MatchSpec` from a caller's buffer: class @0, family @4, flags @8, the
+// constraint count @12, the constraints from @16. 0 is any class or family;
+// an empty buffer matches everything.
+function readMatch(spec: borrow Buffer) -> Result<Match, TesseraError> {
+    var parsed = Match { entryClass: .None, family: .None, defaultOnly: false, constraints: [] }
+    if spec.length == 0 || isNull(spec.address) { return .Ok(parsed) }
+    if spec.length < 16 { return .Error(failure(.InvalidArgument, 0)) }
+    let entryClass = heapLoad<U32>(spec.address, 0)
+    if entryClass != U32(0) {
+        match knownEntryClass(entryClass) {
+            Some(value) -> parsed.entryClass = .Some(value)
+            None -> return .Error(failure(.InvalidArgument, 0))
+        }
+    }
+    let family = heapLoad<U32>(spec.address, 4)
+    if family != U32(0) {
+        match knownFamily(family) {
+            Some(value) -> parsed.family = .Some(value)
+            None -> return .Error(failure(.InvalidArgument, 4))
+        }
+    }
+    parsed.defaultOnly = (heapLoad<U32>(spec.address, 8) & MatchFlags.defaultOnly) != U32(0)
+    let count = heapLoad<U32>(spec.address, 12)
+    parsed.constraints = try readProperties(spec.address, 16, spec.length, count)
+    return .Ok(parsed)
+}
+
+namespace EntryRecord {
+    let bytes: Number = 48
+}
+
+function entryInfo(entries: borrow [Entry], index: Number) -> EntryInfo {
+    let entry = entries[index]
+    return EntryInfo {
+        id: entry.id,
+        entryClass: entry.entryClass,
+        family: entry.family,
+        parent: entry.parent.or(EntryId(0)),
+        generation: deviceLibrary.registry.generation,
+        flags: entry.flags,
+        childCount: U32(childCount(entries, entry.id)),
+        name: U64(0),
+    }
+}
+
+// An `EntryInfo` record at `at`.
+function writeEntry(out: RawPtr, at: Number, info: borrow EntryInfo) {
+    heapStore<U64>(out, at, info.id.raw)
+    heapStore<U32>(out, at + 8, code(info.entryClass))
+    heapStore<U32>(out, at + 12, code(info.family))
+    heapStore<U64>(out, at + 16, info.parent.raw)
+    heapStore<U64>(out, at + 24, info.generation)
+    heapStore<U32>(out, at + 32, info.flags.raw)
+    heapStore<U32>(out, at + 36, info.childCount)
+    heapStore<U64>(out, at + 40, info.name)
+}
+
+// Writes the entries at `chosen` as an `EntryInfo` list; the answer is the
+// count.
+function writeEntries(
+    out: borrow Buffer,
+    entries: borrow [Entry],
+    chosen: borrow [Number]
+) -> Result<Number, TesseraError> {
+    try requireRoom(out, Number(8 + chosen.count * EntryRecord.bytes))
+    writeListHeader(out.address, chosen.count, EntryRecord.bytes)
+    for (slot, index) in chosen.enumerated() {
+        writeEntry(out.address, 8 + slot * EntryRecord.bytes, entryInfo(entries, index))
+    }
+    return .Ok(Number(chosen.count))
+}
+
+public function registryMatch(
+    spec: borrow Buffer,
+    out: borrow Buffer
+) -> Result<Number, TesseraError> {
+    let parsed = try readMatch(spec)
+    let entries = try scan()
+    var chosen: [Number] = []
+    for (index, entry) in entries.enumerated() {
+        if parsed.admits(entry) { chosen.append(index) }
+    }
+    if parsed.defaultOnly && chosen.count > 1 {
+        let first = chosen[0]
+        chosen = [first]
+    }
+    return writeEntries(out, entries, chosen)
+}
+
+// The index of `entry` in `entries`.
+function requireEntry(entries: borrow [Entry], entry: EntryId) -> Result<Number, TesseraError> {
+    return match findEntry(entries, entry) {
+        Some(index) -> .Ok(index)
+        None -> .Error(failure(.NotFound))
+    }
+}
+
+public function registryLookup(entry: EntryId) -> Result<EntryInfo, TesseraError> {
+    let entries = try scan()
+    let index = try requireEntry(entries, entry)
+    return .Ok(entryInfo(entries, index))
+}
+
+// Planes (§7.1): the Service plane is the provider tree; the Bus plane is the
+// physical path, which sysfs nests the same way; the Power plane is the
+// device's `supplier:` links, which name suppliers and not consumers, so no
+// entry has children there.
+public function registryChildren(
+    entry: EntryId,
+    plane: borrow Plane,
+    out: borrow Buffer
+) -> Result<Number, TesseraError> {
+    let entries = try scan()
+    let found = try requireEntry(entries, entry)
+    return match plane {
+        Power -> writeEntries(out, entries, [])
+        Service -> writeEntries(out, entries, childrenOf(entries, entry))
+        Bus -> writeEntries(out, entries, childrenOf(entries, entry))
+    }
+}
+
+function childrenOf(entries: borrow [Entry], entry: EntryId) -> [Number] {
+    var chosen: [Number] = []
+    for (index, candidate) in entries.enumerated() {
+        if candidate.parent == .Some(entry) { chosen.append(index) }
+    }
+    return chosen
+}
+
+// The parent on `plane`; 0 for none (§7.1).
+public function registryParent(
+    entry: EntryId,
+    plane: borrow Plane
+) -> Result<EntryId, TesseraError> {
+    let entries = try scan()
+    let index = try requireEntry(entries, entry)
+    return match plane {
+        Power -> {
+            let supplier = try supplierOf(entries, index)
+            return .Ok(supplier.or(EntryId(0)))
+        }
+        Service -> .Ok(entries[index].parent.or(EntryId(0)))
+        Bus -> .Ok(entries[index].parent.or(EntryId(0)))
+    }
+}
+
+function supplierOf(entries: borrow [Entry], index: Number) -> Result<EntryId?, TesseraError> {
+    let device = entries[index].path + "/device"
+    for name in listedEntries(device) {
+        if !name.startsWith("supplier:") { continue }
+        let supplier = try canonicalPath(device + "/" + name + "/supplier")
+        match findEntry(entries, entryIdOf(supplier)) {
+            Some(found) -> return .Ok(.Some(entries[found].id))
+            None -> {}
+        }
+    }
+    return .Ok(.None)
+}
+
+// Every property, as a `Property` list; the answer is the bytes written.
+public function registryProperties(
+    entry: EntryId,
+    out: borrow Buffer
+) -> Result<Number, TesseraError> {
+    let entries = try scan()
+    let index = try requireEntry(entries, entry)
+    let properties = entries[index].properties
+    var needed = 8
+    for property in properties { needed += property.recordSize() }
+    try requireRoom(out, Number(needed))
+    writeListHeader(out.address, properties.count, 0)
+    var at = 8
+    for property in properties {
+        property.write(out.address, at)
+        at += property.recordSize()
+    }
+    return .Ok(Number(needed))
+}
+
+// One property as a `Property` record; the answer is the bytes written.
+public function registryProperty(
+    entry: EntryId,
+    key: borrow String,
+    out: borrow Buffer
+) -> Result<Number, TesseraError> {
+    let entries = try scan()
+    let index = try requireEntry(entries, entry)
+    let property = try entries[index].property(key) otherwise return .Error(failure(.NotFound))
+    let needed = property.recordSize()
+    try requireRoom(out, Number(needed))
+    property.write(out.address, 0)
+    return .Ok(Number(needed))
+}
+
+// The device node behind an entry, for the device manager: it is the only
+// process that opens one (§20.1), and it needs the walk's answer to do so.
+public function registryNode(entry: EntryId) -> Result<String, TesseraError> {
+    let entries = try scan()
+    let index = try requireEntry(entries, entry)
+    return match entries[index].node {
+        Some(node) -> .Ok(node)
+        None -> .Error(failure(.Unsupported))
+    }
+}
+
+// The sysfs directory behind an entry, for the families that act through
+// sysfs files rather than a node (power supplies, thermal zones, backlights).
+function entryPath(entry: EntryId) -> Result<String?, TesseraError> {
+    let entries = try scan()
+    return match findEntry(entries, entry) {
+        Some(index) -> .Ok(.Some(entries[index].path))
+        None -> .Ok(.None)
+    }
+}
+
+// An entry of this tree, for this library's own use.
+function entryNamed(entry: EntryId) -> Result<Entry?, TesseraError> {
+    let entries = try scan()
+    return match findEntry(entries, entry) {
+        Some(index) -> .Ok(.Some(entries[index]))
+        None -> .Ok(.None)
+    }
+}

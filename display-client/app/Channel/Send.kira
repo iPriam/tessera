@@ -1,0 +1,157 @@
+import Foundation
+import LibTessera
+
+// The messages a client sends by name: each one a `DisplayMessage` written
+// with `sendDisplayMessage`, named for what it asks.
+
+// Asks the compositor to change mode. Honoured only from the platform session; the
+// compositor ignores it from an application.
+public function sendSetMode(
+    channel: Handle,
+    mode: borrow CompositorMode,
+    split: Bool
+) -> Result<Void, TesseraError> {
+    return sendDisplayMessage(channel, .SetMode(DisplayMode { mode: mode, split: split }))
+}
+
+// The platform takes the band along the top of the output, `height` tall, for
+// its bar. Honoured only from the platform session: MosaicDisplay configures
+// every other surface below it.
+public function sendSetBar(channel: Handle, height: UNumber) -> Result<Void, TesseraError> {
+    return sendDisplayMessage(channel, .SetBar(height))
+}
+
+// The platform grants focus to a surface. Honoured only from the platform session;
+// the compositor routes input to the granted surface and no other.
+public function sendGrantFocus(
+    channel: Handle,
+    surface: DisplaySurfaceId
+) -> Result<Void, TesseraError> {
+    return sendDisplayMessage(channel, .GrantFocus(surface))
+}
+
+// The platform installs a grab for a key it wants before the focused surface: a
+// global shortcut. MosaicDisplay matches it before routing and fires it to the
+// platform instead of the application.
+public function sendInstallGrab(channel: Handle, keyCode: UNumber) -> Result<Void, TesseraError> {
+    return sendDisplayMessage(channel, .InstallGrab(keyCode))
+}
+
+// Presents a system prompt in the system band. The compositor holds it
+// front-most and no client can assert that in its place.
+public function sendPresentSystem(channel: Handle) -> Result<Void, TesseraError> {
+    return sendDisplayMessage(channel, .PresentSystem)
+}
+
+// Asks the compositor whether the presented prompt may be trusted: front-most
+// and the last input real hardware. The answer comes back as VerifyResult.
+public function sendVerify(channel: Handle) -> Result<Void, TesseraError> {
+    return sendDisplayMessage(channel, .Verify)
+}
+
+// Injects an input event. The compositor tags it synthetic, so it reaches the
+// focused surface but cannot satisfy the trusted path — the shape an agent's
+// injected input takes.
+public function sendInjectInput(
+    channel: Handle,
+    keyCode: UNumber,
+    state: DisplayKeyState
+) -> Result<Void, TesseraError> {
+    return sendDisplayMessage(channel, .InjectInput(DisplayKeyPress { key: keyCode, state: state }))
+}
+
+// Asks for a window action on the client's own surface: the person dragged
+// its title bar or pressed one of the buttons at its leading edge. The
+// platform decides.
+public function sendRequestWindow(
+    channel: Handle,
+    surface: DisplaySurfaceId,
+    action: DisplayWindowAction
+) -> Result<Void, TesseraError> {
+    return sendDisplayMessage(
+        channel,
+        .RequestWindow(DisplayWindowRequest { surface: surface, action: action })
+    )
+}
+
+// The platform takes the band along the bottom of the output, `height` tall,
+// for its dock. Honoured only from the platform session.
+public function sendSetDock(channel: Handle, height: UNumber) -> Result<Void, TesseraError> {
+    return sendDisplayMessage(channel, .SetDock(height))
+}
+
+// The platform grants the move a surface asked for.
+public function sendGrantMove(
+    channel: Handle,
+    surface: DisplaySurfaceId
+) -> Result<Void, TesseraError> {
+    return sendDisplayMessage(channel, .GrantMove(surface))
+}
+
+// The platform grants the resize MosaicDisplay asked it for.
+public function sendGrantResize(
+    channel: Handle,
+    surface: DisplaySurfaceId
+) -> Result<Void, TesseraError> {
+    return sendDisplayMessage(channel, .GrantResize(surface))
+}
+
+// The platform holds the keyboard and the pointer, or lets them go, with
+// focus left where it is.
+public function sendHoldInput(channel: Handle, held: Bool) -> Result<Void, TesseraError> {
+    return sendDisplayMessage(channel, .HoldInput(held))
+}
+
+// The platform says which part of the output its overlay takes; an empty
+// rectangle gives it back.
+public function sendSetOverlay(
+    channel: Handle,
+    overlay: DisplayOverlay
+) -> Result<Void, TesseraError> {
+    return sendDisplayMessage(channel, .SetOverlay(overlay))
+}
+
+// The platform places a surface.
+public function sendPlaceSurface(
+    channel: Handle,
+    placement: DisplayPlacement
+) -> Result<Void, TesseraError> {
+    return sendDisplayMessage(channel, .PlaceSurface(placement))
+}
+
+// The platform hides a surface, or shows it again.
+public function sendSetHidden(
+    channel: Handle,
+    surface: DisplaySurfaceId,
+    hidden: Bool
+) -> Result<Void, TesseraError> {
+    return sendDisplayMessage(
+        channel,
+        .SetHidden(DisplayVisibility { surface: surface, hidden: hidden })
+    )
+}
+
+// An application says how far round its window `surface` its buffers reach,
+// and the radius of the window's corners.
+public function sendSetMargin(
+    channel: Handle,
+    surface: DisplaySurfaceId,
+    margin: UNumber,
+    corner: UNumber
+) -> Result<Void, TesseraError> {
+    return sendDisplayMessage(
+        channel,
+        .SetMargin(DisplayMargin { surface: surface, margin: margin, corner: corner })
+    )
+}
+
+// A client asks for a piece of glass under its surface; one with no width
+// or height takes the piece away.
+public function sendSetGlass(channel: Handle, glass: DisplayGlass) -> Result<Void, TesseraError> {
+    return sendDisplayMessage(channel, .SetGlass(glass))
+}
+
+// Sets how long the output goes without input before it dims and blanks.
+public function sendSetIdle(channel: Handle, idle: DisplayIdle) -> Result<Void, TesseraError> {
+    return sendDisplayMessage(channel, .SetIdle(idle))
+}

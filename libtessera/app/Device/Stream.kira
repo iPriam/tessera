@@ -1,0 +1,562 @@
+import Foundation
+import Heap
+
+// Streams (§16.3): a ring of Memory slots between the process and a device.
+// The Devices service drives the device (17 §25); a stream is one connection
+// to it. The service makes the slots and sends them with its answer to
+// `Open`, so both sides read and write them in place, and it answers every
+// enqueued slot with a `Done` message (see `Wire.kira`).
+//
+// A Stream object's `backing` is the connection and `word0` its index in
+// `library.streams`. An enqueued slot is a pending `opStream` operation: `b` is the
+// slot and `options` bit 0 marks a flush.
+
+public function streamOpen(
+    descriptor: borrow StreamDescriptor,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    try streamDescriptorCheck(descriptor)
+    let target = try portTarget(port)
+    if !deviceClassEntitled(descriptor.streamClass) {
+        portComplete(
+            target,
+            key,
+            .Error(failureIn(.NotEntitled, .Devices)),
+            .Stream,
+            U64(0),
+            U64(0),
+            U64(0)
+        )
+        return .Ok
+    }
+    if descriptor.flags.has(
+        StreamFlags.exclusive
+    ) && descriptor.streamClass == .AudioOutput && !entitlementHeld("tessera.audio.exclusive") {
+        portComplete(
+            target,
+            key,
+            .Error(failureIn(.NotEntitled, .Devices)),
+            .Stream,
+            U64(0),
+            U64(0),
+            U64(0)
+        )
+        return .Ok
+    }
+    let connection = match serviceConnectFd("tessera.devices") {
+        Ok(value) -> value
+        Error(failed) -> {
+            portComplete(
+                target,
+                key,
+                .Error(failureIn(.DeviceLost, .Devices)),
+                .Stream,
+                U64(0),
+                U64(0),
+                U64(0)
+            )
+            return .Ok
+        }
+    }
+    let blockBytes = streamDescriptorBlock(descriptor)
+    let block = blockBytes.pointer()
+    let answer = deviceCall(connection, .None, .Open, U64(0), block, Device.descriptorBytes)
+    let reply = match answer {
+        Ok(value) -> value
+        Error(failed) -> {
+            kernelRelease(connection)
+            portComplete(target, key, .Error(failed), .Stream, U64(0), U64(0), U64(0))
+            return .Ok
+        }
+    }
+    var outcome = deviceMessageError(reply)
+    if succeeded(outcome) && reply.length < Device.descriptorBytes {
+        outcome = .Error(failureIn(.Internal, .Devices))
+    }
+    var descriptorAnswered = descriptor
+    if succeeded(outcome) {
+        match descriptorRead(reply.payload) {
+            Ok(value) -> descriptorAnswered = value
+            Error(failed) -> outcome = .Error(failed)
+        }
+    }
+    if !succeeded(outcome) {
+        deviceMessageRelease(reply)
+        kernelRelease(connection)
+        portComplete(target, key, outcome, .Stream, U64(0), U64(0), U64(0))
+        return .Ok
+    }
+    var stream = library.streams.count
+    for at in 0..library.streams.count {
+        if stream == library.streams.count && !library.streams[at].live { stream = at }
+    }
+    let object = objectCreate(.Stream(StreamObject { stream: stream }), connection)
+    let entry = StreamState {
+        live: true,
+        object: object,
+        descriptor: descriptorAnswered,
+        state: .Configured
+    }
+    if stream == library.streams.count {
+        library.streams.append(entry)
+    } else {
+        library.streams[stream] = entry
+    }
+    streamSlotsAdopt(stream, reply.handles)
+    deviceMessageRelease(reply)
+    let handle = match handleMint(object, Rights.processDefault | Rights.read | Rights.write) {
+        Ok(value) -> value
+        Error(failed) -> {
+            objectDestroy(object)
+            portComplete(target, key, .Error(failed), .Stream, U64(0), U64(0), U64(0))
+            return .Ok
+        }
+    }
+    let negotiated = library.streams[stream].descriptor
+    portComplete(
+        target,
+        key,
+        .Ok,
+        .Stream,
+        handle.raw,
+        U64(negotiated.bufferSize),
+        U64(negotiated.bufferCount)
+    )
+    return .Ok
+}
+
+// Closing the connection is how the service learns the stream is gone.
+function streamTeardown(object: Number) {
+    let stream = match streamIndexOf(object) {
+        Some(value) -> value
+        None -> return
+    }
+    objectRelease(object)
+    streamSlotsRelease(stream)
+    library.streams[stream].live = false
+}
+
+public function streamBuffer(stream: Handle, index: UNumber) -> Result<Handle, TesseraError> {
+    let object = try resolveObject(stream, .Stream, Rights.none)
+    let state = try streamIndexOf(object) otherwise return .Error(failure(.BadState))
+    let slot = try streamSlotOf(state, index) otherwise return .Error(failure(.OutOfRange))
+    var rights = Rights.read | Rights.map | Rights.inspect | Rights.duplicate | Rights.transfer
+    if streamIsOutput(state) { rights = rights | Rights.write }
+    return handleMint(library.streamSlots[slot].memory, rights)
+}
+
+public function streamEnqueue(
+    stream: Handle,
+    index: UNumber,
+    packet: StreamPacket,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    let handleSlot = try resolve(stream, .Stream, Rights.write)
+    let target = try portTarget(port)
+    let object = objectOfSlot(handleSlot)
+    let state = try streamIndexOf(object) otherwise return .Error(failure(.BadState))
+    let slot = try streamSlotOf(state, index) otherwise return .Error(failure(.OutOfRange))
+    if library.streamSlots[slot].queued || library.streams[state].state == .Failed {
+        return .Error(failure(.BadState))
+    }
+    if U64(packet.length) > library.streamSlots[slot].size { return .Error(failure(.OutOfRange)) }
+    let pending = pendingAdd(.Stream(.Slot(U64(index))), .Handle(handleSlot), target, key)
+    library.streamSlots[slot].queued = true
+    var length = U64(0)
+    if streamIsOutput(state) { length = U64(packet.length) | (U64(packet.flags.raw) << U64(32)) }
+    let backing = try backingOf(object)
+    let sent = deviceSend(
+        backing,
+        code(DeviceOperation.Enqueue),
+        U64(index),
+        length,
+        packet.timestamp,
+        nullPointer(),
+        U64(0)
+    )
+    if !succeeded(sent) {
+        streamFinish(
+            pending,
+            U64(index),
+            .Error(failureIn(.DeviceLost, .Devices)),
+            U64(0),
+            U64(0),
+            U32(0)
+        )
+    }
+    return .Ok
+}
+
+// Returns the slot with the packet's metadata: `aux` is `length | flags << 32`.
+function streamFinish(
+    index: Number,
+    slotIndex: U64,
+    outcome: borrow Result<Void, TesseraError>,
+    timestamp: U64,
+    length: U64,
+    flags: U32
+) {
+    let object = library.pending[index].object
+    match streamIndexOf(object) {
+        Some(state) -> {
+            match streamSlotOf(state, slotIndex) {
+                Some(slot) -> library.streamSlots[slot].queued = false
+                None -> {}
+            }
+        }
+        None -> {}
+    }
+    pendingFinish(index, outcome, slotIndex, timestamp, length | (U64(flags) << U64(32)))
+}
+
+// The pending slot `slot` of the stream, or its flush for None.
+// Whether `stream` is the slot `slot` enqueued, or for None the flush.
+function streamWorkIs(stream: borrow StreamWork, slot: borrow Number?) -> Bool {
+    return match stream {
+        Slot(number) -> match slot {
+            Some(wanted) -> number == U64(wanted)
+            None -> false
+        }
+        Flush -> match slot {
+            Some -> false
+            None -> true
+        }
+    }
+}
+
+function streamPendingFor(object: Number, slot: Number?) -> Number? {
+    for index in 0..library.pending.count {
+        if !library.pending[index].live || library.pending[index].object != object { continue }
+        let wanted = match library.pending[index].work {
+            Stream(stream) -> streamWorkIs(stream, slot)
+            WaitAsync, Timer, Accept, Connect, Send, Receive, Wake, Call, Lock, Source, Transfer -> false
+        }
+        if wanted { return .Some(index) }
+    }
+    return .None
+}
+
+// A message that is not the answer someone is waiting for: a slot coming
+// back, or the end of a flush.
+function streamDispatch(object: Number, message: borrow DeviceMessage) {
+    if message.op == code(DeviceOperation.Done) {
+        match streamPendingFor(object, .Some(message.a)) {
+            Some(index) -> {
+                streamFinish(
+                    index,
+                    message.a,
+                    deviceMessageError(message),
+                    message.b,
+                    message.c & U64(0xFFFFFFFF),
+                    U32(message.c >> U64(32))
+                )
+            }
+            None -> {}
+        }
+        return
+    }
+    if message.op == code(DeviceOperation.Flush) {
+        match streamPendingFor(object, .None) {
+            Some(index) -> pendingFinish(index, deviceMessageError(message), U64(0), U64(0), U64(0))
+            None -> {}
+        }
+    }
+}
+
+// Reads everything the service has sent. A connection the service closed
+// fails the stream and returns every slot `DeviceLost`.
+function streamPump(object: Number) {
+    // A stream torn down has nothing more to read.
+    let backing = match library.objects[object].backing {
+        Some(value) -> value
+        None -> return
+    }
+    while true {
+        match deviceReceive(backing) {
+            Ok(message) -> {
+                streamDispatch(object, message)
+                deviceMessageRelease(message)
+            }
+            Error(failed) -> {
+                if failed.code != .ShouldWait {
+                    match streamIndexOf(object) {
+                        Some(state) -> {
+                            library.streams[state].state = .Failed
+                            streamCancelAll(state, failureIn(.DeviceLost, .Devices))
+                        }
+                        None -> {}
+                    }
+                }
+                break
+            }
+        }
+    }
+}
+
+function streamStep(index: Number) {
+    streamPump(library.pending[index].object)
+}
+
+// The stream's control operations are answered by the service before the
+// call returns and complete at once, as `Stream` packets.
+// The stream's state and the port a control call completes to.
+struct StreamCall {
+    var state: Number
+    var port: Number
+}
+
+function streamControlTarget(stream: Handle, port: Handle) -> Result<StreamCall, TesseraError> {
+    let object = try resolveObject(stream, .Stream, Rights.write)
+    let target = try portTarget(port)
+    return match streamIndexOf(object) {
+        Some(state) -> .Ok(StreamCall { state: state, port: target })
+        None -> .Error(failure(.BadState))
+    }
+}
+
+// A request without bytes, answered with its error.
+function streamSimpleCall(state: Number, op: borrow DeviceOperation) -> Result<Void, TesseraError> {
+    let object = library.streams[state].object
+    let backing = try backingOf(object)
+    return match deviceCall(backing, .Some(object), op, U64(0), nullPointer(), U64(0)) {
+        Ok(reply) -> {
+            let outcome = deviceMessageError(reply)
+            deviceMessageRelease(reply)
+            return outcome
+        }
+        Error(failed) -> .Error(failed)
+    }
+}
+
+public function streamStart(
+    stream: Handle,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    let call = try streamControlTarget(stream, port)
+    let state = call.state
+    if library.streams[state].state == .Running || library.streams[state].state == .Failed {
+        return .Error(failure(.BadState))
+    }
+    let started = streamSimpleCall(state, .Start)
+    if succeeded(started) { library.streams[state].state = .Running }
+    portComplete(call.port, key, started, .Stream, U64(0), U64(0), U64(0))
+    return .Ok
+}
+
+// Every enqueued slot comes back `Cancelled`; the service returns them
+// before it answers.
+public function streamStop(
+    stream: Handle,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    let call = try streamControlTarget(stream, port)
+    let state = call.state
+    let stopped = streamSimpleCall(state, .Stop)
+    library.streams[state].state = .Stopped
+    streamCancelAll(state, failure(.Cancelled))
+    portComplete(call.port, key, stopped, .Stream, U64(0), U64(0), U64(0))
+    return .Ok
+}
+
+function streamCancelAll(stream: Number, error: borrow TesseraError) {
+    let object = library.streams[stream].object
+    for index in 0..library.pending.count {
+        if !library.pending[index].live || library.pending[index].object != object { continue }
+        match library.pending[index].work {
+            Stream(stream) -> {
+                match stream {
+                    Slot(slot) -> streamFinish(index, slot, .Error(error), U64(0), U64(0), U32(0))
+                    Flush -> pendingFinish(index, .Ok, U64(0), U64(0), U64(0))
+                }
+            }
+            WaitAsync, Timer, Accept, Connect, Send, Receive, Wake, Call, Lock, Source, Transfer -> {}
+        }
+    }
+}
+
+// Completes when every enqueued output slot is done and the device has
+// played what it was given: the service answers `Flush` then.
+public function streamFlush(
+    stream: Handle,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    let slot = try resolve(stream, .Stream, Rights.write)
+    let target = try portTarget(port)
+    let object = objectOfSlot(slot)
+    let state = try streamIndexOf(object) otherwise return .Error(failure(.BadState))
+    if !streamIsOutput(state) || library.streams[state].state != .Running {
+        portComplete(target, key, .Ok, .Stream, U64(0), U64(0), U64(0))
+        return .Ok
+    }
+    let index = pendingAdd(.Stream(.Flush), .Handle(slot), target, key)
+    let backing = try backingOf(object)
+    let sent = deviceSend(
+        backing,
+        code(DeviceOperation.Flush),
+        U64(0),
+        U64(0),
+        U64(0),
+        nullPointer(),
+        U64(0)
+    )
+    if !succeeded(sent) {
+        pendingFinish(index, .Error(failureIn(.DeviceLost, .Devices)), U64(0), U64(0), U64(0))
+    }
+    return .Ok
+}
+
+// Only while not running; the slots are made again, so `Stream.buffer` must
+// be called again.
+public function streamReconfigure(
+    stream: Handle,
+    descriptor: borrow StreamDescriptor,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    try streamDescriptorCheck(descriptor)
+    let call = try streamControlTarget(stream, port)
+    let state = call.state
+    if library.streams[state].state == .Running { return .Error(failure(.BadState)) }
+    if descriptor.streamClass != streamClassOf(state) { return .Error(failure(.InvalidArgument)) }
+    if descriptor.deviceId != U64(
+        0
+    ) && descriptor.deviceId != library.streams[state].descriptor.deviceId {
+        return .Error(failure(.InvalidArgument))
+    }
+    streamCancelAll(state, failure(.Cancelled))
+    streamSlotsRelease(state)
+    var chosen = descriptor
+    chosen.deviceId = library.streams[state].descriptor.deviceId
+    let object = library.streams[state].object
+    let blockBytes = streamDescriptorBlock(chosen)
+    let block = blockBytes.pointer()
+    let backing = try backingOf(object)
+    let answer = deviceCall(
+        backing,
+        .Some(object),
+        .Reconfigure,
+        U64(0),
+        block,
+        Device.descriptorBytes
+    )
+    var configured: Result<Void, TesseraError> = .Ok
+    match answer {
+        Ok(reply) -> {
+            configured = deviceMessageError(reply) if succeeded(
+                configured
+            ) && reply.length >= Device.descriptorBytes {
+                match descriptorRead(reply.payload) {
+                    Ok(answered) -> {
+                        library.streams[state].descriptor = answered
+                        streamSlotsAdopt(state, reply.handles)
+                    }
+                    Error(failed) -> configured = .Error(failed)
+                }
+
+            }
+            deviceMessageRelease(reply)
+        }
+        Error(failed) -> configured = .Error(failed)
+    }
+    library.streams[state].state = succeeded(configured) ? .Configured : .Failed
+    let negotiated = library.streams[state].descriptor
+    portComplete(
+        call.port,
+        key,
+        configured,
+        .Stream,
+        U64(0),
+        U64(negotiated.bufferSize),
+        U64(negotiated.bufferCount)
+    )
+    return .Ok
+}
+
+// Per-class controls; `result0` is the bytes written to `out`.
+public function streamControl(
+    stream: Handle,
+    request: UNumber,
+    input: borrow Buffer,
+    out: borrow Buffer,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    let call = try streamControlTarget(stream, port)
+    let state = call.state
+    let object = library.streams[state].object
+    let backing = try backingOf(object)
+    let answer = deviceCall(
+        backing,
+        .Some(object),
+        .Control,
+        U64(request),
+        input.address,
+        input.length
+    )
+    match answer {
+        Ok(reply) -> {
+            let outcome = deviceMessageError(reply)
+            if !succeeded(outcome) {
+                portComplete(call.port, key, outcome, .Stream, U64(0), U64(0), U64(0))
+            } else if reply.length > out.length {
+                portComplete(
+                    call.port,
+                    key,
+                    .Error(failureDetail(.BufferTooSmall, reply.length)),
+                    .Stream,
+                    U64(0),
+                    U64(0),
+                    U64(0)
+                )
+            } else {
+                copyBytes(out.address, reply.payload, reply.length)
+                portComplete(call.port, key, .Ok, .Stream, reply.length, U64(0), U64(0))
+            }
+            deviceMessageRelease(reply)
+        }
+        Error(failed) -> portComplete(
+            call.port,
+            key,
+            .Error(failed),
+            .Stream,
+            U64(0),
+            U64(0),
+            U64(0)
+        )
+    }
+    return .Ok
+}
+
+function streamSignals(object: Number) -> U32 {
+    let state = try streamIndexOf(object) otherwise return U32(0)
+    if library.streams[state].state == .Failed { return Signals.error.raw }
+    return match library.objects[object].backing {
+        Some(backing) -> socketSignals(backing) & complement32(Signals.error.raw)
+        None -> U32(0)
+    }
+}
+
+// `StreamInfo`, 64 bytes, as the service keeps it.
+function streamInfoWrite(object: Number, block: RawPtr) -> Result<U64, TesseraError> {
+    let state = try streamIndexOf(object) otherwise return .Error(failure(.BadState))
+    zeroBytes(block, 64)
+    heapStore<U32>(block, 0, code(library.streams[state].state))
+    heapStore<U32>(block, 40, code(streamClassOf(state)))
+    heapStore<U64>(block, 48, library.streams[state].descriptor.deviceId)
+    heapStore<U32>(block, 56, library.streams[state].descriptor.bufferCount)
+    heapStore<U32>(block, 60, library.streams[state].descriptor.bufferSize)
+    let backing = try backingOf(object)
+    let reply = try deviceCall(backing, .Some(object), .Info, U64(0), nullPointer(), U64(0))
+    let answered = deviceMessageError(reply)
+    if succeeded(answered) && reply.length >= U64(40) {
+        copyBytes(heapOffset(block, 8), heapOffset(reply.payload, 8), 32)
+    }
+    deviceMessageRelease(reply)
+    try answered
+    return .Ok(64)
+}

@@ -1,0 +1,144 @@
+import Foundation
+import LibTessera
+import PlatformKit
+import TesseraUI
+
+// What a person chooses of Home and the Dock. The applications they keep in
+// the Dock of a touch platform, as an iPad's favourites, are put there from
+// Home while it is edited, by carrying an icon down onto the Dock, and taken
+// out from App Library. They are kept in Settings, under `dock.favourites`,
+// their names one after another, so the platform hears at once that they
+// changed. None kept is the platform's own order of everything installed.
+
+public namespace DockFavouritesSetting {
+    let key: String = "dock.favourites"
+    let separator: String = "|"
+}
+
+// The names kept in the Dock, in their order; none when none were chosen.
+public function dockFavourites() -> [String] {
+    let text = settingValue(DockFavouritesSetting.key, "")
+    var names: [String] = []
+    for name in text.split(DockFavouritesSetting.separator) {
+        if name.count > 0 && !names.contains(name) { names.append(copy name) }
+    }
+    return names
+}
+
+// Keeps `names` in the Dock, in that order.
+public function keepDockFavourites(names: borrow [String]) {
+    let kept = joined(names, DockFavouritesSetting.separator)
+    match storeSetting(DockFavouritesSetting.key, .Some(kept)) {
+        Ok -> log info("the Dock's favourites changed", count: names.count)
+        Error(failed) -> log warn(
+            "the Dock's favourites could not be kept",
+            error: errorName(failed)
+        )
+    }
+}
+
+// What the Dock keeps, in its order: the favourites chosen, or with none
+// chosen yet everything installed, which the first choice starts from.
+public function keptInDock() -> [String] {
+    let names = dockFavourites()
+    if names.count > 0 { return names }
+    var installed: [String] = []
+    for application in installedApplications() { installed.append(copy application.name) }
+    return installed
+}
+
+// Puts `name` in the Dock, at its end, unless it is there.
+public function addDockFavourite(name: borrow String) {
+    var names = keptInDock()
+    if names.contains(name) { return }
+    names.append(copy name)
+    keepDockFavourites(names)
+}
+
+// Puts `name` in the Dock at `index` among what it keeps, moving it there
+// when it is kept already.
+public function placeDockFavourite(name: borrow String, index: Number) {
+    keepDockFavourites(namesPlaced(dockWithout(keptInDock(), name), name, index))
+}
+
+// `names` with `name` put at `index`, or at their end when `index` is past it.
+function namesPlaced(names: borrow [String], name: borrow String, index: Number) -> [String] {
+    let at = min(max(index, 0), names.count)
+    var placed: [String] = []
+    for (position, each) in names.enumerated() {
+        if position == at { placed.append(copy name) }
+        placed.append(copy each)
+    }
+    if at == names.count { placed.append(copy name) }
+    return placed
+}
+
+// Takes `name` out of the Dock, keeping the rest as they are.
+public function removeDockFavourite(name: borrow String) {
+    keepDockFavourites(dockWithout(keptInDock(), name))
+}
+
+// What is installed, kept in `state`'s Dock as the person chose it: their
+// favourites when they chose any, which are then all it keeps, or else
+// `first` and then the rest. The installed applications, to open from.
+public function keepFavouritesInDock(
+    state: borrow mut PlatformState,
+    first: borrow [String]
+) -> [Application] {
+    let favourites = dockFavourites()
+    if favourites.count == 0 { return keepInstalledInDock(state, first) }
+    let installed = installedApplications()
+    var names: [String] = []
+    for name in favourites {
+        for application in installed {
+            if application.name == name { names.append(copy name) }
+        }
+    }
+    state.keepInDock(move names)
+    return installed
+}
+
+// Where an application installed after Home was first arranged goes, as an
+// iPad's "Newly Downloaded Apps": onto Home, or into App Library only.
+public namespace NewApplicationsSetting {
+    let key: String = "home.newApplications"
+    let home: String = "home"
+    let library: String = "library"
+}
+
+public function newApplicationsToLibrary() -> Bool {
+    return settingValue(
+        NewApplicationsSetting.key,
+        NewApplicationsSetting.home
+    ) == NewApplicationsSetting.library
+}
+
+// Settings' Reset Home Screen Layout: the time it was last asked for, which
+// Home compares with the reset its arrangement last followed. Only the
+// arrangement goes; every application stays installed.
+public namespace HomeResetSetting {
+    let key: String = "home.resetLayout"
+}
+
+struct HomeResetRead {
+    var generation: Number? = .None
+    var asked: String = ""
+}
+
+namespace HomeResetSlot {
+    let key: PersistentStateKey = PersistentStateKey { name: "platformui.home.reset" }
+}
+
+// The reset last asked for, read again only when Settings changed.
+public function homeResetAsked() -> String {
+    if !ambientStateHas(HomeResetSlot.key) {
+        ambientStatePut(HomeResetSlot.key, nativeUserData(nativeState(HomeResetRead {})))
+    }
+    var read = nativeRecover<HomeResetRead>(ambientStateGet(HomeResetSlot.key))
+    let generation = settingsGeneration()
+    if read.generation != .Some(generation) {
+        read.asked = settingValue(HomeResetSetting.key, "")
+        read.generation = .Some(generation)
+    }
+    return copy read.asked
+}

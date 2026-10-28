@@ -1,0 +1,109 @@
+import Foundation
+import Heap
+import LibTessera
+
+// Relaying a service's standard output and error to the console.
+//
+// Each service writes to a channel of its own, which PID 1 reads and writes
+// to its own standard output one line at a time, after the service's name:
+// `notes: saved`. A line the service has not finished waits for the rest of
+// it, and is written as it is when the service closes its output.
+
+namespace OutputRelay {
+    // The most one read takes. A larger write is read in one larger block.
+    let readBytes: Number = 65536
+}
+
+// Asks for a completion on `port` when the service in `slot` writes or
+// closes its output.
+function watchOutput(fleet: borrow Fleet, slot: Number, port: Handle) {
+    if fleet.outputs[slot] == Handle.invalid { return }
+    match objectWaitAsync(
+        fleet.outputs[slot],
+        Signals.readable | Signals.peerClosed,
+        .Once,
+        port,
+        slotKey(fleet, slot, .Output)
+    ) {
+        Ok -> {}
+        Error(failed) -> log warn(
+            "cannot read a service's output",
+            service: fleet.services[slot].name,
+            error: errorName(failed)
+        )
+    }
+}
+
+// Writes what the service in `slot` has written since the last time, and
+// answers whether its output is still open and worth waiting on again.
+function relayOutput(fleet: borrow mut Fleet, slot: Number) -> Result<Bool, TesseraError> {
+    var size = OutputRelay.readBytes
+    while fleet.outputs[slot] != Handle.invalid {
+        let block = zeroedBlock(count: size, alignment: 16)
+        match channelRead(
+            fleet.outputs[slot],
+            Buffer { address: block.pointer(), length: size },
+            0
+        ) {
+            Ok(received) -> {
+                releaseAll(received.handles)
+                size = OutputRelay.readBytes
+                relayText(fleet, slot, textOf(block.pointer(), received.bytes))
+            }
+            Error(failed) -> {
+                match failed.code {
+                    ShouldWait -> return .Ok(true)
+                    BufferTooSmall -> { size = failed.detail }
+                    else -> {
+                        closeOutput(fleet, slot)
+                        if failed.code != .PeerClosed { return .Error(failed) }
+                    }
+                }
+            }
+        }
+    }
+    return .Ok(false)
+}
+
+// A port means keep relaying later; none means drain only what is available.
+function handleOutput(fleet: borrow mut Fleet, slot: Number, port: borrow Handle?) {
+    match relayOutput(fleet, slot) {
+        Ok(open) -> {
+            if open {
+                match port {
+                    Some(value) -> watchOutput(fleet, slot, value)
+                    None -> {}
+                }
+            }
+        }
+        Error(failed) -> log warn(
+            "could not read a service's output",
+            service: fleet.services[slot].name,
+            error: errorName(failed)
+        )
+    }
+}
+
+// Writes every line `text` ends, and keeps the line it begins. The console
+// takes them in one write: each is a trip through the serial port.
+function relayText(fleet: borrow mut Fleet, slot: Number, text: String) {
+    let pieces = (fleet.partial[slot] + text).split("\n")
+    var console: [String] = []
+    for index in 0..pieces.count - 1 {
+        console.append("\(fleet.services[slot].name): \(pieces[index])")
+        writeSystemLog(fleet.systemLog, fleet.services[slot].name, pieces[index])
+    }
+    if console.count > 0 { print(joined(console, "\n")) }
+    fleet.partial[slot] = copy pieces[pieces.count - 1]
+}
+
+// Writes the line the service left unfinished, and lets its output go.
+function closeOutput(fleet: borrow mut Fleet, slot: Number) {
+    if fleet.partial[slot].count > 0 {
+        print("\(fleet.services[slot].name): \(fleet.partial[slot])")
+        writeSystemLog(fleet.systemLog, fleet.services[slot].name, fleet.partial[slot])
+        fleet.partial[slot] = ""
+    }
+    release(fleet.outputs[slot])
+    fleet.outputs[slot] = Handle.invalid
+}

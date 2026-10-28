@@ -1,0 +1,336 @@
+import Foundation
+import Heap
+
+// A GUID partition table written to a disk (UEFI 2.10 §5.2-5.3): the
+// protective MBR at block 0, the header at block 1 and its 128 entries after
+// it, and the same entries and a header pointing back at the first in the
+// disk's last 33 blocks. The disk is opened exclusively, so the kernel
+// refuses it while a volume on it is mounted, and `BLKRRPART` has the kernel
+// read the new table before the call returns.
+
+namespace PartitionTable {
+    let entries: Number = 128
+    let entryBytes: Number = 128
+    let headerBytes: Number = 92
+    // Every partition starts and ends on a whole mebibyte.
+    let alignment: Number = 1048576
+    // `_IO(0x12, 95)`.
+    let rereadPartitions: U64 = U64(0x125F)
+    // The type GUID of a Tessera volume.
+    let tesseraType: String = "C78F59E8-19CD-4D28-9693-3A5DE6474426"
+}
+
+// The protective MBR: one partition of type 0xEE from block 1 over the disk,
+// in the first of the four entries at 446, and the signature at 510.
+namespace ProtectiveRecord {
+    let entry: Number = 446
+    let type: Number = 450
+    let firstBlock: Number = 454
+    let blockCount: Number = 458
+    let signature: Number = 510
+}
+
+// A GPT header's fields, by their byte offsets.
+namespace TableHeader {
+    let signature: Number = 0
+    let revision: Number = 8
+    let size: Number = 12
+    let checksum: Number = 16
+    let currentBlock: Number = 24
+    let backupBlock: Number = 32
+    let firstUsable: Number = 40
+    let lastUsable: Number = 48
+    let diskGuid: Number = 56
+    let entriesBlock: Number = 72
+    let entryCount: Number = 80
+    let entrySize: Number = 84
+    let entriesChecksum: Number = 88
+}
+
+// A GPT entry's fields, by their byte offsets.
+namespace TableEntry {
+    let type: Number = 0
+    let unique: Number = 16
+    let firstBlock: Number = 32
+    let lastBlock: Number = 40
+    let name: Number = 56
+}
+
+function kernelDiskBytes(disk: borrow String) -> Result<Number, TesseraError> {
+    // `/sys/block/<disk>/size` counts 512-byte sectors whatever the disk's
+    // own block is.
+    let sectors = try readSmallFile(AtDirectory.current, "/sys/block/" + disk + "/size")
+    return .Ok(Number(parseUnsigned(sectors.trim())) * 512)
+}
+
+function kernelDiskBlockBytes(disk: borrow String) -> Result<Number, TesseraError> {
+    let text = try readSmallFile(
+        AtDirectory.current,
+        "/sys/block/" + disk + "/queue/logical_block_size"
+    )
+    let bytes = Number(parseUnsigned(text.trim()))
+    if bytes < 512 { return .Error(failure(.Unsupported)) }
+    return .Ok(bytes)
+}
+
+// The entries of `/sys/block/<disk>` that are its partitions: each is named
+// after the disk and holds a `partition` file with its number, by which they
+// are put in order.
+function kernelPartitionNames(disk: borrow String) -> Result<[String], TesseraError> {
+    let base = "/sys/block/" + disk
+    let listed = try listPath(base)
+    var numbered: [Number] = []
+    var names: [String] = []
+    for index in 0..listed.count {
+        let name = listed[index].name
+        if !name.startsWith(disk) || name == disk { continue }
+        let text = try readSmallFile(AtDirectory.current, base + "/" + name + "/partition")
+        let number = Number(parseUnsigned(text.trim()))
+        var at = names.count
+        names.append(copy name)
+        numbered.append(number)
+        while at > 0 && numbered[at] < numbered[at - 1] {
+            let earlier = copy names[at - 1]
+            names[at - 1] = copy names[at]
+            names[at] = earlier
+            let earlierNumber = numbered[at - 1]
+            numbered[at - 1] = numbered[at]
+            numbered[at] = earlierNumber
+            at -= 1
+        }
+    }
+    return .Ok(names)
+}
+
+function kernelWritePartitions(
+    disk: borrow String,
+    partitions: borrow [VolumePartition]
+) -> Result<Void, TesseraError> {
+    let blockBytes = try kernelDiskBlockBytes(disk)
+    let blocks = trunc(try kernelDiskBytes(disk) / blockBytes)
+    let tableBlocks = trunc(PartitionTable.entries * PartitionTable.entryBytes / blockBytes)
+    let lastBlock = blocks - 1
+    let firstUsable = 2 + tableBlocks
+    let lastUsable = lastBlock - 1 - tableBlocks
+    let step = trunc(PartitionTable.alignment / blockBytes)
+    let entries = zeroedBlock(
+        count: PartitionTable.entries * PartitionTable.entryBytes,
+        alignment: 16
+    )
+    var start = step
+    for index in 0..partitions.count {
+        let partition = partitions[index]
+        var end = 0
+        if partition.bytes == 0 {
+            end = trunc((lastUsable + 1) / step) * step - 1
+        } else {
+            end = start + trunc(
+                (partition.bytes + PartitionTable.alignment - 1) / PartitionTable.alignment
+            ) * step - 1
+        }
+        if end > lastUsable || end < start { return .Error(failure(.InvalidArgument)) }
+        let at = heapOffset(entries.pointer(), index * PartitionTable.entryBytes)
+        storeGuid(at, TableEntry.type, guidBytes(kindGuid(partition.kind)))
+        storeGuid(at, TableEntry.unique, try randomGuid())
+        heapStore<U64>(at, TableEntry.firstBlock, U64(start))
+        heapStore<U64>(at, TableEntry.lastBlock, U64(end))
+        for character in 0..partition.name.count {
+            heapStore<U16>(
+                at,
+                TableEntry.name + character * 2,
+                U16(partition.name.charAt(character))
+            )
+        }
+        start = end + 1
+    }
+    let entriesSum = checksum(entries.pointer(), PartitionTable.entries * PartitionTable.entryBytes)
+    let diskGuid = try randomGuid()
+    let primary = tableHeader(
+        blockBytes,
+        1,
+        lastBlock,
+        firstUsable,
+        lastUsable,
+        2,
+        diskGuid,
+        entriesSum
+    )
+    let backup = tableHeader(
+        blockBytes,
+        lastBlock,
+        1,
+        firstUsable,
+        lastUsable,
+        lastUsable + 1,
+        diskGuid,
+        entriesSum
+    )
+    let record = protectiveRecord(blockBytes, blocks)
+    let fd = openat(
+        AtDirectory.current,
+        cStringFrom("/dev/" + disk),
+        LinuxOpen.readWrite | LinuxOpen.exclusive | LinuxOpen.closeOnExec,
+        0
+    )
+    if answerFailed(fd) { return .Error(errnoFailure(answerErrno(fd))) }
+    let written = writeTable(
+        fd,
+        blockBytes,
+        lastBlock,
+        lastUsable,
+        record,
+        primary,
+        entries,
+        backup
+    )
+    closeBacking(fd)
+    return written
+}
+
+// The table's blocks, the backup's last so a table cut short has no header
+// at the end pointing at it, then the kernel told to read it.
+function writeTable(
+    fd: Number,
+    blockBytes: Number,
+    lastBlock: Number,
+    lastUsable: Number,
+    record: borrow ByteBlock,
+    primary: borrow ByteBlock,
+    entries: borrow ByteBlock,
+    backup: borrow ByteBlock
+) -> Result<Void, TesseraError> {
+    let tableLength = PartitionTable.entries * PartitionTable.entryBytes
+    try writeAll(fd, record.pointer(), blockBytes, 0)
+    try writeAll(fd, primary.pointer(), blockBytes, blockBytes)
+    try writeAll(fd, entries.pointer(), tableLength, 2 * blockBytes)
+    try writeAll(fd, entries.pointer(), tableLength, (lastUsable + 1) * blockBytes)
+    try writeAll(fd, backup.pointer(), blockBytes, lastBlock * blockBytes)
+    try answerStatus(fsync(fd))
+    return answerStatus(ioctlValue(fd, PartitionTable.rereadPartitions, 0))
+}
+
+// One header block: the header's 92 bytes, with its own checksum, and zeros.
+function tableHeader(
+    blockBytes: Number,
+    current: Number,
+    other: Number,
+    firstUsable: Number,
+    lastUsable: Number,
+    entriesBlock: Number,
+    diskGuid: borrow [U8],
+    entriesSum: U32
+) -> ByteBlock {
+    let block = zeroedBlock(count: blockBytes, alignment: 16)
+    let at = block.pointer()
+    let signature = "EFI PART"
+    for index in 0..signature.count {
+        heapStore<U8>(at, TableHeader.signature + index, U8(signature.charAt(index)))
+    }
+    heapStore<U32>(at, TableHeader.revision, U32(0x00010000))
+    heapStore<U32>(at, TableHeader.size, U32(PartitionTable.headerBytes))
+    heapStore<U64>(at, TableHeader.currentBlock, U64(current))
+    heapStore<U64>(at, TableHeader.backupBlock, U64(other))
+    heapStore<U64>(at, TableHeader.firstUsable, U64(firstUsable))
+    heapStore<U64>(at, TableHeader.lastUsable, U64(lastUsable))
+    storeGuid(at, TableHeader.diskGuid, diskGuid)
+    heapStore<U64>(at, TableHeader.entriesBlock, U64(entriesBlock))
+    heapStore<U32>(at, TableHeader.entryCount, U32(PartitionTable.entries))
+    heapStore<U32>(at, TableHeader.entrySize, U32(PartitionTable.entryBytes))
+    heapStore<U32>(at, TableHeader.entriesChecksum, entriesSum)
+    heapStore<U32>(at, TableHeader.checksum, checksum(at, PartitionTable.headerBytes))
+    return move block
+}
+
+function protectiveRecord(blockBytes: Number, blocks: Number) -> ByteBlock {
+    let block = zeroedBlock(count: blockBytes, alignment: 16)
+    let at = block.pointer()
+    // CHS start 0/0/2 and end at the largest the fields hold.
+    heapStore<U8>(at, ProtectiveRecord.entry + 2, U8(2))
+    heapStore<U8>(at, ProtectiveRecord.type, U8(0xEE))
+    heapStore<U8>(at, ProtectiveRecord.type + 1, U8(0xFF))
+    heapStore<U8>(at, ProtectiveRecord.type + 2, U8(0xFF))
+    heapStore<U8>(at, ProtectiveRecord.type + 3, U8(0xFF))
+    heapStore<U32>(at, ProtectiveRecord.firstBlock, U32(1))
+    let covered = blocks - 1 > 0xFFFFFFFF ? 0xFFFFFFFF : blocks - 1
+    heapStore<U32>(at, ProtectiveRecord.blockCount, U32(covered))
+    heapStore<U8>(at, ProtectiveRecord.signature, U8(0x55))
+    heapStore<U8>(at, ProtectiveRecord.signature + 1, U8(0xAA))
+    return move block
+}
+
+function writeAll(
+    fd: Number,
+    from: RawPtr,
+    length: Number,
+    offset: Number
+) -> Result<Void, TesseraError> {
+    var done = 0
+    while done < length {
+        let wrote = pwrite(fd, heapOffset(from, done), U64(length - done), U64(offset + done))
+        if answerFailed(wrote) {
+            if answerErrno(wrote) != code(Errno.Interrupted) {
+                return .Error(errnoFailure(answerErrno(wrote)))
+            }
+        } else {
+            done += wrote
+        }
+    }
+    return .Ok
+}
+
+function kindGuid(kind: VolumePartitionKind) -> String {
+    return match kind {
+        Tessera -> PartitionTable.tesseraType
+    }
+}
+
+// A GUID's 16 bytes as the table stores them: its first three fields little
+// endian, the last two in the order they are written.
+function guidBytes(text: borrow String) -> [U8] {
+    var digits: [Number] = []
+    for index in 0..text.count {
+        let character = text.charAt(index)
+        if character >= 48 && character <= 57 { digits.append(character - 48) }
+        if character >= 65 && character <= 70 { digits.append(character - 55) }
+        if character >= 97 && character <= 102 { digits.append(character - 87) }
+    }
+    var written: [U8] = []
+    for index in 0..16 {
+        written.append(U8(digits[index * 2] * 16 + digits[index * 2 + 1]))
+    }
+    let order = [3, 2, 1, 0, 5, 4, 7, 6, 8, 9, 10, 11, 12, 13, 14, 15]
+    var stored: [U8] = []
+    for index in order { stored.append(written[index]) }
+    return stored
+}
+
+// A random version-4 GUID, in the table's byte order.
+function randomGuid() -> Result<[U8], TesseraError> {
+    let block = zeroedBlock(count: 16, alignment: 16)
+    try kernelRandomFill(block.pointer(), U64(16))
+    var bytes: [U8] = []
+    for index in 0..16 { bytes.append(heapLoad<U8>(block.pointer(), index)) }
+    // The version in the third field's high byte, stored last of its two.
+    bytes[7] = (bytes[7] & U8(0x0F)) | U8(0x40)
+    bytes[8] = (bytes[8] & U8(0x3F)) | U8(0x80)
+    return .Ok(bytes)
+}
+
+function storeGuid(at: RawPtr, offset: Number, bytes: borrow [U8]) {
+    for index in 0..16 { heapStore<U8>(at, offset + index, bytes[index]) }
+}
+
+// The CRC-32 of `length` bytes at `from`, as the table's checksums are:
+// IEEE 802.3's, reflected, with the register's bits flipped before and after.
+function checksum(from: RawPtr, length: Number) -> U32 {
+    var register = U32(0xFFFFFFFF)
+    for index in 0..length {
+        register = register ^ U32(heapLoad<U8>(from, index))
+        for bit in 0..8 {
+            let low = (register & U32(1)) != U32(0)
+            register = register >> U32(1)
+            if low { register = register ^ U32(0xEDB88320) }
+        }
+    }
+    return complement32(register)
+}

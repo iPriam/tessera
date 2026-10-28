@@ -1,0 +1,87 @@
+//! The menu records' round trips and refusals, checked through their encoders.
+import Foundation
+
+// The menu records: what an application's menus become on the wire, and what
+// the platform reads back from them.
+
+@Test
+function menusRoundTripThroughTheirRecords() {
+    let menus = [
+        BridgeMenu {
+            title: "File",
+            application: true,
+            items: [
+                BridgeMenuItem {
+                    number: 7,
+                    title: "Save",
+                    key: "s",
+                    modifiers: [.Command, .Shift],
+                    enabled: false
+                },
+                BridgeMenuItem { separator: true },
+                BridgeMenuItem { number: 9, title: "Close", key: "", modifiers: [], enabled: true }
+            ]
+        }
+    ]
+    let text = encodedMenus(menus)
+    let decoded = match decodedMenus(text) {
+        Some(value) -> value
+        None -> []
+    }
+    expect!(decoded.count == 1)
+    expect!(decoded[0].title == "File")
+    expect!(decoded[0].application)
+    expect!(decoded[0].items.count == 3)
+    expect!(decoded[0].items[0].number == 7)
+    expect!(decoded[0].items[0].key == "s")
+    expect!(!decoded[0].items[0].enabled)
+    expect!(decoded[0].items[0].modifiers.count == 2)
+    expect!(decoded[0].items[1].separator)
+    expect!(decoded[0].items[2].modifiers.count == 0)
+}
+
+@Test
+function tabsAndLineBreaksInTitlesBecomeSpaces() {
+    expect!(recordText("a\tb\nc") == "a b c")
+}
+
+@Test
+function emptyTextIsNoMenus() {
+    let decoded = match decodedMenus("") {
+        Some(value) -> value
+        None -> [BridgeMenu {}]
+    }
+    expect!(decoded.count == 0)
+}
+
+@Test
+function rowBeforeAnyMenuIsRefused() {
+    expect!(!decodedMenus("I\t1\t1\ts\t1\tSave").isSome())
+}
+
+@Test
+function unknownRecordKindIsRefused() {
+    expect!(!decodedMenus("Q\t1\t2").isSome())
+}
+
+@Test
+function modifierBitsAreReadBackInOrder() {
+    let picked: [BridgeModifier] = [.Control, .Command]
+    let bits = modifierBits(picked)
+    expect!(bits == 9)
+    let modifiers = modifiersOf(bits)
+    expect!(modifiers.count == 2)
+    expect!(modifiers[0] == BridgeModifier.Command)
+    expect!(modifiers[1] == BridgeModifier.Control)
+}
+
+@Test
+function wholeNumberAcceptsOnlyDigits() {
+    let number = match wholeNumber("0042") {
+        Some(value) -> value
+        None -> 0
+    }
+    expect!(number == 42)
+    expect!(!wholeNumber("4a").isSome())
+    expect!(!wholeNumber("").isSome())
+}

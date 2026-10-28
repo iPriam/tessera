@@ -1,0 +1,61 @@
+import Foundation
+import FileOperations
+
+// Each test works in a folder of its own beside where the tests run, made
+// empty first and removed after.
+function freshFolder(name: borrow String) -> String {
+    let folder = ".operations-scratch-" + name
+    if pathExists(folder) { expect!(removed(removeTree(folder))) }
+    expect!(made(makeDirectory(folder)))
+    return folder
+}
+
+function made(result: Result<Void, FileFailure>) -> Bool {
+    return match result {
+        Ok -> true
+        Error(failure) -> {
+            absorb failure
+            false
+        }
+    }
+}
+
+function removed(result: Result<Void, ChangeFailure>) -> Bool {
+    return match result {
+        Ok -> true
+        Error(failure) -> {
+            absorb failure
+            false
+        }
+    }
+}
+
+function writeText(path: borrow String, text: borrow String) {
+    expect!(made(writeFile(path, text)))
+}
+
+function textAt(path: borrow String) -> String {
+    return match readFile(path) {
+        Ok(contents) -> contents.text
+        Error(failure) -> {
+            absorb failure
+            ""
+        }
+    }
+}
+
+function names(entries: borrow [Entry]) -> [String] {
+    var found: [String] = []
+    for entry in entries { found.append(copy entry.name) }
+    return found
+}
+
+function listed(folder: borrow String) -> [String] {
+    return match entriesIn(folder) {
+        Ok(entries) -> names(entries)
+        Error(failure) -> {
+            absorb failure
+            []
+        }
+    }
+}

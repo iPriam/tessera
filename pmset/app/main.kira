@@ -1,0 +1,225 @@
+//! The `pmset` command's entry point: reads the Power service's page and prints the battery and thermal state.
+import Foundation
+import ArgumentParser
+import LibTessera
+
+// pmset: what the Power service says of the machine's power, as macOS's
+// pmset says what powerd and IOPMrootDomain do.
+//
+// It reads LibTessera's `Power.read` (roadmap/16-libtessera.md §18), the
+// page the Power service keeps, and prints it in pmset's words. `-g batt`
+// is where the power comes from and what the battery holds, `-g therm`
+// the thermal level and how far the processor is held back, and `-g`
+// both. It changes nothing: the settings pmset writes on macOS have no
+// counterpart here yet. It exits 0 when it read the page, 1 when the
+// service could not be read, and 2 when the command was wrong.
+
+/// The exit status of `pmset`: 0 when it read the power page, 1 when the service could not be read, 2 when the command was wrong.
+@Derive(Copy)
+enum PmsetExit: UN8 {
+    Read = 0
+    Unreadable = 1
+    Usage = 2
+}
+
+/// How long `pmset` waits for the Power service to come up: the tries and the time between them.
+namespace ServiceStart {
+    // The Power service may still be starting, and says nothing when it is
+    // up, so pmset asks again: every tenth of a second, for ten seconds.
+    let tries: Number = 100
+    let interval: Number = 100000000
+}
+
+/// The units the Power service's page is read in.
+namespace PowerPage {
+    let nanosecondsPerMinute: Number = 60000000000
+}
+
+/// What `-g` prints: the battery, the thermal state, or both.
+enum PowerTopic {
+    Battery
+    Thermal
+    Both
+}
+
+/// The monotonic clock's reading, or the error that stopped it being read.
+function monotonicNow() -> Result<Number, TesseraError> {
+    match timeRead(.Monotonic) {
+        Ok(value) -> return .Ok(value)
+        Error(failed) -> return .Error(failed)
+    }
+}
+
+/// Closes the port to the Power service, logging a warning when it cannot.
+function closePort(port: Handle) {
+    match handleClose(port) {
+        Ok -> {}
+        Error(failed) -> log warn("cannot close the port", failed)
+    }
+}
+
+/// The Power service's page, once the service is up, or the error that stopped it being read.
+function readPower() -> Result<PowerInfo, TesseraError> {
+    let port = match portCreate(.None) {
+        Ok(value) -> value
+        Error(failed) -> return .Error(failed)
+    }
+    var last = TesseraError {
+        code: .Internal,
+        subsystem: .Power,
+        flags: ErrorFlags.none,
+        detail: 0
+    }
+    for _ in 0..ServiceStart.tries {
+        match powerRead() {
+            Ok(info) -> {
+                closePort(port)
+                return .Ok(info)
+            }
+            Error(failed) -> last = failed
+        }
+        let now = match monotonicNow() {
+            Ok(value) -> value
+            Error(failed) -> {
+                closePort(port)
+                return .Error(failed)
+            }
+        }
+        match portWait(port, 1, now + ServiceStart.interval) {
+            // Nothing is ever sent to the port: this is the pause.
+            Ok -> {}
+            Error(waited) -> {
+                if waited.code != .Timeout { last = waited }
+            }
+        }
+    }
+    closePort(port)
+    return .Error(last)
+}
+
+/// The battery's state in pmset's words.
+function batteryStateName(state: borrow BatteryState) -> String {
+    match state {
+        Discharging -> return "discharging"
+        Charging -> return "charging"
+        Full -> return "charged"
+        NotCharging -> return "AC attached; not charging"
+        Unknown -> return "unknown"
+    }
+}
+
+/// Whether the battery is charging in `state`.
+function isCharging(state: borrow BatteryState) -> Bool {
+    match state {
+        Charging -> return true
+        Unknown, Discharging, Full, NotCharging -> return false
+    }
+}
+
+/// Where the machine's power comes from, in pmset's words.
+function sourceName(power: borrow ExternalPower) -> String {
+    match power {
+        None -> return "Battery Power"
+        Usb, Wireless, Dock, Mains -> return "AC Power"
+    }
+}
+
+/// A duration in nanoseconds as pmset's `h:mm`, or what pmset says when the estimate is not known.
+function remaining(nanoseconds: Number) -> String {
+    if nanoseconds == 0 { return "(no estimate)" }
+    let minutes = trunc(nanoseconds / PowerPage.nanosecondsPerMinute)
+    let rest = minutes % 60
+    return "\(trunc(minutes / 60)):\(rest < 10 ? "0" : "")\(rest) remaining"
+}
+
+/// Prints the power source and the battery's state in pmset's words.
+function printBattery(info: borrow PowerInfo) {
+    print("Now drawing from '\(sourceName(info.externalPower))'")
+    if info.batteryPercent == PowerInfo.noBattery { return }
+    let left = isCharging(info.batteryState) ? info.timeToFull : info.timeToEmpty
+    print(
+        " -InternalBattery-0\t\(info.batteryPercent)%; \(batteryStateName(info.batteryState)); \(remaining(left)) present: true"
+    )
+}
+
+/// Prints the thermal warning level and the processor's throttling in pmset's words.
+function printThermal(info: borrow PowerInfo) {
+    match info.thermalLevel {
+        Nominal -> print("Note: No thermal warning level has been recorded")
+        Fair, Serious, Critical -> print(
+            "Thermal warning level set to \(info.thermalLevel.rawValue())."
+        )
+    }
+    if info.cpuThrottlePercent == 0 {
+        print("Note: No CPU power status has been recorded")
+    } else {
+        print("CPU_Speed_Limit \t= \(100 - info.cpuThrottlePercent)")
+    }
+    if info.lowPowerMode { print("lowpowermode         1") }
+}
+
+/// The command `pmset` takes: `-g`, and what to get, the battery, the thermal state, or both.
+function pmsetCommand() -> CommandRouter {
+    let configuration = CommandConfiguration {
+        name: "pmset",
+        abstract: "What the Power service says of the machine's power"
+    }
+    return CommandRouter {
+        root: Command {
+            configuration: configuration,
+            arguments: [flag(name: "get", help: "Print the power settings and state").short(
+                "g"
+            ), argument(name: "what", help: "batt or therm; both when left out").optional().oneOf(
+                ["batt", "therm"]
+            ),]
+        }
+    }
+}
+
+/// What `-g` asked for, from the optional `batt` or `therm` argument; both when none was given.
+function topicOf(parsed: borrow ParsedArguments) -> PowerTopic {
+    match parsed.text("what") {
+        Some(what) -> return what == "batt" ? .Battery : .Thermal
+        None -> return .Both
+    }
+}
+
+/// Runs `pmset`: prints what the Power service says of the machine's power, and returns the exit status.
+function pmset() -> PmsetExit {
+    let router = pmsetCommand()
+    let tokens = commandLineArguments()
+    let parsed = match router.parse(tokens) {
+        Ok(value) -> value
+        Error(error) -> {
+            router.explain(error, tokens)
+            return error.isCleanExit() ? PmsetExit.Read : PmsetExit.Usage
+        }
+    }
+    // Only reading is here yet: without `-g` there is nothing to do.
+    if !parsed.flag("get") {
+        printError(router.help())
+        return PmsetExit.Usage
+    }
+    let info = match readPower() {
+        Ok(value) -> value
+        Error(failed) -> {
+            log warn("cannot read the power state", failed)
+            return PmsetExit.Unreadable
+        }
+    }
+    match topicOf(parsed) {
+        Battery -> printBattery(info)
+        Thermal -> printThermal(info)
+        Both -> {
+            printBattery(info)
+            printThermal(info)
+        }
+    }
+    return PmsetExit.Read
+}
+
+/// Runs `pmset` and returns its exit status to the shell.
+@Main
+function main() -> UN8 {
+    return code(pmset())
+}

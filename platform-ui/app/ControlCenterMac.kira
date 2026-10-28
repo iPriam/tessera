@@ -1,0 +1,302 @@
+import Foundation
+import KiraUI
+
+// A Mac's Control Center, as macOS Tahoe's: no panel, every module on its own
+// glass under the bar. Wi-Fi, Bluetooth and AirDrop stand as pills down the
+// leading half beside Now Playing's square, round toggles and the Focus pill
+// under them, then Display and Sound across the whole width, and Edit
+// Controls under all of it. Every length is a grid cell's or a gap's.
+
+// A Mac's modules' size, in points.
+function macControlCenterSize(metrics: borrow ControlCenterMetrics) -> Size {
+    let step = metrics.pt(metrics.cell + metrics.spacing)
+    return Size { width: metrics.span(4), height: step * 6 + macEditControlsSize(metrics).height }
+}
+
+function macSliderCorner(metrics: borrow ControlCenterMetrics) -> Number {
+    return metrics.pt(metrics.cell * 0.4)
+}
+
+function macEditControlsSize(metrics: borrow ControlCenterMetrics) -> Size {
+    return Size { width: metrics.pt(metrics.cell * 1.45), height: metrics.pt(metrics.cell * 0.38) }
+}
+
+construct MacControlModules(
+    controls: [ControlCenterControl],
+    metrics: ControlCenterMetrics,
+    wifi: Binding<Bool>,
+    bluetooth: Binding<Bool>,
+    airDrop: Binding<Bool>,
+    mirroring: Binding<Bool>,
+    darkMode: Binding<Bool>,
+    keyboardLight: Binding<Bool>,
+    brightness: Binding<Number>,
+    volume: Binding<Number>,
+    focusMode: Binding<String>,
+    playing: Binding<Bool>,
+    playedFrom: Binding<Number>,
+    pausedAt: Binding<Number>
+) extends Widget {
+    body {
+        let gap = metrics.pt(metrics.spacing)
+        let size = macControlCenterSize(metrics)
+        let circles = self.circles()
+        VStack(spacing = .Length(gap), alignment = .Leading) {
+            HStack(spacing = .Length(gap), alignment = .Top) {
+                VStack(spacing = .Length(gap), alignment = .Leading) {
+                    MacControlPill(
+                        title = "Wi-Fi",
+                        detail = wifi.get() ? "On" : "Off",
+                        systemImage = .Wifi,
+                        isOn = wifi,
+                        metrics = copy metrics
+                    )
+                    MacControlPill(
+                        isOn = bluetooth,
+                        title = "Bluetooth",
+                        detail = bluetooth.get() ? "On" : "Off",
+                        metrics = copy metrics
+                    ) {
+                        BluetoothGlyph(size = metrics.pt(metrics.cell * 0.3))
+                    }
+                }
+                NowPlayingCard(
+                    playing = playing,
+                    playedFrom = playedFrom,
+                    pausedAt = pausedAt,
+                    metrics = copy metrics,
+                    tile = true
+                )
+            }
+            HStack(spacing = .Length(gap), alignment = .Center) {
+                MacControlPill(
+                    title = "AirDrop",
+                    detail = airDrop.get() ? "Everyone" : "Off",
+                    systemImage = .DotRadiowavesLeftRight,
+                    isOn = airDrop,
+                    metrics = copy metrics
+                )
+                circles[0]
+                circles[1]
+            }
+            HStack(spacing = .Length(gap), alignment = .Center) {
+                circles[2]
+                circles[3]
+                FocusTile(focus = copy controls[0], mode = focusMode, metrics = copy metrics)
+            }
+            MacSliderModule(title = "Display", value = brightness, metrics = copy metrics) {
+                Icon(symbol = .SunMin)
+            } trailing: {
+                Icon(symbol = .SunMax)
+            }
+            MacSliderModule(title = "Sound", value = volume, metrics = copy metrics) {
+                Icon(symbol = .Speaker1Fill)
+            } trailing: {
+                Icon(symbol = .Speaker3Fill)
+            }
+            HStack(spacing = .Length(0), alignment = .Center) {
+                Spacer()
+                MacEditControls(metrics = copy metrics)
+                Spacer()
+            }
+        }
+        .width(resolvedLength(size.width))
+        .height(resolvedLength(size.height))
+    }
+
+    // The round toggles: the platform's after Focus, then Screen Mirroring,
+    // Dark Mode and the keyboard's light, the first four of them.
+    function circles() -> [Any Widget] {
+        let cell = metrics.pt(metrics.cell)
+        let style = ControlToggleStyle(diameter = cell, onTint = .White, onForeground = .Blue)
+        var circles: [Any Widget] = []
+        for (index, control) in controls.enumerated() {
+            if index > 0 {
+                let flip = copy control.toggle
+                let on = control.on
+                circles.append(
+                    ControlButton(
+                        title = copy control.title,
+                        systemImage = copy control.symbol,
+                        isOn = Binding<Bool> {
+                            get: { in
+                                return on
+                            },
+                            set: { value in flip() }
+                        },
+                        style = copy style
+                    )
+                )
+            }
+        }
+        circles.append(
+            ControlButton(
+                title = "Screen Mirroring",
+                systemImage = .RectangleOnRectangle,
+                isOn = mirroring,
+                style = copy style
+            )
+        )
+        circles.append(
+            ControlButton(
+                title = "Dark Mode",
+                systemImage = .CircleLefthalfFill,
+                isOn = darkMode,
+                style = copy style
+            )
+        )
+        circles.append(
+            ControlButton(
+                title = "Keyboard Brightness",
+                systemImage = .Keyboard,
+                isOn = keyboardLight,
+                style = copy style
+            )
+        )
+        return circles
+    }
+}
+
+// A pill two cells wide: the switch's circle, its title and what it says
+// under it. Choosing it flips the switch.
+construct MacControlPill(
+    isOn: Binding<Bool>,
+    title: String,
+    detail: String,
+    metrics: ControlCenterMetrics,
+) extends Widget {
+    let glyph: some Widget
+
+    init(
+        title: String,
+        detail: String,
+        systemImage: Symbol,
+        isOn: Binding<Bool>,
+        metrics: ControlCenterMetrics,
+    ) {
+        return MacControlPill(isOn = isOn, title = title, detail = detail, metrics = metrics) {
+            Icon(symbol = systemImage)
+        }
+    }
+
+    body {
+        let cell = metrics.pt(metrics.cell)
+        let diameter = cell * 0.62
+        let inset = (cell - diameter) / 2
+        HStack(spacing = .Length(metrics.pt(10)), alignment = .Center) {
+            Toggle(isOn = isOn) {
+                glyph
+                .accessibilityLabel(copy title)
+            }
+            .toggleStyle(
+                ControlToggleStyle(diameter = diameter, onTint = .White, onForeground = .Blue)
+            )
+
+            VStack(spacing = .Length(0), alignment = .Leading) {
+                Text(content = copy title)
+                .font(size: resolvedLength(metrics.pt(16)), weight: .SemiBold)
+                Text(content = copy detail)
+                .font(size: resolvedLength(metrics.pt(14)))
+                .foregroundColor(.Secondary)
+            }
+            .lineLimit(1)
+            .foregroundColor(.White)
+
+            Spacer(minLength = resolvedLength(0))
+        }
+        .edgePadding(EdgeSet.horizontal, resolvedLength(inset))
+        .width(resolvedLength(metrics.span(2)))
+        .height(resolvedLength(cell))
+        .controlGround(.Capsule)
+    }
+}
+
+// A slider across the whole width: its title over a thin track between two
+// glyphs. A drag along the track sets the level where it is.
+construct MacSliderModule(
+    title: String,
+    value: Binding<Number>,
+    metrics: ControlCenterMetrics,
+) extends Widget {
+    let leading: some Widget
+    let trailing: some Widget
+
+    body {
+        let level = min(max(value.get(), 0.0), 1.0)
+        let adjust = copy value
+        let glyph = metrics.pt(15)
+        VStack(spacing = .Length(metrics.pt(8)), alignment = .Leading) {
+            Text(content = copy title)
+            .font(size: resolvedLength(metrics.pt(16)), weight: .SemiBold)
+            HStack(spacing = .Length(metrics.pt(10)), alignment = .Center) {
+                leading
+                .font(size: resolvedLength(glyph), weight: .Medium)
+                MacSliderTrack(value = value, height = metrics.pt(5))
+                trailing
+                .font(size: resolvedLength(glyph), weight: .Medium)
+            }
+        }
+        .foregroundColor(.White)
+        .edgePadding(EdgeSet.horizontal, resolvedLength(metrics.pt(18)))
+        .width(resolvedLength(metrics.span(4)))
+        .height(resolvedLength(metrics.pt(metrics.cell)))
+        .controlGround(.RoundedRect(macSliderCorner(metrics)))
+        .accessibilityElement()
+        .accessibilityLabel(copy title)
+        .accessibilityValue("\(trunc(level * 100.0 + 0.5))%")
+        .accessibilityAdjustableAction(
+            { direction in
+                match direction {
+                    Increment -> adjust.set(min(adjust.get() + 0.1, 1.0))
+                    Decrement -> adjust.set(max(adjust.get() - 0.1, 0.0))
+                }
+            }
+        )
+    }
+}
+
+// The track, filled white as far as `value`; a drag on it sets the value
+// where the pointer is along it.
+construct MacSliderTrack(value: Binding<Number>, height: Number) extends Widget {
+    body {
+        let level = min(max(value.get(), 0.0), 1.0)
+        let set = copy value
+        GeometryReader { proxy in
+            let width = proxy.size.width
+            return ZStack(alignment = .Leading) {
+                Capsule()
+                .fill(RGBAColor { r: 1.0, g: 1.0, b: 1.0, a: 0.25 })
+                .height(resolvedLength(height))
+                Capsule()
+                .fill(RGBAColor { r: 1.0, g: 1.0, b: 1.0, a: 1.0 })
+                .width(resolvedLength(max(height, width * level)))
+                .height(resolvedLength(height))
+            }
+            .height(resolvedLength(height * 4))
+            .gesture(
+                DragGesture(minimumDistance: 0).onChanged(
+                    { drag in
+                        if width > 0 { set.set(min(max(drag.location.x / width, 0.0), 1.0)) }
+                    }
+                )
+            )
+        }
+        .height(resolvedLength(height * 4))
+    }
+}
+
+// Edit Controls, under the modules.
+construct MacEditControls(metrics: ControlCenterMetrics) extends Widget {
+    body {
+        let size = macEditControlsSize(metrics)
+        Button(action = { in }) {
+            Text(content = "Edit Controls")
+            .font(size: resolvedLength(metrics.pt(15)), weight: .Medium)
+            .foregroundColor(.White)
+            .width(resolvedLength(size.width))
+            .height(resolvedLength(size.height))
+        }
+        .buttonStyle(.Plain)
+        .controlGround(.Capsule)
+    }
+}

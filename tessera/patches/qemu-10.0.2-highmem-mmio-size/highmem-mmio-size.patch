@@ -1,0 +1,49 @@
+Let the virt board's high PCI MMIO window be smaller than 512 GiB.
+
+The window is 512 GiB by default and has to fit under the guest physical
+address size. Hypervisor.framework on an Apple M1 gives the guest 36 bits,
+64 GiB, so QEMU drops the window without a word and every 64-bit BAR lands in
+the 32-bit window at 0x10000000-0x3efeffff. A BAR is aligned to its size, so
+the largest virtio-gpu host-visible window that fits there is 256 MiB, and
+venus runs out of it with a few windows open.
+
+Two things keep it out. `highmem-mmio-size` exists to change the window's
+size but refuses anything below the default, and the high IO regions never
+start below 256 GiB, past the end of a 36-bit space whatever their size. With
+the check gone, and the 256 GiB floor kept only where the PA space reaches past
+it, `highmem-mmio-size=16G` puts the window at 16 GiB, under the 64 GiB limit,
+and the hostmem BAR can be as large as the guest wants. A host with more than
+38 bits keeps the layout it had.
+
+--- a/hw/arm/virt.c
++++ b/hw/arm/virt.c
+@@ -1891,7 +1891,13 @@
+         error_report("maxmem/slots too huge");
+         exit(EXIT_FAILURE);
+     }
+-    if (base < vms->memmap[VIRT_MEM].base + LEGACY_RAMLIMIT_BYTES) {
++    /*
++     * A PA space that ends at or below the legacy limit has no room above
++     * it: the high IO regions go straight after the memory instead, or not
++     * at all.
++     */
++    if (base < vms->memmap[VIRT_MEM].base + LEGACY_RAMLIMIT_BYTES &&
++        BIT_ULL(pa_bits) > vms->memmap[VIRT_MEM].base + LEGACY_RAMLIMIT_BYTES) {
+         base = vms->memmap[VIRT_MEM].base + LEGACY_RAMLIMIT_BYTES;
+     }
+ 
+@@ -2582,14 +2588,6 @@
+ 
+     if (!is_power_of_2(size)) {
+         error_setg(errp, "highmem-mmio-size is not a power of 2");
+-        return;
+-    }
+-
+-    if (size < DEFAULT_HIGH_PCIE_MMIO_SIZE) {
+-        char *sz = size_to_str(DEFAULT_HIGH_PCIE_MMIO_SIZE);
+-        error_setg(errp, "highmem-mmio-size cannot be set to a lower value "
+-                         "than the default (%s)", sz);
+-        g_free(sz);
+         return;
+     }
+ 

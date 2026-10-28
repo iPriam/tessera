@@ -1,0 +1,153 @@
+//! Files and folders as Inlay lists them, and the names it gives new ones.
+
+import Foundation
+
+/// What an entry in a folder is.
+public enum EntryKind {
+    File
+    Folder
+    /// A link or a device, which Inlay lists and does not open.
+    Other
+}
+
+/// One entry of a folder.
+public struct Entry {
+    let name: String
+    let path: String
+    let kind: EntryKind
+    /// Its length in bytes; a folder's is zero.
+    let size: UNumber
+    /// When its contents last changed, in nanoseconds since the Unix epoch.
+    let modified: Number
+}
+
+/// Why a folder could not be read.
+public enum FolderFailure {
+    /// Nothing is at the path.
+    Missing(String)
+    /// The path is not a folder.
+    NotFolder(String)
+}
+
+/// The entries of `folder`, by name without regard to case.
+///
+/// # Errors
+///
+/// [`FolderFailure`] when `folder` is not there or is no folder.
+public function entriesIn(folder: borrow String) -> Result<[Entry], FolderFailure> {
+    let listing = match listDirectory(folder) {
+        Ok(found) -> found
+        Error(failure) -> return match failure {
+            NotDirectory -> .Error(.NotFolder(copy folder))
+            Missing, NotFile, ReadFailed, InvalidText, WriteFailed, CreateFailed, RenameFailed,
+                RemoveFailed, InvalidRange -> .Error(.Missing(copy folder))
+        }
+    }
+    var entries: [Entry] = []
+    for name in listing.entries {
+        if name == "." || name == ".." { continue }
+        match entryAt(childPath(folder, name), name) {
+            Some(entry) -> entries.append(entry)
+            // It went between the listing and its status: it is no entry now.
+            None -> {}
+        }
+    }
+    return .Ok(sortedByName(entries))
+}
+
+/// The entry at `path`, named `name`, none when nothing is there.
+function entryAt(path: String, name: borrow String) -> Entry? {
+    let status = match linkStatus(path) {
+        Ok(found) -> found
+        Error(failure) -> {
+            // Nothing there is plain absence.
+            absorb failure
+            return .None
+        }
+    }
+    let kind: EntryKind = match status.kind {
+        File -> .File
+        Directory -> .Folder
+        Link, Other -> .Other
+    }
+    let size = match kind {
+        File -> status.size
+        Folder, Other -> 0
+    }
+    return .Some(
+        Entry { name: copy name, path: path, kind: kind, size: size, modified: status.modified }
+    )
+}
+
+/// `entries` by name, without regard to case.
+function sortedByName(entries: borrow [Entry]) -> [Entry] {
+    var sorted: [Entry] = []
+    for entry in entries {
+        var at = sorted.count
+        for (index, placed) in sorted.enumerated() {
+            if compare(entry.name.lowercased(), placed.name.lowercased()) == .Less {
+                at = index
+                break
+            }
+        }
+        sorted = inserted(sorted, copy entry, at)
+    }
+    return sorted
+}
+
+function inserted(entries: borrow [Entry], entry: Entry, at: Number) -> [Entry] {
+    var result: [Entry] = []
+    for (index, each) in entries.enumerated() {
+        if index == at { result.append(copy entry) }
+        result.append(copy each)
+    }
+    if at == entries.count { result.append(entry) }
+    return result
+}
+
+/// The path of `name` in `folder`.
+public function childPath(folder: borrow String, name: borrow String) -> String {
+    if folder.endsWith("/") { return folder + name }
+    return folder + "/" + name
+}
+
+/// The last part of `path`.
+public function lastPathPart(path: borrow String) -> String {
+    let parts = path.split("/")
+    for index in 0..parts.count {
+        let part = parts[parts.count - 1 - index]
+        if part.count > 0 { return copy part }
+    }
+    return copy path
+}
+
+/// The folder holding `path`.
+public function parentPath(path: borrow String) -> String {
+    let name = lastPathPart(path)
+    let end = path.count - name.count - (path.endsWith("/") ? 1 : 0)
+    if end <= 1 { return "/" }
+    return path.substring(0, end - 1)
+}
+
+/// A name for `name` in `folder` that nothing there has yet: `name` itself, or
+/// with ` 2`, ` 3` and on before its extension, as a Mac numbers copies.
+public function freeName(folder: borrow String, name: borrow String) -> String {
+    if !pathExists(childPath(folder, name)) { return copy name }
+    let (stem, extension) = nameParts(name)
+    var number: Number = 2
+    while true {
+        let candidate = "\(stem) \(number)\(extension)"
+        if !pathExists(childPath(folder, candidate)) { return candidate }
+        number += 1
+    }
+    return copy name
+}
+
+/// `name` split before its extension: `notes.txt` is `notes` and `.txt`. A
+/// name with no dot, or only a leading one, has no extension.
+public function nameParts(name: borrow String) -> (String, String) {
+    let pieces = name.split(".")
+    if pieces.count < 2 || pieces[0].count == 0 { return (copy name, "") }
+    let extension = "." + pieces[pieces.count - 1]
+    return (name.substring(0, name.count - extension.count), extension)
+}

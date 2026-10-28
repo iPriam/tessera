@@ -1,0 +1,21 @@
+TessIcon {
+    fill: Choice {
+        light: .LinearGradient(Gradient { from: Color { space: .Srgb, red: 0.26, green: 0.16, blue: 0.12, alpha: 1 }, to: Color { space: .Srgb, red: 0.09, green: 0.055, blue: 0.045, alpha: 1 }, start: Point { x: 0.5, y: 0 }, stop: Point { x: 0.5, y: 1 } }),
+        dark: .LinearGradient(Gradient { from: Color { space: .Srgb, red: 0.14, green: 0.095, blue: 0.08, alpha: 1 }, to: Color { space: .Srgb, red: 0.04, green: 0.03, blue: 0.025, alpha: 1 }, start: Point { x: 0.5, y: 0 }, stop: Point { x: 0.5, y: 1 } }),
+        mono: .Solid(Color { space: .Srgb, red: 0.098, green: 0.098, blue: 0.098, alpha: 1 })
+    },
+    groups: [
+        Group {
+            name: "Panes",
+            layers: [
+                Layer { name: "Upper pane", image: "pane-upper.svg", fill: Choice { light: .AutomaticGradient(Color { space: .Srgb, red: 0.86, green: 0.55, blue: 0.38, alpha: 1 }), dark: .AutomaticGradient(Color { space: .Srgb, red: 0.62, green: 0.38, blue: 0.26, alpha: 1 }), mono: .Solid(Color { space: .Srgb, red: 1, green: 1, blue: 1, alpha: 1 }) } },
+                Layer { name: "Lower pane", image: "pane-lower.svg", fill: Choice { light: .AutomaticGradient(Color { space: .Srgb, red: 0.86, green: 0.55, blue: 0.38, alpha: 1 }), dark: .AutomaticGradient(Color { space: .Srgb, red: 0.62, green: 0.38, blue: 0.26, alpha: 1 }), mono: .Solid(Color { space: .Srgb, red: 1, green: 1, blue: 1, alpha: 1 }) } },
+                Layer { name: "Left pane", image: "pane-left.svg", fill: Choice { light: .AutomaticGradient(Color { space: .Srgb, red: 0.86, green: 0.55, blue: 0.38, alpha: 1 }), dark: .AutomaticGradient(Color { space: .Srgb, red: 0.62, green: 0.38, blue: 0.26, alpha: 1 }), mono: .Solid(Color { space: .Srgb, red: 1, green: 1, blue: 1, alpha: 1 }) } }
+            ],
+            lighting: .Individual,
+            specular: .Inside,
+            translucency: Translucency { enabled: true, amount: 0.5 },
+            shadow: Shadow { kind: .Neutral, opacity: 0.5 }
+        }
+    ]
+}

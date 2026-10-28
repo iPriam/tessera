@@ -1,0 +1,321 @@
+import Foundation
+import LibTessera
+import TesseraDisplayClient
+
+// The platform's control of the compositor: its mode, its bar, focus, grabs and
+// the trusted path, each applied as the platform sends it.
+
+// Applies the platform's `SetMode`. The compositor holds one mode and a platform
+// changes it while running; surfaces admitted later take it, and those on
+// screen are laid out again at once.
+function setMode(server: borrow mut Server, requested: borrow DisplayMode) {
+    let mode = requested.mode
+    let split = requested.split
+    if mode == server.mode && split == server.split { return }
+    let before = stageSnapshot(server)
+    if server.mode == .Freeform && mode != .Freeform { keepWindowFrames(server) }
+    server.mode = mode
+    server.split = split
+    // Each window is back where it was left; one placed while windows are
+    // freeform keeps that frame (`placeFrame`).
+    relayoutAll(server)
+    animateStage(server, before)
+    log info(
+        "the mode changed",
+        mode: compositorModeName(mode),
+        split: split,
+        layout: describeLayout(server)
+    )
+    broadcastModeChanged(server)
+}
+
+// Where every application window is, as a log line says it: its surface, its
+// origin and its size, in the order the windows were admitted.
+function describeLayout(server: borrow Server) -> String {
+    var placed: [String] = []
+    for client in server.clients {
+        if client.alive && client.role == .Application {
+            let frame = client.frame
+            placed.append(
+                "\(client.surface.raw) at \(frame.x),\(frame.y) \(frame.width)x\(frame.height)"
+            )
+        }
+    }
+    return joined(placed, ", ")
+}
+
+// Keeps where every application window is while windows are freeform, for
+// freeform to give back.
+function keepWindowFrames(server: borrow mut Server) {
+    for index in 0..server.clients.count {
+        if server.clients[index].role == .Application {
+            server.clients[index].windowFrame = .Some(copy server.clients[index].frame)
+        }
+    }
+}
+
+// Lays every application surface out again. Each is sent its new frame and
+// acknowledges in its own time: a client answers a `Configure` wherever it
+// waits, and an acknowledgement is taken wherever a client's messages are
+// read, inside a frame exchange too, so nothing waits on a client here.
+function relayoutAll(server: borrow mut Server) {
+    var placed: [String] = []
+    for index in 0..server.clients.count {
+        let client = server.clients[index]
+        if client.alive && client.role != .Platform {
+            let frame = geometryFor(server, index)
+            let moved = frame.x != client.frame.x || frame.y != client.frame.y
+                || frame.width != client.frame.width || frame.height != client.frame.height
+            server.clients[index].frame = copy frame
+            if moved {
+                match sendConfigure(server, index, Relayout.serial) {
+                    Ok -> {
+                        tellPlaced(server, index)
+                        placed.append(
+                            "\(client.surface.raw) at \(frame.x),\(frame.y) \(frame.width)x\(frame.height)"
+                        )
+                    }
+                    Error(reason) -> configurationFailed(server, index, reason)
+                }
+            }
+        }
+    }
+    // One event for the whole layout, which a surface's own "configured" line,
+    // repeated for every surface, does not stay readable as.
+    if placed.count > 0 { log info("laid the surfaces out", layout: joined(placed, ", ")) }
+    tellInsets(server)
+}
+
+// Applies the platform's `SetBar`: the band along the top of the output,
+// `height` tall, is the bar's, and every application surface is laid out
+// again below it.
+function setBar(server: borrow mut Server, height: UNumber) {
+    let band = Number(height)
+    if band >= server.display.scanout.pointHeight() {
+        log warn("the platform asked for a bar as tall as the output", height: band)
+        return
+    }
+    // A platform that sets its bar, as one does when its session begins,
+    // is told how bright the picture under it is anew.
+    server.barBackdrop = .None
+    server.bottomBackdrop = .None
+    if band == server.bar { return }
+    server.bar = band
+    relayoutAll(server)
+    log info("the platform's bar takes the top of the output", height: band)
+}
+
+function grantFocus(server: borrow mut Server, surface: DisplaySurfaceId) {
+    for index in 0..server.clients.count {
+        if server.clients[index].alive && !server.clients[index].hidden && server.clients[index].surface == surface {
+            if server.focus != .Some(index) {
+                moveFocus(server, index)
+                // On a stage, focus is what is in front, and the strip changes
+                // with it before either application draws again.
+                if server.mode == .Stage { redraw(server, "the stage") }
+            }
+            log info("the platform granted focus", surface: surface.raw)
+            return
+        }
+    }
+    log info("a focus grant named a surface that is gone", surface: surface.raw)
+}
+
+// One message from the platform session: a control message, applied, or a
+// step of its bar's frame exchange. False once the platform has gone, sent
+// something that is neither, or broke the exchange.
+function servePlatform(server: borrow mut Server, index: Number) -> Result<Void, SessionFailure> {
+    let control = try nextMessage(server.clients[index].channel)
+    if isFrameStep(control) { return exchangeStep(server, index, move control) }
+    return applyControl(server, index, move control)
+}
+
+// Whether `message` is one the platform controls the compositor with. The
+// platform sends them when its own state changes, inside its bar's frame
+// exchange too, and each is applied as it arrives.
+function isPlatformControl(message: borrow DisplayMessage) -> Bool {
+    return match message {
+        SetMode, SetBar, GrantFocus, InstallGrab, PresentSystem, Verify, InjectInput, SetDock,
+            GrantMove, GrantResize, HoldInput, SetOverlay, SetIdle, PlaceSurface, SetHidden, SetStageBadge -> true
+        Hello, Welcome, Attach, Commit, Key, FrameDone, FrameRequest, FrameReady, FocusIn, FocusOut,
+            Configure, AckConfigure, ModeChanged, InputCapability, SurfaceCreated, SurfaceDestroyed,
+            GrabFired, SetChannel, ChannelChanged, VerifyResult, Notify, Notification,
+            ActivateRequested, PointerMotion, PointerButton, PointerAxis, PointerEnter,
+            PointerLeave, SurfacePressed, RequestWindow, WindowRequested, SurfacePlaced, SetMargin, Insets, Output,
+            IdleChanged, BarBackdrop, SetGlass, SetLaunchOrigin -> false
+    }
+}
+
+// Whether `message` grants focus, which only the platform may do.
+function asksForFocus(message: borrow DisplayMessage) -> Bool {
+    return match message {
+        GrantFocus -> true
+        SetMode, SetBar, InstallGrab, PresentSystem, Verify, InjectInput, SetDock, GrantMove, GrantResize, HoldInput, SetOverlay, SetIdle, IdleChanged, BarBackdrop, SetGlass, SetLaunchOrigin, SetStageBadge,
+            PlaceSurface, SetHidden, Hello, Welcome, Attach, Commit, Key, FrameDone, FrameRequest,
+            FrameReady, FocusIn, FocusOut, Configure, AckConfigure, ModeChanged, InputCapability,
+            SurfaceCreated, SurfaceDestroyed, GrabFired, SetChannel, ChannelChanged, VerifyResult,
+            Notify, Notification, ActivateRequested, PointerMotion, PointerButton, PointerAxis,
+            PointerEnter, PointerLeave, SurfacePressed, RequestWindow, WindowRequested,
+            SurfacePlaced, SetMargin, Insets, Output -> false
+    }
+}
+
+// Applies one message from the platform session at `index`. False when it is
+// not a control message.
+function applyControl(
+    server: borrow mut Server,
+    index: Number,
+    control: DisplayMessage
+) -> Result<Void, SessionFailure> {
+    let channel = server.clients[index].channel
+    match control {
+        SetMode(mode) -> setMode(server, mode)
+        SetBar(height) -> setBar(server, height)
+        // A configure the platform acknowledged in its own time.
+        AckConfigure(frame) -> log info(
+            "the platform acknowledged a configure",
+            surface: frame.surface.raw,
+            serial: frame.serial
+        )
+        GrantFocus(surface) -> grantFocus(server, surface)
+        InstallGrab(key) -> {
+            if !arrayContains(server.grabbed, key) { server.grabbed.append(key) }
+            log info("the platform grabbed a key", key: key)
+        }
+        // Only input made after the prompt is up answers it: a key pressed
+        // before it was presented cannot have been meant for it.
+        PresentSystem -> {
+            server.systemPresent = true
+            server.lastInputHardware = false
+            log info("the platform presented a system prompt")
+        }
+        Verify -> {
+            let verdict = server.systemPresent && server.lastInputHardware
+            tell(channel, .VerifyResult(verdict))
+            log info("verified the system prompt", ok: verdict)
+        }
+        InjectInput(press) -> return injectKeyForControl(server, press)
+        SetDock(height) -> setDock(server, height)
+        GrantMove(surface) -> grantMove(server, surface)
+        GrantResize(surface) -> grantResize(server, surface)
+        HoldInput(held) -> holdInput(server, held)
+        SetOverlay(overlay) -> setOverlay(server, overlay)
+        SetIdle(idle) -> return setIdleForControl(server, idle)
+        PlaceSurface(placement) -> placeSurface(server, placement)
+        SetHidden(visibility) -> return setHiddenForControl(server, visibility)
+        SetGlass(asked) -> setGlass(server, index, asked)
+        SetStageBadge(asked) -> setStageBadge(server, index, asked)
+        SetLaunchOrigin(asked) -> return setLaunchOriginForControl(server, index, asked)
+        // Nothing else is a control message.
+        // The platform draws its bar as any client draws, through
+        // `exchangeStep`, so a frame step is never one.
+        Hello, Welcome, Attach, Commit, Key, FrameDone, FrameRequest, FrameReady, FocusIn, FocusOut, Configure,
+            ModeChanged, InputCapability, SurfaceCreated, SurfaceDestroyed, GrabFired, SetChannel,
+            ChannelChanged, VerifyResult, Notify, Notification, ActivateRequested, PointerMotion, PointerButton, PointerAxis, PointerEnter, PointerLeave, SurfacePressed, RequestWindow, WindowRequested, SurfacePlaced, SetMargin, Insets, Output, IdleChanged, BarBackdrop -> {
+            return .Error(.NotControl)
+        }
+    }
+    return .Ok
+}
+
+function injectKeyForControl(
+    server: borrow mut Server,
+    press: borrow DisplayKeyPress
+) -> Result<Void, SessionFailure> {
+    match injectKey(server, press) {
+        Ok -> return .Ok
+        Error(reason) -> return .Error(.ClockFailure(reason))
+    }
+}
+
+function setIdleForControl(
+    server: borrow mut Server,
+    idle: borrow DisplayIdle
+) -> Result<Void, SessionFailure> {
+    match setIdle(server, idle) {
+        Ok -> return .Ok
+        Error(reason) -> return .Error(.ClockFailure(reason))
+    }
+}
+
+function setHiddenForControl(
+    server: borrow mut Server,
+    visibility: borrow DisplayVisibility
+) -> Result<Void, SessionFailure> {
+    match setHidden(server, visibility) {
+        Ok -> return .Ok
+        Error(reason) -> return .Error(.ClockFailure(reason))
+    }
+}
+
+function setLaunchOriginForControl(
+    server: borrow mut Server,
+    index: Number,
+    asked: borrow DisplayLaunchOrigin
+) -> Result<Void, SessionFailure> {
+    match setLaunchOrigin(server, index, asked) {
+        Ok -> return .Ok
+        Error(reason) -> return .Error(.ClockFailure(reason))
+    }
+}
+
+// A key the platform injected: delivered to the focused surface, tagged
+// synthetic, and no longer the hardware input the trusted path asks for. It
+// changes the modifiers as a key off the keyboard does, so an injected Shift
+// shifts the keys injected after it.
+function injectKey(
+    server: borrow mut Server,
+    press: borrow DisplayKeyPress
+) -> Result<Void, TesseraError> {
+    let key = PendingKey { code: press.key, state: press.state, time: try nowMillis() }
+    followModifiers(server, key.code, key.state)
+    match server.focus {
+        Some(focused) -> tell(
+            server.clients[focused].channel,
+            .Key(
+                keyEvent(
+                    server,
+                    server.clients[focused].surface,
+                    key,
+                    .Synthetic,
+                    DisplayInteractionToken {}
+                )
+            )
+        )
+        None -> {}
+    }
+    server.lastInputHardware = false
+    log info("injected a synthetic key", key: press.key)
+    return .Ok
+}
+
+// Applies the platform's `SetOverlay`: the pointer over the rectangle goes to
+// the platform, as over its bar and Dock, while the window in front keeps
+// focus and the keys.
+function setOverlay(server: borrow mut Server, overlay: borrow DisplayOverlay) {
+    if overlay.x == server.overlay.x && overlay.y == server.overlay.y
+        && overlay.width == server.overlay.width && overlay.height == server.overlay.height {
+        return
+    }
+    server.overlay = copy overlay
+    retarget(server)
+    log info(
+        "the platform's overlay takes part of the output",
+        x: overlay.x,
+        y: overlay.y,
+        width: overlay.width,
+        height: overlay.height
+    )
+}
+
+// Applies the platform's `HoldInput`: keys and the pointer go to the platform
+// while it holds them, and focus stays on the window in front, which stays
+// active.
+function holdInput(server: borrow mut Server, held: Bool) {
+    if held == server.inputHeld { return }
+    server.inputHeld = held
+    retarget(server)
+    if held { log info("the platform holds the input") } else {
+        log info("the platform let the input go")
+    }
+}

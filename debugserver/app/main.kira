@@ -1,0 +1,146 @@
+import Foundation
+import LibTessera
+
+// debugserver: lldb's remote stub on a development machine, after macOS's
+// debugserver. init starts it when the boot line has `tessera.dev`; it serves
+// the machine's debug port, which a `-dev` boot joins to 127.0.0.1:7331 on
+// the host:
+//
+//     (lldb) gdb-remote 127.0.0.1:7331
+//     (lldb) process attach --name notes
+//
+// It speaks the gdb-remote protocol lldb's own lldb-server speaks, in
+// all-stop mode, over libtessera's Debug calls. With `--lldb` it is the gate
+// in front of LLVM's own lldb-server instead (LldbGate.kira).
+
+@Derive(Copy)
+enum ServerExit: UN8 {
+    NoPort = 1
+    // `--lldb`: lldb-server could not be started in the gate's place.
+    NoServer = 2
+}
+
+function serverExit() -> ServerExit {
+    let port = match debugPortOpen() {
+        Ok(value) -> value
+        Error(failed) -> {
+            log warn("the debug port could not be opened", failed)
+            return .NoPort
+        }
+    }
+    let architecture = debugArchitecture()
+    var session = Session {
+        port: port,
+        architecture: architecture,
+        table: registerTable(architecture)
+    }
+    while true {
+        let read = match debugPortRead(port, ServerTiming.stoppedWait) {
+            Ok(value) -> value
+            Error(failed) -> {
+                log warn("the debug port could not be read", failed)
+                return .NoPort
+            }
+        }
+        let arrived = match read {
+            Some(bytes) -> bytes
+            None -> {
+                // No debugger is connected.
+                hostLeft(session)
+                match awaitHost() {
+                    Ok -> {}
+                    Error(reason) -> {
+                        log warn("the debugger wait failed", reason)
+                        return .NoPort
+                    }
+                }
+                continue
+            }
+        }
+        for inbound in takeInbound(session.reader, arrived) {
+            match inbound {
+                Packet(text) -> serve(session, text)
+                // The process is stopped already.
+                Interrupt -> {}
+                Corrupt -> {
+                    if session.acknowledging { send(session, [Framing.rejected]) }
+                }
+            }
+        }
+    }
+}
+
+function serve(session: borrow mut Session, text: borrow String) {
+    if session.acknowledging { send(session, [Framing.acknowledged]) }
+    let request = requestOf(text)
+    let next = acknowledgingAfter(session, request)
+    let reply = match answer(session, move request) {
+        Ok(value) -> value
+        Error(failed) -> {
+            log warn("a request failed", request: text, failed)
+            Reply.Text(Answer.failed)
+        }
+    }
+    send(session, framedReply(replyBytes(reply)))
+    session.acknowledging = next
+}
+
+// The debugger went: the process it was debugging is let go, and the next
+// to connect starts with packets acknowledged and nothing half read.
+function hostLeft(session: borrow mut Session) {
+    if session.process.isSome() {
+        match detachProcess(session) {
+            Ok -> log info("the debugger went; the process was let go")
+            Error(failed) -> log warn(
+                "the debugger went and the process could not be let go",
+                failed
+            )
+        }
+    }
+    session.acknowledging = true
+    session.reader = PacketReader {}
+}
+
+// Waits a while before looking for a debugger again.
+function awaitHost() -> Result<Void, TesseraError> {
+    let now = try timeRead(.Monotonic)
+    try threadSleep(now + ServerTiming.unconnectedWait)
+    return .Ok
+}
+
+// Whether packets are acknowledged once `request` is answered: not after
+// `QStartNoAckMode`, and again after a detach or kill, as the next debugger
+// to connect starts with them.
+function acknowledgingAfter(session: borrow Session, request: borrow Request) -> Bool {
+    return match request {
+        StartNoAck -> false
+        Detach, Kill -> true
+        Supported, HostInfo, ProcessInfo, RegisterInfo, FirstThreads, MoreThreads, CurrentThread,
+            StopReason, SelectThread, ThreadAlive, ReadRegisters, WriteRegisters, ReadRegister,
+            WriteRegister, ReadMemory, WriteMemory, InsertBreakpoint, RemoveBreakpoint, MemoryRegion,
+            AuxiliaryVector, Continue, Step, ContinueActions, Attach, AttachName, Accepted,
+            Unsupported -> session.acknowledging
+    }
+}
+
+function replyBytes(reply: borrow Reply) -> [UN8] {
+    return match reply {
+        Text(text) -> text.utf8()
+        Binary(bytes) -> copy bytes
+    }
+}
+
+function send(session: borrow Session, bytes: borrow [UN8]) {
+    match debugPortWrite(session.port, bytes) {
+        Ok -> {}
+        // The host side closed; the next debugger to connect asks again.
+        Error(failed) -> absorb failed
+    }
+}
+
+@Main
+function main() -> UN8 {
+    let arguments = try processArguments() otherwise[]
+    if arguments.contains(LldbGate.flag) { return code(gateExit()) }
+    return code(serverExit())
+}

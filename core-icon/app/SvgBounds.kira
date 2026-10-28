@@ -1,0 +1,120 @@
+import Foundation
+import RenderBox
+
+// The box a path's outline spans, curves included where they bulge, as
+// CGPathGetPathBoundingBox measures it and SVG's objectBoundingBox means.
+
+struct BoundsWalk {
+    var low: Point = Point { x: 0, y: 0 }
+    var high: Point = Point { x: 0, y: 0 }
+    var any: Bool = false
+    var at: Point = Point {}
+}
+
+extend BoundsWalk {
+    function include(borrow mut self, point: borrow Point) {
+        if !any {
+            low = copy point
+            high = copy point
+            any = true
+            return
+        }
+        low = Point { x: min(low.x, point.x), y: min(low.y, point.y) }
+        high = Point { x: max(high.x, point.x), y: max(high.y, point.y) }
+    }
+
+    // The curve from the pen through `controls`, at each turn of each axis.
+    function includeCurve(borrow mut self, controls: borrow [Point]) {
+        var points = [copy at]
+        points.appendAll(copy controls)
+        for t in curveTurns(points) {
+            include(curvePoint(points, t))
+        }
+        at = copy controls[controls.count - 1]
+        include(at)
+    }
+}
+
+// The point at `t` along the Bézier curve `points` defines.
+function curvePoint(points: borrow [Point], t: Number) -> Point {
+    var level = copy points
+    for _ in 1..points.count {
+        var next: [Point] = []
+        for index in 0..(level.count - 1) {
+            let a = level[index]
+            let b = level[index + 1]
+            next.append(Point { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t })
+        }
+        level = next
+    }
+    return copy level[0]
+}
+
+// Where, between its ends, the curve `points` turns back along x or y: the
+// roots of each axis's derivative.
+function curveTurns(points: borrow [Point]) -> [Number] {
+    var turns: [Number] = []
+    let xs = points.count == 3 ? [points[0].x, points[1].x, points[2].x] : [
+        points[0].x, points[1].x, points[2].x, points[3].x
+    ]
+    let ys = points.count == 3 ? [points[0].y, points[1].y, points[2].y] : [
+        points[0].y, points[1].y, points[2].y, points[3].y
+    ]
+    turns.appendAll(axisTurns(xs))
+    turns.appendAll(axisTurns(ys))
+    return turns
+}
+
+function axisTurns(v: borrow [Number]) -> [Number] {
+    if v.count == 3 {
+        let denominator = v[0] - 2 * v[1] + v[2]
+        if denominator == 0 { return [] }
+        return inside([(v[0] - v[1]) / denominator])
+    }
+    // The derivative a t² + b t + c of a cubic, over three.
+    let a = -v[0] + 3 * v[1] - 3 * v[2] + v[3]
+    let b = 2 * (v[0] - 2 * v[1] + v[2])
+    let c = v[1] - v[0]
+    if a == 0 {
+        return b == 0 ? [] : inside([-c / b])
+    }
+    let discriminant = b * b - 4 * a * c
+    if discriminant < 0 { return [] }
+    let root = sqrt(discriminant)
+    return inside([(-b + root) / (2 * a), (-b - root) / (2 * a)])
+}
+
+function inside(values: borrow [Number]) -> [Number] {
+    var kept: [Number] = []
+    for value in values {
+        if value > 0 && value < 1 { kept.append(value) }
+    }
+    return kept
+}
+
+function pathBounds(path: borrow Path) -> Rect {
+    var walk = BoundsWalk {}
+    for element in path.elements {
+        match element {
+            MoveTo(point) -> {
+                walk.include(point)
+                walk.at = copy point
+            }
+            LineTo(point) -> {
+                walk.include(point)
+                walk.at = copy point
+            }
+            QuadraticTo(segment) -> walk.includeCurve([copy segment.control, copy segment.end])
+            CubicTo(segment) -> walk.includeCurve(
+                [copy segment.firstControl, copy segment.secondControl, copy segment.end]
+            )
+            CloseSubpath -> {}
+        }
+    }
+    return Rect {
+        x: walk.low.x,
+        y: walk.low.y,
+        width: walk.high.x - walk.low.x,
+        height: walk.high.y - walk.low.y
+    }
+}

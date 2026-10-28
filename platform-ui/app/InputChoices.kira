@@ -1,0 +1,60 @@
+import Foundation
+import LibTessera
+
+// The languages and keyboard layouts a person chooses from, in Welcome's
+// first-run setup and in Settings alike (roadmap/33-language-and-input.md).
+// The language is kept for applications to follow (`language.preferred`);
+// the layout is what MosaicDisplay types every key through
+// (`keyboard.layout`).
+
+/// A language: its BCP 47 code, its name in itself, and the keyboard layout
+/// a person speaking it most likely has.
+public struct LanguageChoice {
+    let code: String
+    let name: String
+    let layout: String
+}
+
+/// A keyboard layout: its XKB name and what it is called.
+public struct LayoutChoice {
+    let code: String
+    let name: String
+}
+
+/// The languages offered, English first.
+public function languageChoices() -> [LanguageChoice] {
+    return [
+        LanguageChoice { code: "en", name: "English", layout: "us" },
+        LanguageChoice { code: "en-GB", name: "English (UK)", layout: "gb" },
+        LanguageChoice { code: "de", name: "Deutsch", layout: "de" },
+        LanguageChoice { code: "fr", name: "Français", layout: "fr" },
+        LanguageChoice { code: "es", name: "Español", layout: "us" },
+        LanguageChoice { code: "it", name: "Italiano", layout: "us" },
+    ]
+}
+
+/// The keyboard layouts MosaicDisplay types through.
+public function layoutChoices() -> [LayoutChoice] {
+    return [
+        LayoutChoice { code: "us", name: "U.S." },
+        LayoutChoice { code: "gb", name: "British" },
+        LayoutChoice { code: "de", name: "German" },
+        LayoutChoice { code: "fr", name: "French" },
+    ]
+}
+
+/// What a language's code is called, the code itself for one not offered.
+public function languageName(code: borrow String) -> String {
+    for choice in languageChoices() {
+        if choice.code == code { return copy choice.name }
+    }
+    return copy code
+}
+
+/// What a layout's XKB name is called, the name itself for one not offered.
+public function layoutName(code: borrow String) -> String {
+    for choice in layoutChoices() {
+        if choice.code == code { return copy choice.name }
+    }
+    return copy code
+}

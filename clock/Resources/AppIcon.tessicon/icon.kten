@@ -1,0 +1,46 @@
+TessIcon {
+    fill: .Automatic,
+    groups: [
+        Group {
+            name: "Seconds",
+            layers: [
+                Layer { name: "6.secondhand", image: "6.secondhand.svg", fill: Choice { light: .Automatic, dark: .Automatic, mono: .Solid(Color { space: .ExtendedGray, red: 0.603, green: 0.603, blue: 0.603, alpha: 1 }) } }
+            ],
+            lighting: .Individual,
+            specular: .Off,
+            translucency: Translucency { enabled: false, amount: 0 },
+            shadow: Shadow { kind: .None, opacity: 0.5 }
+        },
+        Group {
+            name: "Minutes",
+            layers: [
+                Layer { name: "5.minutehand", image: "5.minutehand.svg", fill: Choice { light: .Automatic, dark: .Solid(Color { space: .Srgb, red: 1, green: 1, blue: 1, alpha: 1 }), mono: .Solid(Color { space: .ExtendedGray, red: 1, green: 1, blue: 1, alpha: 1 }) }, opacity: Choice { light: 0.95, dark: 0.95, mono: 1 } }
+            ],
+            lighting: .Individual,
+            specular: .Off,
+            translucency: Translucency { enabled: false, amount: 0 },
+            shadow: Shadow { kind: .Neutral, opacity: 0.5 }
+        },
+        Group {
+            name: "Hour",
+            layers: [
+                Layer { name: "4.hourhand", image: "4.hourhand.svg", fill: Choice { light: .Automatic, dark: .Solid(Color { space: .Srgb, red: 1, green: 1, blue: 1, alpha: 1 }), mono: .Solid(Color { space: .ExtendedGray, red: 1, green: 1, blue: 1, alpha: 1 }) }, opacity: Choice { light: 0.95, dark: 0.95, mono: 1 } }
+            ],
+            lighting: .Individual,
+            specular: .Off,
+            translucency: Translucency { enabled: false, amount: 0 },
+            shadow: Shadow { kind: .Neutral, opacity: 0.5 }
+        },
+        Group {
+            name: "Dial",
+            layers: [
+                Layer { name: "2.dial", image: "2.dial.svg", glass: false, fill: Choice { light: .Automatic, dark: .Automatic, mono: .Solid(Color { space: .ExtendedGray, red: 0.5, green: 0.5, blue: 0.5, alpha: 1 }) }, opacity: Choice { light: 1, dark: 0.5 } },
+                Layer { name: "3.dialnumbers", image: "3.dialnumbers.svg", glass: false, fill: Choice { light: .Automatic, dark: .Solid(Color { space: .Srgb, red: 1, green: 1, blue: 1, alpha: 1 }), mono: .Solid(Color { space: .Srgb, red: 1, green: 1, blue: 1, alpha: 1 }) }, opacity: Choice { light: 0.9, dark: 0.9, mono: 1 } }
+            ],
+            lighting: .Individual,
+            specular: .Off,
+            translucency: Translucency { enabled: true, amount: 0.3 },
+            shadow: Shadow { kind: .None, opacity: 0.5 }
+        }
+    ]
+}

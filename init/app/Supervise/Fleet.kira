@@ -1,0 +1,228 @@
+import Foundation
+import LibTessera
+
+// What PID 1 is running: one slot per service, in start order.
+//
+// A slot whose service is not running holds `Handle.invalid`. `starts`
+// counts each slot's launches; it is part of every key the slot's waits are
+// made under, so an answer about a process that has since been replaced is
+// recognised as stale.
+struct Fleet {
+    var services: [Service]
+    var processes: [Handle]
+    var channels: [Handle]
+    // PID 1's end of each slot's standard output and error.
+    var outputs: [Handle]
+    // The job each slot's service and what it started run in.
+    var jobs: [Handle] = []
+    // The line each slot's output has begun and not yet ended.
+    var partial: [String]
+    var starts: [Number]
+    var deaths: [Deaths]
+    // What the owner was asked and said about the images it opens.
+    var consent: Consent = Consent {}
+    // Where each line a service writes is kept.
+    var systemLog: SystemLog = SystemLog {}
+    // Whether MosaicDisplay has reported the mode it chose since it last
+    // started: it is up, and has said so.
+    var displayUp: Bool = false
+}
+
+// When a slot's service last died, on the monotonic clock, oldest first: at
+// most `RestartWindow.deaths` of them, which is all the restart policy asks.
+struct Deaths {
+    var times: [Number] = []
+}
+
+extend Deaths {
+    // Notes a death at `at`, forgetting the oldest beyond the window's count.
+    function note(borrow mut self, at: Number) {
+        times.append(at)
+        if times.count > RestartWindow.deaths {
+            var kept: [Number] = []
+            for index in 1..times.count { kept.append(times[index]) }
+            times = kept
+        }
+    }
+
+    // Whether the window's count of deaths all fell within its span: a
+    // service that dies as soon as it starts, and will go on doing so.
+    function failing(borrow self) -> Bool {
+        if times.count < RestartWindow.deaths { return false }
+        return times[times.count - 1] - times[0] <= seconds(RestartWindow.seconds)
+    }
+}
+
+// What a wait on the supervisor's port was made for. The kind is the low
+// byte of the wait's key.
+enum KeyKind {
+    // The machine's own events. No slot key is this small: a slot's start
+    // count is at least one, and it is the key's top half.
+    System
+    // A service's process ended.
+    Ended
+    // A service's channel has a request.
+    Request
+    // A service wrote to its standard output or error, or closed them.
+    Output
+    // A key PID 1 never made.
+    Unknown
+}
+
+function keyKindValue(kind: borrow KeyKind) -> Number {
+    return match kind {
+        System -> 1
+        Ended -> 1
+        Request -> 2
+        Output -> 3
+        Unknown -> 0xFF
+    }
+}
+
+// The key the machine's own events arrive under.
+let systemKey: Number = 1
+
+function slotKey(fleet: borrow Fleet, slot: Number, kind: KeyKind) -> Number {
+    return (Number(fleet.starts[slot]) << 32) | (Number(slot) << 8) | keyKindValue(kind)
+}
+
+function keySlot(key: Number) -> Number { return Number((key >> 8) & 0xFFFFFF) }
+
+function keyStarts(key: Number) -> Number { return Number(key >> 32) }
+
+function keyKind(key: Number) -> KeyKind {
+    if key == systemKey { return .System }
+    return match key & 0xFF {
+        1 -> .Ended
+        2 -> .Request
+        3 -> .Output
+        else -> .Unknown
+    }
+}
+
+// Ends whatever the slot's service started that outlived it, and lets the
+// job they ran in go. The service itself has ended or been ended already.
+function endJob(fleet: borrow mut Fleet, slot: Number) {
+    let job = fleet.jobs[slot]
+    if job == Handle.invalid { return }
+    match jobKill(job) {
+        Ok -> {}
+        Error(failed) -> log warn(
+            "could not end what a service started",
+            service: fleet.services[slot].name,
+            error: errorName(failed)
+        )
+    }
+    release(job)
+    fleet.jobs[slot] = Handle.invalid
+}
+
+function running(fleet: borrow Fleet, slot: Number) -> Bool {
+    return fleet.processes[slot] != Handle.invalid
+}
+
+// Starts the service in `slot` and greets it. Its earlier channel, if any,
+// went with the process that held the other end: a restarted service is a
+// new connection.
+function startSlot(
+    calls: Handle,
+    fleet: borrow mut Fleet,
+    slot: Number
+) -> Result<Void, TesseraError> {
+    if fleet.channels[slot] != Handle.invalid {
+        release(fleet.channels[slot])
+        fleet.channels[slot] = Handle.invalid
+    }
+    fleet.starts[slot] += 1
+    endJob(fleet, slot)
+    let started = try start(calls, fleet.services[slot])
+    fleet.processes[slot] = started.process
+    fleet.channels[slot] = started.channel
+    fleet.jobs[slot] = started.job
+    // What the last process wrote and did not end with a line break has
+    // been written by now; an output still open went with it.
+    if fleet.outputs[slot] != Handle.invalid { release(fleet.outputs[slot]) }
+    fleet.outputs[slot] = started.output
+    fleet.partial[slot] = ""
+    greet(calls, started.channel, fleet.services[slot].name)
+    return .Ok
+}
+
+// Starts every service in the table, in order, keeping what each writes in
+// `systemLog`.
+function startFleet(calls: Handle, services: borrow [Service], systemLog: SystemLog) -> Fleet {
+    var fleet = Fleet {
+        services: [],
+        processes: [],
+        channels: [],
+        outputs: [],
+        partial: [],
+        starts: [],
+        deaths: [],
+        systemLog: move systemLog
+    }
+    for index in 0..services.count {
+        fleet.services.append(copy services[index])
+        fleet.processes.append(Handle.invalid)
+        fleet.channels.append(Handle.invalid)
+        fleet.outputs.append(Handle.invalid)
+        fleet.jobs.append(Handle.invalid)
+        fleet.partial.append("")
+        fleet.starts.append(0)
+        fleet.deaths.append(Deaths {})
+        match startSlot(calls, fleet, index) {
+            Ok -> {}
+            Error(failed) -> log warn(
+                "could not start a service",
+                service: fleet.services[index].name,
+                path: fleet.services[index].path,
+                error: errorName(failed)
+            )
+        }
+    }
+    return fleet
+}
+
+// Asks for a completion on `port` when the service in `slot` ends and,
+// for the desktop, the platform and the dev root, when it sends a request.
+function watchSlot(fleet: borrow Fleet, slot: Number, port: Handle) {
+    if !running(fleet, slot) { return }
+    match objectWaitAsync(
+        fleet.processes[slot],
+        Signals.terminated,
+        .Once,
+        port,
+        slotKey(fleet, slot, .Ended)
+    ) {
+        Ok -> {}
+        Error(failed) -> log warn(
+            "cannot watch a service",
+            service: fleet.services[slot].name,
+            error: errorName(failed)
+        )
+    }
+    watchOutput(fleet, slot, port)
+    // The desktop and the platform ask for applications, the dev root for
+    // restarts, and MosaicDisplay reports the mode it chose.
+    let name = fleet.services[slot].name
+    if fleet.services[slot].asksForApplications() || name == "devroot" || name == "mosaicdisplay" {
+        watchRequests(fleet, slot, port)
+    }
+}
+
+function watchRequests(fleet: borrow Fleet, slot: Number, port: Handle) {
+    match objectWaitAsync(
+        fleet.channels[slot],
+        Signals.readable | Signals.peerClosed,
+        .Once,
+        port,
+        slotKey(fleet, slot, .Request)
+    ) {
+        Ok -> {}
+        Error(failed) -> log warn(
+            "cannot read a service's requests",
+            service: fleet.services[slot].name,
+            error: errorName(failed)
+        )
+    }
+}

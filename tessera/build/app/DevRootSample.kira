@@ -1,0 +1,614 @@
+import Foundation
+import Build
+
+// `kira build devroot sample [seconds] [hz]`: the devroot service samples
+// every CPU of the dev machine and writes what it found to the stick
+// (devroot/app/Root/Sample.kira). Here the samples are read back off the
+// stick's image and named: kernel frames from the machine's own kallsyms,
+// user frames from each component's symbols. The report says which
+// processes the CPUs were in and which functions they were in, by
+// themselves and with what they called; beside it, the stacks folded one a
+// line for a flame graph.
+
+namespace SampleReport {
+    let file: String = "samples"
+    let mapsFile: String = "maps"
+    let kernelFile: String = "kernel"
+    let stackFile: String = "stacks"
+    let blockFile: String = "blocks"
+    let resumeFile: String = "resumes"
+    // The top of the address space, where perf's context markers are.
+    let markers: Number = 18446744073709547520
+    let kernelMarker: Number = 18446744073709551488
+    let functions: Number = 60
+    let perProcess: Number = 15
+    let processes: Number = 8
+}
+
+struct SampleSymbol {
+    let start: Number
+    let end: Number
+    let name: String
+}
+
+// One ELF's functions, by address, and how its addresses relate to where
+// it was mapped.
+struct SampledImage {
+    let symbols: [SampleSymbol]
+    let shared: Bool
+    let lowest: Number
+}
+
+struct SampleMapping {
+    let start: Number
+    let end: Number
+    let path: String
+    let offset: Number
+    let code: Bool
+}
+
+struct SampledProcessFacts {
+    let name: String
+    var mappings: [SampleMapping] = []
+    var named: Map<Number, String> = Map {}
+}
+
+struct SampleTally {
+    var total: Number = 0
+    var processes: Map<String, Number> = Map {}
+    var leaves: Map<String, Number> = Map {}
+    var within: Map<String, Number> = Map {}
+    var folded: Map<String, Number> = Map {}
+}
+
+function reportSamples(
+    host: borrow Host,
+    image: borrow String,
+    symbols: borrow SampleRoots,
+    report: borrow String
+) -> Result<Void, String> {
+    let raw = report + ".raw"
+    try dumpSampleFile(host, image, SampleReport.file, raw)
+    let text = match readFile(raw) {
+        Ok(contents) -> contents.text
+        Error(failure) -> return .Error("the machine wrote no samples: \(traceText(failure))")
+    }
+    let stackFile = report + ".stacks"
+    try dumpSampleFile(host, image, SampleReport.stackFile, stackFile)
+    var processes: Map<Number, SampledProcessFacts> = Map {}
+    var kernel: [SampleSymbol] = []
+    var lost: Number = 0
+    var stacks: [[Number]] = []
+    var counts: [SampledCount] = []
+    for line in text.split("\n") {
+        let words = line.split(" ")
+        if words.count < 2 { continue }
+        match words[0] {
+            "lost" -> lost = wordNumber(words[1])
+            "process" -> {
+                let pid = wordNumber(words[1])
+                let name = words.count > 2 ? line.substring(
+                    words[0].count + words[1].count + 2,
+                    line.count
+                ) : ""
+                processes.set(pid, SampledProcessFacts { name: pid == 0 ? "idle" : name })
+            }
+            "stack" -> {
+                var stack: [Number] = []
+                for index in 1..words.count { stack.append(wordNumber(words[index])) }
+                stacks.append(move stack)
+            }
+            "counter" -> match sampledCount(line, words) {
+                Some(count) -> counts.append(count)
+                None -> {}
+            }
+            else -> {}
+        }
+    }
+    if fileExists(stackFile) {
+        match readFileBytes(stackFile) {
+            Ok(bytes) -> appendStackWords(stacks, bytes)
+            Error(failure) -> return .Error("\(stackFile) cannot be read: \(traceText(failure))")
+        }
+    }
+    let mapsText = try dumpedText(host, image, SampleReport.mapsFile, report + ".maps")
+    var mapped = 0
+    for line in mapsText.split("\n") {
+        if line.startsWith("pid ") {
+            mapped = wordNumber(line.substring(4, line.count))
+            continue
+        }
+        match sampleMapping("map \(mapped) \(line)".split(" ")) {
+            Some(mapping) -> match processes.value(mapped) {
+                Some(facts) -> {
+                    var kept = facts
+                    kept.mappings.append(mapping)
+                    processes.set(mapped, move kept)
+                }
+                None -> {}
+            }
+            None -> {}
+        }
+    }
+    let kernelText = try dumpedText(host, image, SampleReport.kernelFile, report + ".kernel")
+    for line in kernelText.split("\n") {
+        let words = line.split(" ")
+        if words.count >= 2 {
+            kernel.append(SampleSymbol { start: hexNumber(words[0]), end: 0, name: copy words[1] })
+        }
+    }
+    let kernelSymbols = boundedSymbols(
+        kernel.sorted({ left, right in return left.start < right.start })
+    )
+    var images: Map<String, SampledImage?> = Map {}
+    var tally = SampleTally {}
+    for stack in stacks {
+        if stack.count < 3 { continue }
+        let pid = stack[0]
+        var facts = match processes.value(pid) {
+            Some(known) -> known
+            None -> SampledProcessFacts { name: "pid \(pid)" }
+        }
+        let names = stackNames(stack, 2, facts, images, symbols, kernelSymbols)
+        tallyStack(tally, facts.name, names, 1)
+        processes.set(pid, move facts)
+    }
+    var written = sampleReportText(tally, lost)
+    written.append(countersReportText(counts, processes))
+    let resumeFile = report + ".resumes"
+    let blockFile = report + ".blocks"
+    try dumpSampleFile(host, image, SampleReport.resumeFile, resumeFile)
+    try dumpSampleFile(host, image, SampleReport.blockFile, blockFile)
+    if fileExists(blockFile) && fileExists(resumeFile) {
+        let blocked = match readFileBytes(blockFile) {
+            Ok(bytes) -> bytes
+            Error(failure) -> return .Error("\(blockFile) cannot be read: \(traceText(failure))")
+        }
+        let resumed = match readFileBytes(resumeFile) {
+            Ok(bytes) -> bytes
+            Error(failure) -> return .Error("\(resumeFile) cannot be read: \(traceText(failure))")
+        }
+        let naming = SampleNaming { symbols: copy symbols, kernel: kernelSymbols }
+        let offCpu = offCpuTally(blocked, resumed, processes, images, naming)
+        written.append(offCpuReportText(offCpu))
+        var foldedOff = ""
+        for entry in offCpu.tally.folded.entries() {
+            foldedOff.append("\(entry.key) \(entry.value)\n")
+        }
+        match writeFile(report + ".offcpu.folded", foldedOff) {
+            Ok -> {}
+            Error(failure) -> return .Error(
+                "\(report).offcpu.folded cannot be written: \(traceText(failure))"
+            )
+        }
+    }
+    match writeFile(report, written) {
+        Ok -> {}
+        Error(failure) -> return .Error("\(report) cannot be written: \(traceText(failure))")
+    }
+    var folded = ""
+    for entry in tally.folded.entries() { folded.append("\(entry.key) \(entry.value)\n") }
+    match writeFile(report + ".folded", folded) {
+        Ok -> {}
+        Error(failure) -> return .Error("\(report).folded cannot be written: \(traceText(failure))")
+    }
+    print(written)
+    log info("wrote the sample report", report: report, samples: tally.total, lost)
+    return .Ok
+}
+
+// Copies `name` off the stick's image to `out`; a file the machine did not
+// write leaves nothing at `out`.
+// A text file of the request's volume, copied to `out` and read.
+function dumpedText(
+    host: borrow Host,
+    image: borrow String,
+    name: borrow String,
+    out: borrow String
+) -> Result<String, String> {
+    try dumpSampleFile(host, image, name, out)
+    return match readFile(out) {
+        Ok(contents) -> .Ok(contents.text)
+        Error(failure) -> .Error("\(out) cannot be read: \(traceText(failure))")
+    }
+}
+
+function dumpSampleFile(
+    host: borrow Host,
+    image: borrow String,
+    name: borrow String,
+    out: borrow String
+) -> Result<Void, String> {
+    if fileExists(out) {
+        match removePath(out) {
+            Ok -> {}
+            Error(failure) -> absorb failure
+        }
+    }
+    let command = ProcessCommand {
+        program: host.find("debugfs"),
+        arguments: ["-R", "dump /\(name) \(out)", copy image],
+        input: .Null
+    }
+    let child = match command.start() {
+        Ok(started) -> started
+        Error(failure) -> return .Error("debugfs did not start: \(traceText(failure))")
+    }
+    let ended = child.wait()
+    match child.release() {
+        Ok -> {}
+        Error(failure) -> absorb failure
+    }
+    match ended {
+        Ok(exit) -> if exitStatus(exit) != 0 { return .Error("debugfs could not read \(image)") }
+        Error(failure) -> return .Error("debugfs could not be waited for: \(traceText(failure))")
+    }
+    return .Ok
+}
+
+// The stacks file: per stack, little-endian words of its pid, its tid, its
+// time, its frame count and then its frames.
+function appendStackWords(stacks: borrow mut [[Number]], bytes: borrow [UN8]) {
+    var at = 0
+    while at + 32 <= bytes.count {
+        let count = elfField(bytes, at + 24, 8)
+        if at + 32 + count * 8 > bytes.count { return }
+        var stack: [Number] = [elfField(bytes, at, 8), elfField(bytes, at + 8, 8)]
+        for index in 0..count { stack.append(elfField(bytes, at + 32 + index * 8, 8)) }
+        stacks.append(move stack)
+        at += 32 + count * 8
+    }
+}
+
+// A line of /proc maps that maps a file, as `map <pid> <start-end> <perms>
+// <offset> <device> <inode> <path>`.
+function sampleMapping(words: borrow [String]) -> SampleMapping? {
+    if words.count < 8 { return .None }
+    let range = words[2].split("-")
+    if range.count != 2 { return .None }
+    var path = ""
+    for index in 7..words.count {
+        if words[index].isEmpty() { continue }
+        path = path.isEmpty() ? copy words[index] : path + " " + words[index]
+    }
+    if path.endsWith(" (deleted)") { path = path.substring(0, path.count - 10) }
+    let start = hexNumber(range[0])
+    return .Some(
+        SampleMapping {
+            start: start,
+            end: hexNumber(range[1]),
+            path: path,
+            offset: hexNumber(words[4]),
+            code: words[3].contains("x")
+        }
+    )
+}
+
+// Where `code`'s file was loaded: the start of its mapping at offset 0,
+// which holds its lowest segment. A linker may place later segments at
+// addresses that differ from their file offsets, so the code mapping's own
+// offset says nothing about the address it was linked at.
+function loadBase(mappings: borrow [SampleMapping], code: borrow SampleMapping) -> Number {
+    for mapping in mappings {
+        if mapping.offset == 0 && mapping.path == code.path { return mapping.start }
+    }
+    return code.start - code.offset
+}
+
+function userFrame(
+    facts: borrow mut SampledProcessFacts,
+    images: borrow mut Map<String, SampledImage?>,
+    symbols: borrow SampleRoots,
+    address: Number
+) -> String {
+    match facts.named.value(address) {
+        Some(name) -> return name
+        None -> {}
+    }
+    var name = "?" + hexText(address)
+    for mapping in facts.mappings {
+        if !mapping.code || address < mapping.start || address >= mapping.end { continue }
+        let base = loadBase(facts.mappings, mapping)
+        let file = lastNameOf(mapping.path)
+        let loaded = match images.value(mapping.path) {
+            Some(known) -> known
+            None -> {
+                let read = readSampledImage(symbols, mapping.path)
+                images.set(copy mapping.path, copy read)
+                read
+            }
+        }
+        name = match loaded {
+            Some(found) -> {
+                let at = found.shared ? address - base + found.lowest : address
+                symbolAt(found.symbols, at, file)
+            }
+            None -> file + "+" + hexText(address - base)
+        }
+        break
+    }
+    facts.named.set(address, copy name)
+    return name
+}
+
+// The names of `stack`'s frames from `first` on, innermost first; kernel
+// frames marked `[k]`.
+function stackNames(
+    stack: borrow [Number],
+    first: Number,
+    facts: borrow mut SampledProcessFacts,
+    images: borrow mut Map<String, SampledImage?>,
+    symbols: borrow SampleRoots,
+    kernelSymbols: borrow [SampleSymbol]
+) -> [String] {
+    var names: [String] = []
+    var inKernel = false
+    for index in first..stack.count {
+        let address = stack[index]
+        if address >= SampleReport.markers {
+            inKernel = address == SampleReport.kernelMarker
+            continue
+        }
+        let name = inKernel ? "[k] " + symbolAt(kernelSymbols, address, "kernel") : userFrame(
+            facts,
+            images,
+            symbols,
+            address
+        )
+        names.append(name)
+    }
+    return names
+}
+
+// Counts `names`, innermost first, `weight` times: once for a CPU sample,
+// its microseconds for a wait.
+function tallyStack(
+    tally: borrow mut SampleTally,
+    process: borrow String,
+    names: borrow [String],
+    weight: Number
+) {
+    tally.total += weight
+    tally.processes.set(copy process, countOf(tally.processes, process) + weight)
+    if names.count == 0 { return }
+    let leaf = process + ": " + names[0]
+    tally.leaves.set(copy leaf, countOf(tally.leaves, leaf) + weight)
+    var counted: [String] = []
+    var path = copy process
+    var index = names.count - 1
+    while index >= 0 {
+        let name = names[index]
+        path = path + ";" + name
+        if !counted.contains(name) {
+            counted.append(copy name)
+            let key = process + ": " + name
+            tally.within.set(copy key, countOf(tally.within, key) + weight)
+        }
+        index -= 1
+    }
+    tally.folded.set(copy path, countOf(tally.folded, path) + weight)
+}
+
+function sampleReportText(tally: borrow SampleTally, lost: Number) -> String {
+    var text = "\(tally.total) samples, \(lost) lost\n\nprocesses\n"
+    let processes = descending(tally.processes)
+    for entry in processes { text.append(sampleRow(entry.value, tally.total, entry.key)) }
+    text.append("\nfunctions, by themselves\n")
+    for (index, entry) in descending(tally.leaves).enumerated() {
+        if index >= SampleReport.functions { break }
+        text.append(sampleRow(entry.value, tally.total, entry.key))
+    }
+    text.append("\nfunctions, with what they called\n")
+    for (index, entry) in descending(tally.within).enumerated() {
+        if index >= SampleReport.functions { break }
+        text.append(sampleRow(entry.value, tally.total, entry.key))
+    }
+    for (rank, process) in processes.enumerated() {
+        if rank >= SampleReport.processes || process.key == "idle" { continue }
+        text.append("\n\(process.key), by themselves\n")
+        var shown = 0
+        for entry in descending(tally.leaves) {
+            if shown >= SampleReport.perProcess { break }
+            if entry.key.startsWith(process.key + ": ") {
+                text.append(
+                    sampleRow(
+                        entry.value,
+                        process.value,
+                        entry.key.substring(process.key.count + 2, entry.key.count)
+                    )
+                )
+                shown += 1
+            }
+        }
+    }
+    return text
+}
+
+function sampleRow(count: Number, total: Number, name: borrow String) -> String {
+    let tenths = total > 0 ? trunc(count * 1000 / total) : 0
+    let percent = "\(trunc(tenths / 10)).\(tenths % 10)%"
+    var padded = percent
+    while padded.count < 7 { padded = " " + padded }
+    var counted = "\(count)"
+    while counted.count < 7 { counted = " " + counted }
+    return "\(padded) \(counted)  \(name)\n"
+}
+
+function descending(counts: borrow Map<String, Number>) -> [MapEntry<String, Number>] {
+    return counts.entries().sorted({ left, right in return left.value > right.value })
+}
+
+// Each symbol ends where the next begins, when it said no size of its own.
+function boundedSymbols(sorted: borrow [SampleSymbol]) -> [SampleSymbol] {
+    var bounded: [SampleSymbol] = []
+    for (index, symbol) in sorted.enumerated() {
+        let next = index + 1 < sorted.count ? sorted[index + 1].start : symbol.start + 4096
+        bounded.append(
+            SampleSymbol {
+                start: symbol.start,
+                end: symbol.end > symbol.start ? symbol.end : next,
+                name: copy symbol.name
+            }
+        )
+    }
+    return bounded
+}
+
+// The symbol `address` is in, or `file` and the address.
+function symbolAt(symbols: borrow [SampleSymbol], address: Number, file: borrow String) -> String {
+    var low = 0
+    var high = symbols.count - 1
+    while low <= high {
+        let middle = trunc((low + high) / 2)
+        let symbol = symbols[middle]
+        if address < symbol.start {
+            high = middle - 1
+        } else if address >= symbol.end {
+            low = middle + 1
+        } else {
+            return copy symbol.name
+        }
+    }
+    return file + "+" + hexText(address)
+}
+
+// Where the names of a sampled program's functions are read: each
+// component's symbols, and the system volume's root for what has none, such
+// as the C runtime and the guest's GPU driver, read from the file as
+// installed.
+struct SampleRoots {
+    let symbols: String
+    let system: String
+}
+
+// The function symbols of the file installed at `path`: its debug symbols
+// when its component has them, else its own symbol table, else the symbols
+// it exports; none when there are none.
+function readSampledImage(roots: borrow SampleRoots, path: borrow String) -> SampledImage? {
+    let relative = path.startsWith("/") ? path.substring(1, path.count) : copy path
+    let debug = "\(roots.symbols)/\(relative).dSYM/Contents/Resources/DWARF/\(lastNameOf(path))"
+    let installed = "\(roots.system)/\(relative)"
+    let chosen = !roots.symbols.isEmpty() && fileExists(debug) ? debug : installed
+    if chosen == installed && (roots.system.isEmpty() || !fileExists(installed)) { return .None }
+    let bytes = match readFileBytes(chosen) {
+        Ok(read) -> read
+        Error(failure) -> {
+            absorb failure
+            return .None
+        }
+    }
+    if bytes.count < 64 { return .None }
+    let shared = elfField(bytes, 16, 2) == 3
+    let programs = elfField(bytes, 32, 8)
+    let programCount = elfField(bytes, 56, 2)
+    var lowest = -1
+    for index in 0..programCount {
+        let at = programs + index * 56
+        if elfField(bytes, at, 4) == 1 {
+            let address = elfField(bytes, at + 16, 8)
+            if lowest < 0 || address < lowest { lowest = address }
+        }
+    }
+    let sections = elfField(bytes, 40, 8)
+    let sectionCount = elfField(bytes, 60, 2)
+    // SHT_SYMTAB, or SHT_DYNSYM where the file was stripped of it.
+    var tableKind = 11
+    for index in 0..sectionCount {
+        if elfField(bytes, sections + index * 64 + 4, 4) == 2 { tableKind = 2 }
+    }
+    var found: [SampleSymbol] = []
+    for index in 0..sectionCount {
+        let header = sections + index * 64
+        if elfField(bytes, header + 4, 4) != tableKind { continue }
+        let table = elfField(bytes, header + 24, 8)
+        let size = elfField(bytes, header + 32, 8)
+        let names = sections + elfField(bytes, header + 40, 4) * 64
+        let strings = elfField(bytes, names + 24, 8)
+        var entry = table
+        while entry + 24 <= table + size {
+            let kind = elfField(bytes, entry + 4, 1) % 16
+            let start = elfField(bytes, entry + 8, 8)
+            if kind == 2 && start > 0 {
+                found.append(
+                    SampleSymbol {
+                        start: start,
+                        end: start + elfField(bytes, entry + 16, 8),
+                        name: elfString(bytes, strings + elfField(bytes, entry, 4))
+                    }
+                )
+            }
+            entry += 24
+        }
+    }
+    return .Some(
+        SampledImage {
+            symbols: boundedSymbols(
+                found.sorted({ left, right in return left.start < right.start })
+            ),
+            shared: shared,
+            lowest: max(lowest, 0)
+        }
+    )
+}
+
+// The little-endian number of `width` bytes at `at`.
+function elfField(bytes: borrow [UN8], at: Number, width: Number) -> Number {
+    var value: Number = 0
+    var index = width - 1
+    while index >= 0 {
+        value = value * 256 + Number(bytes[at + index])
+        index -= 1
+    }
+    return value
+}
+
+function elfString(bytes: borrow [UN8], at: Number) -> String {
+    var end = at
+    while end < bytes.count && bytes[end] != 0 { end += 1 }
+    var collected: [UN8] = []
+    for index in at..end { collected.append(bytes[index]) }
+    return match textFromBytes(collected) {
+        Some(text) -> text
+        None -> "?"
+    }
+}
+
+function hexNumber(text: borrow String) -> Number {
+    var value: Number = 0
+    for character in text.lowercased().utf8() {
+        let digit = Number(character)
+        if digit >= 48 && digit <= 57 {
+            value = value * 16 + digit - 48
+        } else if digit >= 97 && digit <= 102 {
+            value = value * 16 + digit - 87
+        }
+    }
+    return value
+}
+
+function hexText(value: Number) -> String {
+    if value <= 0 { return "0x0" }
+    let digits = "0123456789abcdef"
+    var text = ""
+    var rest = value
+    while rest > 0 {
+        let digit = rest % 16
+        text = digits.substring(digit, digit + 1) + text
+        rest = trunc(rest / 16)
+    }
+    return "0x" + text
+}
+
+function wordNumber(word: borrow String) -> Number {
+    return match word.toNumber() {
+        Some(value) -> value
+        None -> 0
+    }
+}
+
+function countOf(counts: borrow Map<String, Number>, key: borrow String) -> Number {
+    return match counts.value(key) {
+        Some(value) -> value
+        None -> 0
+    }
+}

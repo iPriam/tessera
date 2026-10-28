@@ -1,0 +1,272 @@
+import Foundation
+
+// Grants, presence and pickers (§14).
+//
+// Every call here is transport to the Presence service, which verifies the
+// interaction token with MosaicDisplay and shows the trusted UI. Neither
+// exists yet, and Presence is never transferable, so no process holds a
+// Presence handle: the calls that take one fail `NotMainProcess`, and the
+// ones that name a grant fail `NotFound`, since none has been issued.
+
+@Derive(Copy)
+public struct InteractionToken {
+    var idLow: UNumber
+    var idHigh: UNumber
+    var surfaceId: UNumber
+    var issued: UNumber
+}
+
+@Derive(Copy)
+public struct GrantId {
+    var low: UNumber
+    var high: UNumber
+}
+
+public struct PickerOptions {
+    var rights: Rights
+    var lifetime: GrantLifetime
+    var flags: PickerFlags
+    var forProcess: Handle?
+    var startLocation: Handle?
+    var suggestedName: String
+    var allowedKinds: String
+    var title: String
+}
+
+// How long a grant lasts.
+@Derive(Copy)
+public enum GrantLifetime: U32 {
+    // For one namespace operation chain; released when the Node is closed.
+    Once = 0
+    // Until the app session ends.
+    Session = 1
+    // Across relaunches; `Grant.restore` recovers it.
+    Persistent = 2
+}
+
+// `GrantRecord.state`.
+@Derive(Copy)
+public enum GrantState: U32 {
+    Active = 0
+    Expired = 1
+    Revoked = 2
+    Released = 3
+    Denied = 4
+}
+
+@Derive(Copy)
+public enum PickerMode: U32 {
+    OpenFile = 0
+    OpenFiles = 1
+    OpenDirectory = 2
+    OpenDirectories = 3
+    SaveFile = 4
+    // A directory and a new name in it.
+    SaveInto = 5
+}
+
+// `PickerOptions.flags`.
+@Derive(Copy)
+public distinct PickerFlags = UNumber
+
+public namespace PickerFlags {
+    let none: PickerFlags = PickerFlags(0)
+    // Ask for Traverse on directories.
+    let allowSubtree: PickerFlags = PickerFlags(1)
+    let showHidden: PickerFlags = PickerFlags(2)
+    let all: PickerFlags = PickerFlags(3)
+}
+
+// The Presence handle, with `Grant`, or `NotMainProcess`.
+function presenceCheck(presence: Handle) -> Result<Void, TesseraError> {
+    match resolve(presence, .Presence, Rights.grant) {
+        Ok(slot) -> {
+            return .Ok
+        }
+        Error(failed) -> {
+            if failed.code == .AccessDenied { return .Error(failed) }
+            return .Error(failureIn(.NotMainProcess, .Presence))
+        }
+    }
+}
+
+// A child the caller may broker for: `Manage` on its Process handle.
+function brokerCheck(forProcess: borrow Handle?) -> Result<Void, TesseraError> {
+    let process = try forProcess otherwise return .Ok
+    return match resolve(process, .Process, Rights.manage) {
+        Ok -> .Ok
+        Error(failed) -> .Error(failed)
+    }
+}
+
+// What a presence call answers once its arguments hold: the port's packet,
+// or the synchronous error when the port itself is wrong.
+function presenceAnswer(presence: Handle, port: Handle, key: U64) -> Result<Void, TesseraError> {
+    let target = try portTarget(port)
+    try presenceCheck(presence)
+    portComplete(
+        target,
+        key,
+        .Error(failureIn(.Unsupported, .Presence)),
+        .Grant,
+        U64(0),
+        U64(0),
+        U64(0)
+    )
+    return .Ok
+}
+
+public function grantRequest(
+    presence: Handle,
+    target: Handle,
+    rights: Rights,
+    lifetime: GrantLifetime,
+    forProcess: Handle?,
+    token: InteractionToken,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    let slot = try resolve(target, .Node, Rights.none)
+    if !rights.has(library.handles[slot].rights) {
+        return .Error(failure(.InvalidArgument))
+    }
+    try brokerCheck(forProcess)
+    if token.idLow == U64(0) && token.idHigh == U64(0) {
+        try presenceCheck(presence)
+        return .Error(failureIn(.NoInteraction, .Presence))
+    }
+    return presenceAnswer(presence, port, key)
+}
+
+public function pickerPresent(
+    presence: Handle,
+    mode: PickerMode,
+    options: borrow PickerOptions,
+    token: InteractionToken,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    if (options.flags.raw | PickerFlags.all.raw) != PickerFlags.all.raw {
+        return .Error(failure(.InvalidArgument))
+    }
+    if options.title.count > 256 || options.suggestedName.count > 255 || options.allowedKinds.count > 4096 {
+        return .Error(failure(.InvalidArgument))
+    }
+    if (mode == .SaveFile || mode == .SaveInto) && options.suggestedName.count > 0 {
+        try nameCheck(options.suggestedName)
+    }
+    match options.startLocation {
+        Some(location) -> {
+            try resolve(location, .Node, Rights.none)
+        }
+        None -> {}
+    }
+    try brokerCheck(options.forProcess)
+    if token.idLow == U64(0) && token.idHigh == U64(0) {
+        try presenceCheck(presence)
+        return .Error(failureIn(.NoInteraction, .Presence))
+    }
+    return presenceAnswer(presence, port, key)
+}
+
+public function grantRestore(
+    presence: Handle,
+    grantId: GrantId,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    return presenceAnswer(presence, port, key)
+}
+
+// No grant has been issued to this process, so the one named is not found.
+function grantUnknown(port: Handle, key: U64) -> Result<Void, TesseraError> {
+    let target = try portTarget(port)
+    portComplete(
+        target,
+        key,
+        .Error(failureIn(.NotFound, .Presence)),
+        .Grant,
+        U64(0),
+        U64(0),
+        U64(0)
+    )
+    return .Ok
+}
+
+public function grantRelease(
+    grantId: GrantId,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    return grantUnknown(port, key)
+}
+
+public function grantList(
+    presence: Handle,
+    out: borrow Buffer,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    return presenceAnswer(presence, port, key)
+}
+
+public function grantInfo(
+    grantId: GrantId,
+    out: borrow Buffer,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    return grantUnknown(port, key)
+}
+
+// A dotted capability name: lowercase labels of `a-z`, `0-9` and `-`.
+function capabilityCheck(name: borrow String) -> Result<Void, TesseraError> {
+    if name.count == 0 || name.count > 128 { return .Error(failure(.InvalidArgument)) }
+    let labels = name.split(".")
+    if labels.count < 2 { return .Error(failure(.InvalidArgument)) }
+    for index in 0..labels.count {
+        if labels[index].count == 0 { return .Error(failure(.InvalidArgument)) }
+    }
+    for index in 0..name.count {
+        let byte = name.charAt(index)
+        let valid = (byte >= 97 && byte <= 122) || (
+            byte >= 48 && byte <= 57
+        ) || byte == 45 || byte == 46
+        if !valid { return .Error(failure(.InvalidArgument)) }
+    }
+    return .Ok
+}
+
+public function authorizationRequest(
+    presence: Handle,
+    capability: borrow String,
+    parameters: borrow Buffer,
+    forProcess: Handle?,
+    token: InteractionToken,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    try capabilityCheck(capability)
+    if parameters.length > U64(65536) { return .Error(failure(.InvalidArgument)) }
+    try brokerCheck(forProcess)
+    if token.idLow == U64(0) && token.idHigh == U64(0) {
+        try presenceCheck(presence)
+        return .Error(failureIn(.NoInteraction, .Presence))
+    }
+    return presenceAnswer(presence, port, key)
+}
+
+public function settingsRedirect(
+    presence: Handle,
+    setting: borrow String,
+    token: InteractionToken,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    try capabilityCheck(setting)
+    if token.idLow == U64(0) && token.idHigh == U64(0) {
+        try presenceCheck(presence)
+        return .Error(failureIn(.NoInteraction, .Presence))
+    }
+    return presenceAnswer(presence, port, key)
+}

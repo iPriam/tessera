@@ -1,0 +1,79 @@
+import KiraUI
+import TesseraUI
+import LibTessera
+import Foundation
+import Ember
+
+// Each turn of the session: the engine runs, the pointer is read for the page,
+// and the page is told how big its area is.
+function browserTick(engine: WebEngine, model: BrowserModel, graphics: borrow Graphics) -> Bool {
+    match engine.start(model.home) {
+        Ok -> {}
+        Error(failure) -> {
+            log fault("the web engine could not start", failure)
+            return true
+        }
+    }
+    engine.resize(viewportWidth(), viewportHeight() - BrowserMetrics.chrome)
+    engine.focus(true)
+    var changed = match engine.pump(graphics) {
+        Ok(value) -> value
+        Error(failure) -> {
+            log warn("the web engine could not take a frame", failure)
+            false
+        }
+    }
+    let down = pointerIsDown()
+    let x = pointerX()
+    let y = pointerY() - BrowserMetrics.chrome
+    if down != model.pointerDown {
+        var held = model
+        held.pointerDown = down
+        if y >= 0 {
+            if down {
+                held.pressX = x
+                held.pressY = y
+                engine.pointerMove(unixMillis(), x, y)
+            }
+            engine.pointerButton(unixMillis(), down, 1, x, y)
+        }
+        changed = true
+    }
+    if engine.address != model.followed {
+        var held = model
+        held.followed = copy engine.address
+        held.field = copy engine.address
+        changed = true
+    }
+    return changed
+}
+
+@Main
+function main() {
+    let engine = WebEngine {}
+    let model = BrowserModel {}
+    // The page a launch names after the program's own name.
+    match processArguments() {
+        Ok(given) -> if given.count > 1 {
+            var held = model
+            held.home = copy given[1]
+        }
+        Error(failed) -> absorb failed
+    }
+    RunTesseraApplication(
+        "Browser",
+        { in
+            return BrowserView(engine = engine, model = model)
+        },
+        ApplicationOptions {
+            embedded: .Some(
+                EmbeddedContent {
+                    tick: { graphics in
+                        return browserTick(engine, model, graphics)
+                    },
+                    interval: 16
+                }
+            )
+        }
+    )
+}

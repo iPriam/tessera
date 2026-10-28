@@ -1,0 +1,178 @@
+//! The menus an application hands the platform, as the platform's menu bar
+//! shows them.
+//!
+//! The menus are plain values. AppKit knows nothing of the toolkit that built
+//! them, so any toolkit, on any platform, can speak them. They travel over a
+//! link as records, one per line, with their fields separated by tabs. The
+//! record layout is described on [`MenuRecord`].
+
+import Foundation
+
+/// A key held with a menu item's key.
+///
+/// Each modifier's raw value is its bit in the modifier field of a record.
+@Derive(Copy)
+public enum BridgeModifier: UN8 {
+    /// The Command key.
+    Command = 1
+    /// The Shift key.
+    Shift = 2
+    /// The Option key.
+    Option = 4
+    /// The Control key.
+    Control = 8
+}
+
+/// Every modifier, in the order their bits are read back.
+let bridgeModifiers: [BridgeModifier] = [.Command, .Shift, .Option, .Control]
+
+/// One row of a menu, or the rule between two groups of rows.
+public struct BridgeMenuItem {
+    /// The number the platform sends back when the person chooses this row.
+    ///
+    /// A rule has none, and carries `0`.
+    var number: Number = 0
+    /// The text of the row.
+    var title: String = ""
+    /// The key of the row's shortcut, as the character on it. Empty for none.
+    var key: String = ""
+    /// The modifiers held with the shortcut's key.
+    var modifiers: [BridgeModifier] = []
+    /// Whether the person can choose the row.
+    var enabled: Bool = true
+    /// Whether the row is a rule between two groups of rows, rather than a command.
+    var separator: Bool = false
+}
+
+/// One menu on the bar, with its title and rows.
+public struct BridgeMenu {
+    /// The title shown on the bar.
+    var title: String = ""
+    /// Whether this is the application's own menu, whose title the bar sets heavier.
+    var application: Bool = false
+    /// The rows of the menu, in order.
+    var items: [BridgeMenuItem] = []
+}
+
+/// The record layout of menus, as they travel over a link.
+///
+/// Each menu starts with a menu record and is followed by its rows, one record
+/// a line:
+///
+/// ```text
+/// M <application 0|1> <title>
+/// I <number> <enabled 0|1> <key> <modifier bits> <title>
+/// S
+/// ```
+///
+/// A tab or a line break in a title or key would end its field, so each is
+/// sent as a space.
+namespace MenuRecord {
+    /// The kind of a menu record.
+    let menu: String = "M"
+    /// The kind of a row record.
+    let item: String = "I"
+    /// The kind of a rule record.
+    let separator: String = "S"
+    /// The separator between the fields of a record.
+    let field: String = "\t"
+    /// The separator between records.
+    let line: String = "\n"
+}
+
+/// Returns `text` with each tab and line break replaced by a space, so it fits in a field.
+function recordText(text: borrow String) -> String {
+    return joined(joined(text.split(MenuRecord.field), " ").split(MenuRecord.line), " ")
+}
+
+/// The record form of a flag: `"1"` when true, `"0"` when false.
+function flag(value: Bool) -> String {
+    return value ? "1" : "0"
+}
+
+/// The bits of `modifiers`, one bit for each, as a whole number.
+function modifierBits(modifiers: borrow [BridgeModifier]) -> Number {
+    var bits: Number = 0
+    for modifier in modifiers { bits = bits | Number(modifier.rawValue()) }
+    return bits
+}
+
+/// The modifiers whose bits are set in `bits`, in the order of [`bridgeModifiers`].
+function modifiersOf(bits: Number) -> [BridgeModifier] {
+    var modifiers: [BridgeModifier] = []
+    for modifier in bridgeModifiers {
+        if (bits & Number(modifier.rawValue())) != 0 { modifiers.append(modifier) }
+    }
+    return modifiers
+}
+
+/// Encodes `menus` as the records the platform reads, one record a line.
+function encodedMenus(menus: borrow [BridgeMenu]) -> String {
+    var lines: [String] = []
+    for menu in menus {
+        lines.append("\(MenuRecord.menu)\t\(flag(menu.application))\t\(recordText(menu.title))")
+        for item in menu.items {
+            if item.separator {
+                lines.append(MenuRecord.separator)
+                continue
+            }
+            lines.append(
+                "\(MenuRecord.item)\t\(item.number)\t\(flag(item.enabled))\t\(recordText(item.key))\t\(modifierBits(item.modifiers))\t\(recordText(item.title))"
+            )
+        }
+    }
+    return joined(lines, MenuRecord.line)
+}
+
+/// Returns the digits of `text` as a whole number, or `.None` when it has any other character.
+///
+/// An empty text is `.None`.
+function wholeNumber(text: borrow String) -> Number? {
+    if text.count == 0 { return .None }
+    var value: Number = 0
+    for at in 0..text.count {
+        let digit = text.charAt(at) - 48
+        if digit < 0 || digit > 9 { return .None }
+        value = value * 10 + digit
+    }
+    return .Some(value)
+}
+
+/// Decodes the records in `text` back into menus.
+///
+/// An empty text is no menus. Returns `.None` when a record is not one of the
+/// three kinds, or when a row or rule comes before any menu, or when a field
+/// count is wrong.
+function decodedMenus(text: borrow String) -> [BridgeMenu]? {
+    var menus: [BridgeMenu] = []
+    if text.count == 0 { return .Some(menus) }
+    for line in text.split(MenuRecord.line) {
+        let fields = line.split(MenuRecord.field)
+        match fields[0] {
+            "M" -> {
+                if fields.count != 3 { return .None }
+                menus.append(BridgeMenu { title: fields[2], application: fields[1] == "1" })
+            }
+            "I" -> {
+                if fields.count != 6 || menus.count == 0 { return .None }
+                let number = try wholeNumber(fields[1]) otherwise return .None
+                let bits = try wholeNumber(fields[4]) otherwise return .None
+                menus[menus.count - 1].items.append(
+                    BridgeMenuItem {
+                        number: number,
+                        title: fields[5],
+                        key: fields[3],
+                        modifiers: modifiersOf(bits),
+                        enabled: fields[2] == "1"
+                    }
+                )
+            }
+            "S" -> {
+                if menus.count == 0 { return .None }
+                menus[menus.count - 1].items.append(BridgeMenuItem { separator: true })
+            }
+            else -> return .None
+        }
+    }
+    return .Some(menus)
+}

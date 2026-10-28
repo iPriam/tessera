@@ -1,0 +1,361 @@
+import Foundation
+import Heap
+import LibTessera
+import DeviceKit
+
+// The power page, and the devices it is read from.
+//
+// One Memory object holds a `PowerInfo` laid out as roadmap/16-libtessera.md
+// §18.1 says, followed by a sequence that is odd while a refresh is being
+// written (LibTessera `app/Power/Power.kira`, `PowerPage`). Every client
+// maps the same page read-only, so `Power.read` costs no message, as
+// IOPMLib's power-source notifications cost none once registered.
+//
+// The page is refreshed every two seconds from every DeviceKit power source
+// and thermal zone. The battery is the first online source of kind battery;
+// the external power is the first other online source's kind, and mains
+// when there is no battery at all, as on a desktop. The thermal level is the
+// worst zone's: DeviceKit reports how far past its trips a zone is, which is
+// LibTessera's Fair, Serious and Critical. Nothing is throttled yet and
+// there is no low-power mode, so those read 0.
+
+// §18.1's `PowerInfo`, as the page holds it.
+@FFI.Struct { layout: c }
+struct PowerInfoRecord {
+    var batteryPercent: U32
+    var batteryState: BatteryState
+    var externalPower: ExternalPower
+    var thermalLevel: ThermalLevel
+    var lowPowerMode: U8
+    var reserved0: Reserved7
+    var timeToEmpty: U64
+    var timeToFull: U64
+    var powerDrawMilliwatts: U32
+    var cpuThrottlePercent: U32
+    var gpuThrottlePercent: U32
+    var reserved1: U32
+    var updated: U64
+}
+
+@FFI.Array { element: U8, count: 7 }
+struct Reserved7 {}
+
+namespace PowerPage {
+    // The sequence follows the 64-byte `PowerInfo`.
+    let sequenceAt: Number = 64
+    // The page is 4096 bytes on every machine; the Memory object holding it
+    // is one machine page.
+    let bytes: Number = 4096
+    // `batteryPercent` on a machine without a battery.
+    let noBattery: Number = 0xFFFFFFFF
+}
+
+namespace Refresh {
+    let nanoseconds: Number = 2000000000
+}
+
+// roadmap/17-devicekit.md §7.4's `MatchSpec`, without property constraints.
+@FFI.Struct { layout: c }
+struct MatchSpecRecord {
+    var entryClass: EntryClass
+    var family: Family
+    var flags: U32
+    var count: U32
+}
+
+// §7's `EntryInfo`, one record of `Registry.match`'s list.
+@FFI.Struct { layout: c }
+struct EntryInfoRecord {
+    var id: U64
+    var entryClass: EntryClass
+    var family: Family
+    var parent: U64
+    var generation: U64
+    var flags: U32
+    var childCount: U32
+    var name: U64
+}
+
+// The list is a header, then 48-byte `EntryInfo` records.
+namespace RegistryRecord {
+    let specBytes: Number = 16
+    let listBytes: Number = 32768
+    let headerBytes: Number = 8
+    let entryBytes: Number = 48
+}
+
+struct Page {
+    var memory: Handle
+    var address: RawPtr
+    var sequence: UNumber
+}
+
+// The devices the page is read from. `stale` once one was lost: every
+// device is opened again at the next refresh, so one that came or went
+// since is seen.
+struct Devices {
+    var sources: [Ref]
+    var zones: [Ref]
+    var clocks: [Ref]
+    var stale: Bool
+}
+
+// What one refresh read.
+struct Reading {
+    var batteryPercent: Number
+    var batteryState: BatteryState
+    var externalPower: ExternalPower?
+    var thermalLevel: ThermalLevel
+    var drawMilliwatts: Number
+    var timeToEmpty: Number
+    var timeToFull: Number
+    var lost: Bool
+}
+
+function createPage() -> Result<Page, TesseraError> {
+    let size = memoryPageRound(PowerPage.bytes)
+    let memory = try memoryCreate(size, MemoryOptions.none)
+    let address = match memoryMap(
+        memory,
+        0,
+        size,
+        Protection.read | Protection.write,
+        MapOptions.none,
+        nullPointer()
+    ) {
+        Ok(value) -> value
+        Error(failed) -> {
+            // The mapping's memory is released before the failure is
+            // returned; try would leak it.
+            closeHandle(memory)
+            return .Error(failed)
+        }
+    }
+    return .Ok(Page { memory: memory, address: address, sequence: UNumber(0) })
+}
+
+// A handle to the page a client may map and read but not write.
+function pageHandle(page: borrow Page) -> Result<Handle, TesseraError> {
+    return handleDuplicate(
+        page.memory,
+        Rights.read | Rights.map | Rights.transfer | Rights.duplicate | Rights.inspect
+    )
+}
+
+// The entries of a registry class.
+function entriesOf(entryClass: borrow EntryClass) -> [EntryId] {
+    let spec = zeroedBlock(count: RegistryRecord.specBytes, alignment: 16)
+    heapStore(
+        spec.pointer(),
+        MatchSpecRecord {
+            entryClass: entryClass,
+            family: Family.None,
+            flags: UN32(0),
+            count: UN32(0)
+        }
+    )
+    let list = zeroedBlock(count: RegistryRecord.listBytes, alignment: 16)
+    let count = match registryMatch(
+        Buffer { address: spec.pointer(), length: RegistryRecord.specBytes },
+        Buffer { address: list.pointer(), length: RegistryRecord.listBytes }
+    ) {
+        Ok(value) -> value
+        Error(failed) -> {
+            log warn("the registry could not be matched", error: errorName(failed))
+            return []
+        }
+    }
+    var found: [EntryId] = []
+    for index in 0..count {
+        let offset = RegistryRecord.headerBytes + index * RegistryRecord.entryBytes
+        let record: EntryInfoRecord = heapLoad(list.pointer(), offset)
+        found.append(EntryId(record.id))
+    }
+    return found
+}
+
+// Opens an entry through devicekitd, waiting for the answer on the port
+// kept for opens.
+function openDevice(
+    service: borrow Service,
+    entry: EntryId,
+    family: borrow Family
+) -> Result<Ref, TesseraError> {
+    try deviceOpen(entry, family, OpenOptions.none, service.openPort, UNumber(1))
+    let completions = try portWait(service.openPort, 1, Number(Deadline.infinite))
+    if completions.count == 0 { return .Error(failure(.Internal)) }
+    let opened = completions[0]
+    if opened.error.code != .Ok { return .Error(opened.error) }
+    return .Ok(Ref(opened.result0))
+}
+
+function openAll(
+    service: borrow Service,
+    entryClass: borrow EntryClass,
+    family: borrow Family
+) -> [Ref] {
+    var opened: [Ref] = []
+    for entry in entriesOf(entryClass) {
+        match openDevice(service, entry, family) {
+            Ok(device) -> opened.append(device)
+            Error(failed) -> log warn(
+                "cannot open an entry",
+                entry: entry.raw,
+                error: errorName(failed)
+            )
+        }
+    }
+    return opened
+}
+
+// Opens every power source, thermal zone and clock again.
+function scan(service: borrow mut Service) {
+    for device in service.devices.sources { closeRef(device) }
+    for device in service.devices.zones { closeRef(device) }
+    for device in service.devices.clocks { closeRef(device) }
+    service.devices = Devices {
+        sources: openAll(service, .PowerSource, .PowerSource),
+        zones: openAll(service, .ThermalZone, .Thermal),
+        clocks: openAll(service, .Rtc, .Rtc),
+        stale: false,
+    }
+}
+
+function batteryStateOf(state: borrow ChargeState) -> BatteryState {
+    return match state {
+        Unknown -> .Unknown
+        Discharging -> .Discharging
+        Charging -> .Charging
+        Full -> .Full
+        NotCharging -> .NotCharging
+    }
+}
+
+// The external power a source of `kind` gives; a battery gives none.
+function externalPowerOf(kind: borrow PowerSourceKind) -> ExternalPower? {
+    return match kind {
+        Battery -> .None
+        Mains -> .Some(ExternalPower.Mains)
+        Usb -> .Some(ExternalPower.Usb)
+        Wireless -> .Some(ExternalPower.Wireless)
+        // A supply DeviceKit cannot name is most often an adapter.
+        Unknown -> .Some(ExternalPower.Mains)
+    }
+}
+
+function thermalLevelOf(policy: borrow ThermalPolicy) -> ThermalLevel {
+    return match policy {
+        Nominal -> .Nominal
+        Fair -> .Fair
+        Serious -> .Serious
+        Critical -> .Critical
+    }
+}
+
+// `online` is a u32 flag (roadmap/17-devicekit.md `PowerSourceInfo`): any
+// value but 0 says the source is connected.
+function isOnline(info: borrow PowerSourceInfo) -> Bool { return info.online > UN32(0) }
+
+function readSource(reading: borrow mut Reading, info: borrow PowerSourceInfo) {
+    if !isOnline(info) { return }
+    match externalPowerOf(info.kind) {
+        Some(external) -> if reading.externalPower.isNone() {
+            reading.externalPower = .Some(external)
+        }
+        None -> if reading.batteryPercent == PowerPage.noBattery {
+            reading.batteryPercent = Number(info.percent)
+            reading.batteryState = batteryStateOf(info.state)
+            reading.drawMilliwatts = floor(Number(info.powerNowUw) / 1000)
+            reading.timeToEmpty = Number(info.timeToEmpty)
+            reading.timeToFull = Number(info.timeToFull)
+        }
+    }
+}
+
+function readDevices(service: borrow Service) -> Reading {
+    var reading = Reading {
+        batteryPercent: PowerPage.noBattery,
+        batteryState: .Unknown,
+        externalPower: .None,
+        thermalLevel: .Nominal,
+        drawMilliwatts: 0,
+        timeToEmpty: 0,
+        timeToFull: 0,
+        lost: false,
+    }
+    for source in service.devices.sources {
+        match powerSourceRead(source) {
+            Ok(info) -> readSource(reading, info)
+            Error(failed) -> {
+                if failed.code == .DeviceLost { reading.lost = true } else {
+                    log warn("a power source could not be read", error: errorName(failed))
+                }
+            }
+        }
+    }
+    for zone in service.devices.zones {
+        match thermalRead(zone) {
+            Ok(info) -> {
+                let level = thermalLevelOf(info.policyLevel)
+                if level.rawValue() > reading.thermalLevel.rawValue() {
+                    reading.thermalLevel = level
+                }
+            }
+            Error(failed) -> {
+                if failed.code == .DeviceLost { reading.lost = true } else {
+                    log warn("a thermal zone could not be read", error: errorName(failed))
+                }
+            }
+        }
+    }
+    return reading
+}
+
+function externalOf(reading: borrow Reading) -> ExternalPower {
+    return match reading.externalPower {
+        Some(external) -> external
+        None -> {
+            // No battery and no named supply: a desktop's mains.
+            if reading.batteryPercent == PowerPage.noBattery { return ExternalPower.Mains }
+            return ExternalPower.None
+        }
+    }
+}
+
+function writePage(page: borrow mut Page, reading: borrow Reading) -> Result<Void, TesseraError> {
+    let updated = try boottime()
+    // Odd while the record is being written, so a reader tries again.
+    page.sequence += UNumber(1)
+    heapStore<U64>(page.address, PowerPage.sequenceAt, page.sequence)
+    heapStore(
+        page.address,
+        PowerInfoRecord {
+            batteryPercent: UN32(reading.batteryPercent),
+            batteryState: reading.batteryState,
+            externalPower: externalOf(reading),
+            thermalLevel: reading.thermalLevel,
+            lowPowerMode: UN8(0),
+            reserved0: Reserved7 {},
+            timeToEmpty: UNumber(reading.timeToEmpty),
+            timeToFull: UNumber(reading.timeToFull),
+            powerDrawMilliwatts: UN32(reading.drawMilliwatts),
+            cpuThrottlePercent: UN32(0),
+            gpuThrottlePercent: UN32(0),
+            reserved1: UN32(0),
+            updated: UNumber(updated),
+        }
+    )
+    page.sequence += UNumber(1)
+    heapStore<U64>(page.address, PowerPage.sequenceAt, page.sequence)
+    return .Ok
+}
+
+function refresh(service: borrow mut Service) -> Result<Void, TesseraError> {
+    if service.devices.stale { scan(service) }
+    let reading = readDevices(service)
+    try writePage(service.page, reading)
+    if reading.lost { service.devices.stale = true }
+    let now = try monotonic()
+    service.nextRefresh = now + Refresh.nanoseconds
+    return .Ok
+}

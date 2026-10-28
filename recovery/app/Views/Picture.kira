@@ -1,0 +1,9 @@
+import KiraUI
+
+// One of the recovery's glyphs (`Glyphs`), `points` tall, in the ink around
+// it.
+construct Picture(name: String, points: Number) extends Widget {
+    body {
+        Artwork(svg = glyphNamed(name), points = points)
+    }
+}

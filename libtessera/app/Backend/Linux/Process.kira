@@ -1,0 +1,490 @@
+import Foundation
+import Heap
+
+// Processes on Linux: a process's backing is a pidfd, readable once the
+// process has ended; what the library reports about one is read from
+// `waitid` and `/proc/<pid>`.
+
+// A backing for process `pid`, or -1 when there is none.
+function kernelProcessOpen(pid: U64) -> Result<Number, TesseraError> {
+    let fd = pidfdOpen(pid, U32(0))
+    if answerFailed(fd) { return .Error(errnoFailure(answerErrno(fd))) }
+    return .Ok(fd)
+}
+
+function processSignal(backing: Number, signal: Number) -> Result<Void, TesseraError> {
+    let answer = pidfdSendSignal(backing, signal, nullPointer(), U32(0))
+    if answerFailed(answer) {
+        if failedWith(answer, .NoProcess) { return .Error(failure(.BadState)) }
+        return .Error(errnoFailure(answerErrno(answer)))
+    }
+    return .Ok
+}
+
+// Ends the process at once (`SIGKILL`); `BadState` when it already has.
+function kernelProcessKill(backing: Number) -> Result<Void, TesseraError> {
+    return processSignal(backing, 9)
+}
+
+// Stops the process running (`SIGSTOP`) and lets it run again (`SIGCONT`).
+function kernelProcessSuspend(backing: Number) -> Result<Void, TesseraError> {
+    return processSignal(backing, 19)
+}
+
+function kernelProcessResume(backing: Number) -> Result<Void, TesseraError> {
+    return processSignal(backing, 18)
+}
+
+// Asks the process to stop (`SIGTERM`), as init does at shutdown.
+function kernelProcessAskToStop(backing: Number) -> Result<Void, TesseraError> {
+    // The first process of a PID namespace of its own, as a confined
+    // application is, never hears a SIGTERM it neither catches nor blocks:
+    // the kernel drops it rather than take the default action, which is to
+    // end. Such a process is ended as that action would, with SIGKILL.
+    let drops = try dropsTermination(backing)
+    if drops { return processSignal(backing, 9) }
+    return processSignal(backing, 15)
+}
+
+// Whether the process `backing` is the first of its own PID namespace and
+// leaves SIGTERM to its default action.
+function dropsTermination(backing: Number) -> Result<Bool, TesseraError> {
+    let info = try procText("/proc/self/fdinfo/" + stringFromUnsigned(U64(backing)))
+    let pid = try statusValue(info, "Pid:")
+    let status = try procText("/proc/" + pid + "/status")
+    let namespaced = statusFields(try statusValue(status, "NSpid:"))
+    if namespaced.count < 2 || namespaced[namespaced.count - 1] != "1" { return .Ok(false) }
+    // SIGTERM is signal 15: bit 14 of each mask.
+    let term = U64(0x4000)
+    let blockedText = try statusValue(status, "SigBlk:")
+    let caughtText = try statusValue(status, "SigCgt:")
+    let blocked = try parseHexadecimal(blockedText)
+    let caught = try parseHexadecimal(caughtText)
+    return .Ok(((blocked | caught) & term) == U64(0))
+}
+
+// The text of an existing /proc file; a missing or unreadable file keeps its
+// reason so the caller does not mistake it for an empty status.
+function procText(path: borrow String) -> Result<String, TesseraError> {
+    return match readSmallFileIfPresent(AtDirectory.current, path) {
+        Ok(found) -> match found {
+            Some(text) -> .Ok(text)
+            None -> .Error(failure(.NotFound))
+        }
+        Error(failed) -> .Error(failed)
+    }
+}
+
+// The value after `key` on the line of `text` that starts with it, trimmed.
+function statusValue(text: borrow String, key: borrow String) -> Result<String, TesseraError> {
+    for line in text.split("\n") {
+        if line.startsWith(key) { return .Ok(line.substring(key.count, line.count).trim()) }
+    }
+    return .Error(failure(.InvalidArgument))
+}
+
+// The words of `text`, between tabs and spaces.
+function statusFields(text: borrow String) -> [String] {
+    var fields: [String] = []
+    var start = 0
+    for index in 0..(text.count + 1) {
+        let gap = index == text.count || text.charAt(index) == 9 || text.charAt(index) == 32
+        if gap {
+            if index > start { fields.append(text.substring(start, index)) }
+            start = index + 1
+        }
+    }
+    return fields
+}
+
+// A hexadecimal proc value, invalid when any character is not a digit.
+function parseHexadecimal(text: borrow String) -> Result<U64, TesseraError> {
+    var value = U64(0)
+    for index in 0..text.count {
+        let byte = text.charAt(index)
+        var digit = 0
+        if byte >= 48 && byte <= 57 {
+            digit = byte - 48
+        } else if byte >= 97 && byte <= 102 {
+            digit = byte - 87
+        } else {
+            return .Error(failure(.InvalidArgument))
+        }
+        value = value * U64(16) + U64(digit)
+    }
+    return .Ok(value)
+}
+
+// Reaps a child that has ended so it does not stay a zombie: `waitid`
+// with `P_PIDFD`, `WEXITED | WNOHANG`.
+function kernelProcessReap(backing: Number) -> Result<Void, TesseraError> {
+    let infoBytes = zeroedBlock(count: 128, alignment: 16)
+    let info = infoBytes.pointer()
+    return answerStatus(
+        waitid(
+            code(WaitWhom.Pidfd),
+            backing,
+            info,
+            (WaitHow.exited | WaitHow.noHang).raw,
+            nullPointer()
+        )
+    )
+}
+
+// The fields of `/proc/<pid>/stat` after the command name; none once the
+// process has gone.
+function processStatFields(pid: U64) -> Result<[String]?, TesseraError> {
+    let read = try readSmallFileIfPresent(
+        AtDirectory.current,
+        "/proc/" + stringFromUnsigned(pid) + "/stat"
+    )
+    let text = try read otherwise return .Ok(.None)
+    return match text.indexOf(") ") {
+        Some(close) -> .Ok(.Some(text.substring(close + 2, text.count).split(" ")))
+        None -> .Error(failure(.Internal))
+    }
+}
+
+// When the process started, on the boot-time clock: `starttime` is in
+// clock ticks of 100 Hz since boot. None once the process has gone.
+function kernelProcessStartTime(pid: U64) -> Result<U64?, TesseraError> {
+    let read = try processStatFields(pid)
+    let fields = try read otherwise return .Ok(.None)
+    if fields.count < 20 { return .Error(failure(.Internal)) }
+    return .Ok(.Some(parseUnsigned(fields[19]) * U64(10000000)))
+}
+
+function procStatusField(pid: U64, key: borrow String) -> Result<U64, TesseraError> {
+    let read = try readSmallFileIfPresent(
+        AtDirectory.current,
+        "/proc/" + stringFromUnsigned(pid) + "/status"
+    )
+    let text = try read otherwise return .Ok(0)
+    let lines = text.split("\n")
+    for index in 0..lines.count {
+        if lines[index].startsWith(key) {
+            return .Ok(parseUnsigned(lines[index].substring(key.count, lines[index].count).trim()))
+        }
+    }
+    return .Ok(0)
+}
+
+// What the kernel knows of a process.
+struct KernelProcessState {
+    var ended: Bool
+    var exitCode: U64
+    var killed: Bool
+    var suspended: Bool
+    var cpu: U64
+    var threads: U32
+    var resident: U64
+    var mapped: U64
+}
+
+// The state of process `pid`. The exit status of another process is read
+// with `WNOWAIT`, so it stays waitable; `CLD_KILLED` (2) and `CLD_DUMPED`
+// (3) are a process killed by a signal.
+function kernelProcessState(
+    pid: U64,
+    backing: Number,
+    own: Bool
+) -> Result<KernelProcessState, TesseraError> {
+    var state = KernelProcessState {
+        ended: false,
+        exitCode: U64(0),
+        killed: false,
+        suspended: false,
+        cpu: U64(0),
+        threads: U32(0),
+        resident: U64(0),
+        mapped: U64(0)
+    }
+    if !own {
+        let infoBytes = zeroedBlock(count: 128, alignment: 16)
+        let info = infoBytes.pointer()
+        let answer = waitid(
+            code(WaitWhom.Pidfd),
+            backing,
+            info,
+            (WaitHow.exited | WaitHow.noHang | WaitHow.noWait).raw,
+            nullPointer()
+        )
+        try answerStatus(answer)
+        if heapLoad<U32>(info, 16) != U32(0) {
+            state.ended = true
+            let code = heapLoad<U32>(info, 8)
+            state.exitCode = U64(heapLoad<U32>(info, 24))
+            state.killed = code == U32(2) || code == U32(3)
+        }
+    }
+    // A process that has gone has no counts left to read.
+    let read = try processStatFields(pid)
+    match read {
+        Some(fields) -> {
+            if fields.count > 12 {
+                state.suspended = fields[0] == "T"
+                state.cpu = (parseUnsigned(fields[11]) + parseUnsigned(fields[12])) * U64(10000000)
+            }
+        }
+        None -> {}
+    }
+    state.threads = U32(try procStatusField(pid, "Threads:"))
+    let statm = try readSmallFileIfPresent(
+        AtDirectory.current,
+        "/proc/" + stringFromUnsigned(pid) + "/statm"
+    )
+    match statm {
+        Some(text) -> {
+            let pages = text.split(" ")
+            if pages.count >= 2 {
+                state.resident = parseUnsigned(pages[1]) * kernelPageSize()
+                state.mapped = parseUnsigned(pages[0]) * kernelPageSize()
+            }
+        }
+        None -> {}
+    }
+    return .Ok(state)
+}
+
+// A backing that becomes readable when the process is asked to stop.
+// `SIGTERM` (15, bit 14 of a signal set) is blocked for the whole process
+// and read through a `signalfd`. A thread takes its mask from the one that
+// made it, so this comes before any thread is made.
+function kernelTerminationWatch() -> Result<Number, TesseraError> {
+    let maskBytes = zeroedBlock(count: 8, alignment: 8)
+    let mask = maskBytes.pointer()
+    heapStore<U64>(mask, 0, U64(1) << U64(14))
+    let blocked = sigprocmask(SignalMaskHow.block, mask, nullPointer(), U64(8))
+    if answerFailed(blocked) { return .Error(errnoFailure(answerErrno(blocked))) }
+    let fd = signalfd4(-1, mask, U64(8), LinuxOpen.nonBlock | LinuxOpen.closeOnExec)
+    if answerFailed(fd) { return .Error(errnoFailure(answerErrno(fd))) }
+    return .Ok(fd)
+}
+
+// `char *argv[]`: the strings and the pointer array in one block.
+function argumentVector(arguments: borrow [String]) -> ByteBlock {
+    var size = U64((arguments.count + 1) * 8)
+    for index in 0..arguments.count { size = size + U64(arguments[index].count + 1) }
+    let blockBytes = zeroedBlock(count: size, alignment: 16)
+    let block = blockBytes.pointer()
+    var at = U64((arguments.count + 1) * 8)
+    for index in 0..arguments.count {
+        let length = U64(arguments[index].count)
+        if length > U64(0) {
+            copyBytes(heapOffset(block, at), arguments[index].data, length)
+        }
+        heapStore<RawPtr>(block, (index * 8), heapOffset(block, at))
+        at += length + U64(1)
+    }
+    return move blockBytes
+}
+
+// A child started: its process id and its backing.
+struct KernelChild {
+    var pid: U64
+    var backing: Number
+}
+
+// Starts `executable` as a new process, `startup` as its startup channel
+// and nothing else inherited, in `job` (a job backing, or None for the
+// caller's own), stopped when `suspended`. `output` and `errors` are the
+// backings of the StdOut and StdErr entries the parent gave, when it gave them.
+//
+// `struct clone_args` (88 bytes): `CLONE_PIDFD`, `SIGCHLD` on exit, and
+// `CLONE_INTO_CGROUP` with the job's directory. The child moves the
+// startup channel to fd 0, marks every other descriptor close-on-exec,
+// puts its standard output and error on 1 and 2 (so a program can write
+// to them before its runtime reads the Startup message), and `execveat`s
+// the executable with the Kira runtime's settings as its environment, or
+// Valgrind's launcher with it when the release names it for memcheck. With
+// a `view`, the child first turns it into its root (Confine.kira).
+function kernelLaunch(
+    executable: Number,
+    startup: Number,
+    arguments: borrow [String],
+    job: borrow Number?,
+    suspended: Bool,
+    output: borrow Number?,
+    errors: borrow Number?,
+    view: borrow KernelView?
+) -> Result<KernelChild, TesseraError> {
+    let valgrind = valgrindArguments(executable, arguments)
+    let argvBytes = match valgrind {
+        Some(wrapped) -> argumentVector(wrapped)
+        None -> argumentVector(arguments)
+    }
+    let argv = argvBytes.pointer()
+    let argsBytes = zeroedBlock(count: 96, alignment: 16)
+    let args = argsBytes.pointer()
+    let envpBytes = runtimeEnvironment()
+    let envp = envpBytes.pointer()
+    let maskBytes = zeroedBlock(count: 8, alignment: 8)
+    let mask = maskBytes.pointer()
+    var flags = CloneFlag.pidfd
+    match job {
+        Some(cgroup) -> {
+            flags = flags | CloneFlag.intoCgroup heapStore<U64>(args, 80, U64(cgroup))
+        }
+        None -> {}
+    }
+    // A confined child has a mount namespace and a PID namespace of its
+    // own, and the parent waits for its exec, so the view is made by the
+    // time the launch answers. A suspended child stops before its exec, and is not waited on.
+    if view.isSome() {
+        flags = flags | CloneFlag.newMountNamespace | CloneFlag.newPidNamespace
+        if !suspended { flags = flags | CloneFlag.vfork }
+    }
+    heapStore<U64>(args, 0, flags)
+    heapStore<RawPtr>(args, 8, heapOffset(args, 88))
+    heapStore<U64>(args, 32, U64(Signal.child))
+    let cloned = clone3(args, U64(88))
+    if cloned == 0 {
+        // The child between clone and exec has no one to answer but its
+        // exit code: a step that fails leaves the program to start without
+        // it, and an exec that fails ends the child with 127.
+        //
+        // A blocked signal stays blocked across exec: a parent that watches
+        // for SIGTERM would otherwise hand a child that never hears it.
+        match answerStatus(sigprocmask(SignalMaskHow.set, mask, nullPointer(), U64(8))) {
+            Ok -> {}
+            Error(failed) -> absorb failed
+        }
+        match answerStatus(dup3(startup, Number(code(StandardStream.Input)), 0)) {
+            Ok -> {}
+            Error(failed) -> absorb failed
+        }
+        match answerStatus(closeRange(U32(1), U32(0xFFFFFFFF), CloseRange.closeOnExec)) {
+            Ok -> {}
+            Error(failed) -> absorb failed
+        }
+        match output {
+            Some(stream) -> match answerStatus(
+                dup3(stream, Number(code(StandardStream.Output)), 0)
+            ) {
+                Ok -> {}
+                Error(failed) -> absorb failed
+            }
+            None -> {}
+        }
+        match errors {
+            Some(stream) -> match answerStatus(
+                dup3(stream, Number(code(StandardStream.Error)), 0)
+            ) {
+                Ok -> {}
+                Error(failed) -> absorb failed
+            }
+            None -> {}
+        }
+        // A program writes its standard streams and expects to wait when the
+        // reader is behind, as on any terminal or pipe: a channel end given
+        // as one is made to wait rather than answer that it would.
+        if output.isSome() { streamWaits(Number(code(StandardStream.Output))) }
+        if errors.isSome() { streamWaits(Number(code(StandardStream.Error))) }
+        match view {
+            Some(confined) -> if !enterView(confined) { exitGroup(ConfineExit.failed) }
+            None -> {}
+        }
+        if suspended {
+            match answerStatus(kill(getpid(), Signal.stop)) {
+                Ok -> {}
+                Error(failed) -> absorb failed
+            }
+        }
+        if valgrind.isSome() {
+            match answerStatus(dup3(executable, Number(ValgrindLaunch.descriptor), 0)) {
+                Ok -> {}
+                Error(failed) -> absorb failed
+            }
+            match answerStatus(execve(cStringFrom(ValgrindLaunch.launcher), argv, envp)) {
+                Ok -> {}
+                Error(failed) -> absorb failed
+            }
+            exitGroup(127)
+        }
+        match answerStatus(execveat(executable, cStringFrom(""), argv, envp, AtFlag.emptyPath)) {
+            Ok -> {}
+            Error(failed) -> absorb failed
+        }
+        exitGroup(127)
+    }
+    if answerFailed(cloned) { return .Error(errnoFailure(answerErrno(cloned))) }
+    return .Ok(KernelChild { pid: U64(cloned), backing: heapLoad<U32>(args, 88) })
+}
+
+// Makes the standard stream at `fd` wait when it is full, keeping every
+// other flag it has. Called between clone and exec, so nothing here
+// allocates.
+function streamWaits(fd: Number) {
+    let flags = fcntl(fd, Fcntl.getFlags, nullPointer())
+    if answerFailed(flags) || (flags & LinuxOpen.nonBlock) == 0 { return }
+    match answerStatus(fcntl(fd, Fcntl.setFlags, RawPtr(flags & ~LinuxOpen.nonBlock))) {
+        Ok -> {}
+        Error(failed) -> absorb failed
+    }
+}
+
+// The startup channel a launching parent left this process: fd 0, when it
+// is a packet end. It is moved above the standard streams (`F_DUPFD_CLOEXEC`
+// from 3) once its message is there or five seconds have passed; None when
+// there is none.
+function kernelStartupChannel() -> Result<Number?, TesseraError> {
+    let packetEnd = try kernelIsPacketEnd(0)
+    if !packetEnd { return .Ok(.None) }
+    kernelWaitOn(0, Ready.readable, U64(5000000000))
+    let moved = fcntl(0, Fcntl.duplicateCloseOnExec, RawPtr(Fcntl.aboveStreams))
+    if answerFailed(moved) { return .Error(errnoFailure(answerErrno(moved))) }
+    return .Ok(.Some(moved))
+}
+
+// The root of the file system, as a Node backing (`O_PATH`).
+function kernelSystemRoot() -> Result<Number, TesseraError> {
+    let root = openat(
+        AtDirectory.current,
+        cStringFrom("/"),
+        LinuxOpen.path | LinuxOpen.closeOnExec | openDirectoryFlag(),
+        0
+    )
+    if answerFailed(root) { return .Error(errnoFailure(answerErrno(root))) }
+    return .Ok(root)
+}
+
+// Makes standard stream `stream` refer to `backing`.
+function kernelSetStandardStream(
+    stream: borrow StandardStream,
+    backing: Number
+) -> Result<Void, TesseraError> {
+    return answerStatus(dup3(backing, Number(code(stream)), 0))
+}
+
+// Whether `/proc/<pid>/maps` names `path`: the process's executable or a
+// library it loaded. A file replaced since it was mapped is listed as
+// `<path> (deleted)` and still counts, since the process runs what it loaded.
+function kernelProcessMaps(pid: U64, path: borrow String) -> Result<Bool, TesseraError> {
+    let fd = openat(
+        AtDirectory.current,
+        cStringFrom("/proc/" + stringFromUnsigned(pid) + "/maps"),
+        LinuxOpen.readOnly | LinuxOpen.closeOnExec,
+        0
+    )
+    if answerFailed(fd) { return .Error(errnoFailure(answerErrno(fd))) }
+    let blockBytes = zeroedBlock(count: 4097, alignment: 16)
+    let block = blockBytes.pointer()
+    var text = ""
+    while true {
+        let got = read(fd, block, U64(4096))
+        if answerFailed(got) {
+            closeBacking(fd)
+            return .Error(errnoFailure(answerErrno(got)))
+        }
+        if got == 0 { break }
+        text.append(stringFromCBytes(block, got))
+    }
+    closeBacking(fd)
+    let lines = text.split("\n")
+    let named = " " + path
+    let replaced = " " + path + " (deleted)"
+    for index in 0..lines.count {
+        if lines[index].endsWith(named) || lines[index].endsWith(replaced) { return .Ok(true) }
+    }
+    return .Ok(false)
+}

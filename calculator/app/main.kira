@@ -1,0 +1,15 @@
+//! The Calculator app's entry point: runs the calculator view as the application's only window.
+import KiraUI
+import TesseraUI
+
+/// Runs the calculator on Tessera's display until the person closes it.
+@Main
+function main() {
+    RunTesseraApplication(
+        "Calculator",
+        { in
+            return CalculatorView()
+        },
+        ApplicationOptions {}
+    )
+}

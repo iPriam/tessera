@@ -1,0 +1,17 @@
+import Foundation
+import KiraUI
+import TesseraUI
+import PlatformUI
+
+// The Dock along the bottom of each page, as an iPad's stands on its home
+// screen: the platform keeps what it holds and says so (`platformDock`), and
+// Home draws it, on its own glass, under every page, so it slides with them;
+// App Library, which is no page, has none. It is edited with Home. A
+// platform that draws its own Dock says nothing of it, and its band is left
+// empty for that one.
+function homeDock(editing: Bool) -> Any Widget {
+    let bridge = ambientBridge()
+    let entries = try platformDock(bridge) otherwise return FixedGap(width = 0, height = dockBand())
+    return Dock(items = platformDockItems(bridge, entries), ownGlass = true, editing = editing)
+    .height(resolvedLength(dockBand()))
+}

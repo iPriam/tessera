@@ -1,0 +1,76 @@
+import Foundation
+import Heap
+import LibTessera
+
+// Asking PID 1 to restart what loads the files a root changed.
+//
+// A process keeps running the files it mapped, replaced or not, so a change
+// takes effect only once what loads it starts again. PID 1 started every
+// service and is the one that can: the dev root sends it the paths over the
+// channel PID 1 started it with, `RestartLoaders` in the service header
+// (opcode, length, serial, and the byte count of the paths in the last word),
+// the paths one a line. A list longer than PID 1 reads at once goes in
+// several.
+
+// The service header PID 1 reads.
+@FFI.Struct { layout: c }
+struct ServiceHeader {
+    var opcode: U32
+    var length: U32
+    var serial: U32
+    var detail: U32
+}
+
+namespace RestartRequest {
+    // The most path bytes in one request: PID 1 reads 4096 bytes with the
+    // header.
+    let pathBytes: Number = 4080
+    let serial: UN32 = 1
+}
+
+function sendRestart(paths: borrow String) -> Result<Void, TesseraError> {
+    let length = paths.utf8().count
+    let total = ServiceMessage.headerBytes + length
+    let bodyBytes = zeroedBlock(count: total, alignment: 16)
+    let body = bodyBytes.pointer()
+    heapStore(
+        body,
+        ServiceHeader {
+            opcode: ServiceOpcode.RestartLoaders.rawValue(),
+            length: UN32(total),
+            serial: RestartRequest.serial,
+            detail: UN32(length),
+        }
+    )
+    copyBytes(heapOffset(body, ServiceMessage.headerBytes), paths.data, length)
+    let handles: [Handle] = []
+    let parent = try startupHandle(StartupTag.parentChannel) otherwise return .Error(
+        storageFailure(.NotFound)
+    )
+    return channelWrite(parent, Buffer { address: body, length: total }, handles)
+}
+
+function sendRestartBatch(paths: borrow String) {
+    match sendRestart(paths) {
+        Ok -> {}
+        Error(failed) -> log warn(
+            "could not ask PID 1 to restart what loads a dev root's files",
+            error: errorName(failed)
+        )
+    }
+}
+
+// Asks PID 1 to restart every process that loads one of `changed`.
+function requestRestart(changed: borrow [String]) {
+    var batch = ""
+    for path in changed {
+        let line = "\(path)\n"
+        if batch.count + line.count > RestartRequest.pathBytes && !batch.isEmpty() {
+            sendRestartBatch(batch)
+            batch = ""
+        }
+        if line.count <= RestartRequest.pathBytes { batch.append(line) }
+    }
+    if !batch.isEmpty() { sendRestartBatch(batch) }
+    log info("asked PID 1 to restart what loads the changed files", files: changed.count)
+}

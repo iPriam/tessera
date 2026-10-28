@@ -1,0 +1,332 @@
+import Foundation
+import Heap
+import LibTessera
+
+// Sensors (17 §14.3) over IIO.
+//
+// The manager opens the device's `/dev/iio:deviceN` node. `configure` sets
+// that node aside and gives the connection a `CLOCK_MONOTONIC` timerfd at
+// the configured rate instead, so a wait for READABLE on the connection is
+// a wait for the next sample. Each tick `read` samples every channel from
+// the device's sysfs directory as `(raw + offset) * scale`, written as an
+// integer of `10^exponent` units.
+
+// The IIO channel prefix behind each `SensorKind` this reads.
+struct SensorPrefix {
+    var prefix: String
+    var kind: SensorKind
+}
+
+let sensorPrefixes: [SensorPrefix] = [SensorPrefix {
+    prefix: "in_accel_",
+    kind: .Accelerometer
+}, SensorPrefix { prefix: "in_anglvel_", kind: .Gyroscope }, SensorPrefix {
+    prefix: "in_magn_",
+    kind: .Magnetometer
+}, SensorPrefix { prefix: "in_pressure", kind: .Barometer }, SensorPrefix {
+    prefix: "in_illuminance",
+    kind: .AmbientLight
+}, SensorPrefix { prefix: "in_proximity", kind: .Proximity }, SensorPrefix {
+    prefix: "in_gravity_",
+    kind: .Gravity
+}, SensorPrefix { prefix: "in_rot_quaternion", kind: .RotationVector }, SensorPrefix {
+    prefix: "in_steps",
+    kind: .StepCounter
+}, SensorPrefix { prefix: "in_temp", kind: .Temperature }, SensorPrefix {
+    prefix: "in_humidityrelative",
+    kind: .Humidity
+}, SensorPrefix { prefix: "in_angl_", kind: .Hinge },]
+
+namespace SensorRate {
+    let standard: Number = 50
+    let highest: Number = 1000
+}
+
+namespace SensorRecord {
+    let channelBytes: Number = 16
+    let timestampBytes: Number = 8
+}
+
+struct SensorChannelRecord {
+    var kind: SensorKind
+    // The channel's place among those of its kind.
+    var index: Number
+    var file: String
+    var scale: Number
+    var offset: Number
+    var exponent: Number
+    var format: SensorChannelFormat
+
+    function bytes(borrow self) -> Number {
+        return match self.format {
+            U64Count -> 8
+            S16 -> 4
+            S32 -> 4
+        }
+    }
+}
+
+// What a Sensor connection keeps besides its object.
+struct SensorConnection {
+    var object: Number
+    // The IIO node, once `configure` has given the connection its timer.
+    var node: Descriptor?
+    var rate: Number
+    var started: Bool
+    var channels: [SensorChannelRecord]
+    // A sample's bytes: its timestamp and every channel's value.
+    var sampleBytes: Number
+}
+
+namespace SensorUnit {
+    let milliExponent: Number = -3
+    let microExponent: Number = -6
+}
+
+// Micro-units, except light, which can pass two thousand lux a million times.
+function sensorExponent(kind: borrow SensorKind) -> Number {
+    if kind == .AmbientLight { return SensorUnit.milliExponent }
+    return SensorUnit.microExponent
+}
+
+// A per-channel attribute (`in_accel_x_scale`) or the shared one
+// (`in_accel_scale`); `fallback` when neither is there.
+function channelAttribute(
+    directory: borrow String,
+    base: borrow String,
+    prefix: borrow String,
+    name: borrow String,
+    fallback: Number
+) -> Number {
+    match numberAttribute(directory + "/" + base + "_" + name) {
+        Some(value) -> return value
+        None -> {}
+    }
+    let shared = prefix.endsWith("_") ? prefix : prefix + "_"
+    return numberAttribute(directory + "/" + shared + name).or(fallback)
+}
+
+function isChannelFile(name: borrow String, prefix: borrow String) -> Bool {
+    return name.startsWith(prefix) && (name.endsWith("_raw") || name.endsWith("_input"))
+}
+
+// Every channel the device has, kind by kind, in name order within a kind so
+// `x`, `y`, `z` line up.
+function scanChannels(directory: borrow String) -> Result<[SensorChannelRecord], TesseraError> {
+    let files = try directoryEntries(directory)
+    var channels: [SensorChannelRecord] = []
+    for source in sensorPrefixes {
+        var names: [String] = []
+        for name in files {
+            if isChannelFile(name, source.prefix) { names.append(name) }
+        }
+        let ordered = names.sorted({ left, right in return orderStrings(left, right) < 0 })
+        for (index, name) in ordered.enumerated() {
+            let raw = name.endsWith("_raw")
+            let base = name.substring(0, name.count - (raw ? 4 : 6))
+            var scale: Number = 1
+            var offset: Number = 0
+            if raw {
+                scale = channelAttribute(directory, base, source.prefix, "scale", 1)
+                offset = channelAttribute(directory, base, source.prefix, "offset", 0)
+            } else if source.kind == .Temperature || source.kind == .Humidity {
+                // Processed temperature and humidity are in thousandths.
+                scale = 0.001
+            }
+            channels.append(
+                SensorChannelRecord {
+                    kind: source.kind,
+                    index: index,
+                    file: name,
+                    scale: scale,
+                    offset: offset,
+                    exponent: sensorExponent(source.kind),
+                    format: source.kind == .StepCounter ? .U64Count : .S32,
+                }
+            )
+        }
+    }
+    return .Ok(channels)
+}
+
+// A Sensor connection's record, made, with its channels, the first time a
+// call needs it.
+function sensorOf(object: Number) -> Result<Number, TesseraError> {
+    for (index, sensor) in deviceLibrary.sensors.enumerated() {
+        if sensor.object == object { return .Ok(index) }
+    }
+    let directory = try sysfsPath(object)
+    let channels = try scanChannels(directory)
+    var sampleBytes = SensorRecord.timestampBytes
+    for channel in channels { sampleBytes += channel.bytes() }
+    deviceLibrary.sensors.append(
+        SensorConnection {
+            object: object,
+            node: .None,
+            rate: 0,
+            started: false,
+            channels: channels,
+            sampleBytes: sampleBytes
+        }
+    )
+    return .Ok(deviceLibrary.sensors.count - 1)
+}
+
+function resolveSensor(sensor: Ref, rights: RefRights) -> Result<Number, TesseraError> {
+    let object = try resolveConnection(sensor, .Sensor, rights)
+    return sensorOf(object)
+}
+
+// One 16-byte `SensorChannel` per channel: kind, index within the kind, the
+// power of ten a value is in, and its format.
+public function sensorChannels(sensor: Ref, out: borrow Buffer) -> Result<Number, TesseraError> {
+    let index = try resolveSensor(sensor, RefRights.read)
+    let channels = deviceLibrary.sensors[index].channels
+    try requireRoom(out, channels.count * SensorRecord.channelBytes)
+    for (count, channel) in channels.enumerated() {
+        let at = count * SensorRecord.channelBytes
+        heapStore<U32>(out.address, at, channel.kind.rawValue())
+        heapStore<U32>(out.address, at + 4, U32(channel.index))
+        heapStore<U32>(out.address, at + 8, word32Of(channel.exponent))
+        heapStore<U32>(out.address, at + 12, code(channel.format))
+    }
+    return .Ok(channels.count)
+}
+
+// Answers the rate taken, 1 to 1000 Hz. Batching is not offered: the
+// samples are read as they are taken, so `batchNs` is not used.
+public function sensorConfigure(
+    sensor: Ref,
+    rateHz: Number,
+    batchNs: UNumber
+) -> Result<Number, TesseraError> {
+    let index = try resolveSensor(sensor, RefRights.write)
+    if deviceLibrary.sensors[index].started { return .Error(failure(.BadState)) }
+    let object = deviceLibrary.sensors[index].object
+    var rate = rateHz <= 0 ? SensorRate.standard : rateHz
+    if rate > SensorRate.highest { rate = SensorRate.highest }
+    // Not every IIO device has a rate to set; it then samples on each read.
+    let directory = try sysfsPath(object)
+    match writeText(directory + "/sampling_frequency", "\(rate)") {
+        Ok -> {}
+        Error(failed) -> log info(
+            "the sensor keeps its own sampling rate",
+            error: errorName(failed)
+        )
+    }
+    if deviceLibrary.sensors[index].node.isNone() {
+        let timer = try timerObject()
+        deviceLibrary.sensors[index].node = deviceLibrary.objects[object].device
+        deviceLibrary.objects[object].device = .Some(timer)
+    }
+    deviceLibrary.sensors[index].rate = rate
+    return .Ok(rate)
+}
+
+// `struct itimerspec` repeating every `period`, or disarmed for 0.
+function armTimer(object: Number, period: Number) -> Result<Void, TesseraError> {
+    let timer = try deviceOf(object)
+    let blockBytes = zeroedBlock(count: 32, alignment: 16)
+    let block = blockBytes.pointer()
+    if period > 0 {
+        storeTimespec(block, 0, period)
+        storeTimespec(block, 16, period)
+    }
+    return timer.setTimer(block)
+}
+
+public function sensorStart(sensor: Ref) -> Result<Void, TesseraError> {
+    let index = try resolveSensor(sensor, RefRights.write)
+    let record = deviceLibrary.sensors[index]
+    if record.rate == 0 || record.node.isNone() { return .Error(failure(.BadState)) }
+    try armTimer(record.object, floor(Time.nanosecondsPerSecond / record.rate))
+    deviceLibrary.sensors[index].started = true
+    return .Ok
+}
+
+public function sensorStop(sensor: Ref) -> Result<Void, TesseraError> {
+    let index = try resolveSensor(sensor, RefRights.write)
+    deviceLibrary.sensors[index].started = false
+    if deviceLibrary.sensors[index].node.isNone() { return .Ok }
+    return armTimer(deviceLibrary.sensors[index].object, 0)
+}
+
+// A channel's value now, in its record's units.
+function channelValue(
+    directory: borrow String,
+    channel: borrow SensorChannelRecord
+) -> Result<Number, TesseraError> {
+    let text = try readText(directory + "/" + channel.file)
+    let reading = match text.trim().toNumber() {
+        Some(value) -> value
+        None -> {
+            log warn("a sensor channel does not read as a number", file: channel.file, text: text)
+            return .Error(failure(.Internal))
+        }
+    }
+    if channel.format == .U64Count { return .Ok(reading) }
+    return .Ok((reading + channel.offset) * channel.scale * pow(10, -channel.exponent))
+}
+
+// The timer's ticks since the last read; `ShouldWait` before the next.
+function ticks(object: Number) -> Result<Number, TesseraError> {
+    let timer = try deviceOf(object)
+    let blockBytes = zeroedBlock(count: 8, alignment: 16)
+    let block = blockBytes.pointer()
+    return match timer.read(block, 8) {
+        Ok(got) -> .Ok(Number(heapLoad<U64>(block, 0)))
+        Error(failed) -> {
+            match errnoOf(failed) {
+                Again -> return .Error(failure(.ShouldWait))
+                else -> return .Error(failed)
+            }
+        }
+    }
+}
+
+// One sample per tick since the last read, as many as fit: a `u64`
+// monotonic timestamp, then each channel's value in channel order. Ticks
+// that do not fit are dropped. Answers the bytes written.
+public function sensorRead(sensor: Ref, out: borrow Buffer) -> Result<Number, TesseraError> {
+    let index = try resolveSensor(sensor, RefRights.read)
+    let record = deviceLibrary.sensors[index]
+    if !record.started { return .Error(failure(.BadState)) }
+    try requireRoom(out, record.sampleBytes)
+    let ticked = try ticks(record.object)
+    let fit = floor(out.length / record.sampleBytes)
+    let samples = ticked < fit ? ticked : fit
+    let directory = try sysfsPath(record.object)
+    var at = 0
+    for sample in 0..samples {
+        let now = try monotonicNow()
+        heapStore<U64>(out.address, at, U64(now))
+        at += 8
+        for channel in record.channels {
+            let value = try channelValue(directory, channel)
+            match channel.format {
+                U64Count -> heapStore<U64>(out.address, at, U64(value))
+                S16 -> heapStore<U32>(out.address, at, word32Of(value))
+                S32 -> heapStore<U32>(out.address, at, word32Of(value))
+            }
+            at += channel.bytes()
+        }
+    }
+    return .Ok(Number(at))
+}
+
+// The connection's own descriptor, the timer, closes with its object; the
+// IIO node set aside closes here.
+function sensorRelease(object: Number) {
+    var kept: [SensorConnection] = []
+    for sensor in deviceLibrary.sensors {
+        if sensor.object != object {
+            kept.append(sensor)
+            continue
+        }
+        match sensor.node {
+            Some(node) -> node.close()
+            None -> {}
+        }
+    }
+    deviceLibrary.sensors = kept
+}

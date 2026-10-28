@@ -1,0 +1,634 @@
+import Foundation
+import LibTessera
+
+// The types at DeviceKit's boundary (17 §3.1). Every record is plain so its
+// RIDL shape is its byte layout; the records DeviceKit writes into a caller's
+// `Buffer` keep the layouts 17 states and are built byte by byte. A distinct
+// integer crosses RIDL as `{ raw }`, which is the shape §3.1 gives `Ref`,
+// `RefRights` and `DeviceEvents`.
+
+// A DeviceKit object reference (§4.1): an index and a generation in this
+// process's table. 0 is invalid.
+public distinct Ref = U64
+
+// A registry entry, stable for one boot; 0 is none.
+public distinct EntryId = U64
+
+// A pixel format, the DRM fourcc values.
+public distinct FourCc = U32
+
+// A buffer layout, the DRM modifier values; 0 is linear.
+public distinct Modifier = U64
+
+// A single-use transfer token (§9.6).
+@Derive(Copy)
+public struct Token {
+    var high: UNumber
+    var low: UNumber
+}
+
+// A kernel object for a graphics API import (§9.7).
+@Derive(Copy)
+public struct NativeHandle {
+    var kind: NativeKind
+    var value: UNumber
+}
+
+// ─── Objects (§4.2) ─────────────────────────────────────────────────────────
+
+public enum DeviceObject: U32 {
+    None = 0
+    Connection = 1
+    Surface = 2
+    Fence = 3
+    Framebuffer = 4
+    RegistryWatch = 5
+    WakeSource = 6
+    Mapper = 7
+    Driver = 9
+}
+
+// `RefInfo.state`.
+public enum ObjectState: U32 {
+    Ok = 0
+    Lost = 1
+    Error = 2
+    Suspended = 3
+}
+
+@Derive(Copy)
+public struct RefInfo {
+    var objectType: DeviceObject
+    var state: ObjectState
+    var rights: RefRights
+    var entry: EntryId
+    var objectId: UNumber
+}
+
+// ─── Rights (§4.3) ──────────────────────────────────────────────────────────
+
+public distinct RefRights = U64
+
+public namespace RefRights {
+    let none: RefRights = RefRights(0)
+    let duplicate: RefRights = RefRights(1)
+    let export: RefRights = RefRights(2)
+    let read: RefRights = RefRights(4)
+    let write: RefRights = RefRights(8)
+    let map: RefRights = RefRights(0x10)
+    let wait: RefRights = RefRights(0x80)
+    let inspect: RefRights = RefRights(0x100)
+    let manage: RefRights = RefRights(0x200)
+    let setProperty: RefRights = RefRights(0x400)
+    let native: RefRights = RefRights(0x10000)
+    let master: RefRights = RefRights(0x20000)
+    let grab: RefRights = RefRights(0x40000)
+    // `Ref.duplicate` and the exports: the same rights as the source.
+    let same: RefRights = RefRights(0xFFFFFFFFFFFFFFFF)
+}
+
+// ─── Events (§4.4) ──────────────────────────────────────────────────────────
+
+public distinct DeviceEvents = U32
+
+public namespace DeviceEvents {
+    let none: DeviceEvents = DeviceEvents(0)
+    let readable: DeviceEvents = DeviceEvents(1)
+    let writable: DeviceEvents = DeviceEvents(2)
+    let lost: DeviceEvents = DeviceEvents(4)
+    let signaled: DeviceEvents = DeviceEvents(8)
+    let idle: DeviceEvents = DeviceEvents(0x10)
+    let error: DeviceEvents = DeviceEvents(0x20)
+    let reset: DeviceEvents = DeviceEvents(0x40)
+    let changed: DeviceEvents = DeviceEvents(0x80)
+    let suspending: DeviceEvents = DeviceEvents(0x100)
+    let resumed: DeviceEvents = DeviceEvents(0x200)
+}
+
+// ─── Completions (§6.2), in `aux` ───────────────────────────────────────────
+
+public enum DeviceCompletion: U32 {
+    Event = 1
+    Open = 2
+    Import = 3
+    Fence = 4
+    Flip = 5
+    Transfer = 6
+    Suspend = 7
+    Token = 8
+}
+
+// ─── Registry (§7.2) ────────────────────────────────────────────────────────
+
+// 17 §7.2 calls this `DeviceClass`, which LibTessera already exports, and
+// §3.2 forbids sharing a name with it.
+public enum EntryClass: U32 {
+    Unknown = 0
+    Bus = 1
+    GpuAdapter = 2
+    DisplayController = 3
+    Connector = 4
+    InputDevice = 5
+    AudioCard = 6
+    AudioEndpoint = 7
+    Camera = 8
+    Sensor = 9
+    HapticDevice = 10
+    PowerSource = 11
+    ThermalZone = 12
+    Backlight = 13
+    BlockDevice = 14
+    Partition = 15
+    HidDevice = 16
+    UsbDevice = 17
+    UsbInterface = 18
+    Rtc = 19
+    Driver = 20
+}
+
+public enum Family: U32 {
+    None = 0
+    Gpu = 1
+    Display = 2
+    Input = 3
+    Audio = 4
+    Camera = 5
+    Sensor = 6
+    Haptic = 7
+    PowerSource = 8
+    Thermal = 9
+    Backlight = 10
+    Block = 11
+    Hid = 12
+    Usb = 13
+    Rtc = 14
+}
+
+public enum Plane: U32 {
+    Service = 0
+    Bus = 1
+    Power = 2
+}
+
+public distinct EntryFlags = U32
+
+public namespace EntryFlags {
+    let none: EntryFlags = EntryFlags(0)
+    let removable: EntryFlags = EntryFlags(1)
+    let builtIn: EntryFlags = EntryFlags(2)
+    let wakeupCapable: EntryFlags = EntryFlags(4)
+    let defaultOfClass: EntryFlags = EntryFlags(8)
+    let virtual: EntryFlags = EntryFlags(0x10)
+}
+
+@Derive(Copy)
+public struct EntryInfo {
+    var id: EntryId
+    var entryClass: EntryClass
+    var family: Family
+    var parent: EntryId
+    var generation: UNumber
+    var flags: EntryFlags
+    var childCount: UN32
+    var name: UNumber
+}
+
+public enum PropertyType: U32 {
+    Bool = 1
+    I64 = 2
+    U64 = 3
+    String = 4
+    Bytes = 5
+    List = 6
+}
+
+// `RegistryChange.kind`.
+public enum RegistryChangeKind: U32 {
+    Matched = 1
+    Terminated = 2
+    PropertiesChanged = 3
+    Resync = 4
+}
+
+// ─── Connections (§8.2) ─────────────────────────────────────────────────────
+
+public distinct OpenOptions = U32
+
+public namespace OpenOptions {
+    let none: OpenOptions = OpenOptions(0)
+    let exclusive: OpenOptions = OpenOptions(1)
+    let master: OpenOptions = OpenOptions(2)
+    let grab: OpenOptions = OpenOptions(4)
+    let readOnly: OpenOptions = OpenOptions(8)
+    let all: OpenOptions = OpenOptions(15)
+}
+
+// `Device.setPowerState`.
+public enum PowerState: U32 {
+    Auto = 0
+    On = 1
+    Suspended = 2
+}
+
+// ─── Surfaces (§9.2) ────────────────────────────────────────────────────────
+
+public distinct SurfaceUsage = U32
+
+public namespace SurfaceUsage {
+    let none: SurfaceUsage = SurfaceUsage(0)
+    let render: SurfaceUsage = SurfaceUsage(1)
+    let sample: SurfaceUsage = SurfaceUsage(2)
+    let scanout: SurfaceUsage = SurfaceUsage(4)
+    let cpuRead: SurfaceUsage = SurfaceUsage(8)
+    let cpuWrite: SurfaceUsage = SurfaceUsage(16)
+    let videoDecode: SurfaceUsage = SurfaceUsage(32)
+    let videoEncode: SurfaceUsage = SurfaceUsage(64)
+    let camera: SurfaceUsage = SurfaceUsage(128)
+    let protectedContent: SurfaceUsage = SurfaceUsage(256)
+}
+
+// `SurfaceDescriptor.flags` and `SurfaceInfo.flags`.
+public distinct SurfaceFlags = U32
+
+public namespace SurfaceFlags {
+    let none: SurfaceFlags = SurfaceFlags(0)
+    let purgeable: SurfaceFlags = SurfaceFlags(1)
+    // `SurfaceDescriptor`: physically contiguous memory.
+    let contiguous: SurfaceFlags = SurfaceFlags(2)
+    // `SurfaceInfo`: the contents were discarded.
+    let purged: SurfaceFlags = SurfaceFlags(2)
+    let imported: SurfaceFlags = SurfaceFlags(4)
+    let adopted: SurfaceFlags = SurfaceFlags(8)
+}
+
+// `Surface.lock`'s access.
+public distinct SurfaceAccess = U32
+
+public namespace SurfaceAccess {
+    let none: SurfaceAccess = SurfaceAccess(0)
+    let read: SurfaceAccess = SurfaceAccess(1)
+    let write: SurfaceAccess = SurfaceAccess(2)
+}
+
+// A surface request. RIDL has no fixed arrays, so the four acceptable
+// modifiers are four fields.
+@Derive(Copy)
+public struct SurfaceDescriptor {
+    var width: UN32
+    var height: UN32
+    var format: FourCc
+    var usage: SurfaceUsage
+    var gpu: EntryId
+    var modifierCount: UN32
+    var flags: SurfaceFlags
+    var modifier0: Modifier
+    var modifier1: Modifier
+    var modifier2: Modifier
+    var modifier3: Modifier
+}
+
+@Derive(Copy)
+public struct SurfacePlane {
+    var offset: UNumber
+    var stride: UN32
+    var size: UNumber
+}
+
+@Derive(Copy)
+public struct SurfaceInfo {
+    var width: UN32
+    var height: UN32
+    var format: FourCc
+    var usage: SurfaceUsage
+    var modifier: Modifier
+    var planeCount: UN32
+    var flags: SurfaceFlags
+    var plane0: SurfacePlane
+    var plane1: SurfacePlane
+    var plane2: SurfacePlane
+    var plane3: SurfacePlane
+}
+
+public enum NativeKind: U32 {
+    None = 0
+    DmaBufFd = 1
+    SyncFileFd = 2
+    DrmSyncobjFd = 3
+    MachPort = 4
+}
+
+// ─── Gpu (§11) ──────────────────────────────────────────────────────────────
+
+public distinct GpuCapabilities = U64
+
+public namespace GpuCapabilities {
+    let none: GpuCapabilities = GpuCapabilities(0)
+    let allocatesSurfaces: GpuCapabilities = GpuCapabilities(1)
+    let scanout: GpuCapabilities = GpuCapabilities(2)
+    let timelineFences: GpuCapabilities = GpuCapabilities(4)
+    let explicitSync: GpuCapabilities = GpuCapabilities(8)
+    let integrated: GpuCapabilities = GpuCapabilities(0x10)
+    let virtual: GpuCapabilities = GpuCapabilities(0x20)
+    let resetNotification: GpuCapabilities = GpuCapabilities(0x40)
+    let priorityHigh: GpuCapabilities = GpuCapabilities(0x80)
+}
+
+public enum GpuPriority: U32 {
+    Low = 0
+    Normal = 1
+    High = 2
+    Realtime = 3
+}
+
+@Derive(Copy)
+public struct GpuMemory {
+    var localUsed: UNumber
+    var localBudget: UNumber
+    var sharedUsed: UNumber
+    var sharedBudget: UNumber
+}
+
+// ─── Display (§12) ──────────────────────────────────────────────────────────
+
+public distinct CommitOptions = U32
+
+public namespace CommitOptions {
+    let none: CommitOptions = CommitOptions(0)
+    let testOnly: CommitOptions = CommitOptions(1)
+    let nonBlock: CommitOptions = CommitOptions(2)
+    let allowModeset: CommitOptions = CommitOptions(4)
+    let flipEvent: CommitOptions = CommitOptions(8)
+    let all: CommitOptions = CommitOptions(15)
+}
+
+@Derive(Copy)
+public struct Vblank {
+    var sequence: UNumber
+    var timestamp: UNumber
+    var serial: UNumber
+}
+
+// ─── Input (§13.2) ──────────────────────────────────────────────────────────
+
+// `InputEvent.type`.
+public enum InputEventKind: U16 {
+    Key = 1
+    Relative = 2
+    Absolute = 3
+    Switch = 4
+    Frame = 5
+    Dropped = 6
+}
+
+// `Input.setLeds`: HID LED usages as bits.
+public distinct InputLeds = U32
+
+public namespace InputLeds {
+    let none: InputLeds = InputLeds(0)
+    let numLock: InputLeds = InputLeds(1)
+    let capsLock: InputLeds = InputLeds(2)
+    let scrollLock: InputLeds = InputLeds(4)
+    let compose: InputLeds = InputLeds(8)
+    let kana: InputLeds = InputLeds(16)
+}
+
+// ─── Media (§14) ────────────────────────────────────────────────────────────
+
+// `AudioConfig.sampleFormat`.
+public enum PcmFormat: U32 {
+    I16 = 0
+    I24 = 1
+    I32 = 2
+    F32 = 3
+}
+
+@Derive(Copy)
+public struct AudioConfig {
+    var sampleRate: UN32
+    var channels: UN32
+    var sampleFormat: PcmFormat
+    var periodFrames: UN32
+    var periods: UN32
+    var channelMap: UNumber
+}
+
+// `AudioPosition.state`.
+public enum AudioState: U32 {
+    Stopped = 0
+    Running = 1
+    Xrun = 2
+}
+
+@Derive(Copy)
+public struct AudioPosition {
+    var frames: UNumber
+    var delay: UN32
+    var state: AudioState
+    var timestamp: UNumber
+}
+
+@Derive(Copy)
+public struct CameraFormat {
+    var format: FourCc
+    var width: UN32
+    var height: UN32
+    var framesPerSecondQ16: UN32
+    var colorSpace: UN32
+    var flags: UN32
+}
+
+public distinct CameraFrameFlags = U32
+
+public namespace CameraFrameFlags {
+    let none: CameraFrameFlags = CameraFrameFlags(0)
+    let keyframe: CameraFrameFlags = CameraFrameFlags(1)
+    let error: CameraFrameFlags = CameraFrameFlags(2)
+}
+
+@Derive(Copy)
+public struct CameraFrame {
+    var slot: UN32
+    var bytes: UN32
+    var sequence: UNumber
+    var timestamp: UNumber
+    var flags: CameraFrameFlags
+}
+
+// `Camera.control` ids (§14.2). 17 calls them controls; LibTessera exports
+// `CameraControl`, so here they are settings.
+public enum CameraSetting: U32 {
+    Exposure = 1
+    Gain = 2
+    Focus = 3
+    WhiteBalance = 4
+    Zoom = 5
+    Torch = 6
+    PowerLineFrequency = 7
+}
+
+// A `Camera.control` value that reads the setting without changing it.
+public namespace CameraValue {
+    let read: Number = -9223372036854775807
+}
+
+// `SensorChannel.format`.
+public enum SensorChannelFormat: U32 {
+    S16 = 1
+    S32 = 2
+    U64Count = 3
+}
+
+public distinct HapticCapabilities = U32
+
+public namespace HapticCapabilities {
+    let none: HapticCapabilities = HapticCapabilities(0)
+    let rumble: HapticCapabilities = HapticCapabilities(1)
+    let periodic: HapticCapabilities = HapticCapabilities(2)
+    let customWaveform: HapticCapabilities = HapticCapabilities(4)
+    let gain: HapticCapabilities = HapticCapabilities(8)
+}
+
+// ─── Power (§15) ────────────────────────────────────────────────────────────
+
+public enum PowerSourceKind: U32 {
+    Unknown = 0
+    Battery = 1
+    Mains = 2
+    Usb = 3
+    Wireless = 4
+}
+
+// `PowerSourceInfo.state`: LibTessera's `BatteryState` values, which are
+// not named here because a RIDL record takes no other module's type.
+public enum ChargeState: U32 {
+    Unknown = 0
+    Discharging = 1
+    Charging = 2
+    Full = 3
+    NotCharging = 4
+}
+
+@Derive(Copy)
+public struct PowerSourceInfo {
+    var kind: PowerSourceKind
+    var state: ChargeState
+    var online: UN32
+    var percent: UN32
+    var energyNowUwh: UNumber
+    var energyFullUwh: UNumber
+    var powerNowUw: UNumber
+    var voltageUv: UNumber
+    var timeToEmpty: UNumber
+    var timeToFull: UNumber
+}
+
+public enum ThermalKind: U32 {
+    Unknown = 0
+    Cpu = 1
+    Gpu = 2
+    Battery = 3
+    Skin = 4
+    Other = 5
+}
+
+// `ThermalInfo.policyLevel`. LibTessera exports `ThermalLevel`.
+public enum ThermalPolicy: U32 {
+    Nominal = 0
+    Fair = 1
+    Serious = 2
+    Critical = 3
+}
+
+@Derive(Copy)
+public struct ThermalInfo {
+    var kind: ThermalKind
+    var tripCount: UN32
+    var milliCelsius: N32
+    var policyLevel: ThermalPolicy
+}
+
+// `Suspend.enter`.
+public enum SuspendState: U32 {
+    Idle = 1
+    Memory = 2
+    Disk = 3
+}
+
+// ─── Block (§16) ────────────────────────────────────────────────────────────
+
+public distinct BlockFlags = U32
+
+public namespace BlockFlags {
+    let none: BlockFlags = BlockFlags(0)
+    let readOnly: BlockFlags = BlockFlags(1)
+    let rotational: BlockFlags = BlockFlags(2)
+    let removable: BlockFlags = BlockFlags(4)
+    let discard: BlockFlags = BlockFlags(8)
+    let writeZeroes: BlockFlags = BlockFlags(0x10)
+    let forceUnitAccess: BlockFlags = BlockFlags(0x20)
+}
+
+@Derive(Copy)
+public struct BlockInfo {
+    var size: UNumber
+    var logicalBlock: UN32
+    var physicalBlock: UN32
+    var optimalIo: UN32
+    var flags: BlockFlags
+    var maxTransfer: UNumber
+    var discardGranularity: UNumber
+}
+
+// `Block.write` flags.
+public distinct BlockWriteFlags = U32
+
+public namespace BlockWriteFlags {
+    let none: BlockWriteFlags = BlockWriteFlags(0)
+    let forceUnitAccess: BlockWriteFlags = BlockWriteFlags(1)
+}
+
+// `MapperTarget.kind`.
+public enum MapperTargetKind: U32 {
+    Linear = 1
+    Verity = 2
+    Crypt = 3
+}
+
+// `Mapper.create` flags.
+public distinct MapperFlags = U32
+
+public namespace MapperFlags {
+    let none: MapperFlags = MapperFlags(0)
+    let readOnly: MapperFlags = MapperFlags(1)
+}
+
+// `Mapper.status`: these bits, and the device's open count in the high
+// half.
+public distinct MapperStatus = U32
+
+public namespace MapperStatus {
+    let none: MapperStatus = MapperStatus(0)
+    let active: MapperStatus = MapperStatus(1)
+    let suspended: MapperStatus = MapperStatus(2)
+    let readOnly: MapperStatus = MapperStatus(4)
+}
+
+// ─── Usb (§17.2) ────────────────────────────────────────────────────────────
+
+// `UsbTransfer.type`.
+public enum UsbTransferKind: U32 {
+    Control = 1
+    Bulk = 2
+    Interrupt = 3
+    Isochronous = 4
+}
+
+@Derive(Copy)
+public struct UsbTransfer {
+    var endpoint: UN32
+    var transferType: UsbTransferKind
+    var buffer: Buffer
+    var timeout: UNumber
+    var setup: UNumber
+    var flags: UN32
+}

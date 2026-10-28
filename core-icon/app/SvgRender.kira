@@ -1,0 +1,41 @@
+import Foundation
+import RenderBox
+
+// An SVG document recorded into a display list: CoreSVG maps its viewBox
+// onto the space it is drawn in, clips to the viewBox, and draws what is
+// inside.
+
+// The box a document is drawn in: its `viewBox`, else its width and height.
+public function svgViewBox(document: borrow SvgElement) -> Result<Rect, SvgFailure> {
+    let box: [Number] = match document.attribute("viewBox") {
+        Some(written) -> svgNumbers(written)
+        // Without a viewBox, the width and height below define the canvas.
+        None -> []
+    }
+    if box.count == 4 && box[2] > 0 && box[3] > 0 {
+        return .Ok(Rect { x: box[0], y: box[1], width: box[2], height: box[3] })
+    }
+    let width = try svgLength(document.attribute("width")) otherwise 0
+    let height = try svgLength(document.attribute("height")) otherwise 0
+    if width <= 0 || height <= 0 { return .Error(.EmptyCanvas) }
+    return .Ok(Rect { width: width, height: height })
+}
+
+// `document` drawn into `list`, its viewBox fitted into `frame` and centred,
+// as `preserveAspectRatio`'s default `xMidYMid meet` places it.
+public function drawSvg(
+    document: borrow SvgElement,
+    list: borrow DisplayList,
+    frame: borrow Rect
+) -> Result<Void, SvgFailure> {
+    let box = try svgViewBox(document)
+    var painter = SvgPainter { list: copy list }
+    painter.collectNamed(document)
+    list.save()
+    list.concat(viewBoxFit(box, frame))
+    var viewport = Shape()
+    viewport.setRect(copy box)
+    list.clipShape(viewport, 1, .Normal)
+    for child in document.children { try painter.draw(child, SvgStyle {}) }
+    return drawn(list.restore())
+}

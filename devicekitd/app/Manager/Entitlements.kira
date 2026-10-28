@@ -1,0 +1,50 @@
+import Foundation
+import DeviceKit
+import LibTessera
+
+// Which program may open which device family (17 §20.2).
+//
+// A program is known by the executable its process runs, read from
+// `/proc/<pid>/exe` of the pid the socket reports. The table is here, in one
+// place, rather than in a manifest each program carries: Tessera has a
+// handful of programs, all built together, and the list is short enough to
+// read in full.
+//
+// A render node is open to everyone: it allows rendering and nothing that
+// touches another process's work, and every client of the display server
+// needs one for its fences. The display and input are the display server's
+// alone. The media families are the Devices service's
+// (`tessera.devicekit.media`), the power families the Power service's
+// (`tessera.devicekit.power`), and block devices the Volume service's
+// (`tessera.devicekit.block`); the display server keeps haptics and the
+// backlight as well, for the feedback and brightness it drives itself.
+// Exporting and importing a token need no entitlement; the token is the
+// authority.
+
+struct Entitlement {
+    var program: String
+    var families: [Family]
+}
+
+let entitlements: [Entitlement] = [Entitlement {
+    program: "/" + SystemDirectory.programs + "/mosaicdisplay",
+    families: [Family.Display, Family.Input, Family.Haptic, Family.Backlight]
+}, Entitlement {
+    program: "/" + SystemDirectory.programs + "/devices",
+    families: [Family.Audio, Family.Camera, Family.Sensor, Family.Haptic]
+}, Entitlement {
+    program: "/" + SystemDirectory.programs + "/power",
+    families: [Family.PowerSource, Family.Thermal, Family.Backlight, Family.Rtc]
+}, Entitlement { program: "/" + SystemDirectory.programs + "/volume", families: [Family.Block] }]
+
+function entitled(program: borrow String?, family: borrow Family) -> Bool {
+    if family == .Gpu { return true }
+    for entitlement in entitlements {
+        if program == .Some(entitlement.program) {
+            for granted in entitlement.families {
+                if granted == family { return true }
+            }
+        }
+    }
+    return false
+}

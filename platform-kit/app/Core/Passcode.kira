@@ -1,0 +1,201 @@
+import Foundation
+
+// The device passcode (roadmap/27-lock-screen.md): never kept itself, only a
+// salted PBKDF2-HMAC-SHA256 of it (RFC 8018 section 5.2), and the lock
+// screen's patience with wrong ones, which waits longer after each run of
+// failures. The platform keeps the record in a file only the system reads,
+// and nothing here logs a passcode or a hash.
+
+/// A passcode as kept: its salt, how many rounds were run, and the result.
+public struct PasscodeRecord {
+    let salt: [UN8]
+    let rounds: Number
+    let derived: [UN8]
+}
+
+/// Why a passcode could not be made into a record.
+public enum PasscodeFailure {
+    /// The passcode is shorter than `PasscodeRule.shortest`.
+    TooShort
+    /// The system's cryptography refused.
+    Crypto(CryptoFailure)
+}
+
+public namespace PasscodeRule {
+    let shortest: Number = 4
+    // Rounds enough to slow a guess on an emulated machine, few enough that
+    // the lock screen answers within about a second there.
+    let rounds: Number = 20000
+    let saltBytes: Number = 16
+    let derivedBytes: Number = 32
+    let kind: String = "pbkdf2-sha256"
+}
+
+/// PBKDF2-HMAC-SHA256 of `password` with `salt`, `rounds` times, `length`
+/// bytes long.
+///
+/// # Errors
+///
+/// The system's cryptography's failure.
+public function pbkdf2(
+    password: borrow [UN8],
+    salt: borrow [UN8],
+    rounds: Number,
+    length: Number
+) -> Result<[UN8], CryptoFailure> {
+    var derived: [UN8] = []
+    var block: Number = 1
+    while derived.count < length {
+        var input = copy salt
+        for byte in [UN8(trunc(block / 16777216) % 256), UN8(trunc(block / 65536) % 256), UN8(
+            trunc(block / 256) % 256
+        ), UN8(block % 256)] {
+            input.append(byte)
+        }
+        var mixed = try hmac(.Sha256, password, input)
+        var sum = copy mixed
+        for _ in 1..rounds {
+            mixed = try hmac(.Sha256, password, mixed)
+            sum = xorBytes(sum, mixed)
+        }
+        for byte in sum {
+            if derived.count < length { derived.append(byte) }
+        }
+        block += 1
+    }
+    return .Ok(derived)
+}
+
+function xorBytes(left: borrow [UN8], right: borrow [UN8]) -> [UN8] {
+    var result: [UN8] = []
+    for (index, byte) in left.enumerated() {
+        result.append(UN8(byte ^ right[index]))
+    }
+    return result
+}
+
+/// A record of `passcode` with a new salt.
+///
+/// # Errors
+///
+/// [`PasscodeFailure`] when it is too short or cryptography refused.
+public function passcodeRecord(passcode: borrow String) -> Result<PasscodeRecord, PasscodeFailure> {
+    if passcode.count < PasscodeRule.shortest { return .Error(.TooShort) }
+    let salt = match randomBytes(PasscodeRule.saltBytes) {
+        Ok(value) -> value
+        Error(failure) -> return .Error(.Crypto(failure))
+    }
+    let derived = match pbkdf2(
+        passcode.utf8(),
+        salt,
+        PasscodeRule.rounds,
+        PasscodeRule.derivedBytes
+    ) {
+        Ok(value) -> value
+        Error(failure) -> return .Error(.Crypto(failure))
+    }
+    return .Ok(PasscodeRecord { salt: salt, rounds: PasscodeRule.rounds, derived: derived })
+}
+
+extend PasscodeRecord {
+    /// Whether `passcode` is the one kept, compared in time that does not
+    /// depend on where they differ. Cryptography that refuses matches
+    /// nothing.
+    function matches(borrow self, passcode: borrow String) -> Bool {
+        let derived = match pbkdf2(passcode.utf8(), salt, rounds, self.derived.count) {
+            Ok(value) -> value
+            Error(failure) -> {
+                // A passcode that cannot be checked does not open the lock.
+                absorb failure
+                return false
+            }
+        }
+        if derived.count != self.derived.count { return false }
+        var difference: Number = 0
+        for (index, byte) in derived.enumerated() {
+            difference = difference | Number(byte ^ self.derived[index])
+        }
+        return difference == 0
+    }
+}
+
+/// `record` as it is kept: `pbkdf2-sha256 <rounds> <salt> <derived>`, the
+/// bytes in hexadecimal.
+public function passcodeRecordText(record: borrow PasscodeRecord) -> String {
+    return "\(PasscodeRule.kind) \(record.rounds) \(hexText(record.salt)) \(hexText(record.derived))"
+}
+
+/// The record `text` holds, none when it holds none.
+public function passcodeRecordFrom(text: borrow String) -> PasscodeRecord? {
+    let fields = text.trim().split(" ")
+    if fields.count != 4 || fields[0] != PasscodeRule.kind { return .None }
+    let rounds = try parseNumber(fields[1]) otherwise return .None
+    let salt = try bytesFromHex(fields[2]) otherwise return .None
+    let derived = try bytesFromHex(fields[3]) otherwise return .None
+    if rounds < 1 || derived.count == 0 { return .None }
+    return .Some(PasscodeRecord { salt: salt, rounds: rounds, derived: derived })
+}
+
+namespace HexDigits {
+    let all: String = "0123456789abcdef"
+}
+
+function hexText(bytes: borrow [UN8]) -> String {
+    var text = ""
+    for byte in bytes {
+        let high = trunc(Number(byte) / 16)
+        let low = Number(byte) % 16
+        text += HexDigits.all.substring(high, high + 1) + HexDigits.all.substring(low, low + 1)
+    }
+    return text
+}
+
+function bytesFromHex(text: borrow String) -> [UN8]? {
+    if text.count % 2 != 0 { return .None }
+    var bytes: [UN8] = []
+    for pair in 0..trunc(text.count / 2) {
+        let high = try HexDigits.all.indexOf(
+            text.substring(pair * 2, pair * 2 + 1)
+        ) otherwise return .None
+        let low = try HexDigits.all.indexOf(
+            text.substring(pair * 2 + 1, pair * 2 + 2)
+        ) otherwise return .None
+        bytes.append(UN8(high * 16 + low))
+    }
+    return .Some(bytes)
+}
+
+/// The lock screen's patience: wrong passcodes in a row, and until when it
+/// takes no more, in milliseconds since 1970.
+public struct UnlockAttempts {
+    var failures: Number = 0
+    var waitUntil: Number = 0
+}
+
+public namespace UnlockPatience {
+    // Wrong passcodes taken before the first wait, the first wait, and the
+    // longest; each run of failures past the first doubles the wait.
+    let free: Number = 5
+    let firstWait: Number = 60000
+    let longestWait: Number = 3600000
+}
+
+extend UnlockAttempts {
+    /// Whether a passcode can be tried at `now`.
+    function allowed(borrow self, now: Number) -> Bool {
+        return now >= waitUntil
+    }
+
+    /// The attempts after a wrong passcode at `now`.
+    function failed(borrow self, now: Number) -> UnlockAttempts {
+        let failures = self.failures + 1
+        if failures < UnlockPatience.free {
+            return UnlockAttempts { failures: failures, waitUntil: 0 }
+        }
+        var wait = UnlockPatience.firstWait
+        for _ in UnlockPatience.free..failures {
+            wait = min(wait * 2, UnlockPatience.longestWait)
+        }
+        return UnlockAttempts { failures: failures, waitUntil: now + wait }
+    }
+}

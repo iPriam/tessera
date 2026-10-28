@@ -1,0 +1,121 @@
+import Foundation
+import Heap
+
+// Known-answer checks of the ports of SHA-256, SHA-512 and Ed25519, against
+// FIPS 180-4's and RFC 8032's vectors. roadmap/13-security-and-updates.md
+// asks that nothing trust them before they pass; PID 1 runs these before it
+// checks the system's seal.
+
+// `bytes` in a block of their own, kept alive by the caller for as long as
+// the pointer is read.
+function knownBlock(bytes: borrow [UN8]) -> ByteBlock {
+    let block = zeroedBlock(count: bytes.count + 1, alignment: 16)
+    for (index, byte) in bytes.enumerated() { heapStore<U8>(block.pointer(), index, U8(byte)) }
+    return move block
+}
+
+// The bytes the lowercase hexadecimal `text` spells.
+function knownHex(text: borrow String) -> [UN8] {
+    var bytes: [UN8] = []
+    var index = 0
+    while index + 1 < text.count {
+        let high = knownDigit(text.substring(index, index + 1))
+        let low = knownDigit(text.substring(index + 1, index + 2))
+        bytes.append(UN8(high * 16 + low))
+        index += 2
+    }
+    return bytes
+}
+
+// The value of the hexadecimal digit `digit`.
+function knownDigit(digit: borrow String) -> Number {
+    let digits = "0123456789abcdef"
+    for value in 0..16 {
+        if digits.substring(value, value + 1) == digit { return value }
+    }
+    return 0
+}
+
+function knownSha256(text: borrow String) -> String {
+    let bytes = text.utf8()
+    let block = knownBlock(bytes)
+    return digestSha256(Buffer { address: block.pointer(), length: bytes.count })
+}
+
+function knownSha512(text: borrow String) -> String {
+    let bytes = text.utf8()
+    let block = knownBlock(bytes)
+    let digest = sha512(block.pointer(), bytes.count)
+    let digits = "0123456789abcdef"
+    var hex = ""
+    for byte in digest {
+        let high = trunc(Number(byte) / 16)
+        let low = Number(byte) % 16
+        hex.append(digits.substring(high, high + 1))
+        hex.append(digits.substring(low, low + 1))
+    }
+    return hex
+}
+
+// Whether the signature `signature` checks over `message` under `key`, all
+// in hexadecimal.
+function knownVerify(key: borrow String, message: borrow String, signature: borrow String) -> Bool {
+    let keyBytes = knownHex(key)
+    let messageBytes = knownHex(message)
+    let signatureBytes = knownHex(signature)
+    let keyBlock = knownBlock(keyBytes)
+    let messageBlock = knownBlock(messageBytes)
+    let signatureBlock = knownBlock(signatureBytes)
+    return signatureVerifyEd25519(
+        Buffer { address: messageBlock.pointer(), length: messageBytes.count },
+        Buffer { address: keyBlock.pointer(), length: keyBytes.count },
+        Buffer { address: signatureBlock.pointer(), length: signatureBytes.count },
+    )
+}
+
+// The name of the first check whose answer is not the known one, or none
+// when every one holds. RFC 8032 section 7.1's tests 1 to 3 must verify, and
+// fail once the signature's first byte changes. Anyone may ask.
+public function cryptoKnownAnswers() -> String? {
+    if knownSha256("") != "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" {
+        return .Some("SHA-256 of nothing")
+    }
+    if knownSha256("abc") != "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" {
+        return .Some("SHA-256 of abc")
+    }
+    let twoBlocks = "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+    if knownSha256(
+        twoBlocks
+    ) != "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1" {
+        return .Some("SHA-256 over two blocks")
+    }
+    let sha512abc = "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
+    if knownSha512("abc") != sha512abc { return .Some("SHA-512 of abc") }
+    let vectors = [
+        [
+            "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+            "",
+            "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b"
+        ],
+        [
+            "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+            "72",
+            "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00"
+        ],
+        [
+            "fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025",
+            "af82",
+            "6291d657deec24024827e69c3abe01a30ce548a284743a445e3680d7db5ac3ac18ff9b538d16f290ae67f760984dc6594a7c15e9716ed28dc027beceea1ec40a"
+        ]
+    ]
+    for (index, vector) in vectors.enumerated() {
+        if !knownVerify(vector[0], vector[1], vector[2]) {
+            return .Some("Ed25519 test \(index + 1)")
+        }
+        let changed = "f" + vector[2].substring(1, vector[2].count)
+        if knownVerify(vector[0], vector[1], changed) {
+            return .Some("Ed25519 test \(index + 1), changed")
+        }
+    }
+    return .None
+}

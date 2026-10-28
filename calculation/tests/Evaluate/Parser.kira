@@ -1,0 +1,21 @@
+import Foundation
+
+// Input the parser refuses, and the message each refusal gives.
+
+@Test
+function emptyInputAsksForAnExpression() {
+    expect!(outcome("") == "Enter an expression")
+}
+
+@Test
+function malformedExpressionsAreNotValid() {
+    expect!(outcome("1+") == "Not a valid expression")
+    expect!(outcome("1..2") == "Not a valid expression")
+    expect!(outcome("2 ^ 3") == "Not a valid expression")
+}
+
+@Test
+function unbalancedParenthesesAreReported() {
+    expect!(outcome("(1+2") == "Unbalanced parentheses")
+    expect!(outcome("1+2)") == "Unbalanced parentheses")
+}

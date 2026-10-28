@@ -1,0 +1,44 @@
+import Foundation
+import LibTessera
+
+// `crashes`: every crash report the machine keeps (reportcrash), written to
+// `crashes` on the request's volume one after another, each after a
+// `--- report <name> ---` line, for the host to read back and name.
+
+namespace CrashesRequest {
+    let file: String = "crashes"
+    let directory: String = "/" + SystemDirectory.diagnosticReports
+}
+
+function writeCrashes(files: borrow Files) -> Result<Void, RootFailure> {
+    var text = ""
+    var reports: Number = 0
+    if isDirectory(CrashesRequest.directory) {
+        match listDirectory(CrashesRequest.directory) {
+            Ok(listing) -> {
+                for index in 0..listing.count() {
+                    match listing.entry(index) {
+                        Some(name) -> {
+                            if !name.endsWith(".crash") { continue }
+                            match readFile("\(CrashesRequest.directory)/\(name)") {
+                                Ok(contents) -> {
+                                    text.append("--- report \(name) ---\n" + contents.text + "\n")
+                                    reports += 1
+                                }
+                                Error(failed) -> log warn(
+                                    "a crash report could not be read",
+                                    report: name,
+                                    problem: "\(failed)"
+                                )
+                            }
+                        }
+                        None -> {}
+                    }
+                }
+            }
+            Error(failed) -> log warn("the crash reports could not be listed", problem: "\(failed)")
+        }
+    }
+    log info("copied the crash reports", reports)
+    return storeText(files, CrashesRequest.file, text)
+}

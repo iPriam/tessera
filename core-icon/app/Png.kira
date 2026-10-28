@@ -1,0 +1,175 @@
+import Foundation
+
+// A PNG (ISO 15948) of an icon's pixels: eight-bit RGBA, each row filtered
+// by whichever of PNG's filters leaves it smallest, then deflated (RFC 1951)
+// with the fixed Huffman code and LZ77 matches, in a zlib stream (RFC 1950).
+// Icons are smooth gradients and flat colour, which the filters and matches
+// shrink well; the fixed code keeps the encoder small.
+
+namespace PngLayout {
+    let signature: [UN8] = [137, 80, 78, 71, 13, 10, 26, 10]
+    let bitDepth: UN8 = 8
+    // Colour type 6: red, green, blue and alpha.
+    let rgba: UN8 = 6
+    let bytesPerPixel: Number = 4
+    // cICP for Display P3: P3 D65 primaries, the sRGB transfer, RGB, full
+    // range (ITU-T H.273).
+    let displayP3: [UN8] = [12, 13, 0, 1]
+}
+
+namespace Crc32 {
+    let polynomial: Number = 0xedb88320
+    let allOnes: Number = 0xffffffff
+}
+
+namespace Adler32 {
+    let modulus: Number = 65521
+    let half: Number = 65536
+}
+
+function crcTable() -> [Number] {
+    var table: [Number] = []
+    for value in 0..256 {
+        var register = value
+        for _ in 0..8 {
+            register = (register & 1) == 1 ? Crc32.polynomial ^ (register >> 1) : register >> 1
+        }
+        table.append(register)
+    }
+    return table
+}
+
+function crc32(bytes: borrow [UN8], table: borrow [Number]) -> Number {
+    var register = Crc32.allOnes
+    for byte in bytes { register = table[(register ^ Number(byte)) & 255] ^ (register >> 8) }
+    return register ^ Crc32.allOnes
+}
+
+function adler32(bytes: borrow [UN8]) -> Number {
+    var low = 1
+    var high = 0
+    for byte in bytes {
+        low = (low + Number(byte)) % Adler32.modulus
+        high = (high + low) % Adler32.modulus
+    }
+    return high * Adler32.half + low
+}
+
+function appendBigEndian(bytes: borrow mut [UN8], value: Number) {
+    bytes.append(UN8((value >> 24) & 255))
+    bytes.append(UN8((value >> 16) & 255))
+    bytes.append(UN8((value >> 8) & 255))
+    bytes.append(UN8(value & 255))
+}
+
+function appendChunk(
+    png: borrow mut [UN8],
+    kind: borrow String,
+    body: borrow [UN8],
+    table: borrow [Number]
+) {
+    appendBigEndian(png, body.count)
+    var checked: [UN8] = []
+    for index in 0..kind.count { checked.append(UN8(kind.charAt(index))) }
+    for byte in body { checked.append(byte) }
+    for byte in checked { png.append(byte) }
+    appendBigEndian(png, crc32(checked, table))
+}
+
+// The PNG file that holds `image`.
+public function encodePng(image: borrow IconImage) -> [UN8] {
+    let table = crcTable()
+    var png = copy PngLayout.signature
+    var header: [UN8] = []
+    appendBigEndian(header, image.width)
+    appendBigEndian(header, image.height)
+    for byte in [PngLayout.bitDepth, PngLayout.rgba, 0, 0, 0] { header.append(byte) }
+    appendChunk(png, "IHDR", header, table)
+    if image.colorSpace == .DisplayP3 {
+        appendChunk(png, "cICP", PngLayout.displayP3, table)
+    }
+    let filtered = filteredRows(image)
+    var stream: [UN8] = [0x78, 0x01]
+    for byte in deflated(filtered) { stream.append(byte) }
+    appendBigEndian(stream, adler32(filtered))
+    appendChunk(png, "IDAT", stream, table)
+    appendChunk(png, "IEND", [], table)
+    return png
+}
+
+// ─── Row filters ────────────────────────────────────────────────────────────
+
+enum RowFilter: UN8 {
+    Plain = 0
+    Sub = 1
+    Up = 2
+    Average = 3
+    Paeth = 4
+}
+
+function paethPredictor(left: Number, up: Number, corner: Number) -> Number {
+    let estimate = left + up - corner
+    let toLeft = abs(estimate - left)
+    let toUp = abs(estimate - up)
+    let toCorner = abs(estimate - corner)
+    if toLeft <= toUp && toLeft <= toCorner { return left }
+    return toUp <= toCorner ? up : corner
+}
+
+// Row `y` of `image` filtered by `filter`.
+function filteredRow(image: borrow IconImage, y: Number, filter: RowFilter) -> [UN8] {
+    let stride = image.width * PngLayout.bytesPerPixel
+    let row = y * stride
+    var out: [UN8] = []
+    for x in 0..stride {
+        let value = Number(image.bytes[row + x])
+        let left = x >= PngLayout.bytesPerPixel ? Number(
+            image.bytes[row + x - PngLayout.bytesPerPixel]
+        ) : 0
+        let up = y > 0 ? Number(image.bytes[row - stride + x]) : 0
+        let corner = x >= PngLayout.bytesPerPixel && y > 0 ? Number(
+            image.bytes[row - stride + x - PngLayout.bytesPerPixel]
+        ) : 0
+        let predicted = match filter {
+            Plain -> 0
+            Sub -> left
+            Up -> up
+            Average -> trunc((left + up) / 2)
+            Paeth -> paethPredictor(left, up, corner)
+        }
+        out.append(UN8((value - predicted + 256) % 256))
+    }
+    return out
+}
+
+// How large a filtered row is likely to deflate to: the sum of its bytes as
+// signed values, the usual measure.
+function rowCost(row: borrow [UN8]) -> Number {
+    var cost = 0
+    for byte in row {
+        let value = Number(byte)
+        cost += value < 128 ? value : 256 - value
+    }
+    return cost
+}
+
+function filteredRows(image: borrow IconImage) -> [UN8] {
+    var out: [UN8] = []
+    for y in 0..image.height {
+        var best = filteredRow(image, y, .Plain)
+        var bestFilter = RowFilter.Plain
+        var bestCost = rowCost(best)
+        for filter in [RowFilter.Sub, .Up, .Average, .Paeth] {
+            let row = filteredRow(image, y, filter)
+            let cost = rowCost(row)
+            if cost < bestCost {
+                best = row
+                bestFilter = filter
+                bestCost = cost
+            }
+        }
+        out.append(UN8(code(bestFilter)))
+        for byte in best { out.append(byte) }
+    }
+    return out
+}

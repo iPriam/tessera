@@ -1,0 +1,229 @@
+import Foundation
+import Heap
+
+// What each object type asserts (§3.4) and what a waiter sleeps on, and the
+// two objects that are nothing but signals: events and event pairs (§9).
+//
+// An event is a 4-byte word in a page of kernel memory, so it can be sent to
+// another process and still be the same event. An event pair is a pair of
+// packet ends; each `Object.signal` sends the end's new word to the peer, and
+// the peer closing is a hang-up.
+
+function eventTeardown(event: borrow EventObject) {
+    // The word goes with the object; an unmap that fails leaves one page
+    // mapped and nothing else to undo.
+    match kernelUnmap(U64(pointerAddress(event.word)), U64(8)) {
+        Ok -> {}
+        Error(failed) -> absorb failed
+    }
+}
+
+// An Event object around kernel memory holding one word, mapped. The object
+// keeps the backing so the word can travel.
+function eventObjectCreate() -> Result<Number, TesseraError> {
+    let backing = try kernelMemoryCreate(U64(8), true)
+    return match eventAround(backing) {
+        Ok(state) -> .Ok(objectCreate(move state, backing))
+        Error(failed) -> {
+            kernelRelease(backing)
+            return .Error(failed)
+        }
+    }
+}
+
+function socketSignals(backing: Number) -> U32 {
+    // In machine words: a decimal's bit operations are never its fast path.
+    let ready = U64(kernelReady(backing, Ready.readable | Ready.writable | Ready.readHangUp))
+    var signals = U32(0)
+    if (ready & U64(Ready.readable)) != U64(0) { signals = signals | Signals.readable.raw }
+    if (ready & U64(Ready.writable)) != U64(0) { signals = signals | Signals.writable.raw }
+    if (ready & U64(Ready.hangUp | Ready.readHangUp)) != U64(0) {
+        signals = signals | Signals.peerClosed.raw
+    }
+    if (ready & U64(Ready.error)) != U64(0) { signals = signals | Signals.error.raw }
+    return signals
+}
+
+// The signals `object` asserts now.
+function objectSignals(object: Number) -> U32 {
+    return match library.objects[object].state {
+        Port -> {
+            if portHasQueued(object) { return Signals.readable.raw }
+            return U32(0)
+        }
+        Event(event) -> heapLoad<U32>(event.word, 0)
+        EventPair(pair) -> eventPairSignals(object, move pair)
+        Timer(timer) -> timerSignals(object, move timer)
+        Channel -> channelSignals(object)
+        Endpoint -> match library.objects[object].backing {
+            Some(backing) -> socketSignals(backing)
+            None -> U32(0)
+        }
+        Process -> match library.objects[object].backing {
+            Some(backing) -> {
+                if (kernelReady(backing, Ready.readable) & Ready.readable) != 0 {
+                    return Signals.terminated.raw
+                }
+                return U32(0)
+            }
+            None -> U32(0)
+        }
+        Job(job) -> {
+            let ended = match jobEnded(object, job) {
+                Ok(value) -> value
+                Error(failed) -> {
+                    // Signals cannot fail: a job whose watch cannot be read
+                    // has not been seen to end.
+                    absorb failed
+                    false
+                }
+            }
+            if ended { return Signals.terminated.raw }
+            return U32(0)
+        }
+        Watch(watch) -> watchSignals(object, watch)
+        Stream -> streamSignals(object)
+        WakeLock(lock) -> wakeLockSignals(object, lock)
+        None, Memory, Thread, Node, File, Presence -> U32(0)
+    }
+}
+
+// What a waiter for `mask` on `object` sleeps on; none for state that has to
+// be looked at again.
+function objectWant(object: Number, mask: U32) -> Interest? {
+    let kind = kindOf(library.objects[object].state)
+    let backing = try library.objects[object].backing otherwise return .None
+    var events = 0
+    if (mask & Signals.readable.raw) != 0 { events = events | Ready.readable }
+    if (mask & Signals.writable.raw) != 0 { events = events | Ready.writable }
+    if (mask & Signals.peerClosed.raw) != 0 { events = events | Ready.readHangUp }
+    if kind == .Channel || kind == .Endpoint || kind == .Stream || kind == .Watch {
+        if kind == .Channel && channelHasBuffered(object) {
+            return .None
+        }
+        return .Some(Interest { backing: backing, ready: events })
+    }
+    if kind == .EventPair || kind == .Timer || kind == .Process {
+        return .Some(Interest { backing: backing, ready: Ready.readable })
+    }
+    return match library.objects[object].state {
+        Job(job) -> .Some(Interest { backing: job.watch, ready: kernelJobWatchReady })
+        None, Port, Event, EventPair, Timer, Channel, Memory, Thread, Process, Node, File, Watch, Endpoint, Stream, WakeLock, Presence -> .None
+    }
+}
+
+// The state of an event whose word is `backing`, mapped.
+function eventAround(backing: Number) -> Result<ObjectState, TesseraError> {
+    let word = try kernelMapShared(backing, U64(8))
+    return .Ok(.Event(EventObject { word: word }))
+}
+
+public function eventCreate(initial: Signals) -> Result<Handle, TesseraError> {
+    if (initial.raw & complement32(signalsUserMask | Signals.signaled.raw)) != U32(0) {
+        return .Error(failure(.InvalidArgument))
+    }
+    let object = try eventObjectCreate()
+    let event = try eventOf(object)
+    heapStore<U32>(event.word, 0, initial.raw)
+    return handleForNew(object, Rights.processDefault)
+}
+
+public function eventPairCreate() -> Result<HandlePair, TesseraError> {
+    let pair = try kernelPacketPair(U64(0))
+    let a = objectCreate(.EventPair(eventPairQuiet()), pair.first)
+    let b = objectCreate(.EventPair(eventPairQuiet()), pair.second)
+    let handleA = match handleMint(a, Rights.processDefault) {
+        Ok(value) -> value
+        Error(failed) -> {
+            objectDestroy(a)
+            objectDestroy(b)
+            return .Error(failed)
+        }
+    }
+    let handleB = match handleMint(b, Rights.processDefault) {
+        Ok(value) -> value
+        Error(failed) -> {
+            handleDrop(handleA)
+            objectDestroy(b)
+            return .Error(failed)
+        }
+    }
+    return .Ok(HandlePair { first: handleA, second: handleB })
+}
+
+function eventPairQuiet() -> EventPairObject {
+    return EventPairObject { observed: Signals(0), sent: Signals(0) }
+}
+
+// Reads every word the peer sent; the last one is what this end observes.
+function eventPairDrain(object: Number, pair: EventPairObject) -> EventPairObject {
+    var drained = move pair
+    let blockBytes = zeroedBlock(count: 8, alignment: 16)
+    let block = blockBytes.pointer()
+    let backing = try library.objects[object].backing otherwise return drained
+    while true {
+        match kernelReadSome(backing, block, U64(4)) {
+            Ok(got) -> {
+                if got < U64(4) { break }
+                drained.observed = Signals(heapLoad<U32>(block, 0))
+            }
+            Error(failed) -> {
+                // `ShouldWait` once every word is read; a peer that went
+                // shows as `PeerClosed` in the signals, not here.
+                absorb failed
+                break
+            }
+        }
+    }
+    return drained
+}
+
+function eventPairSignals(object: Number, pair: EventPairObject) -> U32 {
+    let drained = eventPairDrain(object, move pair)
+    var signals = drained.observed.raw
+    setEventPair(object, move drained)
+    let hungUp = match library.objects[object].backing {
+        Some(backing) -> (kernelReady(backing, Ready.readable) & Ready.hangUp) != 0
+        None -> true
+    }
+    if hungUp { signals = signals | Signals.peerClosed.raw }
+    return signals
+}
+
+// Sets and clears `SIGNALED` and the user bits. On an event pair the peer
+// observes them.
+public function objectSignal(
+    handle: Handle,
+    set: Signals,
+    clear: Signals
+) -> Result<Void, TesseraError> {
+    let allowed = signalsUserMask | Signals.signaled.raw
+    let object = try resolveObject(handle, .None, Rights.none)
+    let kind = kindOf(library.objects[object].state)
+    if kind != .Event && kind != .EventPair { return .Error(failure(.WrongType)) }
+    let slot = try resolve(handle, .None, Rights.none)
+    if !library.handles[slot].rights.has(Rights.signal) {
+        return .Error(failure(.AccessDenied))
+    }
+    if ((set.raw | clear.raw) & complement32(allowed)) != U32(0) {
+        return .Error(failure(.InvalidArgument))
+    }
+    if kind == .Event {
+        let event = try eventOf(object)
+        let word = event.word
+        heapStore<U32>(word, 0, (heapLoad<U32>(word, 0) & complement32(clear.raw)) | set.raw)
+        return .Ok
+    }
+    var pair = try eventPairOf(object)
+    let sent = (pair.sent.raw & complement32(clear.raw)) | set.raw
+    pair.sent = Signals(sent)
+    setEventPair(object, move pair)
+    let blockBytes = zeroedBlock(count: 8, alignment: 16)
+    let block = blockBytes.pointer()
+    heapStore<U32>(block, 0, sent)
+    let backing = try backingOf(object)
+    return match kernelWriteSome(backing, block, U64(4)) {
+        Ok -> .Ok
+        Error(failed) -> .Error(failed)
+    }
+}

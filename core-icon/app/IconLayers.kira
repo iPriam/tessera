@@ -1,0 +1,197 @@
+import Foundation
+import RenderBox
+
+// A group's layers as IconRendering draws them: each layer's artwork fitted
+// to the 1024-point canvas as Icon Composer places an artboard, moved where
+// the layer and its group put it, in a layer of its own at its opacity and
+// blend, clipped to the canvas.
+
+enum LayerArt {
+    Vector(SvgElement)
+    Raster(Bitmap)
+}
+
+// One layer ready to draw: its art, where on the canvas it goes, how it
+// composites and what fills it, and the box it covers on the canvas.
+struct PlacedLayer {
+    let name: String
+    let art: LayerArt
+    let placement: AffineTransform
+    let opacity: Number
+    let blend: BlendMode
+    let fill: IconFill
+    let bounds: Rect
+    // Whether it takes part in the group's glass: only such layers shape
+    // the distance field its shadow, translucency and highlights read.
+    let glass: Bool
+}
+
+// The transform `position` makes on the canvas: a scale about its centre,
+// then a move in points.
+function placement(position: borrow IconPosition) -> AffineTransform {
+    let centre = IconGeometry.canvas / 2
+    return AffineTransform {}.translatedBy(centre + position.x, centre + position.y).scaledBy(
+        position.scale,
+        position.scale
+    ).translatedBy(-centre, -centre)
+}
+
+function blendMode(mode: IconBlendMode) -> BlendMode {
+    return match mode {
+        Normal -> .Normal
+        Darken -> .Darken
+        Multiply -> .Multiply
+        PlusDarker -> .PlusDarker
+        ColorBurn -> .ColorBurn
+        Lighten -> .Lighten
+        Screen -> .Screen
+        PlusLighter -> .PlusLighter
+        ColorDodge -> .ColorDodge
+        Overlay -> .Overlay
+        SoftLight -> .SoftLight
+        HardLight -> .HardLight
+        Difference -> .Difference
+        Exclusion -> .Exclusion
+        Hue -> .Hue
+        Saturation -> .Saturation
+        Color -> .Color
+        Luminosity -> .Luminosity
+    }
+}
+
+// The canvas, which each layer is clipped to.
+function canvasShape() -> Shape {
+    var shape = Shape()
+    shape.setRect(Rect { width: IconGeometry.canvas, height: IconGeometry.canvas })
+    return shape
+}
+
+// The layer's art drawn in its own colours, through its placement, clipped
+// to the canvas.
+function drawLayerArt(
+    list: borrow DisplayList,
+    layer: borrow PlacedLayer
+) -> Result<Void, IconRenderFailure> {
+    list.save()
+    list.clipShape(canvasShape(), 1, .Normal)
+    list.concat(layer.placement)
+    match layer.art {
+        Vector(document) -> try svgDrawn(drawSvg(document, list, canvasRect()))
+        Raster(bitmap) -> list.drawShape(rasterShape(bitmap), rasterFill(bitmap), 1, .Normal)
+    }
+    return listDrawn(list.restore())
+}
+
+function canvasRect() -> Rect {
+    return Rect { width: IconGeometry.canvas, height: IconGeometry.canvas }
+}
+
+// A bitmap fitted into the canvas as an artboard is, centred.
+function rasterFrame(bitmap: borrow Bitmap) -> Rect {
+    let box = Rect { width: Number(bitmap.width), height: Number(bitmap.height) }
+    return viewBoxFit(box, canvasRect()).applying(box)
+}
+
+function rasterShape(bitmap: borrow Bitmap) -> Shape {
+    var shape = Shape()
+    shape.setRect(rasterFrame(bitmap))
+    return shape
+}
+
+function rasterFill(bitmap: borrow Bitmap) -> Fill {
+    let frame = rasterFrame(bitmap)
+    var fill = Fill()
+    fill.setImage(
+        ImageFill {
+            image: .Bitmap(copy bitmap),
+            transform: AffineTransform {
+                a: frame.width,
+                d: frame.height,
+                tx: frame.x,
+                ty: frame.y
+            },
+            interpolation: .Linear,
+            tint: .None,
+            colorSpace: .StandardRgb
+        }
+    )
+    return fill
+}
+
+// The layer as the group draws it: in a layer of its own, painted its fill
+// when it has one, composited at its opacity and blend.
+function drawPlacedLayer(
+    list: borrow DisplayList,
+    layer: borrow PlacedLayer
+) -> Result<Void, IconRenderFailure> {
+    list.beginLayer(LayerFlags.none)
+    match layer.fill {
+        Automatic, SystemLight, SystemDark -> try drawLayerArt(list, layer)
+        None -> {}
+        Solid, LinearGradient, AutomaticGradient -> try drawFilledArt(list, layer, layer.fill)
+    }
+    return listDrawn(list.drawLayer(layer.opacity, layer.blend))
+}
+
+// The layer as its group's shadow casts it: a solid fill at full alpha,
+// whatever its colour's (Tips' bulb, filled clear yellow, casts yellow).
+function drawShadowLayer(
+    list: borrow DisplayList,
+    layer: borrow PlacedLayer
+) -> Result<Void, IconRenderFailure> {
+    list.beginLayer(LayerFlags.none)
+    match layer.fill {
+        Automatic, SystemLight, SystemDark -> try drawLayerArt(list, layer)
+        None -> {}
+        Solid(color) -> {
+            var opaque = copy color
+            opaque.alpha = 1
+            try drawFilledArt(list, layer, .Solid(opaque))
+        }
+        LinearGradient, AutomaticGradient -> try drawFilledArt(list, layer, layer.fill)
+    }
+    return listDrawn(list.drawLayer(layer.opacity, layer.blend))
+}
+
+// The group's layers that take part in its glass, back to front, as its
+// shadow casts them.
+function drawShadowLayers(
+    list: borrow DisplayList,
+    layers: borrow [PlacedLayer]
+) -> Result<Void, IconRenderFailure> {
+    for back in 0..layers.count {
+        let index = layers.count - 1 - back
+        if layers[index].glass { try drawShadowLayer(list, layers[index]) }
+    }
+    return .Ok
+}
+
+// The art's coverage painted the layer's fill, which runs across the
+// layer's bounds kept to the canvas.
+function drawFilledArt(
+    list: borrow DisplayList,
+    layer: borrow PlacedLayer,
+    fill: borrow IconFill
+) -> Result<Void, IconRenderFailure> {
+    list.save()
+    list.beginLayer(LayerFlags.none)
+    try drawLayerArt(list, layer)
+    try listDrawn(list.clipLayer(1, .Normal))
+    var everywhere = Shape()
+    everywhere.setInfinite()
+    let box = try intersectionOf(layer.bounds, chicletRect()) otherwise copy layer.bounds
+    list.drawShape(everywhere, try paintFill(fill, box), 1, .Normal)
+    return listDrawn(list.restore())
+}
+
+// The group's layers, back to front; a group lists them frontmost first.
+function drawGroupLayers(
+    list: borrow DisplayList,
+    layers: borrow [PlacedLayer]
+) -> Result<Void, IconRenderFailure> {
+    for back in 0..layers.count {
+        let index = layers.count - 1 - back
+        try drawPlacedLayer(list, layers[index])
+    }
+    return .Ok
+}

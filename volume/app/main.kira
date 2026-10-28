@@ -1,0 +1,24 @@
+import Foundation
+import LibTessera
+
+// volume: the Volume service (roadmap/17-devicekit.md §25).
+//
+// It listens, scans the disks once and then answers every connection: the
+// list, or a volume to mount, unmount or eject (`Service/Eject.kira`). A
+// client that connects during the scan waits for it. One thread and one
+// LibTessera port; connections are answered as they arrive and closed after
+// their answer, as a client asks once, except a `Watch`, which is kept
+// (`Service/Watchers.kira`).
+
+@Main
+function main() {
+    var service = match startService() {
+        Ok(value) -> value
+        Error(failed) -> {
+            log fault("the service could not start", error: errorName(failed))
+            return
+        }
+    }
+    log info("listening", volumes: service.volumes.count)
+    run(service)
+}

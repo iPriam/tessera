@@ -1,0 +1,234 @@
+import Foundation
+import Build
+import Kten
+
+// Dev roots (roadmap/18-components.md §5):
+//
+//     kira build devroot install|uninstall <component>... [-force]
+//     kira build devroot sample [seconds] [hz]
+//     kira build devroot crashes
+//     kira build devroot wait
+//
+// The step builds the install root of each component it names, and of each
+// component linking a library it names, and packs each
+// as a dev root archive, which DevRootVolume.kira carries to the machine
+// `kira build boot -dev` is running. A dependent the machine cannot swap
+// while it runs is left for the image.
+
+namespace DevRootArchive {
+    let magic: String = "TESSERA-ROOT 1\n"
+    // The step's output: a directory holding `<component>.root` for each.
+    let directory: String = "archives"
+}
+
+// What the command line asked the step for.
+struct DevRootRequest {
+    let action: String
+    let components: [String]
+}
+
+// What an install request packs: the components it names and their
+// dependents, in build order, and the dependents only an image can carry.
+struct DevRootSelection {
+    let install: [String]
+    let left: [String]
+}
+
+// PID 1, what it starts before the dev root service, and the service itself.
+function imageOnlyComponent(name: borrow String) -> Bool {
+    return ["init", "installer", "bootstrap", "devicekitd", "devroot", "recovery"].contains(name)
+}
+
+// The request after `devroot`, when the command line names that step.
+function devRootRequest(graph: borrow Graph) -> DevRootRequest {
+    var components: [String] = []
+    let passed = graph.passed("devroot")
+    if !graph.requested("devroot") || passed.count == 0 {
+        return DevRootRequest { action: "", components: components }
+    }
+    if passed[0] == "install" {
+        for index in 1..passed.count {
+            if !passed[index].startsWith("-") { components.append(copy passed[index]) }
+        }
+    }
+    return DevRootRequest { action: copy passed[0], components: components }
+}
+
+// The components `request` names, then each one linking a library it names,
+// directly or through another library.
+function devRootSelection(
+    release: borrow DescribedRelease,
+    request: borrow DevRootRequest
+) -> DevRootSelection {
+    var named: [Number] = []
+    for (index, described) in release.components.enumerated() {
+        if request.components.contains(described.component.name) { named.append(index) }
+    }
+    var install: [String] = []
+    var left: [String] = []
+    for (index, described) in release.components.enumerated() {
+        let name = described.component.name
+        if named.contains(index) {
+            install.append(copy name)
+        } else {
+            var dependent = false
+            for linked in described.libraries {
+                if named.contains(linked) { dependent = true }
+            }
+            if dependent {
+                if imageOnlyComponent(name) { left.append(copy name) } else {
+                    install.append(copy name)
+                }
+            }
+        }
+    }
+    return DevRootSelection { install: install, left: left }
+}
+
+// The `devroot` step, and the archives it packs.
+function describeDevRoot(
+    graph: borrow mut Graph,
+    release: borrow DescribedRelease,
+    host: borrow Host,
+    architecture: Architecture
+) {
+    let request = devRootRequest(graph)
+    let selection = devRootSelection(release, request)
+    var roots: [Artifact] = []
+    var names: [Kten] = []
+    var known: [String] = []
+    for described in release.components {
+        known.append(copy described.component.name)
+        if selection.install.contains(described.component.name) {
+            // The component, and its dSYM bundle where the base's is, so a
+            // crash names the frames of the build installed.
+            let symbols = graph.tree(
+                "\(architecture.name())/\(described.component.name)/developer-symbols",
+                [.Place(
+                    TreePlace {
+                        path: DeveloperSymbols.directory,
+                        artifact: copy described.roots.symbols
+                    }
+                )]
+            )
+            roots.append(
+                graph.union(
+                    "\(architecture.name())/\(described.component.name)/devroot",
+                    [copy described.roots.install, symbols]
+                )
+            )
+            names.append(.Text(copy described.component.name))
+        }
+    }
+    for name in request.components {
+        if !known.contains(name) { graph.problems.append("devroot: \(name) is not a component") }
+        if imageOnlyComponent(name) {
+            graph.problems.append(
+                "devroot: \(name) runs before the dev root service; build it into the image"
+            )
+        }
+    }
+    let packing = copy selection.install
+    var produces: [Artifact] = []
+    if roots.count > 0 {
+        let packed = graph.native(
+            NativeAction {
+                label: "dev root archives (\(architecture.name()))",
+                code: sourceDigest!("package"),
+                parameters: .List(names),
+                inputs: roots,
+                outputs: [Output { name: DevRootArchive.directory, kind: .Tree }],
+                work: { run in return packArchives(packing, run) }
+            }
+        )
+        produces.append(packed[0])
+    }
+    if request.action == "sample" || request.action == "crashes" {
+        produces.append(copy release.symbols)
+        produces.append(copy release.systemRoot)
+    }
+    let machine = copy host
+    let chosen = copy selection
+    graph.step(
+        Step {
+            name: "devroot",
+            summary: "install or uninstall component roots on the running dev machine; the arguments after it say which",
+            produces: produces,
+            run: .Some({ run in return carryOutDevRoot(machine, architecture, known, chosen, run) })
+        }
+    )
+}
+
+// Packs input `index`'s tree as `<components[index]>.root` in the output.
+function packArchives(
+    components: borrow [String],
+    run: borrow NativeRun
+) -> Result<Void, BuildFailure> {
+    for (index, name) in components.enumerated() {
+        let target = "\(run.outputs[0])/\(name).root"
+        match packArchive(run.inputs[index], run.trees[index], target) {
+            Ok -> {}
+            Error(problem) -> return .Error(.Failed("\(name): \(problem)"))
+        }
+    }
+    return .Ok
+}
+
+// One dev root archive (devroot/app/Root/Archive.kira reads it): its magic
+// line, then for each directory `d <mode> 0 /<path>` and for each file
+// `f <mode> <size> /<path>` followed by its bytes, a directory before what it
+// holds. A link is packed as the file it names, which is how the machine's
+// loader finds it either way.
+function packArchive(
+    root: borrow String,
+    entries: borrow [TreeEntry],
+    target: borrow String
+) -> Result<Void, String> {
+    var archive: [UN8] = []
+    appendText(archive, DevRootArchive.magic)
+    for entry in entries {
+        let path = "\(root)/\(entry.path)"
+        match entry.kind {
+            Directory -> appendText(archive, "d \(octal(entry.mode)) 0 /\(entry.path)\n")
+            File, Link -> {
+                let bytes = match readFileBytes(path) {
+                    Ok(read) -> read
+                    Error(failure) -> return .Error(
+                        "\(entry.path) could not be read: \(traceText(failure))"
+                    )
+                }
+                var mode = entry.mode
+                if entry.kind == .Link {
+                    match fileStatus(path) {
+                        Ok(status) -> mode = status.mode
+                        Error(failure) -> return .Error(
+                            "\(entry.path) names nothing: \(traceText(failure))"
+                        )
+                    }
+                }
+                appendText(archive, "f \(octal(mode)) \(bytes.count) /\(entry.path)\n")
+                for byte in bytes { archive.append(byte) }
+            }
+        }
+    }
+    match writeFileBytes(target, archive) {
+        Ok -> return .Ok
+        Error(failure) -> return .Error("\(target) could not be written: \(traceText(failure))")
+    }
+}
+
+function appendText(bytes: borrow mut [UN8], text: borrow String) {
+    bytes.appendAll(text.utf8())
+}
+
+// `value` in octal digits.
+function octal(value: Number) -> String {
+    if value == 0 { return "0" }
+    var digits = ""
+    var rest = value
+    while rest > 0 {
+        digits = String(rest % 8) + digits
+        rest = floor(rest / 8)
+    }
+    return digits
+}

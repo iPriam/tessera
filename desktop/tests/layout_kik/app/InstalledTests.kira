@@ -1,0 +1,39 @@
+import Foundation
+import HomeLayout
+
+@Test
+function aFirstArrangementHoldsEverythingInFullPages() {
+    let home = arranged(["A", "B", "C", "D", "E"])
+    expect!(home.pages.count == 2)
+    let first = namesOn(home, 0) == ["A", "B", "C", "D"]
+    expect!(first)
+    let second = namesOn(home, 1) == ["E"]
+    expect!(second)
+}
+
+@Test
+function anUninstalledAppLeavesPagesFoldersAndTheLibrary() {
+    var home = arranged(["A", "B", "C"])
+    home.dropItem(HomeSlot { page: 0, index: 1 }, HomeSlot { page: 0, index: 0 }, smallSpace)
+    home.removeFromHome("C")
+    let kept = withInstalled(home, ["A"], false, smallSpace)
+    let page = namesOn(kept, 0) == ["Folder"]
+    expect!(page)
+    let folder = folderAt(kept, 0, 0) == ["A"]
+    expect!(folder)
+    expect!(kept.removed.count == 0)
+    let none = withInstalled(kept, [], false, smallSpace)
+    expect!(namesOn(none, 0).count == 0)
+}
+
+@Test
+function aNewAppFollowsThePlacementChoice() {
+    let home = arranged(["A"])
+    let onHome = withInstalled(home, ["A", "B"], false, smallSpace)
+    let placed = namesOn(onHome, 0) == ["A", "B"]
+    expect!(placed)
+    let toLibrary = withInstalled(home, ["A", "B"], true, smallSpace)
+    let library = namesOn(toLibrary, 0) == ["A"]
+    expect!(library)
+    expect!(toLibrary.removed.contains("B"))
+}

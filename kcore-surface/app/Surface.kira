@@ -1,0 +1,108 @@
+//! Surfaces, the bands they sit in, and the buffers and textures they carry.
+//!
+//! This is the data the display protocol is spoken in. A surface is named by a
+//! handle, placed in a band, and backed by a buffer that the client owns until a
+//! frame releases it. The types hold no behaviour beyond checking their own
+//! fields.
+
+import Foundation
+
+/// The client-chosen number that names a surface.
+///
+/// The client picks it. A surface is identified by its [`SurfaceHandle`], which
+/// also carries a generation, so a number reused after a surface is destroyed
+/// cannot be mistaken for the old surface.
+public distinct SurfaceId = UNumber
+
+/// The generation of a surface id. The server increments it when the id is reused.
+public distinct SurfaceGeneration = UNumber
+
+/// The identity of one surface at one point in its life.
+///
+/// A handle from a destroyed surface never resolves to a live surface that has
+/// taken over its id, because the generation differs.
+@Derive(Copy)
+public struct SurfaceHandle {
+    /// The surface's id, as the client chose it.
+    var id: SurfaceId
+    /// The generation of the id this handle names.
+    var generation: SurfaceGeneration
+}
+
+/// Where a surface sits in the stack the compositor builds.
+///
+/// `Content` is an ordinary application surface. `Overlay(order)` is chrome
+/// above it, ordered by `order`. `System` is reserved for prompts the operating
+/// system forces through the platform, so a trusted-path presentation is never
+/// below a surface a client drew.
+public enum Band {
+    /// An ordinary application surface.
+    Content
+    /// Chrome above the content, ordered by the number given.
+    Overlay(Number)
+    /// Prompts the operating system forces through. Always above every other band.
+    System
+}
+
+/// A pixel format, named after the DRM fourcc code it corresponds to.
+///
+/// The name spells the byte order. `Xrgb8888` is the little-endian `B G R x`
+/// layout the framebuffer already scans out.
+public enum PixelFormat {
+    /// 32 bits per pixel: unused, red, green, blue. Opaque.
+    Xrgb8888
+    /// 32 bits per pixel: alpha, red, green, blue.
+    Argb8888
+    /// 32 bits per pixel: unused, blue, green, red. Opaque.
+    Xbgr8888
+    /// 32 bits per pixel: alpha, blue, green, red.
+    Abgr8888
+}
+
+/// A buffer a client hands the compositor: a descriptor onto shared memory and
+/// the shape of the pixels behind it.
+///
+/// The compositor imports the descriptor and does not copy it. The buffer stays
+/// the client's until a frame releases it.
+public struct Buffer {
+    /// The file descriptor of the shared memory that holds the pixels.
+    var fd: Number
+    /// The pixel format of the buffer.
+    var format: PixelFormat = PixelFormat.Xrgb8888
+    /// The width in pixels.
+    var width: Number
+    /// The height in pixels.
+    var height: Number
+    /// The distance in bytes between the starts of two rows.
+    var stride: Number
+    /// A DRM format modifier. Zero is the linear layout.
+    var modifier: UNumber = 0
+
+    /// Returns whether the buffer's size and stride are consistent.
+    ///
+    /// A buffer is valid when it has a positive size and each row is at least
+    /// `width * 4` bytes, which is what four bytes per pixel requires.
+    function isValid() -> Bool {
+        return width > 0 && height > 0 && stride >= width * 4
+    }
+}
+
+/// A texture handle: the graphics texture the platform composites.
+///
+/// It is an opaque number here, so this library does not depend on the graphics
+/// stack to name the texture.
+public distinct TextureHandle = UNumber
+
+/// A texture the compositor hands back, from capturing a surface or a band.
+public struct Texture {
+    /// The graphics texture the platform composites.
+    var handle: TextureHandle
+    /// The width in pixels.
+    var width: Number
+    /// The height in pixels.
+    var height: Number
+    /// The pixel format of the texture.
+    var format: PixelFormat = PixelFormat.Xrgb8888
+    /// The texture generation counter.
+    var generation: UNumber
+}

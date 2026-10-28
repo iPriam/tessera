@@ -1,0 +1,139 @@
+import Foundation
+import Heap
+
+// The Trash (roadmap/19, decisions in its Decisions section): the `trash`
+// service moves a person's item into the Trash on the data volume, and puts
+// it back. `trashMove` asks it to move an item and answers the item's id.
+//
+// The service is the only writer of the Trash. Only programs the system runs
+// hold the `tessera.trash` entitlement, so an application asks through the
+// system's own tools until a grant is made for it.
+
+namespace Trash {
+    let service: String = "tessera.trash"
+    // The longest path a request carries, in bytes of UTF-8.
+    let maximumPathBytes: Number = 4096
+    // The header every request and answer starts with: op @0, code @4, then
+    // three arguments at @8, @16 and @24.
+    let headerBytes: Number = 32
+}
+
+// What the trash service is asked, as its wire numbers it.
+@Derive(Copy)
+enum TrashOperation: U32 {
+    Move = 1
+    PutBack = 2
+    List = 3
+    Empty = 4
+}
+
+// One request on a connection of its own, answered with the service's result.
+// The reply's payload is the item's id, for a move; a put back has none.
+function trashRequest(
+    operation: TrashOperation,
+    payload: RawPtr,
+    length: U64
+) -> Result<DeviceMessage, TesseraError> {
+    let connection = match serviceConnectFd(Trash.service) {
+        Ok(value) -> value
+        Error(failed) -> return .Error(failureIn(.DeviceLost, .Trash))
+    }
+    let operationCode = code(operation)
+    let sent = deviceSend(connection, operationCode, U64(0), U64(0), U64(0), payload, length)
+    if !succeeded(sent) {
+        kernelRelease(connection)
+        return .Error(failureIn(.DeviceLost, .Trash))
+    }
+    let answer = match deviceAwait(connection, .None, operationCode) {
+        Ok(value) -> value
+        Error(failed) -> {
+            kernelRelease(connection)
+            var error = failed
+            error.subsystem = .Trash
+            return .Error(error)
+        }
+    }
+    kernelRelease(connection)
+    if answer.code != U32(0) {
+        let refused = answer.code
+        deviceMessageRelease(answer)
+        return .Error(failureIn(errorCodeFrom(refused), .Trash))
+    }
+    return .Ok(answer)
+}
+
+// Moves the item at `path` into the Trash and answers the item's id. The path
+// is absolute, on the data volume, and not part of the system's state or of
+// the Trash itself; the service refuses any other with the reason.
+public function trashMove(path: borrow String) -> Result<String, TesseraError> {
+    if path.count > Trash.maximumPathBytes {
+        return .Error(failureIn(.NameTooLong, .Trash))
+    }
+    let reply = try trashRequest(.Move, path.data, U64(path.count))
+    let id = stringFromCBytes(reply.payload, Number(reply.length))
+    deviceMessageRelease(reply)
+    return .Ok(id)
+}
+
+// Puts the item `id`, which `trashMove` answered, back where it was. It is
+// refused `AlreadyExists` when something is now at its original path, and
+// then nothing changes: the caller decides what to do about that thing.
+public function trashPutBack(id: borrow String) -> Result<Void, TesseraError> {
+    if id.count > Trash.maximumPathBytes {
+        return .Error(failureIn(.NameTooLong, .Trash))
+    }
+    let reply = try trashRequest(.PutBack, id.data, U64(id.count))
+    deviceMessageRelease(reply)
+    return .Ok
+}
+
+// One item in the Trash: the id `trashPutBack` takes, and the path it was
+// moved from, none when the Trash lost its record.
+public struct TrashedItem {
+    let id: String
+    let original: String?
+}
+
+// Every item in the Trash, as many as one answer carries.
+public function trashItems() -> Result<[TrashedItem], TesseraError> {
+    let none = ""
+    let reply = try trashRequest(.List, none.data, U64(0))
+    let text = stringFromCBytes(reply.payload, Number(reply.length))
+    deviceMessageRelease(reply)
+    return .Ok(trashedItemsFrom(text))
+}
+
+// The items a listing's lines name: an id, then the path it came from, empty
+// for none.
+function trashedItemsFrom(text: borrow String) -> [TrashedItem] {
+    let lines = text.split("\n")
+    var items: [TrashedItem] = []
+    for pair in 0..trunc(lines.count / 2) {
+        let id = lines[pair * 2]
+        if id.count == 0 { continue }
+        let path = lines[pair * 2 + 1]
+        items.append(
+            TrashedItem { id: copy id, original: path.count > 0 ? .Some(copy path) : .None }
+        )
+    }
+    return items
+}
+
+// Deletes everything in the Trash for good.
+public function trashEmpty() -> Result<Void, TesseraError> {
+    let none = ""
+    let reply = try trashRequest(.Empty, none.data, U64(0))
+    deviceMessageRelease(reply)
+    return .Ok
+}
+
+// The path the Trash service knows `path` by, on the data volume, when it is
+// there: `/Documents/x`, bound at the root from the data volume, is
+// `/data/Documents/x`. None for any other volume, which has no Trash.
+public function trashPathFor(path: borrow String) -> String? {
+    let documents = "/" + SystemDirectory.documents
+    let data = "/" + SystemDirectory.data
+    if path.startsWith(documents + "/") { return .Some(data + path) }
+    if path.startsWith(data + "/") { return .Some(copy path) }
+    return .None
+}

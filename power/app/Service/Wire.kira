@@ -1,0 +1,143 @@
+import Foundation
+import Heap
+import LibTessera
+
+// The wire, the Devices service's (LibTessera `app/Device/Wire.kira`): a
+// 32-byte header, `op` @0, `code` @4 (an `ErrorCode` value), `a` @8, `b`
+// @16, `c` @24, then the operation's bytes, with handles beside them. An
+// answer carries the request's `op`. A request is decoded here, once, into
+// a `Request`.
+
+// The operations (LibTessera `app/Power/Power.kira`).
+@Derive(Copy)
+@Derive(CaseIterable)
+enum Operation: UN32 {
+    Page = 1
+    WakeLock = 2
+    ScheduleWake = 3
+}
+
+namespace PowerWire {
+    let headerBytes: Number = 32
+    // The biggest message a client sends: a header and a 256-byte reason.
+    let messageBytes: Number = 512
+    let reasonBytes: Number = 256
+    // A client's message carries no handles; a few are taken to close them.
+    let handleCapacity: Number = 4
+}
+
+let wakeLockKinds: [WakeLockKind] = [WakeLockKind.Cpu, WakeLockKind.Display, WakeLockKind.Audio, WakeLockKind.Network]
+
+// `WakeLock`: `a` the kind, `b` the timeout, then the reason's bytes.
+struct LockRequest {
+    var kind: WakeLockKind
+    var timeout: Number
+    var reason: String
+}
+
+enum Request {
+    Page
+    WakeLock(LockRequest)
+    // `a` the boot-clock deadline; `b`, the tolerance, is not needed to arm
+    // the clock.
+    ScheduleWake(Number)
+}
+
+// A request refused as it was sent, answered with the reason.
+struct Refusal {
+    var operation: Operation
+    var reason: ErrorCode
+}
+
+// Why nothing could be taken off a channel as a request.
+enum ReceiveFailure {
+    // The channel had nothing (`ShouldWait`) or failed.
+    Channel(TesseraError)
+    // An operation a client does not send; it is answered `Unsupported`.
+    UnknownOperation(UN32)
+    Refused(Refusal)
+}
+
+function kindOf(raw: UNumber) -> WakeLockKind? {
+    return caseWithCode(wakeLockKinds, raw)
+}
+
+function lockRequest(
+    kindCode: UNumber,
+    timeoutNanoseconds: UNumber,
+    reason: borrow Buffer
+) -> Result<Request, ReceiveFailure> {
+    let kind = try kindOf(kindCode) otherwise return .Error(
+        .Refused(Refusal { operation: .WakeLock, reason: .InvalidArgument })
+    )
+    if timeoutNanoseconds == UNumber(0) {
+        return .Error(.Refused(Refusal { operation: .WakeLock, reason: .InvalidArgument }))
+    }
+    let length = min(reason.length, PowerWire.reasonBytes)
+    return .Ok(
+        .WakeLock(
+            LockRequest {
+                kind: kind,
+                timeout: Number(timeoutNanoseconds),
+                reason: stringFromCBytes(reason.address, length)
+            }
+        )
+    )
+}
+
+// The next request on `channel`. Handles a client sends are closed: no
+// request carries any.
+function receive(channel: Handle) -> Result<Request, ReceiveFailure> {
+    let block = zeroedBlock(count: PowerWire.messageBytes, alignment: 16)
+    let bytes = Buffer { address: block.pointer(), length: PowerWire.messageBytes }
+    let received = match channelRead(channel, bytes, PowerWire.handleCapacity) {
+        Ok(value) -> value
+        Error(failed) -> return .Error(.Channel(failed))
+    }
+    closeHandles(received.handles)
+    if received.bytes < PowerWire.headerBytes { return .Error(.Channel(failure(.InvalidArgument))) }
+    let raw = blockLoad<U32>(block, 0)
+    let operation = try caseWithCode(allCases_Operation(), raw) otherwise return .Error(
+        .UnknownOperation(raw)
+    )
+    let firstArgument = blockLoad<U64>(block, 8)
+    let secondArgument = blockLoad<U64>(block, 16)
+    let payload = Buffer {
+        address: heapOffset(block.pointer(), PowerWire.headerBytes),
+        length: received.bytes - PowerWire.headerBytes,
+    }
+    return match operation {
+        Page -> .Ok(.Page)
+        WakeLock -> lockRequest(firstArgument, secondArgument, payload)
+        ScheduleWake -> .Ok(.ScheduleWake(Number(firstArgument)))
+    }
+}
+
+// Sends one header-only answer under the raw `operation`; `handles` leave
+// this process once it is sent.
+function send(
+    channel: Handle,
+    operation: UN32,
+    outcome: borrow ErrorCode,
+    handles: borrow [Handle]
+) -> Result<Void, TesseraError> {
+    let block = zeroedBlock(count: PowerWire.headerBytes, alignment: 16)
+    blockStore<U32>(block, 0, operation)
+    blockStore<U32>(block, 4, outcome.rawValue())
+    return channelWrite(
+        channel,
+        Buffer { address: block.pointer(), length: PowerWire.headerBytes },
+        handles
+    )
+}
+
+// An answer with no handles. A client that cannot be sent to has gone, and
+// its channel's wait closes it.
+function answer(channel: Handle, operation: UN32, outcome: borrow ErrorCode) {
+    let none: [Handle] = []
+    match send(channel, operation, outcome, none) {
+        // The answer is sent, so there is nothing more to do.
+        Ok -> {}
+        Error(failed) -> log warn("a client could not be answered", error: errorName(failed))
+    }
+}

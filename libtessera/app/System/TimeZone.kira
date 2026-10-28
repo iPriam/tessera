@@ -1,0 +1,291 @@
+import Foundation
+
+// The time zone the Settings service names (16 §14). The library's clocks
+// are UTC (§8); the zone the person chose is the setting `time.zone`, an IANA
+// name such as `Europe/Paris`, and its rules are the TZif file of that name
+// (RFC 8536) under `SystemDirectory.zoneInfo`. A zone whose file is missing
+// or malformed is UTC. Until the person names one the setting is automatic:
+// the zone of the region the machine was booted in, which the boot names with
+// `tessera.zone=` (the host's own zone on a virtual machine).
+
+public namespace TimeZoneSetting {
+    let key: String = "time.zone"
+    let utc: String = "UTC"
+    let automatic: String = "automatic"
+    let bootWord: String = "tessera.zone="
+    // Every zone a person picks from, one `country  coordinates  name` line
+    // each, as the tz database's `zone.tab` lists them.
+    let table: String = "zone.tab"
+}
+
+public struct TimeZone {
+    let name: String
+    // The instants, in seconds since 1970, at which the offset changes, in
+    // order.
+    let transitions: [Number]
+    // The offset from UTC, in seconds, from each transition on, and the
+    // abbreviation the time is named by then, such as `CEST`.
+    let offsets: [Number]
+    let abbreviations: [String]
+    // The offset and the abbreviation before the first transition, and
+    // always when there is none.
+    let initial: Number
+    let initialAbbreviation: String
+}
+
+extend TimeZone {
+    // The offset from UTC, in seconds, at `seconds` since 1970.
+    function offsetAt(seconds: Number) -> Number {
+        return match transitionAt(seconds) {
+            Some(index) -> offsets[index]
+            None -> initial
+        }
+    }
+
+    // The abbreviation the time at `seconds` since 1970 is named by.
+    function abbreviationAt(seconds: Number) -> String {
+        return match transitionAt(seconds) {
+            Some(index) -> copy abbreviations[index]
+            None -> copy initialAbbreviation
+        }
+    }
+
+    // The last transition at or before `seconds`, none before the first.
+    function transitionAt(seconds: Number) -> Number? {
+        if transitions.count == 0 || seconds < transitions[0] { return .None }
+        var low = 0
+        var high = transitions.count - 1
+        while low < high {
+            let middle = floor((low + high + 1) / 2)
+            if transitions[middle] <= seconds {
+                low = middle
+            } else {
+                high = middle - 1
+            }
+        }
+        return .Some(low)
+    }
+
+    // The wall clock `realtime`, in milliseconds since 1970, moved into this
+    // zone: what a clock in it reads, counted as though it were UTC.
+    function local(realtime: Number) -> Number {
+        return realtime + offsetAt(floor(realtime / 1000)) * 1000
+    }
+}
+
+public function utcTimeZone() -> TimeZone {
+    return TimeZone {
+        name: copy TimeZoneSetting.utc,
+        transitions: [],
+        offsets: [],
+        abbreviations: [],
+        initial: 0,
+        initialAbbreviation: copy TimeZoneSetting.utc
+    }
+}
+
+// The unsigned big-endian number in `bytes` from `at`, `width` bytes long.
+function bigEndian(bytes: borrow [UN8], at: Number, width: Number) -> Number {
+    var value: Number = 0
+    for index in 0..width {
+        value = value * 256 + Number(bytes[at + index])
+    }
+    return value
+}
+
+// The same, read as two's complement. A negative one is its bytes'
+// complement, plus one, negated, so no step passes 2^63.
+function signedBigEndian(bytes: borrow [UN8], at: Number, width: Number) -> Number {
+    if Number(bytes[at]) < 128 { return bigEndian(bytes, at, width) }
+    var complement: Number = 0
+    for index in 0..width {
+        complement = complement * 256 + (255 - Number(bytes[at + index]))
+    }
+    return 0 - complement - 1
+}
+
+public enum TimeZoneFailure {
+    Truncated
+    BadMagic
+    NoTypes
+    InvalidTypeIndex
+    InvalidAbbreviation
+}
+
+// A file of version 2 or later is read in its 64-bit second part.
+public function parseTimeZone(
+    name: borrow String,
+    bytes: borrow [UN8]
+) -> Result<TimeZone, TimeZoneFailure> {
+    let header = 44
+    if bytes.count < header { return .Error(TimeZoneFailure.Truncated) }
+    if bytes[0] != UN8(84) || bytes[1] != UN8(90) || bytes[2] != UN8(105) || bytes[3] != UN8(102) {
+        return .Error(TimeZoneFailure.BadMagic)
+    }
+    var at: Number = 0
+    var width: Number = 4
+    if bytes[4] != UN8(0) {
+        // Skip the 32-bit part: its header, then its data.
+        let skipped = header + bigEndian(bytes, 32, 4) * 5 + bigEndian(bytes, 36, 4) * 6
+            + bigEndian(bytes, 40, 4) + bigEndian(bytes, 28, 4) * 8
+            + bigEndian(bytes, 24, 4) + bigEndian(bytes, 20, 4)
+        if bytes.count < skipped + header { return .Error(TimeZoneFailure.Truncated) }
+        at = skipped
+        width = 8
+    }
+    let timeCount = bigEndian(bytes, at + 32, 4)
+    let typeCount = bigEndian(bytes, at + 36, 4)
+    let characterCount = bigEndian(bytes, at + 40, 4)
+    let times = at + header
+    let indices = times + timeCount * width
+    let types = indices + timeCount
+    let characters = types + typeCount * 6
+    if typeCount == 0 { return .Error(TimeZoneFailure.NoTypes) }
+    if bytes.count < characters + characterCount { return .Error(TimeZoneFailure.Truncated) }
+    // Each type's offset and abbreviation, the abbreviation a NUL-ended run
+    // of the designation characters.
+    var typeOffsets: [Number] = []
+    var typeNames: [String] = []
+    for type in 0..typeCount {
+        typeOffsets.append(signedBigEndian(bytes, types + type * 6, 4))
+        var run: [UN8] = []
+        var index = Number(bytes[types + type * 6 + 5])
+        while index < characterCount && bytes[characters + index] != UN8(0) {
+            run.append(bytes[characters + index])
+            index = index + 1
+        }
+        typeNames.append(
+            match textFromBytes(run) {
+                Some(text) -> text
+                None -> return .Error(TimeZoneFailure.InvalidAbbreviation)
+            }
+        )
+    }
+    var transitions: [Number] = []
+    var offsets: [Number] = []
+    var abbreviations: [String] = []
+    for index in 0..timeCount {
+        let type = Number(bytes[indices + index])
+        if type >= typeCount { return .Error(TimeZoneFailure.InvalidTypeIndex) }
+        transitions.append(signedBigEndian(bytes, times + index * width, width))
+        offsets.append(typeOffsets[type])
+        abbreviations.append(copy typeNames[type])
+    }
+    return .Ok(
+        TimeZone {
+            name: copy name,
+            transitions: move transitions,
+            offsets: move offsets,
+            abbreviations: move abbreviations,
+            initial: typeOffsets[0],
+            initialAbbreviation: copy typeNames[0]
+        }
+    )
+}
+
+// A zone name is a path under the zone directory: words joined by `/`, none
+// of them empty or a step up.
+function zoneNameIsPlain(name: borrow String) -> Bool {
+    if name.count == 0 || name.startsWith("/") { return false }
+    for part in name.split("/") {
+        if part.count == 0 || part == "." || part == ".." { return false }
+    }
+    return true
+}
+
+// The zone `name`, UTC when its rules cannot be read.
+public function loadTimeZone(name: borrow String) -> TimeZone {
+    if name == TimeZoneSetting.utc || !zoneNameIsPlain(name) { return utcTimeZone() }
+    let path = "/" + SystemDirectory.zoneInfo + "/" + name
+    let bytes = match readFileBytes(path) {
+        Ok(read) -> read
+        Error(failure) -> {
+            log warn("the time zone cannot be read; the clock is UTC", zone: name, failure)
+            return utcTimeZone()
+        }
+    }
+    return match parseTimeZone(name, bytes) {
+        Ok(zone) -> zone
+        Error(reason) -> {
+            log warn("the time zone's file is not TZif; the clock is UTC", zone: name, reason)
+            utcTimeZone()
+        }
+    }
+}
+
+// The zone the person chose in Settings, or the region's while it is set
+// automatically.
+public function currentTimeZone() -> TimeZone {
+    return loadTimeZone(chosenTimeZoneName())
+}
+
+// The name of the zone the clocks read in: the setting's, or the region's.
+public function chosenTimeZoneName() -> String {
+    let chosen = settingValue(TimeZoneSetting.key, TimeZoneSetting.automatic)
+    if chosen != TimeZoneSetting.automatic { return chosen }
+    return regionTimeZoneName()
+}
+
+// The zone of the region the machine was booted in, UTC when the boot named
+// none.
+public function regionTimeZoneName() -> String {
+    let words = match kernelBootWords() {
+        Ok(read) -> read
+        Error(failure) -> return copy TimeZoneSetting.utc
+    }
+    for word in words {
+        if !word.startsWith(TimeZoneSetting.bootWord) { continue }
+        let name = word.substring(TimeZoneSetting.bootWord.count, word.count)
+        if zoneNameIsPlain(name) { return name }
+    }
+    return copy TimeZoneSetting.utc
+}
+
+// Every zone a person can choose, by name, in order: UTC, then the tz
+// database's own list.
+public function timeZoneNames() -> [String] {
+    var names = [copy TimeZoneSetting.utc]
+    let text = match readFile("/" + SystemDirectory.zoneInfo + "/" + TimeZoneSetting.table) {
+        Ok(read) -> read.text
+        Error(failure) -> {
+            log warn("the list of time zones cannot be read", failure)
+            return names
+        }
+    }
+    var listed: [String] = []
+    for line in text.split("\n") {
+        if line.count == 0 || line.startsWith("#") { continue }
+        let fields = line.split("\t")
+        if fields.count >= 3 { listed.append(copy fields[2]) }
+    }
+    for name in listed.sorted({ left, right in return orderStrings(left, right) < 0 }) {
+        names.append(name)
+    }
+    return names
+}
+
+// The region a zone is listed under: the part of its name before the first
+// `/`, and UTC under itself.
+public function timeZoneRegion(name: borrow String) -> String {
+    return copy name.split("/")[0]
+}
+
+// The regions of `names`, each once, in the order they first come.
+public function timeZoneRegions(names: borrow [String]) -> [String] {
+    var regions: [String] = []
+    for name in names {
+        let region = timeZoneRegion(name)
+        if !regions.contains(region) { regions.append(region) }
+    }
+    return regions
+}
+
+// A zone as a person reads it: its city, `America/North_Dakota/New_Salem` as
+// `New Salem, North Dakota`, and UTC as it is.
+public function timeZoneCity(name: borrow String) -> String {
+    let parts = name.split("/")
+    if parts.count < 2 { return copy name }
+    var city = joined(parts[parts.count - 1].split("_"), " ")
+    if parts.count > 2 { city = city + ", " + joined(parts[parts.count - 2].split("_"), " ") }
+    return city
+}

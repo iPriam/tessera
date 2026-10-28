@@ -1,0 +1,35 @@
+Give the device a memory type that is only device-local.
+
+KosmicKrisp has one memory type, host-visible and device-local. Under venus
+every host-visible allocation is a pointer the renderer imports
+(VK_EXT_external_memory_host), a plain MTLBuffer with no heap, so every image
+the guest binds is backed by a linear texture
+(buffer-backed-optimal-textures.patch). A linear texture is slower to sample
+and to render into than a tiled one, and the guest's glass captures, blurs and
+glyph atlas are read many times a frame.
+
+The second type is the same heap without HOST_VISIBLE. venus does not import a
+pointer for memory the guest cannot map, so the renderer allocates it through
+kk_alloc_bo, a MTLHeap, and an optimal image bound to it keeps its tiled
+layout. It comes after the existing type, so a caller taking the first type
+that fits its flags gets what it got before; one that wants tiled images asks
+for device-local memory that is not host-visible.
+
+--- a/src/kosmickrisp/vulkan/kk_physical_device.c
++++ b/src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -1192,6 +1192,15 @@
+       .heapIndex = sysmem_heap_idx,
+    };
+ 
++   /* The same heap, for memory nothing maps. A renderer that backs
++    * host-visible memory with a pointer it imports allocates this kind itself,
++    * so it is a MTLHeap and an optimal image bound to it is tiled.
++    */
++   pdev->mem_types[pdev->mem_type_count++] = (VkMemoryType){
++      .propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
++      .heapIndex = sysmem_heap_idx,
++   };
++
+    assert(pdev->mem_heap_count <= ARRAY_SIZE(pdev->mem_heaps));
+    assert(pdev->mem_type_count <= ARRAY_SIZE(pdev->mem_types));
+ 

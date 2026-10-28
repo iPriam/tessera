@@ -1,0 +1,179 @@
+import Foundation
+
+// QEMU's human monitor, on the Unix socket a services boot opens: what the
+// boot checks press keys, move the pointer and plug devices in with, from
+// outside the guest, so a check needs no helper inside it.
+
+struct Monitor {
+    let path: String
+}
+
+namespace MonitorWords {
+    // What the monitor prints when it is ready for a command: once on
+    // connecting, and again once a command's answer is written.
+    let prompt: String = "(qemu) "
+    let readRoom: Number = 65536
+}
+
+extend Monitor {
+    // Sends `command` and answers what the monitor wrote back within
+    // `seconds`, or nothing when no machine listens.
+    function ask(borrow self, command: borrow String, seconds: Number) -> String {
+        if !pathExists(path) { return "" }
+        let stream = match connectUnix(path) {
+            Ok(connected) -> connected
+            Error(failure) -> {
+                absorb failure
+                return ""
+            }
+        }
+        let answer = exchange(stream, command, seconds)
+        match stream.close() {
+            Ok -> {}
+            Error(failure) -> absorb failure
+        }
+        return answer
+    }
+
+    // Sends `command`, waiting for its answer no longer than a second.
+    function send(borrow self, command: borrow String) {
+        ask(command, 1)
+    }
+
+    // The number of the virtio mouse in `info mice`, which a relative move
+    // reaches only once it is the active one.
+    function virtioMouse(borrow self) -> String? {
+        for line in ask("info mice", 1).split("\n") {
+            let named = line.contains("irtio Mouse") || line.contains("irtio mouse")
+            let hash = match line.indexOf("Mouse #") {
+                Some(at) -> at
+                None -> continue
+            }
+            if !named { continue }
+            let from = hash + 7
+            let colon = match line.indexOf(":", from) {
+                Some(at) -> at
+                None -> continue
+            }
+            return .Some(line.substring(from, colon))
+        }
+        return .None
+    }
+
+    // Makes the virtio mouse the one the monitor's pointer moves.
+    function takeVirtioMouse(borrow self) {
+        match virtioMouse() {
+            Some(number) -> send("mouse_set \(number)")
+            None -> {}
+        }
+    }
+
+    // A click of the left button where the pointer is.
+    function click(borrow self) {
+        send("mouse_button 1")
+        send("mouse_button 0")
+    }
+}
+
+// Writes `command` to `stream` and reads until the monitor's prompt follows
+// its answer, or `seconds` pass.
+function exchange(stream: borrow TcpStream, command: borrow String, seconds: Number) -> String {
+    let poller = match makePoller() {
+        Ok(made) -> made
+        Error(failure) -> {
+            absorb failure
+            return ""
+        }
+    }
+    match poller.watch(stream.handle, .Readable, 1) {
+        Ok -> {}
+        Error(failure) -> absorb failure
+    }
+    var pending: [UN8] = []
+    for byte in (command + "\n").utf8() { pending.append(UN8(byte)) }
+    let deadline = unixMillis() + seconds * 1000
+    var answer = ""
+    while pending.count > 0 && unixMillis() < deadline {
+        match stream.send(pending) {
+            Ok(taken) -> {
+                var rest: [UN8] = []
+                for index in Number(taken)..pending.count { rest.append(pending[index]) }
+                pending = rest
+            }
+            Error(failure) -> {
+                absorb failure
+                processSleep(10)
+            }
+        }
+    }
+    while unixMillis() < deadline && prompts(answer) < 2 {
+        match poller.wait(.Some(0.05), 4) {
+            Ok(events) -> {}
+            Error(failure) -> absorb failure
+        }
+        match stream.receive(MonitorWords.readRoom) {
+            Ok(bytes) -> {
+                if bytes.count == 0 { break }
+                match textFromBytes(bytes) {
+                    Some(text) -> answer.append(text)
+                    None -> {}
+                }
+            }
+            // Nothing has come yet: the poller waits for it.
+            Error(failure) -> match failure {
+                WouldBlock -> {}
+                else -> absorb failure
+            }
+        }
+    }
+    match poller.close() {
+        Ok -> {}
+        Error(failure) -> absorb failure
+    }
+    return answer
+}
+
+// How many prompts `text` holds.
+function prompts(text: borrow String) -> Number {
+    return text.split(MonitorWords.prompt).count - 1
+}
+
+// Whether the PPM at `path` is a picture `width` by `height` in more than a
+// few colours: a composed desktop rather than a console's placeholder or one
+// cleared colour.
+function picturedScreen(path: borrow String, width: Number, height: Number) -> Bool {
+    let bytes = match readFileBytes(path) {
+        Ok(read) -> read
+        Error(failure) -> {
+            absorb failure
+            return false
+        }
+    }
+    // `P6`, the size and the largest value, each ended by a newline.
+    var at = 0
+    var lines: [String] = []
+    var start = 0
+    for (index, byte) in bytes.enumerated() {
+        if lines.count == 3 { break }
+        if byte == UN8(10) {
+            lines.append(textFromByteRun(bytes, start, index).or(""))
+            start = index + 1
+            at = start
+        }
+    }
+    if lines.count < 3 || lines[1] != "\(width) \(height)" { return false }
+    var colours: Map<Number, Bool> = Map {}
+    var different = 0
+    while at + 2 < bytes.count && different < 64 {
+        let colour = Number(bytes[at]) * 65536 + Number(bytes[at + 1]) * 256 + Number(bytes[at + 2])
+        match colours.value(colour) {
+            Some(seen) -> {}
+            None -> {
+                colours.set(colour, true)
+                different = different + 1
+            }
+        }
+        at = at + 3
+    }
+    return different >= 64
+}

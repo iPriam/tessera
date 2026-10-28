@@ -1,0 +1,487 @@
+import Foundation
+import Heap
+import LibTessera
+
+// Display calls other than the commit (17 §12.3).
+
+// The display record behind `display`.
+function resolveDisplay(display: Ref, rights: RefRights) -> Result<Number, TesseraError> {
+    let object = try resolveConnection(display, .Display, rights)
+    return displayOf(object)
+}
+
+namespace ResourceLayout {
+    let header: Number = 16
+    let connector: Number = 32
+    let crtc: Number = 16
+    let plane: Number = 24
+    let formatModifier: Number = 16
+}
+
+// A hotplug notice that brought the caller here is answered by the read
+// that follows, so the connection's uevents are taken off its socket.
+function answerHotplug(object: Number) {
+    match connectionOf(object) {
+        Some(index) -> match deviceLibrary.connections[index].uevents {
+            Some(socket) -> {
+                let answered = drainUevents(socket)
+            }
+            None -> {}
+        }
+        None -> {}
+    }
+}
+
+// Each `ConnectorInfo` with its modes, from `at`; the offset after them.
+function writeConnectors(
+    display: Number,
+    card: borrow Descriptor,
+    out: borrow Buffer,
+    start: Number
+) -> Result<Number, TesseraError> {
+    var at = start
+    for id in deviceLibrary.displays[display].connectors {
+        let connector = try readConnector(card, id)
+        put32(out, at, connector.id)
+        put32(out, at + 4, code(connector.kind()))
+        put32(out, at + 8, code(connector.state()))
+        put32(out, at + 12, try connectorCrtcs(card, connector))
+        put32(out, at + 16, connector.widthMm)
+        put32(out, at + 20, connector.heightMm)
+        put32(out, at + 24, U32(connector.modes.count))
+        // No EDID is read.
+        put32(out, at + 28, U32(0))
+        at += ResourceLayout.connector
+        for mode in connector.modes {
+            mode.writeRecord(out, at)
+            at += ModeLayout.record
+        }
+    }
+    return .Ok(at)
+}
+
+// Each `CrtcInfo`, from `struct drm_mode_crtc`: the CRTC @12, the gamma size
+// @28, whether a mode is set @32.
+function writeCrtcs(
+    display: Number,
+    card: borrow Descriptor,
+    out: borrow Buffer,
+    start: Number
+) -> Result<Number, TesseraError> {
+    var at = start
+    let crtcBytes = zeroedBlock(count: 104, alignment: 16)
+    let crtc = crtcBytes.pointer()
+    for (index, id) in deviceLibrary.displays[display].crtcs.enumerated() {
+        zeroBytes(crtc, 104)
+        heapStore<U32>(crtc, 12, id)
+        let read = try card.control(Drm.modeGetCrtc, crtc)
+        put32(out, at, id)
+        put32(out, at + 4, U32(index))
+        put32(out, at + 8, heapLoad<U32>(crtc, 32))
+        put32(out, at + 12, heapLoad<U32>(crtc, 28))
+        at += ResourceLayout.crtc
+    }
+    return .Ok(at)
+}
+
+// Each `PlaneInfo` with its format and modifier pairs.
+function writePlanes(
+    display: Number,
+    card: borrow Descriptor,
+    out: borrow Buffer,
+    start: Number
+) -> Result<Number, TesseraError> {
+    var at = start
+    for id in deviceLibrary.displays[display].planes {
+        let kms = try kmsObject(display, id, Drm.objectPlane)
+        let facts = try planeFacts(card, id)
+        let pairs = try planeFormats(card, kms, facts)
+        put32(out, at, id)
+        put32(out, at + 4, code(planeKind(kms)))
+        put32(out, at + 8, facts.crtcMask)
+        put16(out, at + 12, U16(0))
+        put16(out, at + 14, U16(0))
+        put32(out, at + 16, planeCapabilities(kms).raw)
+        put32(out, at + 20, U32(pairs.count))
+        at += ResourceLayout.plane
+        for pair in pairs {
+            put32(out, at, pair.format.raw)
+            put32(out, at + 4, U32(1))
+            put64(out, at + 8, pair.modifier.raw)
+            at += ResourceLayout.formatModifier
+        }
+    }
+    return .Ok(at)
+}
+
+public function displayResources(display: Ref, out: borrow Buffer) -> Result<Number, TesseraError> {
+    let index = try resolveDisplay(display, RefRights.read)
+    let object = deviceLibrary.displays[index].object
+    let card = try deviceOf(object)
+    answerHotplug(object)
+    put32(out, 0, U32(deviceLibrary.displays[index].connectors.count))
+    put32(out, 4, U32(deviceLibrary.displays[index].crtcs.count))
+    put32(out, 8, U32(deviceLibrary.displays[index].planes.count))
+    put32(out, 12, U32(0))
+    let afterConnectors = try writeConnectors(index, card, out, ResourceLayout.header)
+    let afterCrtcs = try writeCrtcs(index, card, out, afterConnectors)
+    let end = try writePlanes(index, card, out, afterCrtcs)
+    try requireRoom(out, Number(end))
+    return .Ok(Number(end))
+}
+
+// What a Framebuffer object keeps: the kernel's id, the display connection
+// it was made on and the surface object it shows.
+struct FramebufferRecord {
+    var object: Number
+    var id: U32
+    var display: Number
+    var surface: Number
+}
+
+// `struct drm_mode_fb_cmd2`: the id @0, size @4 and @8, format @12, flags
+// @16, then four handles @20, pitches @36, offsets @52 and modifiers @72.
+namespace FramebufferLayout {
+    let bytes: Number = 104
+    // `DRM_MODE_FB_MODIFIERS`.
+    let modifiers: U32 = U32(2)
+}
+
+function addFramebuffer(
+    card: borrow Descriptor,
+    handle: U32,
+    info: borrow SurfaceInfo
+) -> Result<U32, TesseraError> {
+    let blockBytes = zeroedBlock(count: FramebufferLayout.bytes, alignment: 16)
+    let block = blockBytes.pointer()
+    heapStore<U32>(block, 4, info.width)
+    heapStore<U32>(block, 8, info.height)
+    heapStore<U32>(block, 12, info.format.raw)
+    if info.modifier != Modifier(0) { heapStore<U32>(block, 16, FramebufferLayout.modifiers) }
+    for (plane, layout) in planesOf(info).enumerated() {
+        heapStore<U32>(block, 20 + plane * 4, handle)
+        heapStore<U32>(block, 36 + plane * 4, layout.stride)
+        heapStore<U32>(block, 52 + plane * 4, U32(layout.offset))
+        heapStore<U64>(block, 72 + plane * 8, info.modifier.raw)
+    }
+    return match card.control(Drm.modeAddFramebuffer2, block) {
+        Ok(added) -> .Ok(heapLoad<U32>(block, 0))
+        Error(failed) -> {
+            if info.modifier != Modifier(0) { return .Error(failure(.IncompatibleModifier)) }
+            return .Error(
+                TesseraError {
+                    code: .ScanoutRejected,
+                    subsystem: .DeviceKit,
+                    flags: failed.flags,
+                    detail: failed.detail
+                }
+            )
+        }
+    }
+}
+
+public function displayFramebuffer(display: Ref, surface: Ref) -> Result<Ref, TesseraError> {
+    let index = try resolveDisplay(display, RefRights.read)
+    let surfaceIndex = try resolveSurface(surface, RefRights.read)
+    let record = deviceLibrary.surfaces[surfaceIndex]
+    if !record.info.usage.has(SurfaceUsage.scanout) { return .Error(failure(.ScanoutRejected)) }
+    let object = deviceLibrary.displays[index].object
+    let card = try deviceOf(object)
+    let buffer = try deviceOf(record.object)
+    let handle = match primeImport(card, buffer) {
+        Ok(value) -> value
+        Error(failed) -> return .Error(
+            TesseraError {
+                code: .ScanoutRejected,
+                subsystem: .DeviceKit,
+                flags: failed.flags,
+                detail: failed.detail
+            }
+        )
+    }
+    let added = addFramebuffer(card, handle, record.info)
+    gemClose(card, handle)
+    let id = try added
+    let framebuffer = createObject(.Framebuffer, .Display, .None)
+    deviceLibrary.framebuffers.append(
+        FramebufferRecord { object: framebuffer, id: id, display: object, surface: record.object }
+    )
+    return .Ok(mintRef(framebuffer, defaultRights(.Framebuffer)))
+}
+
+function framebufferOf(object: Number) -> Result<Number, TesseraError> {
+    for (index, framebuffer) in deviceLibrary.framebuffers.enumerated() {
+        if framebuffer.object == object { return .Ok(index) }
+    }
+    return .Error(failure(.InvalidHandle))
+}
+
+// `DRM_IOCTL_MODE_CLOSEFB` keeps a framebuffer on screen until a commit
+// replaces it; `RMFB`, for a kernel without it, turns the plane off.
+function framebufferRelease(object: Number) {
+    let index = match framebufferOf(object) {
+        Ok(value) -> value
+        Error(failed) -> return
+    }
+    let record = deviceLibrary.framebuffers[index]
+    var kept: [FramebufferRecord] = []
+    for framebuffer in deviceLibrary.framebuffers {
+        if framebuffer.object != object { kept.append(framebuffer) }
+    }
+    deviceLibrary.framebuffers = kept
+    // The display went first, and the kernel freed the framebuffer with it.
+    if !deviceLibrary.objects[record.display].live || deviceLibrary.objects[record.display].kind != .Connection {
+        return
+    }
+    // No open card remains after teardown; the kernel released its buffers.
+    let card = match deviceLibrary.objects[record.display].device {
+        Some(value) -> value
+        None -> return
+    }
+    match card.controlWord(Drm.modeCloseFramebuffer, record.id) {
+        Ok(closed) -> {}
+        Error(failed) -> {
+            match card.controlWord(Drm.modeRemoveFramebuffer, record.id) {
+                Ok(removed) -> {}
+                Error(again) -> log warn("a framebuffer was not removed", error: errorName(again))
+            }
+        }
+    }
+}
+
+// `struct drm_event_vblank`: type @0, length @4, the commit serial @8, the
+// time @16 and @20, the sequence @24, the CRTC @28.
+namespace FlipEventLayout {
+    let header: Number = 8
+    let bufferBytes: Number = 1024
+}
+
+// Reads every DRM event waiting, keeping the last flip per CRTC.
+function drainFlips(display: Number) -> Result<Void, TesseraError> {
+    let card = try deviceOf(deviceLibrary.displays[display].object)
+    let blockBytes = zeroedBlock(count: FlipEventLayout.bufferBytes, alignment: 16)
+    let block = blockBytes.pointer()
+    while true {
+        let got = match card.read(block, Number(FlipEventLayout.bufferBytes)) {
+            Ok(value) -> value
+            Error(failed) -> {
+                match errnoOf(failed) {
+                    Again -> return .Ok
+                    else -> return .Error(failed)
+                }
+            }
+        }
+        if got == 0 { return .Ok }
+        var at = 0
+        while at + FlipEventLayout.header <= got {
+            let kind = heapLoad<U32>(block, at)
+            let length = heapLoad<U32>(block, at + 4)
+            if length < FlipEventLayout.header { break }
+            if kind == Drm.eventFlipComplete && U64(length) >= Drm.eventVblankSize {
+                let seconds = Number(heapLoad<U32>(block, at + 16))
+                let micros = Number(heapLoad<U32>(block, at + 20))
+                recordFlip(
+                    display,
+                    Flip {
+                        crtc: heapLoad<U32>(block, at + 28),
+                        sequence: U64(heapLoad<U32>(block, at + 24)),
+                        time: U64(
+                            seconds * Time.nanosecondsPerSecond + micros * Time.nanosecondsPerMicrosecond
+                        ),
+                        serial: heapLoad<U64>(block, at + 8),
+                    }
+                )
+            }
+            at += length
+        }
+    }
+    return .Ok
+}
+
+function recordFlip(display: Number, flip: borrow Flip) {
+    for (index, known) in deviceLibrary.displays[display].flips.enumerated() {
+        if known.crtc == flip.crtc {
+            deviceLibrary.displays[display].flips[index] = flip
+            return
+        }
+    }
+    deviceLibrary.displays[display].flips.append(flip)
+}
+
+public function displayTimeline(display: Ref) -> Result<Ref, TesseraError> {
+    let index = try resolveDisplay(display, RefRights.read)
+    let fence = try deviceLibrary.displays[index].timeline otherwise return .Error(failure(.Unsupported))
+    // The display keeps its own reference; the caller's reads and waits.
+    return .Ok(
+        mintRef(
+            fence,
+            RefRights.duplicate | RefRights.inspect | RefRights.read | RefRights.wait | RefRights.export | RefRights.native
+        )
+    )
+}
+
+public function displayLastFlip(display: Ref, crtc: UN32) -> Result<Vblank, TesseraError> {
+    let index = try resolveDisplay(display, RefRights.read)
+    try drainFlips(index)
+    for flip in deviceLibrary.displays[index].flips {
+        if flip.crtc == crtc {
+            return .Ok(
+                Vblank { sequence: flip.sequence, timestamp: flip.time, serial: flip.serial }
+            )
+        }
+    }
+    return .Error(failure(.NotFound))
+}
+
+// `struct drm_crtc_get_sequence`: the CRTC @0, the count @8, the time @16.
+public function displayVblank(display: Ref, crtc: UN32) -> Result<Vblank, TesseraError> {
+    let index = try resolveDisplay(display, RefRights.read)
+    let card = try deviceOf(deviceLibrary.displays[index].object)
+    let blockBytes = zeroedBlock(count: 24, alignment: 16)
+    let block = blockBytes.pointer()
+    heapStore<U32>(block, 0, crtc)
+    return match card.control(Drm.crtcGetSequence, block) {
+        Ok(read) -> .Ok(
+            Vblank {
+                sequence: heapLoad<U64>(block, 8),
+                timestamp: heapLoad<U64>(block, 16),
+                serial: U64(0)
+            }
+        )
+        Error(failed) -> {
+            // A controller without vertical blank interrupts (virtio-gpu)
+            // has no count to report.
+            match errnoOf(failed) {
+                Invalid -> return .Error(failure(.Unsupported))
+                NotSupported -> return .Error(failure(.Unsupported))
+                else -> return .Error(failed)
+            }
+        }
+    }
+}
+
+namespace Backlight {
+    // The level's scale (§12.3).
+    let full: Number = 65535
+}
+
+// The backlight behind an internal panel: the first backlight entry.
+function backlightPath() -> Result<String, TesseraError> {
+    let entries = try scan()
+    for entry in entries {
+        if entry.entryClass == .Backlight { return .Ok(entry.path) }
+    }
+    return .Error(failure(.Unsupported))
+}
+
+function backlightMaximum(path: borrow String) -> Result<Number, TesseraError> {
+    let maximum = numberAttribute(path + "/max_brightness").or(0)
+    if maximum <= 0 { return .Error(failure(.Unsupported)) }
+    return .Ok(maximum)
+}
+
+// Only an internal connector has a backlight.
+function requireInternal(display: Number, connector: U32) -> Result<Void, TesseraError> {
+    let card = try deviceOf(deviceLibrary.displays[display].object)
+    let found = try readConnector(card, connector)
+    return match found.kind() {
+        Internal -> .Ok
+        Unknown -> .Error(failure(.Unsupported))
+        Hdmi -> .Error(failure(.Unsupported))
+        DisplayPort -> .Error(failure(.Unsupported))
+        Virtual -> .Error(failure(.Unsupported))
+        UsbC -> .Error(failure(.Unsupported))
+    }
+}
+
+// 0 to 65535, scaled to the backlight's `max_brightness`.
+public function displaySetBacklight(
+    display: Ref,
+    connector: UN32,
+    level: Number
+) -> Result<Void, TesseraError> {
+    let index = try resolveDisplay(display, RefRights.master)
+    if level < 0 || level > Backlight.full { return .Error(failure(.InvalidArgument)) }
+    try requireInternal(index, connector)
+    let path = try backlightPath()
+    let maximum = try backlightMaximum(path)
+    return writeText(path + "/brightness", "\(round(level * maximum / Backlight.full))")
+}
+
+public function displayBacklight(display: Ref, connector: UN32) -> Result<Number, TesseraError> {
+    let index = try resolveDisplay(display, RefRights.read)
+    try requireInternal(index, connector)
+    let path = try backlightPath()
+    let maximum = try backlightMaximum(path)
+    let value = try numberAttribute(path + "/actual_brightness") otherwise return .Error(
+        failure(.Unsupported)
+    )
+    return .Ok(floor(value * Backlight.full / maximum))
+}
+
+public function displayRelease(display: Ref) -> Result<Void, TesseraError> {
+    let index = try resolveDisplay(display, RefRights.master)
+    let card = try deviceOf(deviceLibrary.displays[index].object)
+    let dropped = try card.controlValue(Drm.dropMaster, 0)
+    deviceLibrary.displays[index].released = true
+    return .Ok
+}
+
+public function displayAcquire(
+    display: Ref,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    let index = try resolveDisplay(display, RefRights.master)
+    let card = try deviceOf(deviceLibrary.displays[index].object)
+    let reply = Reply { port: port, key: key }
+    return match card.controlValue(Drm.setMaster, 0) {
+        Ok(taken) -> {
+            deviceLibrary.displays[index].released = false
+            return reply.post(.Ok(Answer.none), .Event)
+        }
+        Error(failed) -> {
+            // Another process is master.
+            log info("display master was not taken back", error: errorName(failed))
+            return reply.post(.Error(failure(.NotMaster)), .Event)
+        }
+    }
+}
+
+// Marks a surface object as on screen or off it, while it is still one.
+function setOnScreen(surface: Number, shown: Bool) {
+    if !deviceLibrary.objects[surface].live || deviceLibrary.objects[surface].kind != .Surface { return }
+    match surfaceOf(surface) {
+        Ok(index) -> deviceLibrary.surfaces[index].onScreen = shown
+        Error(failed) -> log debug("a scanned-out surface has no record", error: errorName(failed))
+    }
+}
+
+// A display connection closing: its out-fences close, its reference to the
+// timeline goes, and nothing it scanned out is on screen any longer.
+function displayConnectionRelease(object: Number) {
+    let index = match displayOf(object) {
+        Ok(value) -> value
+        Error(failed) -> return
+    }
+    let record = deviceLibrary.displays[index]
+    for fence in record.outFences { fence.close() }
+    for scan in record.scanned {
+        match scan.surface {
+            Some(surface) -> setOnScreen(surface, false)
+            None -> {}
+        }
+    }
+    match record.timeline {
+        Some(fence) -> {
+            deviceLibrary.objects[fence].refs -= 1
+            if deviceLibrary.objects[fence].refs <= 0 { destroyObject(fence) }
+        }
+        None -> {}
+    }
+    var kept: [DisplayRecord] = []
+    for display in deviceLibrary.displays {
+        if display.object != object { kept.append(display) }
+    }
+    deviceLibrary.displays = kept
+}

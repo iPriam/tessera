@@ -1,0 +1,128 @@
+// MosaicDisplay — Tessera's display server, in its first form.
+//
+// # The name
+//
+// A tessera is one tile of a mosaic; a mosaic is what many of them make when
+// something sets them in place. That is a compositor's whole job, and the word
+// was already sitting in this project's own name rather than borrowed from
+// somewhere else.
+//
+// It is also the company the rest of the field keeps: WindowServer, DWM,
+// SurfaceFlinger. None of them is cute, and each says what the thing does.
+//
+// `MosaicDisplay` rather than `Mosaic`, because Mosaic is a prefix rather than
+// a program: what sets the tiles is one part of it, and the parts that route
+// input and run the platform are others. A name that took the prefix for itself
+// would leave them nowhere to be.
+//
+// It owns the screen and the keyboard, and it is a process rather than part of
+// PID 1 for a reason that is not tidiness: **DRM master is exclusive**. Whoever
+// holds the display as master owns it and nobody else can set a mode while they
+// do. An init that held it would be an init that no application could ever take
+// the screen from.
+//
+// So this program asks DeviceKit for the display and the keyboard, sets a mode,
+// draws Tessera's mark, puts its clients' frames on the screen, and does not
+// exit. PID 1 starts it and restarts it if it dies — see init. The display's
+// reference is never closed on purpose: the last close of a DRM master hands the
+// console its mode back, and takes the picture with it. Nothing here knows a DRM
+// or evdev structure; that is DeviceKit's, and the device manager is what opens
+// the nodes.
+//
+// What it grows into is roadmap/08: surfaces, a protocol, composition, and
+// input routed to whoever has focus.
+
+import Foundation
+import LibTessera
+
+@Main
+function main() {
+    log info("starting")
+    // The loop's port, and the request to stop on it, before any thread is
+    // made: a thread that does not block SIGTERM would still be killed by it.
+    let ports = match loopPorts() {
+        Ok(value) -> value
+        Error(reason) -> {
+            log fault("the display loop could not start", error: errorName(reason))
+            return
+        }
+    }
+    let port = ports.0
+    match processWatchTermination(port, PortKey.stop) {
+        Ok -> {}
+        Error(failed) -> log warn("cannot hear a request to stop", error: errorName(failed))
+    }
+    // Blocking reads wait here, so the loop's port only ever hears what the
+    // loop armed.
+    let reader = ports.1
+    reportKernel()
+    reportClock()
+    reportTimer()
+    reportMemory()
+
+    // The channel first, because the File that arrives on it is the proof
+    // that two Tessera processes can hand each other an open file — and
+    // because init is waiting on nothing else until it has been taken.
+    match takeGreeting(reader) {
+        Some(file) -> {
+            sayWhatArrived(reader, file)
+            closeHandle(file)
+        }
+        None -> {}
+    }
+
+    let links = takeDisplayLinks(reader)
+    let driven = match driveDisplay() {
+        Ok(value) -> value
+        Error(reason) -> {
+            log fault("the display could not be driven", error: errorName(reason))
+            closeLinks(links)
+            holdDisplay(port)
+            return
+        }
+    }
+    match driven {
+        Some(display) -> {
+            reportDisplayMode(display.scanout)
+            if links.count > 0 {
+                let asked = runDisplayLoop(port, reader, links, move display)
+                // A display-client connection belongs to exactly one protocol
+                // session. Once that session ends, whether by EOF or a
+                // malformed message, keep no reference to the dead peer. The
+                // current scanout framebuffer has its own DRM lifetime and
+                // remains valid after this channel is closed.
+                closeLinks(links)
+                log info("the display client's session closed")
+                match asked {
+                    Ok -> return
+                    Error(reason) -> log warn("the loop's port failed", error: errorName(reason))
+                }
+            }
+        }
+        None -> closeLinks(links)
+    }
+
+    log info("holding the display after the client's session")
+    holdDisplay(port)
+}
+
+function holdDisplay(port: Handle) {
+    match holdTheDisplay(port) {
+        Ok -> {}
+        Error(reason) -> log fault("the display could not be held", error: errorName(reason))
+    }
+}
+
+function loopPorts() -> Result<(Handle, Handle), TesseraError> {
+    let port = try portCreate(.None)
+    let reader = match portCreate(.None) {
+        Ok(value) -> value
+        Error(reason) -> return closeLoopPort(port, reason)
+    }
+    return .Ok((port, reader))
+}
+
+function closeLoopPort(port: Handle, reason: borrow TesseraError) -> Result<(Handle, Handle), TesseraError> {
+    closeHandle(port)
+    return .Error(reason)
+}

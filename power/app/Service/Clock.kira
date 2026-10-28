@@ -1,0 +1,78 @@
+import Foundation
+import Heap
+import LibTessera
+
+// The realtime clock watched for jumps, as macOS posts
+// NSSystemClockDidChangeNotification (roadmap/16-libtessera.md §12
+// `timeChanged`).
+//
+// Realtime less Monotonic stays the same while nobody sets the clock, so
+// each tick compares it with the last tick's. A change of more than a
+// second means the clock was set, and the service posts `timeChanged`
+// through the broker to every process, with no entitlement, since every
+// application shows the time. The body is §8.1's `RealtimeDetails`: the
+// new offset, unsynchronised, and the monotonic instant it was seen, with
+// no error bound. Ticks come at least every two seconds (the refresh), so
+// a process hears of a change within about that.
+
+struct ClockWatch {
+    // Realtime less Monotonic at the last tick, once known.
+    var offset: Number?
+}
+
+// §8.1's `RealtimeDetails`.
+@FFI.Struct { layout: c }
+struct RealtimeDetailsRecord {
+    // Int is the C layout's field type here, not the program's number type.
+    var monotonicOffset: Int
+    var synchronised: U8
+    var reserved: Reserved7
+    var lastSet: U64
+    var errorBound: U64
+}
+
+namespace TimeChanged {
+    let method: String = "System/timeChanged"
+    let bodyBytes: Number = 32
+    // A smaller move is the clock's own drift being corrected.
+    let leastMove: Number = 1000000000
+}
+
+function postTimeChanged(service: borrow Service, offset: Number, seen: Number) {
+    let block = zeroedBlock(count: TimeChanged.bodyBytes, alignment: 16)
+    heapStore(
+        block.pointer(),
+        RealtimeDetailsRecord {
+            monotonicOffset: offset,
+            synchronised: UN8(0),
+            reserved: Reserved7 {},
+            lastSet: UNumber(seen),
+            errorBound: UNumber(0),
+        }
+    )
+    let body = Buffer { address: block.pointer(), length: Number(TimeChanged.bodyBytes) }
+    match serviceNotify(service.listener, TimeChanged.method, body, "") {
+        // The notice is with the broker, which passes it on to every process.
+        Ok -> {}
+        Error(failed) -> log warn("cannot post timeChanged", error: errorName(failed))
+    }
+}
+
+function watchClock(service: borrow mut Service) -> Result<Void, TesseraError> {
+    let seen = try monotonic()
+    let realtime = try clockRead(.Realtime)
+    if realtime == 0 || realtime < seen { return .Ok }
+    let offset = realtime - seen
+    let before = service.clock.offset
+    service.clock.offset = .Some(offset)
+    let last = try before otherwise return .Ok
+    let moved = abs(offset - last)
+    if moved <= TimeChanged.leastMove { return .Ok }
+    log info(
+        "the clock was set",
+        forward: offset > last,
+        seconds: floor(moved / Seconds.nanoseconds)
+    )
+    postTimeChanged(service, offset, seen)
+    return .Ok
+}

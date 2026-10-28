@@ -1,0 +1,50 @@
+Give the HVF accelerator 512 memory slots instead of 32.
+
+QEMU's HVF accelerator keeps its own table of guest memory mappings, fixed at
+32 entries, and aborts with "No free slots" when a new RAM region arrives and
+the table is full. Hypervisor.framework sets no such limit on hv_vm_map.
+
+Every virtio-gpu blob the guest maps (RESOURCE_MAP_BLOB) is a RAM subregion of
+the hostmem window and takes a slot. Tessera's display server and each
+application keep their exported frames mapped, so the services boot, with
+several windows up, filled the table and the emulator aborted.
+
+The table is scanned linearly when the memory map changes, which 512 entries
+does not make noticeable.
+
+--- a/accel/hvf/hvf-accel-ops.c
++++ b/accel/hvf/hvf-accel-ops.c
+@@ -86,7 +86,7 @@
+     uint64_t gva;
+ };
+ 
+-struct mac_slot mac_slots[32];
++struct mac_slot mac_slots[HVF_NUM_SLOTS];
+ 
+ static int do_hvf_set_memory(hvf_slot *slot, hv_memory_flags_t flags)
+ {
+--- a/include/system/hvf_int.h
++++ b/include/system/hvf_int.h
+@@ -22,6 +22,13 @@
+ /* hvf_slot flags */
+ #define HVF_SLOT_LOG (1 << 0)
+ 
++/*
++ * Hypervisor.framework has no slot table of its own; this is QEMU's. Every
++ * mapped virtio-gpu blob takes a slot, and a guest showing several windows
++ * keeps far more than 32 mapped.
++ */
++#define HVF_NUM_SLOTS 512
++
+ typedef struct hvf_slot {
+     uint64_t start;
+     uint64_t size;
+@@ -42,7 +49,7 @@
+ 
+ struct HVFState {
+     AccelState parent;
+-    hvf_slot slots[32];
++    hvf_slot slots[HVF_NUM_SLOTS];
+     int num_slots;
+ 
+     hvf_vcpu_caps *hvf_caps;

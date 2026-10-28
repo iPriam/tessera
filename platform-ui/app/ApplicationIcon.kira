@@ -1,0 +1,139 @@
+import Foundation
+import KiraUI
+
+// An application's icon, as every place that shows one draws it: the
+// desktop's grid, the Dock and the switcher. It is one of the pictures
+// CoreIcon drew from the application's `.tessicon` when it was built, in its
+// bundle's `Contents/Resources`: on the Mac's desktop framed as macOS shows
+// it, the chiclet inside the picture casting its own shadow and `side` the
+// chiclet's, not the picture's, size; on a touch
+// screen edge to edge, clipped to Apple's continuous corners, which are
+// 22.37% of its side, in the dark version while the interface is drawn
+// dark. An application that carries none, or one installed as an image that is not
+// open, shows its initial on a square tinted from the system's colors.
+
+public namespace IconShape {
+    // The corner of an icon, as a share of its side: Apple's.
+    let corner: Number = 0.2237
+    // The share of a framed picture its icon fills, the rest its margin and
+    // shadow: macOS's 824 of 1024, CoreIcon's IconGeometry.bodyShare.
+    let framedBody: Number = 0.8046875
+    // The initial's size, as a share of the side.
+    let initial: Number = 0.5
+}
+
+// The tints an icon is drawn in: the system's colors, as Apple's own icons are
+// made from.
+let iconTints: [RGBAColor] = [
+    RGBAColor { r: 0.0, g: 0.478, b: 1.0, a: 1.0 },
+    RGBAColor { r: 0.204, g: 0.78, b: 0.349, a: 1.0 },
+    RGBAColor { r: 1.0, g: 0.584, b: 0.0, a: 1.0 },
+    RGBAColor { r: 0.345, g: 0.337, b: 0.839, a: 1.0 },
+    RGBAColor { r: 1.0, g: 0.176, b: 0.333, a: 1.0 },
+    RGBAColor { r: 0.686, g: 0.322, b: 0.871, a: 1.0 },
+    RGBAColor { r: 0.188, g: 0.69, b: 0.78, a: 1.0 },
+    RGBAColor { r: 1.0, g: 0.231, b: 0.188, a: 1.0 },
+]
+
+// The tint `name` is drawn in: always the same one for the same name.
+public function iconTint(name: borrow String) -> RGBAColor {
+    return iconTints[abs(Number(hash(name))) % iconTints.count]
+}
+
+let applicationIconInk: RGBAColor = RGBAColor { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }
+// A Mac's initial icon floats on a soft, faint shadow that spreads well past its
+// edge and falls a little: never a dark rim along its bottom.
+let applicationIconShadow: RGBAColor = RGBAColor { r: 0.0, g: 0.0, b: 0.0, a: 0.2 }
+// The blur and the fall, as shares of the side.
+let applicationIconShadowBlur: Number = 1 / 20
+let applicationIconShadowFall: Number = 1 / 50
+
+// The icon of the application named `name`, `side` points square.
+public construct ApplicationIcon(name: String, side: Number) extends Widget {
+    body {
+        applicationIcon(name, side)
+    }
+}
+
+function applicationIcon(name: borrow String, side: Number) -> Any Widget {
+    return match applicationIconArt(name) {
+        Some(art) -> applicationIconPicture(move art, side)
+        None -> applicationInitialIcon(name, side)
+    }
+}
+
+// Where the system's applications and the person's are, and the pictures a
+// bundle carries.
+namespace IconArt {
+    let folders: [String] = ["/System/Applications", "/Applications"]
+    let framed: String = "AppIcon"
+    let edge: String = "AppIconEdge"
+    let dark: String = "Dark"
+    let extension: String = ".png"
+}
+
+// The picture `name`'s icon is drawn from, as the platform lays icons out
+// and dark while the interface is drawn dark, then the same layout light,
+// then the framed light picture an older bundle carries alone. None when the
+// bundle carries no icon.
+function applicationIconArt(name: borrow String) -> String? {
+    let prefix = interfaceMode() == .AdaptiveDesktop ? IconArt.framed : IconArt.edge
+    let files = [
+        prefix + (interfaceDrawnDark() ? IconArt.dark : ""),
+        prefix,
+        IconArt.framed
+    ]
+    for folder in IconArt.folders {
+        let resources = "\(folder)/\(name).app/Contents/Resources/"
+        for file in files {
+            let path = resources + file + IconArt.extension
+            if pathExists(path) { return .Some(path) }
+        }
+    }
+    return .None
+}
+
+// A picture CoreIcon drew: a framed one drawn so that its icon, not the
+// picture, is `side` across, its margin and shadow spilling past the box as a
+// Mac's Dock shows them; an edge-to-edge one clipped to the icon's corners.
+function applicationIconPicture(art: String, side: Number) -> Any Widget {
+    if interfaceMode() == .AdaptiveDesktop {
+        let picture = side / IconShape.framedBody
+        return ImageFile(path = art)
+        .width(resolvedLength(picture))
+        .height(resolvedLength(picture))
+        .frame(width: side, height: side)
+    }
+    return ImageFile(path = art)
+    .width(resolvedLength(side))
+    .height(resolvedLength(side))
+    .clipShape(.Squircle(side * IconShape.corner))
+}
+
+// An icon with no picture: its initial on its tinted square, which on a Mac
+// stands on a shadow, as the framed pictures do, and on an iPad lies flat.
+function applicationInitialIcon(name: borrow String, side: Number) -> Any Widget {
+    if interfaceMode() != .AdaptiveDesktop { return applicationInitialFace(name, side) }
+    return applicationInitialFace(name, side)
+    .shadow(
+        color: applicationIconShadow,
+        radius: resolvedLength(side * applicationIconShadowBlur),
+        x: resolvedLength(0),
+        y: resolvedLength(side * applicationIconShadowFall)
+    )
+}
+
+// The face of an application that carries no artwork: its initial on its
+// tinted square.
+function applicationInitialFace(name: borrow String, side: Number) -> Any Widget {
+    let initial = name.count > 0 ? name.substring(0, 1) : "?"
+    return ZStack(alignment = .Center) {
+        RoundedRectangle(cornerRadius = side * IconShape.corner, style = .Continuous)
+        .fill(iconTint(name))
+        Text(initial)
+        .font(size: resolvedLength(side * IconShape.initial), weight: .SemiBold)
+        .textColor(applicationIconInk)
+    }
+    .width(resolvedLength(side))
+    .height(resolvedLength(side))
+}

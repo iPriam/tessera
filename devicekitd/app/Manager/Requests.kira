@@ -1,0 +1,164 @@
+import Foundation
+import Heap
+import LibTessera
+import DeviceKit
+
+// What the manager does with one request (17 §20.1). Every request gets one
+// reply; a descriptor the request carried is either kept or closed before
+// the reply goes out.
+
+// The reply to send, and the descriptor to pass with it, which is closed
+// once sent.
+struct Answer {
+    var reply: ByteBlock
+    var passing: Descriptor?
+}
+
+function replyBlock() -> ByteBlock { return zeroedBlock(count: Wire.bytes, alignment: 16) }
+
+function answered(reply: ByteBlock) -> Answer {
+    return Answer { reply: move reply, passing: .None }
+}
+
+function refuse(code: borrow ErrorCode, detail: U64) -> Answer {
+    let reply = replyBlock()
+    blockStore<U32>(reply, ReplyAt.code, code.rawValue())
+    blockStore<U64>(reply, ReplyAt.detail, detail)
+    return answered(move reply)
+}
+
+function closePassed(passed: borrow Descriptor?) {
+    match passed {
+        Some(descriptor) -> closeDescriptor(descriptor)
+        // The request carried no descriptor, so there is nothing to close.
+        None -> {}
+    }
+}
+
+// Carries out `request` from `client`, and answers it. `passed` is the
+// descriptor the request carried, if any, and the operation decides whether
+// it is kept.
+function answerRequest(
+    manager: borrow mut Manager,
+    client: borrow Client,
+    request: borrow Request,
+    passed: Descriptor?
+) -> Answer {
+    let operation = match managerOperationOf(request.operation) {
+        Some(value) -> value
+        None -> {
+            closePassed(passed)
+            return refuse(.Unsupported, U64(request.operation))
+        }
+    }
+    return match operation {
+        Export -> export(manager, request, move passed)
+        Publish -> publish(manager, client, request, move passed)
+        Open -> {
+            closePassed(passed)
+            open(manager, client, request)
+        }
+        Import -> {
+            closePassed(passed)
+            importToken(manager, request)
+        }
+        Claim -> {
+            closePassed(passed)
+            claim(manager, client, request)
+        }
+        Unpublish -> {
+            closePassed(passed)
+            unpublish(manager, client, request)
+        }
+        Published -> {
+            closePassed(passed)
+            publishedList(manager, request)
+        }
+    }
+}
+
+let families: [Family] = [Family.None, Family.Gpu, Family.Display, Family.Input, Family.Audio, Family.Camera, Family.Sensor, Family.Haptic, Family.PowerSource, Family.Thermal, Family.Backlight, Family.Block, Family.Hid, Family.Usb, Family.Rtc]
+
+function familyOf(raw: U32) -> Family? {
+    return caseWithCode(families, raw)
+}
+
+// An `open` errno as the error a client reads.
+function openRefusal(failed: borrow TesseraError) -> Answer {
+    let errno = try errnoOf(failed) otherwise return refuse(.Internal, failed.detail)
+    return match errno {
+        NotPermitted -> refuse(.AccessDenied, failed.detail)
+        AccessDenied -> refuse(.AccessDenied, failed.detail)
+        NoEntry -> refuse(.NotFound, failed.detail)
+        Busy -> refuse(.DeviceBusy, failed.detail)
+        NoDeviceOrAddress -> refuse(.DeviceLost, failed.detail)
+        NoDevice -> refuse(.DeviceLost, failed.detail)
+        Again -> refuse(.Internal, failed.detail)
+    }
+}
+
+// Whether the family acts through sysfs files the client reads itself.
+function readsSysfs(family: borrow Family) -> Bool {
+    return match family {
+        PowerSource -> true
+        Thermal -> true
+        Backlight -> true
+        else -> false
+    }
+}
+
+// The families whose entries a driver may open once it claimed them: the
+// Hid and Usb devices its manifest matched.
+function isClaimableFamily(family: borrow Family) -> Bool {
+    return match family {
+        Hid -> true
+        Usb -> true
+        else -> false
+    }
+}
+
+// How the node is opened: read-only when asked, and for a real-time clock,
+// which is only ever read and whose sysfs attributes do the rest.
+function accessFor(family: borrow Family, options: U64) -> LinuxOpen {
+    if family == .Rtc || OpenOptions(U32(options)).has(OpenOptions.readOnly) {
+        return LinuxOpen.readOnly
+    }
+    return LinuxOpen.readWrite
+}
+
+// `Device.open`: the program's entitlement for the family, then the entry's
+// own family, then the node.
+function open(manager: borrow Manager, client: borrow Client, request: borrow Request) -> Answer {
+    let family = try familyOf(request.kind) otherwise return refuse(
+        .InvalidArgument,
+        U64(request.kind)
+    )
+    let entry = request.entry
+    // Hid and Usb are open to the driver that claimed the entry.
+    let claimed = isClaimableFamily(family) && holds(manager, client.socket, entry)
+    if !claimed && !entitled(client.program, family) {
+        return refuse(.NotEntitled, U64(request.kind))
+    }
+    let info = match registryLookup(EntryId(entry)) {
+        Ok(value) -> value
+        Error(failed) -> return refuse(failed.code, failed.detail)
+    }
+    if info.family != family { return refuse(.WrongType, U64(info.family.rawValue())) }
+    let reply = replyBlock()
+    blockStore<U32>(reply, ReplyAt.kind, request.kind)
+    blockStore<U64>(reply, ReplyAt.entry, entry)
+    // Flags bit 0: the driver may detach a kernel driver.
+    if claimed && family == .Usb && holdsDetach(manager, client.socket, entry) {
+        blockStore<U32>(reply, ReplyAt.flags, U32(1))
+    }
+    if readsSysfs(family) { return answered(move reply) }
+    let node = match registryNode(EntryId(entry)) {
+        Ok(value) -> value
+        Error(failed) -> return refuse(failed.code, failed.detail)
+    }
+    let opened = match openPath(node, accessFor(family, request.options) | LinuxOpen.nonBlock) {
+        Ok(value) -> value
+        Error(failed) -> return openRefusal(failed)
+    }
+    return Answer { reply: move reply, passing: .Some(opened) }
+}

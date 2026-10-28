@@ -1,0 +1,130 @@
+//! The Clock's tabs and the world clock and timer sections of its window.
+import KiraUI
+
+/// The Clock's tabs, as on a Mac and an iPad: the world clock, the stopwatch and the timers, chosen in the toolbar's row.
+construct ClockView(
+    seconds: UNumber,
+    zone: String,
+    timer: ClockTimer,
+    stopwatch: ClockStopwatch
+) extends Widget {
+    // Which tab is shown.
+    @State var selection: Number = ClockPane.world
+
+    body {
+        TabView(selection: $selection) {
+            Tab(title: "World Clock", systemImage: .Globe, value: ClockPane.world) {
+                WorldClockView(seconds = seconds, zone = zone)
+            }
+            Tab(title: "Stopwatch", systemImage: .Stopwatch, value: ClockPane.stopwatch) {
+                StopwatchView(stopwatch = stopwatch)
+            }
+            Tab(title: "Timers", systemImage: .Timer, value: ClockPane.timers) {
+                TimerSection(timer = timer)
+                .padding(resolvedLength(48))
+            }
+        }
+    }
+}
+
+/// The Clock's tabs, by the value each is tagged with.
+namespace ClockPane {
+    let world: Number = 0
+    let stopwatch: Number = 1
+    let timers: Number = 2
+}
+
+/// The time and the date at `seconds`, large, with the zone they are in.
+construct WorldClockView(seconds: UNumber, zone: String) extends Widget {
+    body {
+        VStack(spacing = .Medium, alignment = .Leading) {
+            Text(hourMinute(seconds))
+            .font(size = scaledMetric(120, relativeTo: .largeTitle), weight = .Bold)
+
+            Text(dateText(seconds))
+            .typography(.title)
+            .fontWeight(.Medium)
+            .foregroundColor(.Secondary)
+
+            Text(zoneTitle(zone))
+            .typography(.body)
+            .foregroundColor(.Secondary)
+            Spacer()
+        }
+        .padding(resolvedLength(64))
+    }
+}
+
+/// The Timers tab: the countdown and Cancel while a timer runs, the preset lengths in a row of round buttons otherwise.
+construct TimerSection(timer: ClockTimer) extends Widget {
+    body {
+        VStack(spacing = .Large, alignment = .Center) {
+            Spacer()
+            match timer.remaining(unixMillis()) {
+                Some(left) -> timerRunning(left, timer)
+                None -> timerPresets(timer)
+            }
+            Spacer()
+        }
+        .fillWidth()
+        .fillHeight()
+    }
+}
+
+/// The countdown, in the Clock's thin tabular figures, and Cancel.
+function timerRunning(left: UNumber, timer: ClockTimer) -> Any Widget {
+    return VStack(spacing = .Large, alignment = .Center) {
+        Text(countdownText(left))
+        .font(size = scaledMetric(88, relativeTo: .largeTitle), weight = .Light)
+        .monospacedDigit()
+        Button(
+            action = { in
+                var held = timer
+                held.cancel()
+                return
+            }
+        ) {
+            Text("Cancel")
+        }
+        .buttonStyle(.Bordered)
+        .buttonBorderShape(.Circle)
+        .controlSize(.Large)
+    }
+}
+
+/// The sizes of the round preset buttons in the Timers tab.
+namespace PresetButton {
+    // The width of a preset's label, the longest of them, `15 min`.
+    let label: Number = 60
+}
+
+/// A round button for each preset length, under the question they answer.
+function timerPresets(timer: ClockTimer) -> Any Widget {
+    var buttons: [Any Widget] = []
+    for seconds in TimerPresets.lengths {
+        buttons.append(
+            Button(
+                action = { in
+                    var held = timer
+                    held.start(seconds)
+                    return
+                }
+            ) {
+                // One width for every label, so the buttons are one size.
+                HStack {
+                    Spacer()
+                    Text(presetName(seconds))
+                    Spacer()
+                }
+                .width(resolvedLength(PresetButton.label))
+            }.buttonStyle(.Bordered).buttonBorderShape(.Circle).controlSize(.Large)
+        )
+    }
+    return VStack(spacing = .Large, alignment = .Center) {
+        Text("Start a Timer")
+        .typography(.title)
+        .fontWeight(.Medium)
+        HStack(spacing = .Large, alignment = .Center, children = buttons)
+        .hugWidth()
+    }
+}

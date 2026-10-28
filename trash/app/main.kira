@@ -1,0 +1,32 @@
+//! The trash service's entry point: starts the service that moves items to the Trash and back.
+import Foundation
+import LibTessera
+import TrashStore
+
+// trash: the Trash service (roadmap/19, decisions in its Decisions section).
+// It moves a person's items into the Trash on the data volume and, once it
+// is built, puts them back. It listens as `tessera.trash`, and serves one
+// request per connection, one connection at a time.
+
+/// The name the trash service listens under.
+namespace ServiceName {
+    let trash: String = "tessera.trash"
+}
+
+/// Starts the trash service and serves it until init asks it to stop.
+@Main
+function main() {
+    let listener = match serviceListen(ServiceName.trash) {
+        Ok(value) -> value
+        Error(failed) -> {
+            log fault("the service could not start", error: errorName(failed))
+            return
+        }
+    }
+    removeOrphanRecords()
+    log info("listening")
+    match serve(listener) {
+        Ok -> {}
+        Error(failed) -> log fault("the Trash service stopped", error: errorName(failed))
+    }
+}

@@ -1,0 +1,236 @@
+import Foundation
+import LibTessera
+import TesseraDisplayClient
+
+// The keymap, which turns a key into the text it types, and the modifiers it
+// is typed with (roadmap/06-devices-and-input.md, "Keycodes are not
+// characters"). Both are the server's, so every client reads a key the same
+// way and none carries a keymap of its own (roadmap/08-display-server.md).
+//
+// Four layouts are compiled in, under their XKB names: `us`, `gb`, `de` and
+// `fr`, each at XKB's first two levels, Shift the second, Caps Lock shifting
+// the letters alone. Keys XKB makes dead (`de`'s `^` and `´`, `fr`'s `^` and
+// `¨`) type their character at once, and the third level (AltGr) is not
+// compiled in. Settings chooses the layout (`keyboard.layout`), and a change
+// is typed through from the next key.
+
+// A run of keys whose usages follow each other, each typing one character
+// plain and one with Shift.
+struct KeymapRow {
+    let first: UNumber
+    let plain: String
+    let shifted: String
+    // Whether Caps Lock shifts the row, as it shifts letters.
+    let locks: Bool = false
+}
+
+// A layout: its name and its rows.
+struct Keymap {
+    let name: String
+    let rows: [KeymapRow]
+}
+
+// The US layout. The letters, the digit row, the space bar, the symbols from
+// `-` to `/` around the non-US `#`, which a US keyboard has no key for, and
+// the keypad, which on a Mac always types its digits.
+namespace Keymaps {
+    let us: Keymap = Keymap {
+        name: "us",
+        rows: [
+            KeymapRow {
+                first: 4,
+                plain: "abcdefghijklmnopqrstuvwxyz",
+                shifted: "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+                locks: true,
+            },
+            KeymapRow { first: 30, plain: "1234567890", shifted: "!@#$%^&*()" },
+            KeymapRow { first: 44, plain: " ", shifted: " " },
+            KeymapRow { first: 45, plain: "-=[]\\", shifted: "_+{}|" },
+            KeymapRow { first: 51, plain: ";'`,./", shifted: ":\"~<>?" },
+            KeymapRow { first: 84, plain: "/*-+", shifted: "/*-+" },
+            KeymapRow { first: 89, plain: "1234567890.", shifted: "1234567890." },
+        ],
+    }
+    // The UK's: `"` over 2 and `£` over 3, `#` on the key beside Return and
+    // `\` on the key beside the left Shift.
+    let gb: Keymap = Keymap {
+        name: "gb",
+        rows: [
+            KeymapRow {
+                first: 4,
+                plain: "abcdefghijklmnopqrstuvwxyz",
+                shifted: "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+                locks: true,
+            },
+            KeymapRow { first: 30, plain: "1234567890", shifted: "!\"£$%^&*()" },
+            KeymapRow { first: 44, plain: " ", shifted: " " },
+            KeymapRow { first: 45, plain: "-=[]", shifted: "_+{}" },
+            KeymapRow { first: 50, plain: "#;'`,./", shifted: "~:@¬<>?" },
+            KeymapRow { first: 84, plain: "/*-+", shifted: "/*-+" },
+            KeymapRow { first: 89, plain: "1234567890.", shifted: "1234567890." },
+            KeymapRow { first: 100, plain: "\\", shifted: "|" },
+        ],
+    }
+    // Germany's QWERTZ: Y and Z swapped, the umlauts and ß in place of the
+    // symbols.
+    let de: Keymap = Keymap {
+        name: "de",
+        rows: [
+            KeymapRow {
+                first: 4,
+                plain: "abcdefghijklmnopqrstuvwxzy",
+                shifted: "ABCDEFGHIJKLMNOPQRSTUVWXZY",
+                locks: true,
+            },
+            KeymapRow { first: 30, plain: "1234567890", shifted: "!\"§$%&/()=" },
+            KeymapRow { first: 44, plain: " ", shifted: " " },
+            KeymapRow { first: 45, plain: "ß´ü+", shifted: "?`Ü*" },
+            KeymapRow { first: 50, plain: "#öä^,.-", shifted: "'ÖÄ°;:_" },
+            KeymapRow { first: 84, plain: "/*-+", shifted: "/*-+" },
+            KeymapRow { first: 89, plain: "1234567890,", shifted: "1234567890," },
+            KeymapRow { first: 100, plain: "<", shifted: ">" },
+        ],
+    }
+    // France's AZERTY: A and Q, Z and W swapped, M beside L, and the digits
+    // under Shift.
+    let fr: Keymap = Keymap {
+        name: "fr",
+        rows: [
+            KeymapRow {
+                first: 4,
+                plain: "qbcdefghijkl,noparstuvzxyw",
+                shifted: "QBCDEFGHIJKL?NOPARSTUVZXYW",
+                locks: true,
+            },
+            KeymapRow { first: 30, plain: "&é\"'(-è_çà", shifted: "1234567890" },
+            KeymapRow { first: 44, plain: " ", shifted: " " },
+            KeymapRow { first: 45, plain: ")=^$", shifted: "°+¨£" },
+            KeymapRow { first: 50, plain: "*mù²;:!", shifted: "µM%²./§" },
+            KeymapRow { first: 84, plain: "/*-+", shifted: "/*-+" },
+            KeymapRow { first: 89, plain: "1234567890.", shifted: "1234567890." },
+            KeymapRow { first: 100, plain: "<", shifted: ">" },
+        ],
+    }
+}
+
+// The layout XKB names `name`, the US one for a name none has.
+function keymapNamed(name: borrow String) -> Keymap {
+    return match name {
+        "gb" -> Keymaps.gb
+        "de" -> Keymaps.de
+        "fr" -> Keymaps.fr
+        "us" -> Keymaps.us
+        else -> {
+            log warn(
+                "no keyboard layout has this name; typing through the US one",
+                layout: copy name
+            )
+            Keymaps.us
+        }
+    }
+}
+
+// `text`'s characters, each its own string: a row's keys, one apiece, though
+// some take more than one byte.
+function characters(text: borrow String) -> [String] {
+    var found: [String] = []
+    var at: Number = 0
+    while at < text.count {
+        let width = scalarWidthAt(text, at)
+        found.append(text.substring(at, at + width))
+        at += width
+    }
+    return found
+}
+
+// The keyboard layout changed in Settings: keys are typed through the new one
+// from the next.
+function settingsChanged(server: borrow mut Server) {
+    let changed = settingsWatchWoke(server.settings)
+    if changed.contains(KeyboardSetting.layout) {
+        server.keymap = keymapNamed(settingValue(KeyboardSetting.layout, KeyboardSetting.fallback))
+        log info("keys are typed through a keymap", layout: server.keymap.name)
+    }
+    armSettingsWatch(server.settings, server.port, UNumber(PortKey.settings))
+}
+
+// The text `key` types on `keymap` with `modifiers` held: one character, or
+// empty for a key no row holds. Control, Option and Command do not change
+// it; a client reads them from the modifiers and decides whether the key is
+// a command.
+function typedText(
+    keymap: borrow Keymap,
+    key: UNumber,
+    modifiers: borrow DisplayModifiers
+) -> String? {
+    for row in keymap.rows {
+        let plain = characters(row.plain)
+        if key >= row.first && key < row.first + plain.count {
+            let at = key - row.first
+            let shifted = modifiers.shift != (row.locks && modifiers.capsLock)
+            return .Some(shifted ? characters(row.shifted)[at] : plain[at])
+        }
+    }
+    return .None
+}
+
+// The modifier keys by usage, on the keyboard page.
+namespace ModifierKey {
+    let capsLock: UNumber = 57
+    let leftControl: UNumber = 224
+    let leftShift: UNumber = 225
+    let leftOption: UNumber = 226
+    let leftCommand: UNumber = 227
+    let rightControl: UNumber = 228
+    let rightShift: UNumber = 229
+    let rightOption: UNumber = 230
+    let rightCommand: UNumber = 231
+}
+
+// Whether `key` is a modifier: one of the eight held keys, or Caps Lock.
+function isModifierKey(key: UNumber) -> Bool {
+    return key == ModifierKey.capsLock
+        || (key >= ModifierKey.leftControl && key <= ModifierKey.rightCommand)
+}
+
+// Follows `key` changing to `state` in the modifiers: a held modifier is down
+// from its press to its release, either of a pair holding it, and Caps Lock
+// turns on and off with each press.
+function followModifiers(server: borrow mut Server, key: UNumber, state: borrow DisplayKeyState) {
+    if !isModifierKey(key) { return }
+    if key == ModifierKey.capsLock {
+        match state {
+            Pressed -> server.modifiers.capsLock = !server.modifiers.capsLock
+            Released, Repeated -> {}
+        }
+        return
+    }
+    var held: [UNumber] = []
+    for down in server.modifiersDown {
+        if down != key { held.append(down) }
+    }
+    match state {
+        Pressed, Repeated -> held.append(key)
+        Released -> {}
+    }
+    server.modifiersDown = held
+    server.modifiers = DisplayModifiers {
+        shift: arrayContains(held, ModifierKey.leftShift) || arrayContains(
+            held,
+            ModifierKey.rightShift
+        ),
+        control: arrayContains(held, ModifierKey.leftControl) || arrayContains(
+            held,
+            ModifierKey.rightControl
+        ),
+        option: arrayContains(held, ModifierKey.leftOption) || arrayContains(
+            held,
+            ModifierKey.rightOption
+        ),
+        command: arrayContains(held, ModifierKey.leftCommand) || arrayContains(
+            held,
+            ModifierKey.rightCommand
+        ),
+        capsLock: server.modifiers.capsLock,
+    }
+}

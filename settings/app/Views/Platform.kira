@@ -1,0 +1,93 @@
+import Foundation
+import KiraUI
+import LibTessera
+
+// Platform: the Dynamic Platform the machine runs, switched at once with
+// everything still open (roadmap/15-form-factors.md). Choosing one writes
+// `platform.dynamic`; the running platform hears it and has PID 1 start the
+// one chosen in its place.
+
+// A platform the machine can run: its `platform.dynamic` value and its name.
+struct PlatformChoice {
+    let value: String
+    let title: String
+}
+
+function platformChoices() -> [PlatformChoice] {
+    return [
+        PlatformChoice { value: PlatformSetting.adaptiveDesktop, title: "Adaptive Desktop" },
+        PlatformChoice { value: PlatformSetting.adaptiveMobile, title: "Adaptive Mobile" },
+        PlatformChoice { value: PlatformSetting.media, title: "Media" },
+    ]
+}
+
+// The platform running: the setting's, or without one the platform the
+// device says it runs.
+function runningPlatform() -> String {
+    let stored = storedSetting(PlatformSetting.key, "")
+    if platformSettingValid(stored) { return stored }
+    return match deviceDescription() {
+        Ok(device) -> match device.dynamicPlatform {
+            0 -> PlatformSetting.adaptiveMobile
+            3 -> PlatformSetting.media
+            else -> PlatformSetting.adaptiveDesktop
+        }
+        Error(failed) -> {
+            log warn("the device could not say its platform", error: errorName(failed))
+            PlatformSetting.adaptiveDesktop
+        }
+    }
+}
+
+function platformTitle(value: borrow String) -> String {
+    for choice in platformChoices() {
+        if choice.value == value { return copy choice.title }
+    }
+    return copy value
+}
+
+construct PlatformPane() extends Widget {
+    @State var platform: String = runningPlatform()
+
+    body {
+        var rows: [Any Widget] = []
+        for choice in platformChoices() {
+            let target = copy choice.value
+            rows.append(
+                Button(
+                    action = { in
+                        platform = copy target
+                        changeSetting(PlatformSetting.key, .Some(copy target))
+                        return
+                    }
+                ) {
+                    HStack(spacing = .Medium, alignment = .Center) {
+                        Text(copy choice.title)
+                        Spacer()
+                        Icon(symbol = .Checkmark)
+                        .foregroundColor(platform == choice.value ? .Accent : .Clear)
+                    }
+                }.buttonStyle(.Plain)
+            )
+        }
+        Form(
+            children: [
+                Section(
+                    children: rows,
+                    footer: Text("The machine switches at once. Open apps keep running.")
+                )
+            ]
+        )
+        .navigationTitle("Platform")
+    }
+}
+
+construct PlatformRoute() extends NavigationRoute {
+    function routeKey() -> String {
+        return "platform"
+    }
+
+    function destination() -> Any Widget {
+        return PlatformPane()
+    }
+}

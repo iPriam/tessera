@@ -1,0 +1,65 @@
+import Foundation
+
+// Where the machine spends its time: every CPU sampled a number of times a
+// second, each sample the call chain it was in, kernel frames and then user
+// frames, each run of them led by its marker (Linux's PERF_CONTEXT_KERNEL and
+// PERF_CONTEXT_USER, at the top of the address space). What the samples need
+// to be read follows them: each sampled process's name and mappings, and the
+// kernel's text symbols. Root only.
+
+public struct SampledStack {
+    let pid: Number
+    let tid: Number
+    // When it was taken, on the monotonic clock; 0 for a CPU sample.
+    let time: U64
+    let frames: [U64]
+}
+
+// A thread switched back in, after a `SampledStack` among `blocks` switched
+// it out.
+public struct SampledResume {
+    let pid: Number
+    let tid: Number
+    let time: U64
+}
+
+// What a process counted with `traceCounter` while it was sampled: how many
+// times, and their sum.
+public struct SampledCounter {
+    let pid: Number
+    let name: String
+    var count: Number = 0
+    var total: Number = 0
+    // The smallest and largest single value counted.
+    var least: Number = 0
+    var most: Number = 0
+}
+
+public struct SampledProcess {
+    let pid: Number
+    let name: String
+    // Its /proc maps, as the kernel wrote them.
+    let maps: String
+}
+
+public struct MachineSamples {
+    var stacks: [SampledStack] = []
+    // Each switch away from a thread, with where it blocked, and each
+    // switch back to one: the time threads spent off the CPUs, and why.
+    var blocks: [SampledStack] = []
+    var resumes: [SampledResume] = []
+    // The sampled span, on the monotonic clock.
+    var began: U64 = U64(0)
+    var ended: U64 = U64(0)
+    var processes: [SampledProcess] = []
+    // `<address> <name>` a line.
+    var kernelSymbols: String = ""
+    var counters: [SampledCounter] = []
+    // Samples the rings had no room for.
+    var lost: Number = 0
+}
+
+// Samples every CPU for `seconds`, `hz` times a second each.
+public function sampleMachine(seconds: Number, hz: Number) -> Result<MachineSamples, TesseraError> {
+    return kernelSampleMachine(seconds, hz)
+}

@@ -1,0 +1,52 @@
+//! The detail of a chosen note in the Notes window.
+import KiraUI
+
+/// The note's lengths at the mobile size, scaled with the type as `scaledMetric` does.
+namespace NoteDetailMetrics {
+    let margin: Number = 40
+    let lineGap: Number = 8
+}
+
+/// The detail of the chosen note, with `field` to add to it, which stays as another note is chosen.
+function noteDetail(note: Note?, listed: Number, field: Any Widget) -> Any Widget {
+    match note {
+        Some(chosen) -> {
+            return VStack(spacing = .Medium, alignment = .Leading) {
+                ScrollView {
+                    VStack(spacing = .Medium, alignment = .Leading) {
+                        Text(longDate(chosen.saved))
+                        .typography(.footnote)
+                        .foregroundColor(.Secondary)
+                        .fillWidth()
+                        Text(chosen.shownTitle())
+                        .typography(.largeTitle)
+                        .fontWeight(.Bold)
+                        noteLines(chosen.lines)
+                    }
+                    .padding(scaledMetric(NoteDetailMetrics.margin))
+                }
+                // Another note is another page: it is put in place at once,
+                // where the last one's text would otherwise slide to its own.
+                .id(chosen.file())
+                field
+                .padding(scaledMetric(NoteDetailMetrics.margin))
+            }
+            .fillHeight()
+        }
+        None -> if listed == 0 {
+            return EmptyView()
+        }
+    }
+    return ContentUnavailableView(title = "No Note Selected", systemImage = .SquarePencil)
+}
+
+/// The lines of a note's text, each as a row.
+function noteLines(lines: borrow [String]) -> Any Widget {
+    var rows: [Any Widget] = []
+    for line in lines { rows.append(Text(copy line)) }
+    return VStack(
+        spacing: .Length(scaledMetric(NoteDetailMetrics.lineGap).points),
+        alignment: .Leading,
+        children: rows
+    )
+}

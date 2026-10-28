@@ -1,0 +1,89 @@
+//! The Stopwatch tab: its time, its buttons and its laps.
+import Foundation
+import KiraUI
+
+/// The Stopwatch tab: the time in thin tabular figures, the two round buttons under it, and the laps, the newest first.
+construct StopwatchView(stopwatch: ClockStopwatch) extends Widget {
+    body {
+        VStack(spacing = .Large, alignment = .Center) {
+            Text(stopwatchText(stopwatch.elapsed(unixMillis())))
+            .font(size = scaledMetric(88, relativeTo: .largeTitle), weight = .Light)
+            .monospacedDigit()
+
+            HStack(spacing = .Large, alignment = .Center) {
+                stopwatchLapButton(stopwatch)
+                Spacer()
+                stopwatchStartButton(stopwatch)
+            }
+            .padding(resolvedLength(24))
+
+            stopwatchLaps(stopwatch)
+            Spacer()
+        }
+        .padding(resolvedLength(48))
+    }
+}
+
+/// Lap while it runs, Reset once it is stopped with time on it; Lap, greyed, before it has been started.
+function stopwatchLapButton(stopwatch: ClockStopwatch) -> Any Widget {
+    let resets = !stopwatch.running() && stopwatch.counted > 0
+    return Button(
+        action = { in
+            var held = stopwatch
+            held.lapOrReset()
+            return
+        }
+    ) {
+        Text(resets ? "Reset" : "Lap")
+    }
+    .buttonStyle(.Bordered)
+    .buttonBorderShape(.Circle)
+    .controlSize(.Large)
+    .disabled(!stopwatch.running() && !resets)
+}
+
+/// Start in green, or Stop in red while it runs, as the Clock's are.
+function stopwatchStartButton(stopwatch: ClockStopwatch) -> Any Widget {
+    let running = stopwatch.running()
+    return Button(
+        action = { in
+            var held = stopwatch
+            if held.running() { held.stop() } else { held.start() }
+            return
+        }
+    ) {
+        Text(running ? "Stop" : "Start")
+    }
+    .buttonStyle(.BorderedProminent)
+    .buttonBorderShape(.Circle)
+    .controlSize(.Large)
+    .tint(running ? .Red : .Green)
+}
+
+/// A row for each lap, the newest on top, with the lap in progress above them while it runs.
+function stopwatchLaps(stopwatch: ClockStopwatch) -> Any Widget {
+    var rows: [Any Widget] = []
+    let count = stopwatch.laps.count
+    if stopwatch.running() && count > 0 {
+        let current = stopwatch.elapsed(unixMillis()) - stopwatch.laps[count - 1]
+        rows.append(lapRow(count + 1, current))
+    }
+    for step in 0..count {
+        let index = count - 1 - step
+        rows.append(lapRow(index + 1, stopwatch.lapLength(index)))
+    }
+    return VStack(spacing = .Small, alignment = .Leading, children = rows)
+}
+
+/// A lap's row: `Lap 3` on the leading side and its length on the trailing, over a hairline.
+function lapRow(number: Number, millis: UNumber) -> Any Widget {
+    return VStack(spacing = .Small) {
+        HStack {
+            Text("Lap \(number)")
+            Spacer()
+            Text(stopwatchText(millis))
+            .monospacedDigit()
+        }
+        Divider()
+    }
+}

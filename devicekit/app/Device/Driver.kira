@@ -1,0 +1,307 @@
+import Foundation
+import Heap
+import LibTessera
+
+// Drivers (17 §18): claiming an entry, and publishing what it turns into.
+//
+// The manager starts a driver for an entry its manifest matches, with a
+// claim token in its arguments (`--claim=` and 32 hex digits), as DriverKit
+// starts a dext with its provider. `Driver.claim` redeems the token: the
+// manager then lets this process open the entry for Hid or Usb, and the
+// answer is a `Driver` Ref (`entry` the claimed entry).
+//
+// A published entry lives in the manager, which every process asks for the
+// list (manager op 7) and merges into its own walk as a child of the claimed
+// entry. It goes when the driver unpublishes it or its connection to the
+// manager closes, which is when the driver exits.
+//
+// Properties, for `publish` and `update`, are a `u32` count @0, then from @8
+// one record each, as a match spec's (§7.4). The manager's list is a `u32`
+// count @0 and the generation @8, then from @16 one record each: id @0,
+// parent @8, class @16, properties length @20, then the properties, padded to
+// 8 bytes.
+
+struct Published {
+    var id: EntryId
+    var parent: EntryId
+    var entryClass: EntryClass
+    var properties: [Property]
+}
+
+namespace PublishLimit {
+    let properties: Number = 65536
+    let list: Number = 16777216
+}
+
+let entryClasses: [EntryClass] = [EntryClass.Unknown, EntryClass.Bus, EntryClass.GpuAdapter, EntryClass.DisplayController, EntryClass.Connector, EntryClass.InputDevice, EntryClass.AudioCard, EntryClass.AudioEndpoint, EntryClass.Camera, EntryClass.Sensor, EntryClass.HapticDevice, EntryClass.PowerSource, EntryClass.ThermalZone, EntryClass.Backlight, EntryClass.BlockDevice, EntryClass.Partition, EntryClass.HidDevice, EntryClass.UsbDevice, EntryClass.UsbInterface, EntryClass.Rtc, EntryClass.Driver,]
+
+// An entry class from its raw value, when it is one.
+function knownEntryClass(raw: U32) -> EntryClass? { return caseWithCode(entryClasses, raw) }
+
+// A properties block: the count @0, records from @8.
+function readPropertyBlock(base: RawPtr, length: Number) -> Result<[Property], TesseraError> {
+    if length == 0 { return .Ok([]) }
+    if length < 8 || isNull(base) { return .Error(failure(.InvalidArgument)) }
+    return readProperties(base, 8, length, heapLoad<U32>(base, 0))
+}
+
+function readPublished(base: RawPtr, length: Number) -> Result<[Published], TesseraError> {
+    var list: [Published] = []
+    if length < 16 { return .Ok(list) }
+    let count = heapLoad<U32>(base, 0)
+    var at = 16
+    for index in 0..count {
+        if at + 24 > length { return .Error(failure(.InvalidArgument, index)) }
+        let size = heapLoad<U32>(base, at + 20)
+        if at + 24 + size > length { return .Error(failure(.InvalidArgument, index)) }
+        let entryClass = try knownEntryClass(heapLoad<U32>(base, at + 16)) otherwise return .Error(
+            failure(.InvalidArgument, index)
+        )
+        list.append(
+            Published {
+                id: EntryId(heapLoad<U64>(base, at)),
+                parent: EntryId(heapLoad<U64>(base, at + 8)),
+                entryClass: entryClass,
+                properties: try readPropertyBlock(heapOffset(base, at + 24), size),
+            }
+        )
+        at = alignRecord(at + 24 + size)
+    }
+    return .Ok(list)
+}
+
+// The manager's list, asked for when it may have changed: the request
+// carries the generation this process holds, and the manager sends the list
+// in a memfd only when its own is newer. A list that cannot be had leaves
+// the one held, and the next call asks again.
+function refreshPublished() {
+    if deviceLibrary.registry.managerKeepsList { return }
+    match fetchPublished() {
+        Ok -> {}
+        Error(failed) -> log warn(
+            "the manager's published entries could not be read",
+            error: errorName(failed)
+        )
+    }
+}
+
+function fetchPublished() -> Result<Void, TesseraError> {
+    var request = managerRequest(.Published)
+    request.entry = deviceLibrary.registry.publishedKnown
+    let answer = try managerCall(request, .None)
+    let list = match answer.passed {
+        Some(memory) -> {
+            let read = readPublishedMemory(memory, answer)
+            memory.close()
+            read
+        }
+        None -> return .Ok
+    }
+    return match list {
+        Ok(published) -> {
+            deviceLibrary.registry.published = published
+            deviceLibrary.registry.publishedKnown = answer.detail
+            deviceLibrary.registry.publishedGeneration += U64(1)
+            return .Ok
+        }
+        Error(failed) -> .Error(failed)
+    }
+}
+
+// The list in the manager's memfd: its generation is the reply's `detail`,
+// its size the payload's first word.
+function readPublishedMemory(
+    memory: borrow Descriptor,
+    answer: borrow ManagerReply
+) -> Result<[Published], TesseraError> {
+    let size = Number(answer.payloadWord(0))
+    if size > PublishLimit.list { return .Error(failure(.InvalidArgument, size)) }
+    let blockBytes = zeroedBlock(count: size + 16, alignment: 16)
+    let block = blockBytes.pointer()
+    let got = try memory.readAt(block, size, 0)
+    if got != size { return .Error(failure(.InvalidArgument, got)) }
+    return readPublished(block, size)
+}
+
+function publishedName(properties: borrow [Property]) -> Result<String, TesseraError> {
+    for property in properties {
+        if property.key == "name" {
+            match property.text() {
+                Some(text) -> return .Ok(text)
+                None -> {}
+            }
+        }
+    }
+    return .Error(failure(.InvalidArgument))
+}
+
+// `entries` and every published entry whose parent is among them, each
+// placed under its parent's path so tree order puts it there.
+function withPublished(entries: borrow [Entry]) -> Result<[Entry], TesseraError> {
+    var merged = entries
+    for published in deviceLibrary.registry.published {
+        match findEntry(entries, published.parent) {
+            Some(parent) -> {
+                let name = try publishedName(published.properties)
+                merged.append(Entry {
+                    id: published.id,
+                    entryClass: published.entryClass,
+                    family: .None,
+                    parent: .Some(published.parent),
+                    flags: EntryFlags.none,
+                    path: entries[parent].path + "/published-" + hexText(published.id.raw, 16),
+                    node: .None,
+                    name: name,
+                    properties: published.properties,
+                })
+            }
+            // Its parent went; the manager drops it with the next list.
+            None -> {}
+        }
+    }
+    return .Ok(merged)
+}
+
+// The manager's own list, in the encoding it sends, after every change.
+public function registryAdoptPublished(records: borrow Buffer) -> Result<Void, TesseraError> {
+    deviceLibrary.registry.managerKeepsList = true
+    if records.length > 0 && isNull(records.address) { return .Error(failure(.InvalidArgument)) }
+    deviceLibrary.registry.published = try readPublished(records.address, records.length)
+    deviceLibrary.registry.publishedGeneration += U64(1)
+    return .Ok
+}
+
+namespace Claim {
+    let marker: String = "--claim="
+    let digits: Number = 32
+}
+
+// The claim token this process was started with.
+public function driverLaunchToken() -> Result<Token, TesseraError> {
+    var claim: String? = .None
+    let arguments = try processArguments()
+    for argument in arguments {
+        if argument.startsWith(Claim.marker) {
+            claim = .Some(argument.substring(Claim.marker.count, argument.count))
+        }
+    }
+    let digits = try claim otherwise return .Error(failure(.NotFound))
+    if digits.count != Claim.digits { return .Error(failure(.InvalidArgument)) }
+    let high = parseHex(digits.substring(0, 16))
+    let low = parseHex(digits.substring(16, 32))
+    return match high {
+        Ok(highWord) -> match low {
+            Ok(lowWord) -> .Ok(Token { high: U64(highWord), low: U64(lowWord) })
+            Error(reason) -> .Error(failure(.InvalidArgument))
+        }
+        Error(reason) -> .Error(failure(.InvalidArgument))
+    }
+}
+
+// Redeems a claim token. Completes `Open` with the Driver Ref and, as
+// `result1`, the claimed entry.
+public function driverClaim(
+    token: borrow Token,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    var request = managerRequest(.Claim)
+    request.token = token
+    let reply = Reply { port: port, key: key }
+    let outcome = managerCall(request, .None)
+    let answer = match move outcome {
+        Ok(value) -> move value
+        Error(failed) -> return reply.post(.Error(failed), .Open)
+    }
+    let object = createObject(.Driver, .None, .None)
+    deviceLibrary.objects[object].entry = EntryId(answer.entry)
+    let ref = mintRef(object, defaultRights(.Driver))
+    return reply.post(.Ok(Answer { result0: ref.raw, result1: answer.entry }), .Open)
+}
+
+public function driverEntry(driver: Ref) -> Result<EntryId, TesseraError> {
+    let object = try resolve(driver, .Driver, RefRights.inspect)
+    return .Ok(deviceLibrary.objects[object].entry)
+}
+
+// The properties, copied into a memfd the manager reads.
+function propertyMemory(properties: borrow Buffer) -> Result<Descriptor, TesseraError> {
+    let memory = try memoryObject("devicekit-properties")
+    var done: Number = 0
+    while done < properties.length {
+        let wrote = match memory.write(
+            heapOffset(properties.address, done),
+            properties.length - done
+        ) {
+            Ok(value) -> value
+            Error(failed) -> {
+                memory.close()
+                return .Error(failed)
+            }
+        }
+        if wrote == 0 {
+            memory.close()
+            return .Error(failure(.NoSpace))
+        }
+        done += wrote
+    }
+    return .Ok(memory)
+}
+
+// Sends a publish (`entry` 0) or an update: the class @4, the entry @8, the
+// properties' length @16 and the claimed entry @24, the properties in a
+// memfd.
+function publishCall(
+    driver: Ref,
+    entryClass: U32,
+    entry: EntryId,
+    properties: borrow Buffer
+) -> Result<EntryId, TesseraError> {
+    let object = try resolve(driver, .Driver, RefRights.write)
+    if properties.length > PublishLimit.properties || (
+        properties.length > 0 && isNull(properties.address)
+    ) {
+        return .Error(failure(.InvalidArgument))
+    }
+    let memory = try propertyMemory(properties)
+    var request = managerRequest(.Publish)
+    request.kind = entryClass
+    request.entry = entry.raw
+    request.options = U64(properties.length)
+    request.rights = deviceLibrary.objects[object].entry.raw
+    let answer = managerCall(request, .Some(memory))
+    memory.close()
+    return match move answer {
+        Ok(published) -> .Ok(EntryId(published.entry))
+        Error(failed) -> .Error(failed)
+    }
+}
+
+public function registryPublish(
+    driver: Ref,
+    entryClass: borrow EntryClass,
+    properties: borrow Buffer
+) -> Result<EntryId, TesseraError> {
+    if entryClass == .Unknown { return .Error(failure(.InvalidArgument)) }
+    return publishCall(driver, code(entryClass), EntryId(0), properties)
+}
+
+public function registryUpdate(
+    driver: Ref,
+    entry: EntryId,
+    properties: borrow Buffer
+) -> Result<Void, TesseraError> {
+    if entry.raw == U64(0) { return .Error(failure(.InvalidArgument)) }
+    let updated = try publishCall(driver, U32(0), entry, properties)
+    return .Ok
+}
+
+// The entry @8 and the claimed entry @24.
+public function registryUnpublish(driver: Ref, entry: EntryId) -> Result<Void, TesseraError> {
+    let object = try resolve(driver, .Driver, RefRights.write)
+    var request = managerRequest(.Unpublish)
+    request.entry = entry.raw
+    request.rights = deviceLibrary.objects[object].entry.raw
+    let answer = try managerCall(request, .None)
+    return .Ok
+}

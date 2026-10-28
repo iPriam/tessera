@@ -1,0 +1,26 @@
+import Foundation
+import KiraUI
+
+// Terminal. Kira UI has no terminal view and Tessera no shell yet, so the
+// pane shows the prompt a shell will stand behind.
+
+namespace TerminalColors {
+    let background: RGBAColor = RGBAColor { r: 0.08, g: 0.08, b: 0.09, a: 1.0 }
+}
+
+public construct TerminalPane() extends Widget {
+    body {
+        VStack(spacing = .Micro, alignment = .Leading) {
+            Text("Last login on the installer's console")
+            Text("-tessera-recovery# ")
+            Spacer()
+        }
+        .font(size = resolvedLength(13.0))
+        .monospaced()
+        .foregroundColor(.White)
+        .edgePadding(EdgeSet.all, resolvedLength(10.0))
+        .fillWidth()
+        .fillHeight()
+        .background(fill = SurfaceTint(color = TerminalColors.background))
+    }
+}

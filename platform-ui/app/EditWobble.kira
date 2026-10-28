@@ -1,0 +1,62 @@
+import Foundation
+import KiraUI
+import KCoreAnimation
+
+// An icon wobbling while Home is edited, as an iPad's do, on Home and in the
+// Dock alike: turned a little either way by the time, each out of step with
+// the next by `phase`, and described again every frame it is shown.
+
+namespace EditWobbleLook {
+    // Its turn either way, in radians, and how many times a second, whole so
+    // each second meets the next.
+    let turn: Number = 0.026
+    let perSecond: Number = 3
+}
+
+// The badge on an icon's top leading corner that takes it out while Home is
+// edited, on Home and in the Dock alike: a minus on a circle of Liquid Glass
+// `side` points across, as an iPad's is, drawn `x` across and `y` down from
+// where layout puts it. Pressed, it calls `action`.
+public function editRemovalBadge(side: Number, x: Number, y: Number, action: () -> Void) -> Any Widget {
+    return Button(action = action) {
+        Icon(symbol = .Minus)
+        .font(size: resolvedLength(side / 2), weight: .Bold)
+        .foregroundColor(.White)
+        .width(resolvedLength(side))
+        .height(resolvedLength(side))
+    }
+    .buttonStyle(.Plain)
+    .glassEffect()
+    .offset(x = resolvedLength(x), y = resolvedLength(y))
+    // It grows out of nothing when Home starts being edited and shrinks back
+    // into it when the edit ends, as an iPad's does. Outermost, so it is the
+    // layer that leaves, and leaves on the transition.
+    .transition(scaleTransition(0.01).combined(opacityTransition()), animation: .Snappy)
+}
+
+// Unless `active`, it stands still: the icon eases from wherever its wobble
+// had turned it back to upright, rather than snapping there, so the same
+// wrapper holds an icon whether Home is edited or not.
+public construct EditWobble(phase: Number, active: Bool = true) extends Widget {
+    let content: some Widget
+
+    // What it holds, unturned; `describe` turns it.
+    body {
+        content
+    }
+
+    function describe(
+        context: borrow BuildContext,
+        modifiers: borrow ModifierContext
+    ) -> CALayerDescription {
+        if !active { return content.describe(context, modifiers) }
+        redrawAfter(0)
+        let seconds = unixMillis() / 1000
+        let turn = (seconds - trunc(seconds)) * EditWobbleLook.perSecond
+        var described = content.describe(context, modifiers)
+        described.rotation = EditWobbleLook.turn * sin(turn * 6.283185307179586 + phase)
+        // Each frame's turn is where the icon is, not a change to ease into.
+        described.disablesActions = true
+        return described
+    }
+}

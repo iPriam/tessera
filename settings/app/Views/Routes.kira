@@ -1,0 +1,187 @@
+import KiraUI
+
+// The panes, one route each: a sidebar row starts the path at one, a row in a
+// pane appends one, and the detail's stack draws the pane the path ends at,
+// with the bar's back button once it is deeper than the sidebar's row.
+
+construct GeneralRoute(release: Release, choices: SettingsChoices) extends NavigationRoute {
+    function routeKey() -> String {
+        return "general"
+    }
+
+    function destination() -> Any Widget {
+        return GeneralPane(release = copy release, choices = choices)
+    }
+}
+
+construct AboutRoute(release: Release) extends NavigationRoute {
+    function routeKey() -> String {
+        return "about"
+    }
+
+    function destination() -> Any Widget {
+        return AboutPane(release = copy release)
+    }
+}
+
+construct StorageRoute() extends NavigationRoute {
+    function routeKey() -> String {
+        return "storage"
+    }
+
+    function destination() -> Any Widget {
+        return StoragePane()
+    }
+}
+
+construct DisplayRoute(choices: SettingsChoices) extends NavigationRoute {
+    function routeKey() -> String {
+        return "display"
+    }
+
+    function destination() -> Any Widget {
+        return DisplayPane(choices = choices)
+    }
+}
+
+construct HomeScreenRoute() extends NavigationRoute {
+    function routeKey() -> String {
+        return "homeScreen"
+    }
+
+    function destination() -> Any Widget {
+        return HomeScreenPane()
+    }
+}
+
+construct WallpaperRoute() extends NavigationRoute {
+    function routeKey() -> String {
+        return "wallpaper"
+    }
+
+    function destination() -> Any Widget {
+        return WallpaperPane()
+    }
+}
+
+construct BatteryRoute() extends NavigationRoute {
+    function routeKey() -> String {
+        return "battery"
+    }
+
+    function destination() -> Any Widget {
+        return BatteryPane()
+    }
+}
+
+construct AppsRoute() extends NavigationRoute {
+    function routeKey() -> String {
+        return "apps"
+    }
+
+    function destination() -> Any Widget {
+        return AppsPane()
+    }
+}
+
+construct BackupRoute() extends NavigationRoute {
+    function routeKey() -> String {
+        return "backup"
+    }
+
+    function destination() -> Any Widget {
+        return BackupPane()
+    }
+}
+
+construct PasscodeRoute() extends NavigationRoute {
+    function routeKey() -> String {
+        return "passcode"
+    }
+
+    function destination() -> Any Widget {
+        return PasscodePane()
+    }
+}
+
+construct KeyboardRoute() extends NavigationRoute {
+    function routeKey() -> String {
+        return "keyboard"
+    }
+
+    function destination() -> Any Widget {
+        return KeyboardPane()
+    }
+}
+
+construct FocusRoute() extends NavigationRoute {
+    function routeKey() -> String {
+        return "focus"
+    }
+
+    function destination() -> Any Widget {
+        return FocusPane()
+    }
+}
+
+construct NotificationsRoute() extends NavigationRoute {
+    function routeKey() -> String {
+        return "notifications"
+    }
+
+    function destination() -> Any Widget {
+        return NotificationsPane()
+    }
+}
+
+// One application, by name, under Apps.
+construct AppRoute(name: String) extends NavigationRoute {
+    function routeKey() -> String {
+        return "app:" + name
+    }
+
+    function destination() -> Any Widget {
+        return AppPane(name = copy name)
+    }
+}
+
+construct AutoLockRoute(choices: SettingsChoices) extends NavigationRoute {
+    function routeKey() -> String {
+        return "autoLock"
+    }
+
+    function destination() -> Any Widget {
+        return AutoLockPane(choices = choices)
+    }
+}
+
+construct DateTimeRoute(choices: SettingsChoices) extends NavigationRoute {
+    function routeKey() -> String {
+        return "dateTime"
+    }
+
+    function destination() -> Any Widget {
+        return DateTimePane(choices = choices)
+    }
+}
+
+construct TimeZoneRoute(choices: SettingsChoices) extends NavigationRoute {
+    function routeKey() -> String {
+        return "timeZone"
+    }
+
+    function destination() -> Any Widget {
+        return TimeZonePane(choices = choices)
+    }
+}
+
+// One region's zones, its key `zone:` and the region.
+construct TimeZoneRegionRoute(region: String, choices: SettingsChoices) extends NavigationRoute {
+    function routeKey() -> String {
+        return "zone:" + region
+    }
+
+    function destination() -> Any Widget {
+        return TimeZoneRegionPane(region = copy region, choices = choices)
+    }
+}

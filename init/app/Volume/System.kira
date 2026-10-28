@@ -1,0 +1,236 @@
+import Foundation
+import LibTessera
+
+// Choosing the system to boot (roadmap/05-storage-and-state.md): the volume
+// is the first disk that mounts as btrfs, `boot/current` names the current
+// system, and that system is mounted sealed at the system's mount point:
+// overlayfs over its composefs image, its snapshot the data, under
+// `verity=require` (roadmap/13). A dev machine boots `system/dev` instead, a
+// writable snapshot of the current system, taken when there is none, mounted
+// directly and unsealed, with the current system mounted read-only inside it
+// as the dev roots' base layer.
+
+// The volume and the subvolume chosen from it.
+struct ChosenSystem {
+    let disk: String
+    let subvolume: String
+    // The sealed system `subvolume` was taken from, on a dev machine.
+    let base: String?
+}
+
+// Mounts the system the volume names at `System.mountPoint`, or says why not.
+function mountSystem(calls: Handle, bootArguments: borrow [String]) -> Result<Void, String> {
+    let disk = try mountVolumeTop() otherwise return .Error("no disk holds the btrfs volume")
+    let chosen = chooseSystem(calls, disk, bootArguments)
+    match volumeUnmount(System.volumeTop, VolumeUnmountOptions.none) {
+        Ok -> {}
+        Error(failed) -> log warn("the volume's top stays mounted", error: errorName(failed))
+    }
+    let system = match chosen {
+        Ok(picked) -> picked
+        Error(problem) -> return .Error(problem)
+    }
+    match system.base {
+        Some(sealed) -> {
+            match volumeMountSubvolume(
+                system.disk,
+                System.mountPoint,
+                system.subvolume,
+                VolumeOptions.none
+            ) {
+                Ok -> {}
+                Error(failed) -> return .Error(
+                    "\(system.subvolume) would not mount: \(errorName(failed))"
+                )
+            }
+            try mountBaseLayer(calls, system.disk, sealed)
+            // Said at every boot of a dev machine, as roadmap/05 asks.
+            print("tessera: unsealed: booting \(system.subvolume), a writable snapshot")
+        }
+        None -> try mountSealed(calls, system.disk, system.subvolume)
+    }
+    log info("mounted the system", disk: system.disk, subvolume: system.subvolume)
+    return .Ok
+}
+
+// Mounts the sealed system `subvolume` at `System.mountPoint`: its snapshot
+// read-only at `System.sealedData`, then, once the signature beside its
+// composefs image checks over the image's digest, the image at
+// `System.sealedImage` and overlayfs over the two, so every file is read
+// through the digest the image records for it.
+function mountSealed(
+    calls: Handle,
+    disk: borrow String,
+    subvolume: borrow String
+) -> Result<Void, String> {
+    for path in [System.sealedLayers, System.sealedData, System.sealedImage] {
+        match ensureDirectory(calls, path) {
+            Ok -> {}
+            Error(failed) -> return .Error("\(path) could not be made: \(errorName(failed))")
+        }
+    }
+    let options = VolumeOptions.readOnly | VolumeOptions.noDevices
+    match volumeMountSubvolume(disk, System.sealedData, subvolume, options) {
+        Ok -> {}
+        Error(failed) -> return .Error("\(subvolume) would not mount: \(errorName(failed))")
+    }
+    let image = System.sealedData + "/" + VolumeLayout.sealedImage
+    let digest = match volumeSealedDigest(image) {
+        Ok(read) -> read
+        Error(failed) -> return .Error(
+            "\(subvolume)'s composefs image is not sealed: \(errorName(failed))"
+        )
+    }
+    match checkSeal(
+        calls,
+        subvolume,
+        digest,
+        System.sealedData + "/" + VolumeLayout.sealedSignature
+    ) {
+        Ok -> {}
+        Error(refusal) -> return .Error(refusal)
+    }
+    match volumeMountImage(image, System.sealedImage, .Erofs, options) {
+        Ok -> {}
+        Error(failed) -> return .Error(
+            "\(subvolume)'s composefs image would not mount: \(errorName(failed))"
+        )
+    }
+    match volumeMountSealed(
+        System.sealedImage,
+        System.sealedData,
+        System.mountPoint,
+        VolumeOptions.none
+    ) {
+        Ok -> {}
+        Error(failed) -> return .Error("\(subvolume) would not mount sealed: \(errorName(failed))")
+    }
+    log info("mounted the system sealed", subvolume, digest)
+    return .Ok
+}
+
+// The first disk that mounts as btrfs, mounted whole at `System.volumeTop`.
+function mountVolumeTop() -> String? {
+    let names = match disks() {
+        Ok(value) -> value
+        Error(failed) -> {
+            log warn("the machine would not list its disks", error: errorName(failed))
+            return .None
+        }
+    }
+    for disk in names {
+        match volumeMount(disk, System.volumeTop, .Btrfs, VolumeOptions.none) {
+            Ok -> return .Some(disk)
+            // Not btrfs: the next disk is tried.
+            Error(failed) -> {
+                if failed.code != .InvalidArgument {
+                    log warn("a disk would not mount", disk, error: errorName(failed))
+                }
+            }
+        }
+    }
+    return .None
+}
+
+// The subvolume to boot, read from the volume mounted at `System.volumeTop`.
+// A volume with no current system is one an install did not finish, and it
+// is refused.
+function chooseSystem(
+    calls: Handle,
+    disk: borrow String,
+    bootArguments: borrow [String]
+) -> Result<ChosenSystem, String> {
+    let record = System.volumeTop + "/" + VolumeLayout.current
+    let recordBytes = match readWholeFile(calls, record) {
+        Ok(value) -> value
+        Error(failed) -> return .Error(
+            "could not read the current system record: \(errorName(failed))"
+        )
+    }
+    let version = match textFromBytes(recordBytes) {
+        Some(text) -> text.trim()
+        None -> return .Error("\(VolumeLayout.current) is not text")
+    }
+    if version.count == 0 { return .Error("the volume records no current system") }
+    let booted = match trialToBoot(calls, version) {
+        Ok(candidate) -> match candidate {
+            Some(trial) -> trial
+            None -> copy version
+        }
+        Error(failed) -> return .Error(
+            "could not check the pending system update: \(errorName(failed))"
+        )
+    }
+    let sealed = "\(VolumeLayout.systems)/\(booted)"
+    match nodeExists(calls, System.volumeTop + "/" + sealed) {
+        Ok(exists) -> if !exists {
+            return .Error("the current system, \(booted), is not on the volume")
+        }
+        Error(failed) -> return .Error("could not look up the current system: \(errorName(failed))")
+    }
+    if !bootFlag(bootArguments, BootFlag.dev) {
+        return .Ok(ChosenSystem { disk: copy disk, subvolume: sealed, base: .None })
+    }
+    let dev = VolumeLayout.devSystem
+    let reset = "\(System.volumeTop)/\(dev)/\(SystemFile.developerRootsReset)"
+    let resetExists = match nodeExists(calls, reset) {
+        Ok(value) -> value
+        Error(failed) -> return .Error(
+            "could not check for the dev reset marker: \(errorName(failed))"
+        )
+    }
+    if resetExists {
+        match volumeDeleteSubvolume(System.volumeTop + "/" + dev) {
+            Ok -> log info("dropped the dev system and every root in it, as asked")
+            Error(failed) -> return .Error("system/dev could not be dropped: \(errorName(failed))")
+        }
+    }
+    let devExists = match nodeExists(calls, System.volumeTop + "/" + dev) {
+        Ok(value) -> value
+        Error(failed) -> return .Error("could not check for system/dev: \(errorName(failed))")
+    }
+    if !devExists {
+        match volumeSnapshot(System.volumeTop + "/" + sealed, System.volumeTop + "/" + dev, false) {
+            Ok -> log info("took the dev system from the current one", version)
+            Error(failed) -> return .Error("system/dev could not be taken: \(errorName(failed))")
+        }
+    }
+    return .Ok(ChosenSystem { disk: copy disk, subvolume: dev, base: .Some(sealed) })
+}
+
+// Mounts the sealed system `sealed` read-only at the dev roots' base, inside
+// the dev system: what a dev root restores when it is uninstalled.
+function mountBaseLayer(
+    calls: Handle,
+    disk: borrow String,
+    sealed: borrow String
+) -> Result<Void, String> {
+    let base = System.mountPoint + "/" + SystemDirectory.developerRootsBase
+    var made = System.mountPoint
+    for name in SystemDirectory.developerRootsBase.split("/") {
+        made = made + "/" + name
+        match ensureDirectory(calls, made) {
+            Ok -> {}
+            Error(failed) -> return .Error("\(made) could not be made: \(errorName(failed))")
+        }
+    }
+    let options = VolumeOptions.readOnly | VolumeOptions.noDevices | VolumeOptions.noSetIdentity
+    match volumeMountSubvolume(disk, base, sealed, options) {
+        Ok -> return .Ok
+        Error(failed) -> return .Error("the base layer would not mount: \(errorName(failed))")
+    }
+}
+
+// Whether anything is at `path`.
+function nodeExists(calls: Handle, path: borrow String) -> Result<Bool, TesseraError> {
+    match lookup(calls, path, Rights.inspect) {
+        Ok(node) -> {
+            release(node)
+            return .Ok(true)
+        }
+        Error(failed) -> {
+            if failed.code == .NotFound { return .Ok(false) }
+            return .Error(failed)
+        }
+    }
+}

@@ -1,0 +1,26 @@
+import Foundation
+
+// What a confined launch's child sees (`LaunchFlags.confined`, §21): the
+// bundle it was given, read-only, and its containers, which it writes. The
+// backend makes the view from them.
+
+// The view for a launch with `options`, or None when it is not confined.
+function launchView(
+    options: borrow LaunchOptions,
+    entries: borrow [StartupEntry]
+) -> Result<KernelView?, TesseraError> {
+    if !options.flags.has(LaunchFlags.confined) { return .Ok(.None) }
+    var places: [ConfinedPlace] = []
+    for index in 0..entries.count {
+        let tag = entries[index].tag
+        let given = tag == StartupTag.bundle || tag == StartupTag.containerData
+            || tag == StartupTag.containerCache || tag == StartupTag.containerTemp
+        if !given { continue }
+        let object = try resolveObject(entries[index].handle, .Node, Rights.none)
+        places.append(
+            ConfinedPlace { backing: try backingOf(object), writable: tag != StartupTag.bundle }
+        )
+    }
+    let view = try kernelConfinedView(places)
+    return .Ok(.Some(view))
+}

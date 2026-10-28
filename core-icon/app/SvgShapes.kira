@@ -1,0 +1,143 @@
+import Foundation
+import RenderBox
+
+// SVG's basic shapes as the paths CoreSVG hands Core Graphics, in their user
+// units: a rounded rect from the middle of its right side round its corners
+// with circular quarter turns, an ellipse as CGPathAddEllipseInRect's four.
+
+namespace ShapeCurve {
+    // A quarter turn's circle is a cubic with its controls this far along
+    // its tangents, as a share of the radius.
+    let kappa: Number = 0.552284749831
+}
+
+function lengthAttribute(element: borrow SvgElement, name: borrow String) -> Number {
+    return try svgLength(element.attribute(name)) otherwise 0
+}
+
+// The path `element` draws, when it is a shape.
+function shapePath(element: borrow SvgElement) -> Path? {
+    return match element.name {
+        "path" -> match element.attribute("d") {
+            Some(written) -> .Some(svgPath(written))
+            // A path without commands is an empty path, not a failed parse.
+            None -> .None
+        }
+        "rect" -> rectPath(element)
+        "circle" -> ellipsePath(
+            lengthAttribute(element, "cx"),
+            lengthAttribute(element, "cy"),
+            lengthAttribute(element, "r"),
+            lengthAttribute(element, "r")
+        )
+        "ellipse" -> ellipsePath(
+            lengthAttribute(element, "cx"),
+            lengthAttribute(element, "cy"),
+            lengthAttribute(element, "rx"),
+            lengthAttribute(element, "ry")
+        )
+        "line" -> .Some(
+            Path().move (
+                Point { x: lengthAttribute(element, "x1"), y: lengthAttribute(element, "y1") }
+            ).line(Point { x: lengthAttribute(element, "x2"), y: lengthAttribute(element, "y2") })
+        )
+        "polyline" -> pointsPath(element, false)
+        "polygon" -> pointsPath(element, true)
+        else -> .None
+    }
+}
+
+function pointsPath(element: borrow SvgElement, closed: Bool) -> Path? {
+    let written = try element.attribute("points") otherwise return .None
+    let values = svgNumbers(written)
+    if values.count < 2 { return .None }
+    var path = Path().move (Point { x: values[0], y: values[1] })
+    for index in 1..trunc(values.count / 2) {
+        path = path.line(Point { x: values[index * 2], y: values[index * 2 + 1] })
+    }
+    return .Some(closed ? path.closed() : path)
+}
+
+// A rect, its corners rounded by `rx` and `ry`, either standing for both
+// when the other is missing, each held to half its side.
+function rectPath(element: borrow SvgElement) -> Path? {
+    let rect = Rect {
+        x: lengthAttribute(element, "x"),
+        y: lengthAttribute(element, "y"),
+        width: lengthAttribute(element, "width"),
+        height: lengthAttribute(element, "height")
+    }
+    if rect.width <= 0 || rect.height <= 0 { return .None }
+    let givenX = svgLength(element.attribute("rx"))
+    let givenY = svgLength(element.attribute("ry"))
+    let rx = try givenX otherwise(try givenY otherwise 0)
+    let ry = try givenY otherwise rx
+    let cornerX = min(max(rx, 0), rect.width / 2)
+    let cornerY = min(max(ry, 0), rect.height / 2)
+    if cornerX == 0 || cornerY == 0 {
+        return .Some(
+            Path().move (Point { x: rect.minX(), y: rect.minY() }).line(
+                Point { x: rect.maxX(), y: rect.minY() }
+            ).line(Point { x: rect.maxX(), y: rect.maxY() }).line(
+                Point { x: rect.minX(), y: rect.maxY() }
+            ).closed()
+        )
+    }
+    return .Some(roundedRectPath(rect, cornerX, cornerY))
+}
+
+// CoreSVG's rounded rect: from the middle of the right side, down and round
+// each corner in turn.
+function roundedRectPath(rect: borrow Rect, rx: Number, ry: Number) -> Path {
+    let kx = rx * ShapeCurve.kappa
+    let ky = ry * ShapeCurve.kappa
+    let (left, top, right, bottom) = (rect.minX(), rect.minY(), rect.maxX(), rect.maxY())
+    return Path().move (Point { x: right, y: top + rect.height / 2 })
+    .line(Point { x: right, y: bottom - ry })
+    .cubic(
+        Point { x: right - rx, y: bottom },
+        Point { x: right, y: bottom - ry + ky },
+        Point { x: right - rx + kx, y: bottom }
+    ).line(Point { x: left + rx, y: bottom })
+    .cubic(
+        Point { x: left, y: bottom - ry },
+        Point { x: left + rx - kx, y: bottom },
+        Point { x: left, y: bottom - ry + ky }
+    ).line(Point { x: left, y: top + ry })
+    .cubic(
+        Point { x: left + rx, y: top },
+        Point { x: left, y: top + ry - ky },
+        Point { x: left + rx - kx, y: top }
+    ).line(Point { x: right - rx, y: top })
+    .cubic(
+        Point { x: right, y: top + ry },
+        Point { x: right - rx + kx, y: top },
+        Point { x: right, y: top + ry - ky }
+    ).closed()
+}
+
+// CGPathAddEllipseInRect: from the right, a quarter turn at a time.
+function ellipsePath(cx: Number, cy: Number, rx: Number, ry: Number) -> Path? {
+    if rx <= 0 || ry <= 0 { return .None }
+    let kx = rx * ShapeCurve.kappa
+    let ky = ry * ShapeCurve.kappa
+    return .Some(
+        Path().move (Point { x: cx + rx, y: cy }).cubic(
+            Point { x: cx, y: cy + ry },
+            Point { x: cx + rx, y: cy + ky },
+            Point { x: cx + kx, y: cy + ry }
+        ).cubic(
+            Point { x: cx - rx, y: cy },
+            Point { x: cx - kx, y: cy + ry },
+            Point { x: cx - rx, y: cy + ky }
+        ).cubic(
+            Point { x: cx, y: cy - ry },
+            Point { x: cx - rx, y: cy - ky },
+            Point { x: cx - kx, y: cy - ry }
+        ).cubic(
+            Point { x: cx + rx, y: cy },
+            Point { x: cx + kx, y: cy - ry },
+            Point { x: cx + rx, y: cy - ky }
+        ).closed()
+    )
+}

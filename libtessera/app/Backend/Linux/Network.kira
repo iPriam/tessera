@@ -1,0 +1,575 @@
+import Foundation
+import Heap
+
+// Endpoints on Linux (§15.3): non-blocking sockets. A `NetAddress` becomes
+// a `sockaddr_in` or `sockaddr_in6` here and nowhere else, and each
+// `EndpointOption` its `setsockopt` level and name. Above this file an
+// address is always the library's 32-byte `NetAddress` layout.
+
+function byteSwap16(value: U16) -> U16 {
+    let word = U32(value)
+    return U16(((word & U32(0xFF)) << U32(8)) | (word >> U32(8)))
+}
+
+// `address` as a `sockaddr` at `block` (28 bytes room) and its length;
+// nothing when the address does not suit an endpoint of `family`.
+function sockaddrFrom(
+    address: borrow NetAddress,
+    family: borrow AddressFamily,
+    block: RawPtr
+) -> U32? {
+    zeroBytes(block, 28)
+    if address.bytes.count != 16 { return .None }
+    match family {
+        Ipv4 -> {
+            if address.family != .Ipv4 { return .None }
+            heapStore<U16>(block, 0, U16(2))
+            heapStore<U16>(block, 2, byteSwap16(address.port))
+            for index in 0..4 { heapStore<U8>(block, (4 + index), address.bytes[index]) }
+            return .Some(16)
+        }
+        Ipv6 -> {
+            heapStore<U16>(block, 0, U16(10))
+            heapStore<U16>(block, 2, byteSwap16(address.port))
+            match address.family {
+                Ipv4 -> {
+                    heapStore<U16>(block, 18, U16(0xFFFF))
+                    for index in 0..4 {
+                        heapStore<U8>(block, (20 + index), address.bytes[index])
+                    }
+                }
+                Ipv6 -> {
+                    for index in 0..16 {
+                        heapStore<U8>(block, (8 + index), address.bytes[index])
+                    }
+                    if address.flags.has(AddressFlags.scopeValid) {
+                        heapStore<U32>(block, 24, address.scope)
+                    }
+                }
+            }
+            return .Some(28)
+        }
+    }
+}
+
+// The `NetAddress` layout at `address` as a `sockaddr` at `block`, as
+// `sockaddrFrom` makes one.
+function sockaddrAt(address: RawPtr, family: borrow AddressFamily, block: RawPtr) -> U32? {
+    match netAddressLoad(address) {
+        Some(loaded) -> return sockaddrFrom(loaded, family, block)
+        None -> return .None
+    }
+}
+
+// A `sockaddr` as the 32-byte `NetAddress` layout at `out`.
+function storeNetAddress(sockaddr: RawPtr, out: RawPtr) {
+    zeroBytes(out, 32)
+    let family = heapLoad<U16>(sockaddr, 0)
+    heapStore<U16>(out, 4, byteSwap16(heapLoad<U16>(sockaddr, 2)))
+    if family == U16(2) {
+        heapStore<U32>(out, 0, code(AddressFamily.Ipv4))
+        copyBytes(heapOffset(out, 8), heapOffset(sockaddr, 4), 4)
+        return
+    }
+    if family == U16(10) {
+        heapStore<U32>(out, 0, code(AddressFamily.Ipv6))
+        copyBytes(heapOffset(out, 8), heapOffset(sockaddr, 8), 16)
+        let scope = heapLoad<U32>(sockaddr, 24)
+        if scope != U32(0) {
+            heapStore<U16>(out, 6, AddressFlags.scopeValid.raw)
+            heapStore<U32>(out, 24, scope)
+        }
+    }
+}
+
+// Whether an endpoint of `family` can send to or bind `address`.
+function kernelAddressSuits(address: borrow NetAddress, family: borrow AddressFamily) -> Bool {
+    let blockBytes = zeroedBlock(count: 32, alignment: 16)
+    match sockaddrFrom(address, family, blockBytes.pointer()) {
+        Some(length) -> return true
+        None -> return false
+    }
+}
+
+// A nonblocking socket for the family and protocol.
+function kernelEndpointCreate(
+    family: borrow AddressFamily,
+    protocol: borrow Protocol,
+    reuseAddress: Bool,
+    dualStack: Bool
+) -> Result<Number, TesseraError> {
+    let domain = family == AddressFamily.Ipv4 ? 2 : 10
+    var kind = 1
+    var number = 0
+    if protocol == Protocol.Udp { kind = 2 }
+    if protocol == Protocol.Raw {
+        kind = 3
+        number = 255
+    }
+    if protocol == Protocol.Icmp {
+        kind = 2
+        number = family == AddressFamily.Ipv4 ? 1 : 58
+    }
+    let fd = socket(domain, kind | SocketKind.nonBlock | SocketKind.closeOnExec, number)
+    if answerFailed(fd) { return .Error(errnoFailure(answerErrno(fd))) }
+    let oneBytes = zeroedBlock(count: 8, alignment: 16)
+    let one = oneBytes.pointer()
+    heapStore<U32>(one, 0, U32(1))
+    if reuseAddress {
+        let reused = setsockopt(fd, SocketLevel.socket, SocketOption.reuseAddress, one, U32(4))
+        if answerFailed(reused) {
+            closeBacking(fd)
+            return .Error(errnoFailure(answerErrno(reused)))
+        }
+    }
+    if family == AddressFamily.Ipv6 {
+        heapStore<U32>(one, 0, dualStack ? U32(0) : U32(1))
+        let only = setsockopt(fd, SocketLevel.ipv6, Ipv6Option.only, one, U32(4))
+        if answerFailed(only) {
+            closeBacking(fd)
+            return .Error(errnoFailure(answerErrno(only)))
+        }
+    }
+    return .Ok(fd)
+}
+
+function kernelEndpointBind(
+    backing: Number,
+    family: borrow AddressFamily,
+    address: borrow NetAddress
+) -> Result<Void, TesseraError> {
+    let blockBytes = zeroedBlock(count: 32, alignment: 16)
+    let block = blockBytes.pointer()
+    match sockaddrFrom(address, family, block) {
+        Some(length) -> return answerStatus(bind(backing, block, length))
+        None -> return .Error(failure(.InvalidArgument))
+    }
+}
+
+function kernelEndpointListen(backing: Number, depth: U32) -> Result<Void, TesseraError> {
+    return answerStatus(listen(backing, depth))
+}
+
+// The local (`peer` false) or peer address as a `NetAddress` at `out`;
+// zeroes when there is none.
+function kernelEndpointAddress(
+    backing: Number,
+    peer: Bool,
+    out: RawPtr
+) -> Result<Void, TesseraError> {
+    let blockBytes = zeroedBlock(count: 136, alignment: 16)
+    let block = blockBytes.pointer()
+    heapStore<U32>(block, 128, U32(128))
+    let answer = peer ? getpeername(backing, block, heapOffset(block, 128)) : getsockname(
+        backing,
+        block,
+        heapOffset(block, 128)
+    )
+    if answerFailed(answer) {
+        if answerErrno(answer) != code(Errno.NotConnected) {
+            return .Error(errnoFailure(answerErrno(answer)))
+        }
+        zeroBytes(out, 32)
+        return .Ok
+    }
+    storeNetAddress(block, out)
+    return .Ok
+}
+
+// A connection taken from the listener, nonblocking; `ShouldWait` when none
+// is waiting. Its address goes to `peer` unless that is null.
+function kernelEndpointAccept(backing: Number, peer: RawPtr) -> Result<Number, TesseraError> {
+    let blockBytes = zeroedBlock(count: 136, alignment: 16)
+    let block = blockBytes.pointer()
+    heapStore<U32>(block, 128, U32(128))
+    let fd = accept4(
+        backing,
+        block,
+        heapOffset(block, 128),
+        LinuxOpen.nonBlock | LinuxOpen.closeOnExec
+    )
+    if answerFailed(fd) { return .Error(errnoFailure(answerErrno(fd))) }
+    if !isNull(peer) { storeNetAddress(block, peer) }
+    return .Ok(fd)
+}
+
+// Starts connecting: `Ok` when connected at once, `ShouldWait` while it
+// goes on (`kernelConnectResult` says how it ended).
+function kernelEndpointConnect(
+    backing: Number,
+    family: borrow AddressFamily,
+    address: borrow NetAddress
+) -> Result<Void, TesseraError> {
+    let blockBytes = zeroedBlock(count: 32, alignment: 16)
+    let block = blockBytes.pointer()
+    let length = try sockaddrFrom(address, family, block) otherwise return .Error(
+        failure(.InvalidArgument)
+    )
+    let answer = connect(backing, block, length)
+    if !answerFailed(answer) { return .Ok }
+    if failedWith(answer, .InProgress) { return .Error(failure(.ShouldWait)) }
+    return .Error(errnoFailure(answerErrno(answer)))
+}
+
+// How a connect that went on ended, once the socket turned writable
+// (`SO_ERROR`).
+function kernelConnectResult(backing: Number) -> Result<Void, TesseraError> {
+    let blockBytes = zeroedBlock(count: 8, alignment: 16)
+    let block = blockBytes.pointer()
+    heapStore<U32>(block, 4, U32(4))
+    let answer = getsockopt(
+        backing,
+        SocketLevel.socket,
+        SocketOption.error,
+        block,
+        heapOffset(block, 4)
+    )
+    if answerFailed(answer) { return .Error(errnoFailure(answerErrno(answer))) }
+    let code = heapLoad<U32>(block, 0)
+    if code == 0 { return .Ok }
+    return .Error(errnoFailure(code))
+}
+
+function kernelEndpointShutdown(
+    backing: Number,
+    how: borrow ShutdownHow
+) -> Result<Void, TesseraError> {
+    match how {
+        Read -> return answerStatus(shutdown(backing, 0))
+        Write -> return answerStatus(shutdown(backing, 1))
+        Both -> return answerStatus(shutdown(backing, 2))
+    }
+}
+
+// A `setsockopt` level and option name.
+struct NativeOption {
+    let level: Number
+    let name: Number
+}
+
+namespace SocketLevel {
+    let ip: Number = 0
+    let socket: Number = 1
+    let tcp: Number = 6
+    let ipv6: Number = 41
+}
+
+// How an `EndpointOption` is set and read on Linux.
+enum OptionPath {
+    // A `u32` option with a native level and name.
+    Integer(NativeOption)
+    Interface
+    Multicast(Bool)
+    Linger
+    // There is none for this family.
+    Unsupported
+}
+
+// How `option` is set and read for an endpoint of `family`.
+function optionPath(option: borrow EndpointOption, family: borrow AddressFamily) -> OptionPath {
+    let six = family == AddressFamily.Ipv6
+    match option {
+        NoDelay -> return .Integer(NativeOption { level: SocketLevel.tcp, name: 1 })
+        KeepAlive -> return .Integer(NativeOption { level: SocketLevel.socket, name: 9 })
+        KeepAliveIdle -> return .Integer(NativeOption { level: SocketLevel.tcp, name: 4 })
+        KeepAliveInterval -> return .Integer(NativeOption { level: SocketLevel.tcp, name: 5 })
+        KeepAliveCount -> return .Integer(NativeOption { level: SocketLevel.tcp, name: 6 })
+        ReceiveBuffer -> return .Integer(NativeOption { level: SocketLevel.socket, name: 8 })
+        SendBuffer -> return .Integer(NativeOption { level: SocketLevel.socket, name: 7 })
+        Ttl -> return six ? .Unsupported : .Integer(NativeOption { level: SocketLevel.ip, name: 2 })
+        HopLimit -> return six ? .Integer(
+            NativeOption { level : SocketLevel.ipv6, name: 16 }
+        ): .Unsupported
+        Broadcast -> return .Integer(NativeOption { level: SocketLevel.socket, name: 6 })
+        MulticastTtl -> return six ? .Integer(
+            NativeOption { level : SocketLevel.ipv6, name: 18 }
+        ): .Integer(NativeOption { level: SocketLevel.ip, name: 33 })
+        MulticastLoop -> return six ? .Integer(
+            NativeOption { level : SocketLevel.ipv6, name: 19 }
+        ): .Integer(NativeOption { level: SocketLevel.ip, name: 34 })
+        ReceiveTimestamps -> return .Integer(NativeOption { level: SocketLevel.socket, name: 35 })
+        TcpUserTimeout -> return .Integer(NativeOption { level: SocketLevel.tcp, name: 18 })
+        TypeOfService -> return six ? .Integer(
+            NativeOption { level : SocketLevel.ipv6, name: 67 }
+        ): .Integer(NativeOption { level: SocketLevel.ip, name: 1 })
+        ReceiveErrorQueue -> return six ? .Integer(
+            NativeOption { level : SocketLevel.ipv6, name: 25 }
+        ): .Integer(NativeOption { level: SocketLevel.ip, name: 11 })
+        TcpFastOpen -> return .Integer(NativeOption { level: SocketLevel.tcp, name: 23 })
+        IpV6Only -> return six ? .Integer(
+            NativeOption { level : SocketLevel.ipv6, name: 26 }
+        ): .Unsupported
+        BindToInterface -> return .Interface
+        MulticastJoin -> return .Multicast(true)
+        MulticastLeave -> return .Multicast(false)
+        Linger -> return .Linger
+    }
+}
+
+// Sets an option. Values are as `endpointSetOption` takes them.
+function kernelEndpointSetOption(
+    backing: Number,
+    family: borrow AddressFamily,
+    option: borrow EndpointOption,
+    value: borrow Buffer
+) -> Result<Void, TesseraError> {
+    let blockBytes = zeroedBlock(count: 8, alignment: 16)
+    let block = blockBytes.pointer()
+    match optionPath(option, family) {
+        Integer(native) -> {
+            heapStore<U32>(block, 0, heapLoad<U32>(value.address, 0))
+            return answerStatus(setsockopt(backing, native.level, native.name, block, U32(4)))
+        }
+        Interface -> return answerStatus(
+            setsockopt(
+                backing,
+                SocketLevel.socket,
+                SocketOption.bindToDevice,
+                value.address,
+                U32(value.length)
+            )
+        )
+        Multicast(joining) -> return multicastSet(backing, family, joining, value)
+        Linger -> {
+            let seconds = heapLoad<U32>(value.address, 0)
+            let off = seconds == Linger.off
+            heapStore<U32>(block, 0, off ? U32(0) : U32(1))
+            heapStore<U32>(block, 4, off ? U32(0) : seconds)
+            return answerStatus(
+                setsockopt(backing, SocketLevel.socket, SocketOption.linger, block, U32(8))
+            )
+        }
+        Unsupported -> return .Error(failure(.Unsupported))
+    }
+}
+
+// `ip_mreqn` (12 bytes) or `ipv6_mreq` (20 bytes).
+function multicastSet(
+    backing: Number,
+    family: borrow AddressFamily,
+    joining: Bool,
+    value: borrow Buffer
+) -> Result<Void, TesseraError> {
+    let group = try netAddressLoad(value.address) otherwise return .Error(failure(.InvalidArgument))
+    let interface = heapLoad<U32>(value.address, 32)
+    let blockBytes = zeroedBlock(count: 24, alignment: 16)
+    let block = blockBytes.pointer()
+    if family != group.family { return .Error(failure(.InvalidArgument)) }
+    return match family {
+        Ipv4 -> {
+            for index in 0..4 { heapStore<U8>(block, index, group.bytes[index]) }
+            heapStore<U32>(block, 8, interface)
+            let name = joining ? IpOption.addMembership : IpOption.dropMembership
+            answerStatus(setsockopt(backing, SocketLevel.ip, name, block, U32(12)))
+        }
+        Ipv6 -> {
+            for index in 0..16 { heapStore<U8>(block, index, group.bytes[index]) }
+            heapStore<U32>(block, 16, interface)
+            let name = joining ? Ipv6Option.joinGroup : Ipv6Option.leaveGroup
+            answerStatus(setsockopt(backing, SocketLevel.ipv6, name, block, U32(20)))
+        }
+    }
+}
+
+// Reads an option into `block` (16 bytes room); the bytes of it.
+function kernelEndpointGetOption(
+    backing: Number,
+    family: borrow AddressFamily,
+    option: borrow EndpointOption,
+    block: RawPtr
+) -> Result<U64, TesseraError> {
+    let lengthBytes = zeroedBlock(count: 8, alignment: 16)
+    let length = lengthBytes.pointer()
+    heapStore<U32>(length, 0, U32(16))
+    var answer = 0
+    var size = U64(4)
+    match optionPath(option, family) {
+        Integer(native) -> answer = getsockopt(backing, native.level, native.name, block, length)
+        Interface -> {
+            answer = getsockopt(
+                backing,
+                SocketLevel.socket,
+                SocketOption.bindToDevice,
+                block,
+                length
+            ) size = answerFailed(answer) ? U64(0) : U64(stringFromCBytes(block, 16).count)
+        }
+        Linger -> {
+            answer = getsockopt(
+                backing,
+                SocketLevel.socket,
+                13,
+                block,
+                length
+            ) let on = heapLoad<U32>(block, 0) != 0 heapStore<U32>(
+                block,
+                0,
+                on ? heapLoad<U32>(block, 4) : Linger.off
+            )
+        }
+        Multicast(joining) -> return .Error(failure(.Unsupported))
+        Unsupported -> return .Error(failure(.Unsupported))
+    }
+    if answerFailed(answer) { return .Error(errnoFailure(answerErrno(answer))) }
+    return .Ok(size)
+}
+
+// What one send or receive did: the bytes moved, whether a datagram was cut
+// short, and its receive time in nanoseconds (0 when none was asked for).
+struct KernelTransfer {
+    var moved: U64
+    var truncated: Bool
+    var stamp: U64
+}
+
+// The `SCM_TIMESTAMPNS` in a received control block, in nanoseconds; 0 when
+// there is none.
+function controlTimestamp(control: RawPtr, length: U64) -> U64 {
+    var at = U64(0)
+    while at + U64(32) <= length {
+        let size = heapLoad<U64>(control, at)
+        if size < U64(16) { return U64(0) }
+        if heapLoad<U32>(control, Number(at + U64(8))) == U32(1) && heapLoad<U32>(
+            control,
+            Number(at + U64(12))
+        ) == U32(35) {
+            return heapLoad<U64>(control, Number(at + U64(16))) * U64(1000000000) + heapLoad<U64>(
+                control,
+                Number(at + U64(24))
+            )
+        }
+        at += ((size + U64(7)) & ~U64(7))
+    }
+    return U64(0)
+}
+
+// One send or receive of the buffers past the first `skip` bytes, never
+// blocking: `ShouldWait` when it would. `address` is a `NetAddress` to send
+// to, or the room a receive writes the sender's to; null for neither.
+// `struct msghdr` at 0, a `sockaddr` at 64, control at 192, `iovec`s from
+// 256.
+function kernelEndpointTransfer(
+    backing: Number,
+    family: borrow AddressFamily,
+    direction: TransferDirection,
+    buffers: borrow [Buffer],
+    skip: U64,
+    address: RawPtr,
+    more: Bool,
+    peek: Bool,
+    timestamps: Bool
+) -> Result<KernelTransfer, TesseraError> {
+    let count = buffers.count
+    let blockBytes = zeroedBlock(count: 256 + count * 16, alignment: 16)
+    let block = blockBytes.pointer()
+    var left = skip
+    var vectors = 0
+    for at in 0..count {
+        let piece = buffers[at]
+        if left >= piece.length {
+            left -= piece.length
+        } else {
+            heapStore<RawPtr>(block, (256 + vectors * 16), heapOffset(piece.address, left))
+            heapStore<U64>(block, (264 + vectors * 16), piece.length - left)
+            left = U64(0)
+            vectors += 1
+        }
+    }
+    let name = heapOffset(block, 64)
+    if !isNull(address) {
+        var length = U32(128)
+        if direction == .Send {
+            length = match sockaddrAt(address, family, name) {
+                Some(value) -> value
+                None -> return .Error(failure(.InvalidArgument))
+            }
+        }
+        heapStore<RawPtr>(block, 0, name)
+        heapStore<U32>(block, 8, length)
+    }
+    heapStore<RawPtr>(block, 16, heapOffset(block, 256))
+    heapStore<U64>(block, 24, U64(vectors))
+    let stamped = direction == .Receive && timestamps
+    if stamped {
+        heapStore<RawPtr>(block, 32, heapOffset(block, 192))
+        heapStore<U64>(block, 40, U64(64))
+    }
+    var answer = 0
+    match direction {
+        Send -> {
+            var flags = MessageFlag.dontWait | MessageFlag.noSignal
+            if more { flags = flags | MessageFlag.more }
+            answer = sendmsg(backing, block, flags)
+        }
+        Receive -> {
+            var flags = MessageFlag.dontWait
+            if peek { flags = flags | MessageFlag.peek }
+            answer = recvmsg(backing, block, flags)
+        }
+    }
+    if answerFailed(answer) { return .Error(errnoFailure(answerErrno(answer))) }
+    var stamp = U64(0)
+    if stamped { stamp = controlTimestamp(heapOffset(block, 192), heapLoad<U64>(block, 40)) }
+    if direction == .Receive && !isNull(address) { storeNetAddress(name, address) }
+    return .Ok(
+        KernelTransfer {
+            moved: U64(answer),
+            truncated: direction == .Receive && (
+                heapLoad<U32>(block, 48) & MessageFlag.truncated
+            ) != U32(0),
+            stamp: stamp
+        }
+    )
+}
+
+// Sends or receives up to `count` of the caller's 56-byte `Datagram`s at
+// once, never blocking; the number done, each with its `moved` (and, when
+// received, its flags and source) written back. A datagram whose address
+// does not suit is `InvalidArgument` with its index in `detail`. `struct
+// mmsghdr`s (64 bytes) first, then a `sockaddr` (32 bytes) each.
+function kernelEndpointTransferMany(
+    backing: Number,
+    family: borrow AddressFamily,
+    direction: TransferDirection,
+    messages: RawPtr,
+    count: Number,
+    connected: Bool
+) -> Result<Number, TesseraError> {
+    let blockBytes = zeroedBlock(count: count * 96, alignment: 16)
+    let block = blockBytes.pointer()
+    for at in 0..count {
+        let datagram = heapOffset(messages, at * 56)
+        let header = heapOffset(block, at * 64)
+        let name = heapOffset(block, count * 64 + at * 32)
+        heapStore<RawPtr>(header, 16, heapLoad<RawPtr>(datagram, 0))
+        heapStore<U64>(header, 24, U64(heapLoad<U32>(datagram, 8)))
+        if direction == .Receive {
+            heapStore<RawPtr>(header, 0, name)
+            heapStore<U32>(header, 8, U32(28))
+        } else if !connected {
+            let length = try sockaddrAt(
+                heapOffset(datagram, 16),
+                family,
+                name
+            ) otherwise return .Error(failureDetail(.InvalidArgument, U64(at)))
+            heapStore<RawPtr>(header, 0, name)
+            heapStore<U32>(header, 8, length)
+        }
+    }
+    let answer = match direction {
+        Send -> sendmmsg(backing, block, U32(count), MessageFlag.dontWait | MessageFlag.noSignal)
+        Receive -> recvmmsg(backing, block, U32(count), MessageFlag.dontWait, nullPointer())
+    }
+    if answerFailed(answer) { return .Error(errnoFailure(answerErrno(answer))) }
+    for at in 0..answer {
+        let datagram = heapOffset(messages, at * 56)
+        let header = heapOffset(block, at * 64)
+        heapStore<U64>(datagram, 48, U64(heapLoad<U32>(header, 56)))
+        if direction == .Receive {
+            let truncated = (heapLoad<U32>(header, 48) & MessageFlag.truncated) != U32(0)
+            heapStore<U32>(datagram, 12, truncated ? DatagramFlags.truncated.raw : U32(0))
+            storeNetAddress(heapOffset(block, count * 64 + at * 32), heapOffset(datagram, 16))
+        }
+    }
+    return .Ok(answer)
+}

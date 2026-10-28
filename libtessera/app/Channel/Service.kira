@@ -1,0 +1,303 @@
+import Foundation
+import Heap
+
+// Named services (§12, `connectService`).
+//
+// Every service is reached through the broker, `bootstrap`, at the address
+// `tessera.system`; no service has an address of its own. A service checks in under its name, and the broker allows that only
+// to the program its table names for it. A client asks the broker for the
+// name, and the broker makes a channel and hands one end to each, telling
+// the service which program the client runs. A connection is a Channel like
+// any other: one packet per message, handles attached to it.
+//
+// A listener is a Channel object in the `ServiceListener` role whose backing is the
+// check-in connection and whose `name` is the service's; it asserts
+// `READABLE` while a connection waits to be accepted, and reading or
+// writing it fails. A connection a service accepted keeps the client's
+// program in `text`.
+//
+// A client asks for a connection, or for the list, on its System channel
+// (`System.kira`). A service checks in on the broker's own wire, 256 bytes a
+// message, with at most one backing attached:
+//
+//     request      @0 op  @8 name length  @16 name (96 bytes)
+//     reply        @0 op  @4 code  @8 count  @16 size
+//     connection   @0 op 16  @8 client pid  @16 program length
+//                  @24 program (232 bytes)
+//     post         @0 op 17  @8 body length  @16 ordinal
+//                  @24 entitlement length  @32 entitlement (64 bytes)
+//                  @96 body (160 bytes)
+//
+// It is `bootstrap`'s `Broker/Wire.kira`; the two change together.
+
+namespace Service {
+    let wireBytes: U64 = U64(256)
+    // How long a service keeps trying to reach the broker, which init starts
+    // at the same moment as every service, or which init is restarting.
+    let brokerPatience: U64 = U64(10000000000)
+}
+
+namespace ServiceOp {
+    let checkIn: U32 = U32(1)
+    let connection: U32 = U32(16)
+    let post: U32 = U32(17)
+}
+
+function serviceNameValid(name: borrow String) -> Bool {
+    return name.count > 0 && name.count <= 96 && !name.contains("/")
+}
+
+// One message from the broker's wire into `block`, and the backing that came
+// with it, if any.
+struct ServiceReceived {
+    var bytes: U64
+    var backing: Number?
+}
+
+// Lets go of a backing a message carried.
+function serviceRelease(passed: borrow Number?) {
+    match passed {
+        Some(backing) -> kernelRelease(backing)
+        None -> {}
+    }
+}
+
+function serviceReceive(
+    backing: Number,
+    block: RawPtr,
+    wait: Bool
+) -> Result<ServiceReceived, TesseraError> {
+    let packet = try kernelPacketReceive(backing, block, Service.wireBytes, wait)
+    var passed: Number? = .None
+    for index in 0..packet.attached.count {
+        if index == 0 { passed = .Some(packet.attached[0]) } else {
+            kernelRelease(packet.attached[index])
+        }
+    }
+    return .Ok(ServiceReceived { bytes: packet.bytes, backing: move passed })
+}
+
+// Asks the broker `op` for `name` on `backing` and reads its answer into
+// `block`; the backing the answer carried, if any.
+function serviceAsk(
+    backing: Number,
+    op: U32,
+    name: borrow String,
+    block: RawPtr
+) -> Result<Number?, TesseraError> {
+    zeroBytes(block, Service.wireBytes)
+    heapStore<U32>(block, 0, op)
+    heapStore<U64>(block, 8, U64(name.count))
+    copyBytes(heapOffset(block, 16), name.data, name.count)
+    let none: [Number] = []
+    try kernelPacketSend(backing, block, Service.wireBytes, nullPointer(), U64(0), none, true)
+    zeroBytes(block, Service.wireBytes)
+    let answer = try serviceReceive(backing, block, true)
+    if answer.bytes == U64(0) { return .Error(failure(.PeerClosed)) }
+    let code = heapLoad<U32>(block, 4)
+    if code != U32(0) {
+        serviceRelease(answer.backing)
+        return .Error(failure(errorCodeFrom(code)))
+    }
+    return .Ok(answer.backing)
+}
+
+// Checks in as `name`, waiting for the broker while it is not running; the
+// check-in connection.
+function serviceCheckIn(name: borrow String) -> Result<Number, TesseraError> {
+    let blockBytes = zeroedBlock(count: Service.wireBytes, alignment: 16)
+    let block = blockBytes.pointer()
+    let deadline = monotonicNow() + Service.brokerPatience
+    while true {
+        match kernelBrokerConnect() {
+            Ok(backing) -> {
+                let asked = serviceAsk(backing, ServiceOp.checkIn, name, block)
+                match asked {
+                    Ok(passed) -> {
+                        serviceRelease(passed)
+                        return .Ok(backing)
+                    }
+                    Error(failed) -> {
+                        kernelRelease(backing)
+                        return .Error(failed)
+                    }
+                }
+            }
+            Error(failed) -> {
+                if failed.code != .NotFound || monotonicNow() >= deadline {
+                    return .Error(failed)
+                }
+                serviceNap()
+            }
+        }
+    }
+    return .Error(failure(.Internal))
+}
+
+// A twentieth of a second.
+function serviceNap() {
+    kernelSleep(U64(50000000))
+}
+
+// A channel object for a connected backing. The backing is released when
+// its queue cannot be sized.
+// A Channel object around a connection; `role` says whether the broker named
+// the program at its other end.
+function serviceChannelObject(backing: Number, role: ChannelRole) -> Result<Number, TesseraError> {
+    match kernelPacketBuffer(backing, channelQueueBytes) {
+        Ok -> {}
+        Error(failed) -> {
+            kernelRelease(backing)
+            return .Error(failed)
+        }
+    }
+    return .Ok(objectCreate(.Channel(move role), backing))
+}
+
+// `WrongType` unless `object` is a service's listener.
+function serviceListenerCheck(object: Number) -> Result<Void, TesseraError> {
+    let role = try channelOf(object)
+    return match role {
+        ServiceListener -> .Ok
+        Plain, Connection, BrokerListener -> .Error(failure(.WrongType))
+    }
+}
+
+function serviceChannel(backing: Number) -> Result<Handle, TesseraError> {
+    let object = try serviceChannelObject(backing, .Plain)
+    return handleForNew(object, Rights.processDefault)
+}
+
+// Checks in as `name` with the broker. Only the program the broker's table
+// names for `name` may: any other is `NotEntitled`, and a second check-in
+// while the first is live is `AlreadyExists`.
+public function serviceListen(name: borrow String) -> Result<Handle, TesseraError> {
+    if !serviceNameValid(name) { return .Error(failure(.InvalidArgument)) }
+    let backing = try serviceCheckIn(name)
+    let object = objectCreate(.Channel(.ServiceListener), backing)
+    library.objects[object].name = name
+    return handleForNew(object, Rights.processDefault)
+}
+
+// The next connection waiting on a listener, or `ShouldWait`. When the
+// broker has gone, which init restarts, the listener checks in again, so a
+// service outlives its broker.
+public function serviceAccept(listener: Handle) -> Result<Handle, TesseraError> {
+    let object = try resolveObject(listener, .Channel, Rights.read)
+    try serviceListenerCheck(object)
+    let blockBytes = zeroedBlock(count: Service.wireBytes, alignment: 16)
+    let block = blockBytes.pointer()
+    while true {
+        zeroBytes(block, Service.wireBytes)
+        let backing = try backingOf(object)
+        let got = match serviceReceive(backing, block, false) {
+            Ok(value) -> value
+            Error(failed) -> {
+                if failed.code == .ShouldWait { return .Error(failed) }
+                return serviceRecheckIn(object)
+            }
+        }
+        if got.bytes == U64(0) { return serviceRecheckIn(object) }
+        let passed = match got.backing {
+            Some(value) -> value
+            None -> {
+                continue
+            }
+        }
+        if heapLoad<U32>(block, 0) == ServiceOp.connection {
+            var length = heapLoad<U64>(block, 16)
+            if length > U64(232) { length = U64(232) }
+            let program = stringFromCBytes(heapOffset(block, 24), length)
+            // Nonblocking, as an accepted connection is.
+            match kernelSetNonBlocking(passed) {
+                Ok -> {}
+                Error(failed) -> {
+                    kernelRelease(passed)
+                    return .Error(failed)
+                }
+            }
+            let channel = try serviceChannelObject(passed, .Connection(program))
+            return handleForNew(channel, Rights.processDefault)
+        }
+        kernelRelease(passed)
+    }
+    return .Error(failure(.Internal))
+}
+
+function serviceRecheckIn(object: Number) -> Result<Handle, TesseraError> {
+    let name = library.objects[object].name
+    let backing = try serviceCheckIn(name)
+    objectRebind(object, backing)
+    return .Error(failure(.ShouldWait))
+}
+
+// A connection to `name`. `NotFound` when no service has that name or the
+// broker is not running, `NotEntitled` when the service needs an
+// entitlement this program lacks, and `Timeout` when the service did not
+// come up in time.
+public function serviceConnect(name: borrow String) -> Result<Handle, TesseraError> {
+    return match serviceConnectFd(name) {
+        Ok(backing) -> serviceChannel(backing)
+        Error(failed) -> .Error(failed)
+    }
+}
+
+// The same connection as a bare backing, for this library's own clients.
+// It is asked for on the process's System channel (`System.kira`).
+function serviceConnectFd(name: borrow String) -> Result<Number, TesseraError> {
+    if !serviceNameValid(name) { return .Error(failure(.InvalidArgument)) }
+    return systemConnectService(name)
+}
+
+// The services the broker knows, into `out`: one 160-byte record each, the
+// name @0 (96 bytes) and the entitlement a client needs to reach it @96 (64
+// bytes, empty for none), both NUL-padded. Answers the count;
+// `BufferTooSmall` when `out` cannot hold them.
+public function serviceList(out: Buffer) -> Result<UNumber, TesseraError> {
+    return .Ok(try systemListServices(out))
+}
+
+// Posts an event from the service listening on `listener`: the broker
+// sends `method` with `body` (at most 160 bytes, §10.3-encoded) on the
+// System channel of every process that holds `entitlement`, as `flags.EVENT`.
+// This is how `deviceChanged` and its kind reach applications (§12).
+public function serviceNotify(
+    listener: Handle,
+    method: borrow String,
+    body: borrow Buffer,
+    entitlement: borrow String
+) -> Result<Void, TesseraError> {
+    let object = try resolveObject(listener, .Channel, Rights.write)
+    try serviceListenerCheck(object)
+    if body.length > U64(160) || entitlement.count > 64 { return .Error(failure(.OutOfRange)) }
+    let blockBytes = zeroedBlock(count: Service.wireBytes, alignment: 16)
+    let block = blockBytes.pointer()
+    zeroBytes(block, Service.wireBytes)
+    heapStore<U32>(block, 0, ServiceOp.post)
+    heapStore<U64>(block, 8, body.length)
+    heapStore<U64>(block, 16, wireOrdinal(method))
+    heapStore<U64>(block, 24, U64(entitlement.count))
+    copyBytes(heapOffset(block, 32), entitlement.data, entitlement.count)
+    copyBytes(heapOffset(block, 96), body.address, body.length)
+    // Without waiting: a broker that has gone loses the event, and the
+    // listener checks in again on its next accept.
+    let none: [Number] = []
+    let backing = try backingOf(object)
+    try kernelPacketSend(backing, block, Service.wireBytes, nullPointer(), U64(0), none, false)
+    return .Ok
+}
+
+// The program at the other end of a service connection, as the path it was
+// started from. A service decides what a client may do by it.
+public function servicePeerProgram(channel: Handle) -> Result<String, TesseraError> {
+    let object = try resolveObject(channel, .Channel, Rights.inspect)
+    let role = try channelOf(object)
+    return match role {
+        // The broker said, for a connection it made.
+        Connection(program) -> .Ok(program)
+        Plain, ServiceListener, BrokerListener -> {
+            let backing = try backingOf(object)
+            return kernelPeerProgram(backing)
+        }
+    }
+}

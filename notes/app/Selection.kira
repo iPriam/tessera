@@ -1,0 +1,228 @@
+//! The window's selection: the navigation routes, the chosen folder and note, and the list's contents.
+import Foundation
+import KiraUI
+
+// What the window shows is the navigation path: the folder chosen in the
+// sidebar, then the note chosen in the list. Each is a value of its own type,
+// so the sidebar selects the folder the path starts at.
+
+/// The routes the window's navigation path holds, so the sidebar selects the folder the path starts at.
+namespace Routes {
+    // The folder name that stands for every folder, which no directory has.
+    let allNotes: String = ""
+}
+
+/// The prefixes that tell the folder and note routes' keys apart.
+namespace RouteKey {
+    let folderPrefix: String = "folder/"
+    let notePrefix: String = "note/"
+}
+
+/// The folder the sidebar chose, as a value of the navigation path.
+construct FolderRoute(name: String) extends NavigationRoute {
+    function routeKey() -> String {
+        return RouteKey.folderPrefix + name
+    }
+
+    function destination() -> Any Widget {
+        return EmptyView()
+    }
+}
+
+/// The note the list chose, by its key, as a value of the navigation path.
+construct NoteRoute(key: String) extends NavigationRoute {
+    function routeKey() -> String {
+        return RouteKey.notePrefix + key
+    }
+
+    function destination() -> Any Widget {
+        return EmptyView()
+    }
+}
+
+/// What follows `prefix` in the first route of the path whose key starts with it, or none.
+function routeNamed(prefix: borrow String) -> String? {
+    let path = NavigationPath {}
+    for value in path.values() {
+        let key = value.routeKey()
+        if key.startsWith(prefix) { return .Some(key.substring(prefix.count, key.count)) }
+    }
+    return .None
+}
+
+/// The folder chosen, every folder when none is.
+function chosenFolder() -> String {
+    return match routeNamed(RouteKey.folderPrefix) {
+        Some(name) -> name
+        None -> Routes.allNotes
+    }
+}
+
+/// The key of the note chosen, or none.
+function chosenNoteKey() -> String? {
+    return routeNamed(RouteKey.notePrefix)
+}
+
+/// Shows `folder`, and `note` in it when there is one.
+function show(folder: String, note: String?) {
+    let path = NavigationPath {}
+    path.removeAll()
+    path.append(FolderRoute(name: folder))
+    match note {
+        Some(key) -> path.append(NoteRoute(key: key))
+        None -> {}
+    }
+}
+
+/// What is typed in the window's search field, which narrows the list.
+class NotesSearch {
+    var query: String = ""
+}
+
+/// What the window opens on: every note, the newest chosen.
+function firstShown(folders: borrow [NotesFolder]) -> NavigationPath {
+    let notes = listedNotes(folders, "")
+    if notes.count > 0 {
+        show(Routes.allNotes, .Some(notes[0].key()))
+    } else {
+        show(Routes.allNotes, .None)
+    }
+    return NavigationPath {}
+}
+
+/// The notes the list shows: the chosen folder's, or every folder's, newest first, those holding `query` when there is one.
+function listedNotes(folders: borrow [NotesFolder], query: borrow String) -> [Note] {
+    let folder = chosenFolder()
+    var notes: [Note] = []
+    for each in folders {
+        if folder != Routes.allNotes && each.name != folder { continue }
+        for note in each.notes {
+            if query.count == 0 || note.holds(query) { notes.append(copy note) }
+        }
+    }
+    return notes.sorted({ a, b in return a.saved > b.saved })
+}
+
+/// The note chosen, or none.
+function chosenNote(folders: borrow [NotesFolder]) -> Note? {
+    match chosenNoteKey() {
+        Some(key) -> {
+            for folder in folders {
+                for note in folder.notes {
+                    if note.key() == key { return .Some(copy note) }
+                }
+            }
+            return .None
+        }
+        None -> return .None
+    }
+}
+
+/// The folder a new note goes in: the chosen one, else the first.
+function folderForNew(folders: borrow [NotesFolder]) -> String {
+    let folder = chosenFolder()
+    if folder != Routes.allNotes { return folder }
+    return copy folders[0].name
+}
+
+/// Makes an empty note and shows it; the folders as they are now.
+function newNote(folders: borrow [NotesFolder]) -> [NotesFolder] {
+    let note = Note { folder: folderForNew(folders), saved: secondsNow(), title: "", lines: [] }
+    match saveNote(note, .None) {
+        Some(saved) -> show(chosenFolder(), .Some(saved.key()))
+        None -> {}
+    }
+    return loadFolders()
+}
+
+/// Adds `typed` to the chosen note: its title while it has none, else a line under it.
+function addTyped(folders: borrow [NotesFolder], typed: String) -> [NotesFolder] {
+    if typed.count == 0 { return copy folders }
+    match chosenNote(folders) {
+        Some(note) -> {
+            var lines = copy note.lines
+            var title = copy note.title
+            if title.count == 0 { title = typed } else { lines.append(typed) }
+            let changed = Note {
+                folder: copy note.folder,
+                saved: note.saved,
+                title: title,
+                lines: lines
+            }
+            match saveNote(changed, .Some(copy note)) {
+                Some(saved) -> show(chosenFolder(), .Some(saved.key()))
+                None -> {}
+            }
+            return loadFolders()
+        }
+        None -> return copy folders
+    }
+}
+
+/// Removes the chosen note and goes back to its folder.
+function deleteChosen(folders: borrow [NotesFolder]) -> [NotesFolder] {
+    match chosenNote(folders) {
+        Some(note) -> {
+            removeNote(note)
+            show(chosenFolder(), .None)
+            return loadFolders()
+        }
+        None -> return copy folders
+    }
+}
+
+/// Makes a folder named `New Folder`, or `New Folder 2` and on when that is taken, and shows it.
+function newFolder(folders: borrow [NotesFolder]) -> [NotesFolder] {
+    var name = "New Folder"
+    var suffix: UN8 = 2
+    while folderNamed(folders, name) {
+        name = "New Folder " + String(suffix)
+        suffix++
+    }
+    if notesKept() {
+        match makeFolder(name) {
+            Ok -> show(copy name, .None)
+            Error(failure) -> log warn("could not make a folder of notes", folder: name, failure)
+        }
+    }
+    return loadFolders()
+}
+
+/// Whether a folder named `name` is kept.
+function folderNamed(folders: borrow [NotesFolder], name: borrow String) -> Bool {
+    for folder in folders {
+        if folder.name == name { return true }
+    }
+    return false
+}
+
+/// How many notes all the folders hold.
+function noteCount(folders: borrow [NotesFolder]) -> UN32 {
+    var count: UN32 = 0
+    for folder in folders { count = count + UN32(folder.notes.count) }
+    return count
+}
+
+/// The notes of one group of the list, as `groupName` names them.
+struct NoteGroup {
+    let name: String
+    let notes: [Note]
+}
+
+/// `notes`, newest first, in groups by when they were saved.
+function grouped(notes: borrow [Note], now: UN32) -> [NoteGroup] {
+    var groups: [NoteGroup] = []
+    var name = ""
+    var run: [Note] = []
+    for note in notes {
+        let group = groupName(note.saved, now)
+        if group != name && run.count > 0 {
+            groups.append(NoteGroup { name: name, notes: run })
+            run = []
+        }
+        name = group
+        run.append(copy note)
+    }
+    if run.count > 0 { groups.append(NoteGroup { name: name, notes: run }) }
+    return groups
+}

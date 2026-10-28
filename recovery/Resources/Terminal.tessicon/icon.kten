@@ -1,0 +1,25 @@
+TessIcon {
+    fill: Choice { light: .SystemDark, dark: .Automatic },
+    groups: [
+        Group {
+            name: "Group",
+            layers: [
+                Layer { name: "terminal.solarium.underscore", image: "terminal.solarium.underscore.svg", position: Position { scale: 1.00781, x: 0, y: 0 } }
+            ],
+            lighting: .Individual,
+            specular: .Inside,
+            translucency: Translucency { enabled: true, amount: 0.2 },
+            shadow: Shadow { kind: .Neutral, opacity: 0.5 }
+        },
+        Group {
+            name: "Group 2",
+            layers: [
+                Layer { name: "terminal.solarium.prompt", image: "terminal.solarium.prompt.svg", position: Position { scale: 1.00781, x: 0, y: 0 } }
+            ],
+            lighting: .Individual,
+            specular: .Inside,
+            translucency: Translucency { enabled: true, amount: 0.2 },
+            shadow: Shadow { kind: .Neutral, opacity: 0.5 }
+        }
+    ]
+}

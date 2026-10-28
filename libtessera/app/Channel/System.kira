@@ -1,0 +1,373 @@
+import Foundation
+import Heap
+
+// The process's System channel (§12): one connection to the broker that it
+// keeps for as long as it runs, over which `connectService` and
+// `listServices` are calls like any other. Its messages are Channel
+// messages: the §10.3 header and body, with the service's end of a new
+// channel as the answer's one handle.
+//
+// It is made the first time a call needs it, or when the process asks for
+// it as `startupHandle(StartupTag.system)` to read its events. A process that
+// forks gets its own, since the broker judges entitlements by the program
+// at the other end. When the broker has gone, which init restarts, a call
+// reconnects once into the same object, waiting for the broker as a
+// service checking in does.
+//
+// Events arrive with `flags.EVENT` and no transaction. A call keeps every
+// message that is not its answer for `Channel.read`, up to
+// `systemEventsKept`, even before the process holds the handle.
+
+// How long a call waits for its answer. The broker holds a `connectService`
+// for a service that has not checked in for up to its own patience, so this
+// is longer.
+let systemPatience: U64 = U64(20000000000)
+
+// The System channel: its object, the process that connected it, and the
+// handle the process was given for it, once it asked.
+struct SystemConnection {
+    var object: Number
+    var pid: U64
+    var handle: Handle?
+}
+
+// Closes the connection and keeps the object, so the handle stays valid
+// across a reconnect.
+function systemDrop() {
+    match library.system {
+        Some(held) -> {
+            objectRelease(held.object)
+        }
+        None -> {}
+    }
+}
+
+// Whether connecting to the broker waits for one that is not listening yet,
+// as one init has just started or restarted is not.
+@Derive(Copy)
+enum BrokerPatience {
+    Once
+    UntilListening
+}
+
+// The System channel's object, connecting when there is none.
+function systemChannel(patience: BrokerPatience) -> Result<Number, TesseraError> {
+    match library.system {
+        Some(held) -> {
+            if held.pid != kernelProcessId() {
+                // Inherited across a fork: the parent's connection, not ours.
+                objectDestroy(held.object)
+                library.system = .None
+            } else if library.objects[held.object].backing.isSome() {
+                return .Ok(held.object)
+            }
+        }
+        None -> {}
+    }
+    let deadline = monotonicNow() + Service.brokerPatience
+    while true {
+        match kernelBrokerConnect() {
+            Ok(backing) -> {
+                match library.system {
+                    Some(held) -> {
+                        objectRebind(held.object, backing)
+                        return .Ok(held.object)
+                    }
+                    None -> {}
+                }
+                let object = try serviceChannelObject(backing, .Plain)
+                library.system = .Some(
+                    SystemConnection { object: object, pid: kernelProcessId(), handle: .None, }
+                )
+                return .Ok(object)
+            }
+            Error(failed) -> {
+                if patience == .Once || failed.code != .NotFound || monotonicNow() >= deadline {
+                    return .Error(failed)
+                }
+                serviceNap()
+            }
+        }
+    }
+    return .Error(failure(.Internal))
+}
+
+// Sleeps until `backing` is readable or a tenth of a second has passed.
+function systemWaitReadable(backing: Number) {
+    kernelWaitOn(backing, Ready.readable, U64(100000000))
+}
+
+// Keeps an event for `Channel.read`, whether or not the process has asked
+// for the handle yet: one that comes while the process makes its first
+// call is read once it does, as a Mach port queues what was sent before
+// anyone received. At most `systemEventsKept` wait, and the oldest goes
+// to make room, so a process that never reads holds no more than that.
+let systemEventsKept: Number = 64
+
+function systemKeepEvent(object: Number, message: borrow RawMessage) {
+    var waiting = 0
+    var oldest: Number? = .None
+    for index in 0..library.bufferedMessages.count {
+        if library.bufferedMessages[index].live && library.bufferedMessages[index].object == object {
+            waiting += 1
+            if oldest == .None { oldest = .Some(index) }
+        }
+    }
+    match oldest {
+        Some(index) -> {
+            if waiting >= systemEventsKept {
+                messageDiscard(library.bufferedMessages[index].message)
+                library.bufferedMessages[index].live = false
+            }
+        }
+        None -> {}
+    }
+    channelKeepBack(object, message)
+}
+
+// The answer to `txid` on the System channel. Anything else is an event,
+// kept for `Channel.read`.
+function systemAwait(object: Number, txid: U64) -> Result<RawMessage, TesseraError> {
+    let deadline = monotonicNow() + systemPatience
+    let backing = try backingOf(object)
+    while true {
+        match channelReceive(backing) {
+            Ok(message) -> {
+                let at = messagePayloadOffset(message)
+                if messagePayloadLength(message) >= Wire.headerBytes && heapLoad<U64>(
+                    message.block,
+                    at
+                ) == txid && MessageFlags(heapLoad<U32>(message.block, Number(at + U64(16)))).has(
+                    MessageFlags.response
+                ) {
+                    return .Ok(message)
+                }
+                systemKeepEvent(object, message)
+            }
+            Error(failed) -> {
+                if failed.code != .ShouldWait { return .Error(failed) }
+                if monotonicNow() >= deadline { return .Error(failure(.Timeout)) }
+                let backing = try backingOf(object)
+                systemWaitReadable(backing)
+            }
+        }
+    }
+    return .Error(failure(.Internal))
+}
+
+// Sends `method` with the body in `encodingBytes` once.
+function systemSendOnce(
+    object: Number,
+    method: borrow String,
+    txid: U64
+) -> Result<Void, TesseraError> {
+    encodeAlign(8)
+    let size = Wire.headerBytes + U64(library.encoding.count)
+    let blockBytes = zeroedBlock(count: size, alignment: 16)
+    let block = blockBytes.pointer()
+    heapStore<U64>(block, 0, txid)
+    heapStore<U64>(block, 8, wireOrdinal(method))
+    heapStore<U32>(block, 16, U32(0))
+    heapStore<U32>(block, 20, U32(1))
+    for index in 0..library.encoding.count {
+        heapStore<U8>(block, Number(Wire.headerBytes + U64(index)), library.encoding[index])
+    }
+    let none: [Handle] = []
+    let backing = try backingOf(object)
+    let sent = channelSend(backing, Buffer { address: block, length: size }, none)
+    return sent
+}
+
+// Calls `method` on the System channel with the body in `encodingBytes`; the
+// answer, or the error it carried. Patient from the first try: a program init
+// starts beside the broker can call before the broker listens, and a service
+// checking in already waits for it the same way.
+function systemCall(method: borrow String) -> Result<RawMessage, TesseraError> {
+    for _ in 0..2 {
+        let object = try systemChannel(.UntilListening)
+        let txid = (kernelProcessId() << U64(32)) | library.nextTransaction
+        library.nextTransaction += U64(1)
+        if library.nextTransaction > U64(0xFFFFFFFF) { library.nextTransaction = U64(1) }
+        var closed = false
+        match systemSendOnce(object, method, txid) {
+            Ok -> {}
+            Error(failed) -> {
+                if failed.code != .PeerClosed { return .Error(failed) }
+                closed = true
+            }
+        }
+        if !closed {
+            match systemAwait(object, txid) {
+                Ok(message) -> {
+                    return systemAnswer(message)
+                }
+                Error(failed) -> {
+                    if failed.code != .PeerClosed { return .Error(failed) }
+                    closed = true
+                }
+            }
+        }
+        systemDrop()
+    }
+    return .Error(failure(.PeerClosed))
+}
+
+// The answer itself, or the `Error` it carries.
+function systemAnswer(message: borrow RawMessage) -> Result<RawMessage, TesseraError> {
+    let at = messagePayloadOffset(message)
+    let flags = heapLoad<U32>(message.block, Number(at + U64(16)))
+    if !MessageFlags(flags).has(MessageFlags.error) { return .Ok(message) }
+    var error = failure(.Internal)
+    if messagePayloadLength(message) >= Wire.headerBytes + U64(16) {
+        let body = heapOffset(message.block, at + Wire.headerBytes)
+        error = TesseraError {
+            code: errorCodeFrom(heapLoad<U32>(body, 0)),
+            subsystem: subsystemFrom(heapLoad<U16>(body, 4)),
+            flags: ErrorFlags(heapLoad<U16>(body, 6)),
+            detail: heapLoad<U64>(body, 8),
+        }
+    }
+    messageDiscard(message)
+    return .Error(error)
+}
+
+// `System/connectService`: the backing of the client's end.
+function systemConnectService(name: borrow String) -> Result<Number, TesseraError> {
+    encodeReset()
+    encodeString(name)
+    let message = try systemCall("System/connectService")
+    if message.attached.count < 1 {
+        messageDiscard(message)
+        return .Error(failure(.Internal))
+    }
+    let backing = message.attached[0]
+    for index in 1..message.attached.count { kernelRelease(message.attached[index]) }
+    deallocate(message.block)
+    return .Ok(backing)
+}
+
+// A §10.3 `String` at `at` in `message`'s body, as at most `room` bytes
+// stored at `target`; the offset after it, or 0 when it runs past `end`.
+function systemDecodeString(source: RawPtr, at: U64, end: U64, target: RawPtr, room: U64) -> U64 {
+    if at + U64(8) > end { return U64(0) }
+    let length = heapLoad<U64>(source, at)
+    let next = at + U64(8) + (length + U64(7)) / U64(8) * U64(8)
+    if length > end || next > end { return U64(0) }
+    var stored = length
+    if stored > room { stored = room }
+    copyBytes(target, heapOffset(source, Number(at + U64(8))), stored)
+    return next
+}
+
+// `System/listServices`, as `serviceList`'s 160-byte records in `out`.
+function systemListServices(out: borrow Buffer) -> Result<U64, TesseraError> {
+    encodeReset()
+    let message = try systemCall("System/listServices")
+    let body = heapOffset(message.block, Number(messagePayloadOffset(message) + Wire.headerBytes))
+    let end = messagePayloadLength(message) - Wire.headerBytes
+    if end < U64(8) {
+        messageDiscard(message)
+        return .Error(failure(.Internal))
+    }
+    let count = heapLoad<U64>(body, 0)
+    if count * U64(160) > out.length {
+        messageDiscard(message)
+        return .Error(failureDetail(.BufferTooSmall, count * U64(160)))
+    }
+    zeroBytes(out.address, Number(count * U64(160)))
+    var at = U64(8)
+    for index in 0..Number(count) {
+        let record = heapOffset(out.address, index * 160)
+        at = systemDecodeString(body, at, end, record, U64(96))
+        if at > U64(0) && at + U64(8) <= end {
+            let present = heapLoad<U64>(body, at)
+            at += U64(8)
+            if present != U64(0) {
+                at = systemDecodeString(body, at, end, heapOffset(record, 96), U64(64))
+            }
+        } else {
+            at = U64(0)
+        }
+        if at == U64(0) { break }
+    }
+    messageDiscard(message)
+    if at == U64(0) { return .Error(failure(.Internal)) }
+    return .Ok(count)
+}
+
+// `System/attach`, which says this connection is a System channel before
+// the process has called anything on it, so the broker sends it events.
+function systemAttach() -> Result<Void, TesseraError> {
+    encodeReset()
+    let message = try systemCall("System/attach")
+    messageDiscard(message)
+    return .Ok
+}
+
+// The System channel as a handle, for `startupHandle(StartupTag.system)`:
+// made and attached the first time it is asked for. A process whose
+// `Channel.read` answered `PeerClosed`, because the broker went, asks again
+// and gets the same handle on a new connection, once the broker init
+// restarts is there.
+function systemStartupHandle() -> Result<Handle, TesseraError> {
+    var patience = BrokerPatience.Once
+    match systemHeld() {
+        Some(held) -> {
+            let closing = Ready.hangUp | Ready.readHangUp
+            let open = match library.objects[held.object].backing {
+                Some(backing) -> (kernelReady(backing, Ready.readable) & closing) == 0
+                None -> false
+            }
+            if open {
+                match held.handle {
+                    Some(handle) -> return .Ok(handle)
+                    None -> {}
+                }
+            } else {
+                systemDrop()
+                patience = .UntilListening
+            }
+        }
+        None -> {}
+    }
+    let object = try systemChannel(patience)
+    let handle = try systemHandleFor(object)
+    // A connection the broker will not attach gets no events, so it is no
+    // System channel: the broker cannot be reached.
+    match systemAttach() {
+        Ok -> return .Ok(handle)
+        Error(failed) -> {
+            systemDrop()
+            return .Error(failed)
+        }
+    }
+}
+
+// The connection this process made, if it made one.
+function systemHeld() -> SystemConnection? {
+    match library.system {
+        Some(held) -> {
+            if held.pid == kernelProcessId() { return .Some(held) }
+            return .None
+        }
+        None -> return .None
+    }
+}
+
+// The handle given for the System channel's `object`, made the first time.
+function systemHandleFor(object: Number) -> Result<Handle, TesseraError> {
+    match library.system {
+        Some(held) -> {
+            match held.handle {
+                Some(handle) -> return .Ok(handle)
+                None -> {}
+            }
+        }
+        None -> {}
+    }
+    let handle = try handleForNew(object, Rights.processDefault)
+    library.system = .Some(
+        SystemConnection { object: object, pid: kernelProcessId(), handle: .Some(handle), }
+    )
+    return .Ok(handle)
+}

@@ -1,0 +1,66 @@
+import Foundation
+import LibTessera
+
+// `debugserver --lldb`: the gate in front of LLVM's own lldb-server on the
+// machine's LLDB port, which a `-dev` boot joins to 127.0.0.1:7332 on the
+// host:
+//
+//     (lldb) gdb-remote 127.0.0.1:7332
+//     (lldb) process attach --name notes
+//
+// lldb-server serves one debugger and leaves when the port reads as its end,
+// which a port with no debugger connected does at once. The gate waits for
+// one to connect, then becomes lldb-server on the port it holds open: the
+// debugger's first packet may already be in it, and closing the port would
+// lose it. init starts the gate again when that debugger is done.
+
+namespace LldbGate {
+    let flag: String = "--lldb"
+    let server: String = "/usr/bin/lldb-server"
+}
+
+function gateExit() -> ServerExit {
+    let port = match debugPortNamed(DebugPortName.lldbServer) {
+        Ok(value) -> value
+        Error(failed) -> {
+            log warn("the LLDB port could not be opened", failed)
+            return .NoPort
+        }
+    }
+    while !debugPortHostAttached(port) {
+        match awaitHost() {
+            Ok -> {}
+            Error(reason) -> {
+                log warn("the debugger wait failed", reason)
+                return .NoPort
+            }
+        }
+    }
+    return becomeLldbServer(port)
+}
+
+// Replaces the gate with lldb-server serving `port`; returns only when it
+// could not.
+function becomeLldbServer(port: DebugPort) -> ServerExit {
+    let descriptor = match debugPortHandedOn(port) {
+        Ok(value) -> value
+        Error(failed) -> {
+            log warn("the LLDB port could not be handed to lldb-server", failed)
+            return .NoServer
+        }
+    }
+    log info("a debugger joined the LLDB port; lldb-server serves it", descriptor)
+    let arguments = ["lldb-server", "gdbserver", "--fd=\(descriptor)"]
+    let launch = match launchInfoCreate(.Debug, arguments) {
+        Ok(memory) -> memory
+        Error(failed) -> {
+            log warn("no arguments for lldb-server", failed)
+            return .NoServer
+        }
+    }
+    match processReplace(LldbGate.server, .Some(launch)) {
+        Ok -> {}
+        Error(failed) -> log warn("lldb-server could not be started", failed)
+    }
+    return .NoServer
+}

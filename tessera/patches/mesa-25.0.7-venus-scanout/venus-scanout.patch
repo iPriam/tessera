@@ -1,0 +1,101 @@
+--- a/src/virtio/vulkan/vn_physical_device.c
++++ b/src/virtio/vulkan/vn_physical_device.c
+@@ -778,7 +778,15 @@
+     * For vtest, the protocol does not support external memory import. So we
+     * only mask out the importable bit so that wsi over vtest can be supported.
+     */
+-   if (physical_dev->renderer_extensions.EXT_external_memory_dma_buf) {
++   /* Tessera: the guest renderer exports any blob as a dma-buf through
++    * virtio-gpu prime, which asks nothing of the host's Vulkan driver. So a
++    * host that exports no dma-buf of its own — KosmicKrisp on Metal, which has
++    * neither a dma-buf nor an opaque fd to give — still lets the guest name a
++    * rendered image's memory as a dma-buf and hand it to the display as a
++    * scanout. has_dma_buf_import is set unconditionally by the virtgpu renderer
++    * and stands here for "this renderer does dma-buf at all". */
++   if (physical_dev->renderer_extensions.EXT_external_memory_dma_buf ||
++       physical_dev->instance->renderer->info.has_dma_buf_import) {
+       physical_dev->external_memory.renderer_handle_type =
+          VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+ 
+@@ -880,6 +888,20 @@
+          VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT;
+    }
+ 
++   /* Tessera: the host driver exports no external semaphore — Metal has none —
++    * but venus emulates a binary sync-fd semaphore guest-side, with an empty
++    * renderer submission for the out fence, and advertises that handle below on
++    * has_external_sync alone. Dawn's external-memory interop refuses to import
++    * an image on a device that cannot also import and export a semaphore to
++    * synchronise it, so mark the sync-fd semaphore importable and exportable on
++    * the same emulated basis. Without it WrapVulkanImage fails with "External
++    * semaphore usage not supported" and Ember cannot hand its pixels to
++    * the display. */
++   if (physical_dev->instance->renderer->info.has_external_sync) {
++      physical_dev->renderer_sync_fd.semaphore_exportable = true;
++      physical_dev->renderer_sync_fd.semaphore_importable = true;
++   }
++
+    physical_dev->external_binary_semaphore_handles = 0;
+    physical_dev->external_timeline_semaphore_handles = 0;
+ 
+@@ -901,8 +923,19 @@
+        VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) {
+       const struct vk_device_extension_table *renderer_exts =
+          &physical_dev->renderer_extensions;
+-      return renderer_exts->EXT_image_drm_format_modifier &&
+-             renderer_exts->EXT_queue_family_foreign;
++      if (renderer_exts->EXT_image_drm_format_modifier &&
++          renderer_exts->EXT_queue_family_foreign)
++         return true;
++
++      /* Tessera: those two extensions let a dma-buf be shared with a second
++       * driver that arranges pixels differently — a tiling to negotiate and a
++       * queue family to hand off to. Neither exists on this stack: the host is
++       * Metal through KosmicKrisp, which advertises neither, and the export is
++       * a guest-side prime of the same virtio-gpu device rather than a handoff
++       * to another one. The images the KosmicKrisp fix produces are linear, so
++       * the modifier is DRM_FORMAT_MOD_LINEAR and there is nothing to
++       * negotiate. Allow the export when the renderer does dma-buf at all. */
++      return physical_dev->instance->renderer->info.has_dma_buf_import;
+    }
+ 
+    /* expand support once the renderer can run on non-Linux platforms */
+--- a/src/virtio/vulkan/vn_device.c
++++ b/src/virtio/vulkan/vn_device.c
+@@ -316,13 +316,29 @@
+        app_exts->EXT_external_memory_dma_buf || has_wsi) {
+       if (physical_dev->external_memory.renderer_handle_type ==
+           VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) {
+-         if (!app_exts->EXT_external_memory_dma_buf) {
+-            extra_exts[extra_count++] =
+-               VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME;
+-         }
+-         if (!app_exts->KHR_external_memory_fd) {
+-            extra_exts[extra_count++] =
+-               VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME;
++         /* Tessera: when the host renderer exports no dma-buf of its own, the
++          * dma-buf the guest hands out is a virtio-gpu prime of the guest bo,
++          * made without the host driver's help. So the host device must not be
++          * asked for the dma-buf and fd extensions it does not have — block
++          * them from the forwarded list rather than adding them. The guest-side
++          * export bookkeeping (base_bo, the prime fd) does not depend on the
++          * host device enabling anything. */
++         if (!physical_dev->renderer_extensions.EXT_external_memory_dma_buf) {
++            if (app_exts->EXT_external_memory_dma_buf)
++               block_exts[block_count++] =
++                  VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME;
++            if (app_exts->KHR_external_memory_fd)
++               block_exts[block_count++] =
++                  VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME;
++         } else {
++            if (!app_exts->EXT_external_memory_dma_buf) {
++               extra_exts[extra_count++] =
++                  VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME;
++            }
++            if (!app_exts->KHR_external_memory_fd) {
++               extra_exts[extra_count++] =
++                  VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME;
++            }
+          }
+       }
+    }

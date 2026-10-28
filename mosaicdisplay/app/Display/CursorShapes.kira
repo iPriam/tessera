@@ -1,0 +1,260 @@
+import Foundation
+import TesseraDisplayClient
+
+// The shapes the cursor takes, as a Mac's does: the arrow, and over a
+// freeform window's edge, or while one is being dragged, a double-headed
+// arrow along the way the edge moves. Each is painted once, black with a
+// white edge, at the scale the display is drawn at (Cursor.kira).
+
+// Each shape's code is its place in `cursorShapes`.
+@Derive(Copy)
+enum CursorShape: UN32 {
+    Arrow = 0
+    // Over the leading or trailing edge.
+    ResizeAcross = 1
+    // Over the top or bottom edge.
+    ResizeUpDown = 2
+    // Over the top leading or bottom trailing corner.
+    ResizeFalling = 3
+    // Over the top trailing or bottom leading corner.
+    ResizeRising = 4
+}
+
+let cursorShapes: [CursorShape] = [
+    CursorShape.Arrow,
+    CursorShape.ResizeAcross,
+    CursorShape.ResizeUpDown,
+    CursorShape.ResizeFalling,
+    CursorShape.ResizeRising,
+]
+
+// Outlines use points; coverage uses fractional pixels.
+
+// The arrow's outline, its tip at the origin, in pixels at one pixel a point:
+// down the left edge, in to the notch, along the tail and out to the wing.
+let arrowOutline: [(Number, Number)] = [
+    (0.0, 0.0),
+    (0.0, 16.6),
+    (3.9, 12.9),
+    (6.6, 19.2),
+    (9.1, 18.2),
+    (6.5, 12.0),
+    (11.7, 12.0),
+]
+
+// The double-headed arrow's outline along the x axis, its centre at the
+// origin: a shaft three points thick between two heads nine points across.
+let resizeOutline: [(Number, Number)] = [
+    (-9.0, 0.0),
+    (-4.0, -4.5),
+    (-4.0, -1.5),
+    (4.0, -1.5),
+    (4.0, -4.5),
+    (9.0, 0.0),
+    (4.0, 4.5),
+    (4.0, 1.5),
+    (-4.0, 1.5),
+    (-4.0, 4.5),
+]
+
+namespace CursorTurn {
+    // The cosine and sine of 45 degrees.
+    let diagonal: Number = 0.7071067811865476
+}
+
+// The shape's outline, in points about its hot spot.
+function shapeOutline(shape: borrow CursorShape) -> [(Number, Number)] {
+    return match shape {
+        Arrow -> arrowOutline
+        ResizeAcross -> resizeOutline
+        ResizeUpDown -> turned(resizeOutline, 0.0, 1.0)
+        ResizeFalling -> turned(resizeOutline, CursorTurn.diagonal, CursorTurn.diagonal)
+        ResizeRising -> turned(resizeOutline, CursorTurn.diagonal, -CursorTurn.diagonal)
+    }
+}
+
+// `outline` turned by the angle whose cosine and sine are given, clockwise on
+// the screen, where y grows downwards.
+function turned(outline: borrow [(Number, Number)], cosine: Number, sine: Number) -> [(Number, Number)] {
+    var points: [(Number, Number)] = []
+    for point in outline {
+        points.append((point.0 * cosine - point.1 * sine, point.0 * sine + point.1 * cosine))
+    }
+    return points
+}
+
+// Where the shape's hot spot, the point the pointer is at, sits in the
+// image: the arrow's tip near the top left, a resize arrow's centre in the
+// middle.
+function shapeHotSpot(shape: borrow CursorShape) -> Number {
+    return match shape {
+        Arrow -> CursorImage.tip
+        ResizeAcross, ResizeUpDown, ResizeFalling, ResizeRising -> trunc(CursorImage.side / 2)
+    }
+}
+
+// A shape ready to be painted at a scale: its outline in points about the hot
+// spot, the square of the image it reaches, and the white edge's reach.
+struct ShapePainter {
+    let outline: [(Number, Number)]
+    // The first and last rows and columns sampled; the rest of the image is
+    // clear.
+    let first: Number
+    let last: Number
+    // The hot spot, in pixels from the image's corner.
+    let spot: Number
+    // Pixels a point.
+    let pixels: Number
+    // How far the white edge reaches from the outline, in points.
+    let reach: Number
+    // Half a pixel's diagonal, in points: a pixel whose centre is further than
+    // this from every edge of the outline and the white band is wholly on one
+    // side of them, and is not sampled.
+    let corner: Number
+}
+
+// The painter for `shape` at `scale` pixels a point.
+function shapePainter(shape: borrow CursorShape, scale: Number) -> ShapePainter {
+    let pixels = scale
+    let side = CursorImage.side
+    let spot = shapeHotSpot(shape)
+    // The arrow reaches 21 points down and across from its tip, a resize arrow
+    // 12 points each way from its centre.
+    let (first, last) = match shape {
+        Arrow -> (0.0, min(side, ceil(spot + 21.0 * pixels)))
+        ResizeAcross, ResizeUpDown, ResizeFalling, ResizeRising -> {
+            let half = ceil(12.0 * pixels)
+            (max(0.0, spot - half), min(side, spot + half))
+        }
+    }
+    return ShapePainter {
+        outline: shapeOutline(shape),
+        first: first,
+        last: last,
+        spot: spot,
+        pixels: pixels,
+        reach: CursorImage.edge / pixels,
+        corner: 0.7072 / pixels,
+    }
+}
+
+// Whether `x`, `y` is inside `outline`, by the even-odd rule.
+function insideOutline(outline: borrow [(Number, Number)], x: Number, y: Number) -> Bool {
+    var inside = false
+    var previous = outline[outline.count - 1]
+    for point in outline {
+        let crosses = (point.1 > y) != (previous.1 > y)
+        if crosses {
+            let at = point.0 + (y - point.1) * (previous.0 - point.0) / (previous.1 - point.1)
+            if x < at { inside = !inside }
+        }
+        previous = point
+    }
+    return inside
+}
+
+// The square of the distance from `x`, `y` to the nearest edge of `outline`.
+function outlineDistanceSquared(outline: borrow [(Number, Number)], x: Number, y: Number) -> Number {
+    // Every cursor outline is nonempty; a vertex is an initial upper bound.
+    let first = outline[0]
+    var nearest = (first.0 - x) * (first.0 - x) + (first.1 - y) * (first.1 - y)
+    var previous = outline[outline.count - 1]
+    for point in outline {
+        let dx = point.0 - previous.0
+        let dy = point.1 - previous.1
+        let length = dx * dx + dy * dy
+        var along: Number = 0.0
+        if length > 0.0 {
+            along = clamp(((x - previous.0) * dx + (y - previous.1) * dy) / length, 0.0, 1.0)
+        }
+        let px = previous.0 + along * dx - x
+        let py = previous.1 + along * dy - y
+        let distance = px * px + py * py
+        if distance < nearest { nearest = distance }
+        previous = point
+    }
+    return nearest
+}
+
+// What a point of the cursor's image shows.
+enum CursorInk {
+    Clear
+    // The white edge around the outline.
+    Edge
+    // The black inside it.
+    Fill
+}
+
+// What the point `x`, `y`, in points about the hot spot, shows.
+function samplePoint(painter: borrow ShapePainter, x: Number, y: Number) -> CursorInk {
+    if outlineDistanceSquared(painter.outline, x, y) < painter.reach * painter.reach {
+        return .Edge
+    }
+    return insideOutline(painter.outline, x, y) ? .Fill : .Clear
+}
+
+// How much of the image's pixel at `row`, `column` the shape's black and its
+// white edge each cover, from 0 to 1. A pixel wholly inside, outside or under
+// the white band is decided by its centre; only a pixel an edge crosses is
+// split into samples.
+function shapeCoverage(painter: borrow ShapePainter, row: Number, column: Number) -> (Number, Number) {
+    if row < painter.first || row >= painter.last || column < painter.first
+        || column >= painter.last
+    {
+        return (0.0, 0.0)
+    }
+    let x = (column + 0.5 - painter.spot) / painter.pixels
+    let y = (row + 0.5 - painter.spot) / painter.pixels
+    let distance = sqrt(outlineDistanceSquared(painter.outline, x, y))
+    // Clear of the band, the pixel is on one side of the outline, which the
+    // band covers; well inside it, it is all white.
+    let whole = distance > painter.reach + painter.corner
+        || distance + painter.corner < painter.reach
+    if whole {
+        return match samplePoint(painter, x, y) {
+            Fill -> (1.0, 0.0)
+            Edge -> (0.0, 1.0)
+            Clear -> (0.0, 0.0)
+        }
+    }
+    let samples = CursorImage.samples
+    var black: Number = 0.0
+    var white: Number = 0.0
+    for sy in 0..samples {
+        for sx in 0..samples {
+            let x = (column + (sx + 0.5) / samples - painter.spot) / painter.pixels
+            let y = (row + (sy + 0.5) / samples - painter.spot) / painter.pixels
+            match samplePoint(painter, x, y) {
+                Fill -> black += 1.0
+                Edge -> white += 1.0
+                Clear -> {}
+            }
+        }
+    }
+    let share = samples * samples
+    return (black / share, white / share)
+}
+
+// The resize arrow for a drag on `edges`: diagonal for a corner, across for
+// a side edge, up and down for the top or the bottom.
+function resizeShape(edges: borrow DisplayEdges) -> CursorShape {
+    if (edges.top && edges.leading) || (edges.bottom && edges.trailing) { return .ResizeFalling }
+    if (edges.top && edges.trailing) || (edges.bottom && edges.leading) { return .ResizeRising }
+    if edges.leading || edges.trailing { return .ResizeAcross }
+    return .ResizeUpDown
+}
+
+// The shape the cursor has where the pointer is: the resize arrow while a
+// window is being resized, and over a freeform window's edge while no button
+// is down; the arrow otherwise.
+function cursorShapeFor(server: borrow Server) -> CursorShape {
+    match server.resizing {
+        Some(resizing) -> return resizeShape(resizing.edges)
+        None -> {}
+    }
+    if server.moving.isSome() || server.buttonsDown != 0 { return .Arrow }
+    return match edgeUnderPointer(server) {
+        Some(found) -> resizeShape(found.1)
+        None -> .Arrow
+    }
+}

@@ -1,0 +1,139 @@
+import Foundation
+import Build
+
+// Checks over a release root before it is packed.
+
+namespace Elf {
+    // `\x7fELF`.
+    let magic: [UN8] = [UN8(127), UN8(69), UN8(76), UN8(70)]
+    // The 64-bit header's fields this reads: e_phoff, e_phentsize, e_phnum.
+    let headerBytes: Number = 64
+    let programHeadersAt: Number = 32
+    let programHeaderSizeAt: Number = 54
+    let programHeaderCountAt: Number = 56
+    // A program header's p_type, p_offset and p_filesz.
+    let interpreterType: Number = 3
+    let segmentOffsetAt: Number = 8
+    let segmentSizeAt: Number = 32
+}
+
+// A report of `root`'s dynamically linked programs, once each finds the
+// loader its ELF header names (PT_INTERP) in `root`, executable. A missing
+// loader boots to "no working init found", which reads like a missing program
+// rather than a missing loader; this names both.
+// The report is the output `report`, which names it in a step's directory.
+function checkLoaders(
+    graph: borrow mut Graph,
+    label: borrow String,
+    report: borrow String,
+    root: Artifact
+) -> Artifact {
+    let checked = graph.native(
+        NativeAction {
+            label: copy label,
+            code: sourceDigest!("package"),
+            inputs: [root],
+            outputs: [Output { name: copy report }],
+            work: { run in return reportLoaders(run) }
+        }
+    )
+    return checked[0]
+}
+
+function reportLoaders(run: borrow NativeRun) -> Result<Void, BuildFailure> {
+    let root = run.inputs[0]
+    var modes: Map<String, UNumber> = Map {}
+    for entry in run.trees[0] {
+        if entry.kind == .File { modes.set(copy entry.path, entry.mode) }
+    }
+    var report = ""
+    var missing = ""
+    for entry in run.trees[0] {
+        if entry.kind == .File {
+            match programLoader(root + "/" + entry.path) {
+                Some(loader) -> {
+                    let inside = loader.startsWith("/") ? loader.substring(1, loader.count) : loader
+                    let runs = match modes.value(inside) {
+                        Some(mode) -> mode % 128 >= 64
+                        None -> false
+                    }
+                    if runs {
+                        report += "\(entry.path)\t\(loader)\n"
+                    } else {
+                        missing += "\n  \(entry.path) names the loader \(loader), which the root does not carry runnable"
+                    }
+                }
+                None -> {}
+            }
+        }
+    }
+    if missing.count > 0 { return .Error(.Failed("a program cannot be loaded:" + missing)) }
+    if report.count == 0 { return .Error(.Failed("no program in the root names a loader")) }
+    match writeFile(run.outputs[0], report) {
+        Ok -> return .Ok
+        Error(failure) -> {
+            absorb failure
+            return .Error(.Files("cannot write the loader report"))
+        }
+    }
+}
+
+// The loader the ELF file at `path` names, when it is a 64-bit little-endian
+// ELF file that names one.
+function programLoader(path: borrow String) -> String? {
+    let header = match readFileRange(path, 0, Elf.headerBytes) {
+        Ok(bytes) -> bytes
+        Error(failure) -> {
+            absorb failure
+            return .None
+        }
+    }
+    if header.count < Elf.headerBytes { return .None }
+    for index in 0..Elf.magic.count {
+        if header[index] != Elf.magic[index] { return .None }
+    }
+    let tableAt = littleEndian(header, Elf.programHeadersAt, 8)
+    let entrySize = littleEndian(header, Elf.programHeaderSizeAt, 2)
+    let entries = littleEndian(header, Elf.programHeaderCountAt, 2)
+    let table = match readFileRange(path, tableAt, entrySize * entries) {
+        Ok(bytes) -> bytes
+        Error(failure) -> {
+            absorb failure
+            return .None
+        }
+    }
+    for index in 0..entries {
+        let at = index * entrySize
+        if at + entrySize <= table.count && littleEndian(table, at, 4) == Elf.interpreterType {
+            let offset = littleEndian(table, at + Elf.segmentOffsetAt, 8)
+            let size = littleEndian(table, at + Elf.segmentSizeAt, 8)
+            let named = match readFileRange(path, offset, size) {
+                Ok(bytes) -> bytes
+                Error(failure) -> {
+                    absorb failure
+                    return .None
+                }
+            }
+            var loader: [UN8] = []
+            for byte in named {
+                if byte == UN8(0) { break }
+                loader.append(byte)
+            }
+            // A separate debug file keeps the program's headers but not the
+            // bytes they point at, so its PT_INTERP reads as nothing: it is
+            // information for a debugger, not a program the kernel loads.
+            if loader.count == 0 { return .None }
+            return textFromBytes(loader)
+        }
+    }
+    return .None
+}
+
+// The `width`-byte little-endian number at `at` of `bytes`.
+function littleEndian(bytes: borrow [UN8], at: Number, width: Number) -> Number {
+    var value: Number = 0
+    for index in 0..width {
+        value = value | (Number(bytes[at + index]) << (index * 8))
+    }
+    return value
+}

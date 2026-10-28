@@ -1,0 +1,262 @@
+import Foundation
+import KiraUI
+
+// Control Center's Now Playing module, from the iOS 27 kit: the artwork, the
+// track and artist, the transport, and how far the track has played.
+
+// The track Now Playing shows, how long it is, in seconds.
+let nowPlayingTitle: String = "Dazzling Stars"
+let nowPlayingArtist: String = "HOYO-MiX"
+let nowPlayingDuration: Number = 97.0
+
+// Where the track is, in seconds, at `date`: while it plays, the time since
+// `playedFrom`, the date it would have started at; while it is paused,
+// `pausedAt`. Until a person first plays or pauses it, `playedFrom` is zero
+// and the track plays round on the clock.
+function nowPlayingElapsed(
+    date: Number,
+    playing: Bool,
+    playedFrom: Number,
+    pausedAt: Number
+) -> Number {
+    if !playing { return pausedAt }
+    if playedFrom == 0 {
+        return date - trunc(date / nowPlayingDuration) * nowPlayingDuration
+    }
+    return min(max(date - playedFrom, 0.0), nowPlayingDuration)
+}
+
+construct NowPlayingCard(
+    playing: Binding<Bool>,
+    playedFrom: Binding<Number>,
+    pausedAt: Binding<Number>,
+    metrics: ControlCenterMetrics,
+    tile: Bool = false
+) extends Widget {
+    body {
+        self.module()
+    }
+
+    function module() -> Any Widget {
+        if tile { return self.square() }
+        return self.card(metrics.pt(130))
+    }
+
+    // A Mac's: a square two cells a side, the artwork over the track and the
+    // transport.
+    function square() -> Any Widget {
+        let side = metrics.span(2)
+        return TimelineView(
+            schedule = .Periodic(1.0),
+            content = { timeline in
+                let elapsed = nowPlayingElapsed(
+                    timeline.date,
+                    playing.get(),
+                    playedFrom.get(),
+                    pausedAt.get()
+                )
+                return VStack(spacing = .Length(0), alignment = .Leading) {
+                    NowPlayingArtwork(metrics = copy metrics, glyph = 32)
+                    .width(resolvedLength(side * 0.42))
+                    .height(resolvedLength(side * 0.42))
+                    Spacer(minLength = resolvedLength(0))
+                    VStack(spacing = .Length(0), alignment = .Leading) {
+                        Text(content = nowPlayingTitle)
+                        .font(size: resolvedLength(metrics.pt(15)), weight: .SemiBold)
+                        Text(content = nowPlayingArtist)
+                        .font(size: resolvedLength(metrics.pt(14)))
+                        .foregroundColor(.Secondary)
+                    }
+                    .lineLimit(1)
+                    .foregroundColor(.White)
+                    Spacer(minLength = resolvedLength(0))
+                    self.transport(timeline.date, elapsed, 18)
+                }
+                .padding(resolvedLength(metrics.pt(16)))
+            }
+        )
+        .width(resolvedLength(side))
+        .height(resolvedLength(side))
+        .controlGround(.RoundedRect(metrics.pt(metrics.moduleCorner)))
+    }
+
+    function card(art: Number) -> Any Widget {
+        return TimelineView(
+            schedule = .Periodic(1.0),
+            content = { timeline in
+                let elapsed = nowPlayingElapsed(
+                    timeline.date,
+                    playing.get(),
+                    playedFrom.get(),
+                    pausedAt.get()
+                )
+                return HStack(spacing = .Length(metrics.pt(13)), alignment = .Top) {
+                    NowPlayingArtwork(metrics = copy metrics)
+                    .width(resolvedLength(art))
+                    .height(resolvedLength(art))
+
+                    VStack(spacing = .Length(0), alignment = .Leading) {
+                        self.header()
+                        Spacer(minLength = resolvedLength(0))
+                        self.transport(timeline.date, elapsed, 30)
+                        Spacer(minLength = resolvedLength(0))
+                        self.progress(elapsed)
+                    }
+                    .height(resolvedLength(art))
+                }
+                .padding(resolvedLength(metrics.pt(14)))
+            }
+        )
+        .width(resolvedLength(metrics.span(4)))
+        .height(resolvedLength(metrics.pt(160)))
+        .controlGround(.RoundedRect(metrics.pt(metrics.moduleCorner)))
+    }
+
+    function header() -> Any Widget {
+        let output = metrics.pt(44)
+        return HStack(spacing = .Length(0), alignment = .Top) {
+            VStack(spacing = .Length(0), alignment = .Leading) {
+                Text(content = nowPlayingTitle)
+                .font(size: resolvedLength(metrics.pt(17)), weight: .SemiBold)
+                Text(content = nowPlayingArtist)
+                .font(size: resolvedLength(metrics.pt(17)))
+                .foregroundColor(.Secondary)
+            }
+            .lineLimit(1)
+            .edgePadding(EdgeSet.top, resolvedLength(metrics.pt(2)))
+
+            Spacer(minLength = resolvedLength(0))
+
+            Button(action = { in }) {
+                ZStack(alignment = .Center) {
+                    Icon(symbol = .Headphones)
+                    .font(size: resolvedLength(metrics.pt(22)), weight: .SemiBold)
+                }
+                .width(resolvedLength(output))
+                .height(resolvedLength(output))
+            }
+            .buttonStyle(.Plain)
+            .controlGround(.Circle)
+            .accessibilityLabel("Audio output")
+        }
+        .foregroundColor(.White)
+    }
+
+    // Back, play or pause, and ahead, their glyphs `glyph` points.
+    function transport(date: Number, elapsed: Number, glyph: Number) -> Any Widget {
+        let on = playing.get()
+        let toggled = copy playing
+        let from = copy playedFrom
+        let paused = copy pausedAt
+        let back = self.skip(date, elapsed, -10.0)
+        let ahead = self.skip(date, elapsed, 10.0)
+        return HStack(spacing = .Length(0), alignment = .Center) {
+            Button(action = back) {
+                Icon(symbol = .BackwardFill)
+            }
+            Spacer()
+            Button(
+                action = { in
+                    if on {
+                        paused.set(elapsed)
+                    } else {
+                        from.set(date - elapsed)
+                    }
+                    toggled.set(!on)
+                }
+            ) {
+                Icon(symbol = on ? .PauseFill : .PlayFill)
+            }
+            Spacer()
+            Button(action = ahead) {
+                Icon(symbol = .ForwardFill)
+            }
+        }
+        .font(size: resolvedLength(metrics.pt(glyph)))
+        .buttonStyle(.Plain)
+        .foregroundColor(.White)
+        .edgePadding(EdgeSet.horizontal, resolvedLength(metrics.pt(6)))
+    }
+
+    // Moves the track `seconds` on from `elapsed` at `date`, within it.
+    function skip(date: Number, elapsed: Number, seconds: Number) -> () -> Void {
+        let on = playing.get()
+        let from = copy playedFrom
+        let paused = copy pausedAt
+        return { in
+            let moved = min(max(elapsed + seconds, 0.0), nowPlayingDuration)
+            if on {
+                from.set(date - moved)
+            } else {
+                paused.set(moved)
+            }
+        }
+    }
+
+    function progress(elapsed: Number) -> Any Widget {
+        return VStack(spacing = .Length(metrics.pt(6)), alignment = .Leading) {
+            ProgressView(value = elapsed, total = nowPlayingDuration)
+            .progressViewStyle(CapsuleTrackProgressStyle(height = metrics.pt(6)))
+            HStack(spacing = .Length(0), alignment = .Center) {
+                Text(duration = Duration { seconds: elapsed }, format = .Time(.MinuteSecond))
+                Spacer()
+                Text(
+                    content = "-\(Duration { seconds: nowPlayingDuration - elapsed }.formatted(.Time(.MinuteSecond)))"
+                )
+            }
+            .font(size: resolvedLength(metrics.pt(12)), weight: .Medium)
+            .monospacedDigit()
+            .foregroundColor(.Secondary)
+        }
+    }
+}
+
+// The album's artwork: a gradient with a note on it, as the kit's stand-in
+// cover is.
+// `glyph` is the note's size; the sparkle keeps to it.
+construct NowPlayingArtwork(metrics: ControlCenterMetrics, glyph: Number = 64) extends Widget {
+    body {
+        LinearGradient(
+            start = RGBAColor { r: 0.36, g: 0.40, b: 0.82, a: 1.0 },
+            end = RGBAColor { r: 0.10, g: 0.10, b: 0.40, a: 1.0 },
+            direction = .Down
+        )
+        .overlay(
+            Icon(symbol = .MusicNote).font(size: resolvedLength(metrics.pt(glyph))).foregroundColor(
+                .White
+            ).opacity(0.85)
+        )
+        .overlay(
+            Icon(symbol = .Sparkles).font(
+                size: resolvedLength(metrics.pt(glyph * 0.34))
+            ).foregroundColor(.Yellow).padding(resolvedLength(metrics.pt(glyph * 0.44))),
+            .TopLeading
+        )
+        .clipShape(.Squircle(metrics.pt(12)))
+        .accessibilityHidden(true)
+    }
+}
+
+// A thin capsule track filled white as far as the track has played.
+construct CapsuleTrackProgressStyle(height: Number) extends ProgressViewStyle {
+    function makeBody(configuration: borrow ProgressViewStyleConfiguration) -> Any Widget {
+        let fraction = match configuration.fractionCompleted {
+            Some(completed) -> completed
+            None -> 0.0
+        }
+        return Capsule()
+        .fill(RGBAColor { r: 1.0, g: 1.0, b: 1.0, a: 0.3 })
+        .overlay(
+            GeometryReader { proxy in
+                return HStack(spacing = .Length(0), alignment = .Center) {
+                    Capsule()
+                    .fill(RGBAColor { r: 1.0, g: 1.0, b: 1.0, a: 1.0 })
+                    .width(resolvedLength(max(proxy.size.height, proxy.size.width * fraction)))
+                    Spacer(minLength = resolvedLength(0))
+                }
+            },
+            .Leading
+        )
+        .height(resolvedLength(height))
+    }
+}

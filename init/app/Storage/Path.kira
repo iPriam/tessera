@@ -1,0 +1,71 @@
+import Foundation
+import Heap
+import LibTessera
+
+// Finding a node by its path.
+//
+// PID 1 is a system process, so LibTessera gives it the root as its
+// SystemRoot handle; every path here is looked up beneath it.
+
+function rootNode() -> Result<Handle, TesseraError> {
+    return match startupHandle(StartupTag.systemRoot) {
+        Some(root) -> .Ok(root)
+        None -> .Error(initFailure(.NotFound))
+    }
+}
+
+// `path` without its leading slash, as a lookup beneath the root takes it.
+function beneathRoot(path: borrow String) -> String {
+    var start = 0
+    while start < path.count && path.charAt(start) == 47 { start += 1 } // '/'
+    return path.substring(start, path.count)
+}
+
+// The node at `path`, with `rights`. The root itself is a duplicate.
+function lookup(
+    calls: Handle,
+    path: borrow String,
+    rights: Rights
+) -> Result<Handle, TesseraError> {
+    let relative = beneathRoot(path)
+    let root = try rootNode()
+    if relative.count == 0 { return handleDuplicate(root, rights) }
+    return answeredHandle(calls, nodeLookup(root, relative, rights, calls, PortKey.call))
+}
+
+// Everything a directory PID 1 writes in needs. Transfer too, because a
+// file made in it can carry no right its directory lacks, and `fileRights`
+// asks for Transfer.
+function directoryRights() -> Rights {
+    return Rights.read | Rights.write | Rights.enumerate | Rights.create
+        | Rights.delete | Rights.traverse | Rights.inspect | Rights.duplicate | Rights.transfer
+}
+
+let fileRights: Rights = Rights.duplicate | Rights.transfer | Rights.read | Rights.write | Rights.inspect
+
+// The directory part of `path` and its last name: `/data/system` is `/data`
+// and `system`.
+function directoryOf(path: borrow String) -> String {
+    match path.lastIndexOf("/") {
+        Some(slash) -> {
+            if slash <= 0 { return "/" }
+            return path.substring(0, slash)
+        }
+        None -> return "/"
+    }
+}
+
+// The last name of `path`: the whole of it when it has no slash.
+function nameOf(path: borrow String) -> String {
+    match path.lastIndexOf("/") {
+        Some(slash) -> return path.substring(slash + 1, path.count)
+        None -> return copy path
+    }
+}
+
+// `count` bytes at `source` as text.
+function textOf(source: RawPtr, count: Number) -> String {
+    let block = zeroedBlock(count: count + 1, alignment: 16)
+    copyBytes(block.pointer(), source, count)
+    return stringFromCString(CString { address: block.pointer() })
+}

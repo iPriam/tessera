@@ -1,0 +1,126 @@
+Build virglrenderer's venus renderer on a Darwin host.
+
+Four things stand between this library and a Mac, and none of them is venus
+itself: its sources include no libdrm header and reach no DRM ioctl.
+
+- meson requires libdrm whenever venus is enabled, for the dma-buf paths a Linux
+  host imports memory through. A Darwin host has neither the library nor the
+  thing it wraps, and imports memory as a host pointer instead — see the
+  host-pointer patch beside this one.
+- `clock_nanosleep` is POSIX-optional and Darwin does not have it. The one call
+  is a backoff between polls of the command ring, where sleeping for about the
+  right interval is the whole requirement, so `nanosleep` says the same thing.
+- `MSG_CMSG_CLOEXEC` and the render server are Linux. The server is a second
+  process built out of `signalfd` and `SOCK_CLOEXEC`; its client half, the
+  proxy, compiles once the flag is defined and is still referenced by the
+  renderer's entry points — so the two are separated rather than dropped
+  together, and only the binary is skipped. Tessera runs venus in the
+  renderer's own process anyway, which is what the sibling patch does.
+- `os_create_anonymous_file` has a branch for memfd, one for SHM_ANON, one for
+  OpenBSD, and a fallback that wants XDG_RUNTIME_DIR. macOS has none of those,
+  so it gets the same arrangement written for its own facilities: a file in
+  TMPDIR, unlinked the moment it is open.
+
+Applied on top of virglrenderer-1.1.1-inproc-venus.
+
+--- a/meson.build	2025-04-02 14:24:35
++++ b/meson.build	2026-09-06 19:50:24
+@@ -107,7 +107,11 @@
+ 
+ with_drm_renderers = drm_renderers.length() > 0
+ 
+-libdrm_dep = dependency('libdrm', version : '>=2.4.50', required: with_drm_renderers or get_option('venus'))
++# venus needs libdrm on Linux for its dma-buf paths, and Darwin has neither —
++# there the memory it would import through a dma-buf comes in as a host pointer
++# instead, so nothing venus does here reaches libdrm.
++libdrm_required = with_drm_renderers or (get_option('venus') and host_machine.system() != 'darwin')
++libdrm_dep = dependency('libdrm', version : '>=2.4.50', required: libdrm_required)
+ libdrm_amdgpu_dep = dependency('libdrm_amdgpu', version : '>=2.4.121', required: with_drm_amdgpu)
+ conf_data.set('ENABLE_DRM', libdrm_dep.found())
+ 
+@@ -324,6 +328,13 @@
+ 
+ with_venus = get_option('venus')
+ with_render_server = with_venus
++# The render server *binary* is a second process venus talks to over a socket,
++# written against signalfd and SOCK_CLOEXEC — neither of which Darwin has. Its
++# client half, the proxy, still compiles and is still referenced by the
++# renderer's own entry points, so the two are separated here rather than
++# dropped together. Tessera runs venus in the renderer's own process anyway
++# (see patches/), so on Darwin the server is unused as well as unbuildable.
++with_render_server_binary = with_render_server and host_machine.system() != 'darwin'
+ with_render_server_worker = get_option('render-server-worker')
+ render_server_install_dir = get_option('prefix') / get_option('libexecdir')
+ if with_venus
+@@ -399,7 +410,7 @@
+    subdir('vtest')
+ endif
+ 
+-if with_render_server
++if with_render_server_binary
+ subdir('server')
+ endif
+ 
+--- a/src/venus/vkr_ring.c	2025-04-02 14:24:35
++++ b/src/venus/vkr_ring.c	2026-09-06 19:49:16
+@@ -202,7 +202,15 @@
+       .tv_sec = us / 1000000,
+       .tv_nsec = (us % 1000000) * 1000,
+    };
++#ifdef __APPLE__
++   /* Darwin has no clock_nanosleep. This sleep is a backoff between polls of
++    * the command ring, so what matters is that it sleeps for about the
++    * requested interval — nanosleep is relative to now, which is exactly what
++    * the flags-of-zero call above asks for. */
++   nanosleep(&ts, NULL);
++#else
+    clock_nanosleep(CLOCK_MONOTONIC, 0, &ts, NULL);
++#endif
+ }
+ 
+ static bool
+--- a/src/proxy/proxy_socket.c	2025-04-02 14:24:35
++++ b/src/proxy/proxy_socket.c	2026-09-06 19:49:16
+@@ -96,6 +96,13 @@
+    return (const int *)CMSG_DATA(cmsg);
+ }
+ 
++#ifndef MSG_CMSG_CLOEXEC
++/* Linux sets close-on-exec on received descriptors as part of the receive.
++ * Darwin has no such flag, so the descriptors arrive without it and the
++ * receiver sets it itself, below. */
++#define MSG_CMSG_CLOEXEC 0
++#endif
++
+ static bool
+ proxy_socket_recvmsg(struct proxy_socket *socket, struct msghdr *msg)
+ {
+--- a/src/mesa/util/anon_file.c	2025-04-02 14:24:35
++++ b/src/mesa/util/anon_file.c	2026-09-07 17:18:11
+@@ -129,6 +129,26 @@
+    fd = shm_mkstemp(template);
+    if (fd != -1)
+       shm_unlink(template);
++#elif defined(__APPLE__)
++   /* Darwin has neither memfd nor SHM_ANON, and the generic path below wants
++    * XDG_RUNTIME_DIR, which nothing on macOS sets. A file in the temporary
++    * directory, unlinked the moment it is open, is the same arrangement: it has
++    * a name for no longer than it takes to create, and what is left is a
++    * descriptor onto storage nothing else can reach by path.
++    */
++   {
++      const char *tmpdir = getenv("TMPDIR");
++      char *template_name;
++      if (asprintf(&template_name, "%s/mesa-shared-XXXXXX",
++                   tmpdir ? tmpdir : "/tmp") < 0)
++         return -1;
++      fd = mkstemp(template_name);
++      if (fd >= 0) {
++         unlink(template_name);
++         fcntl(fd, F_SETFD, FD_CLOEXEC);
++      }
++      free(template_name);
++   }
+ #else
+    const char *path;
+    char *name;

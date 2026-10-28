@@ -1,0 +1,70 @@
+import Foundation
+import LibTessera
+
+// What a session begins with: the output the client is on, and the first
+// configuration of its surface.
+public struct DisplayBeginning {
+    var output: DisplayOutput
+    var configured: DisplayConfiguration
+}
+
+// Says hello on `link`, takes the welcome and the output MosaicDisplay
+// announces, and the first configuration it gives the client's surface,
+// acknowledging it (roadmap/08-display-server.md, "Connection").
+public function beginDisplaySession(
+    link: borrow DisplayLink
+) -> Result<DisplayBeginning, TesseraError> {
+    if link.clientIndex == 0 { return .Error(protocolFailure(.InvalidArgument)) }
+    try sendDisplayMessage(link.channel, .Hello)
+    let welcome = try receiveDisplayMessage(link.channel)
+    let range = match welcome {
+        Welcome(value) -> value
+        Hello, Attach, Commit, Key, FrameDone, FrameRequest, FrameReady, FocusIn,
+            FocusOut, Configure, AckConfigure, SetMode, ModeChanged, InputCapability,
+            SurfaceCreated, SurfaceDestroyed, GrantFocus, InstallGrab, GrabFired, SetChannel,
+            ChannelChanged, PresentSystem, Verify, VerifyResult, InjectInput, Notify, Notification,
+            ActivateRequested, SetBar, PointerMotion, PointerButton, PointerAxis, PointerEnter, PointerLeave, SetDock, SurfacePressed, RequestWindow, WindowRequested, GrantMove, GrantResize, HoldInput, SetOverlay, PlaceSurface, SurfacePlaced, SetHidden, SetMargin, Insets, Output, SetIdle, IdleChanged, BarBackdrop, SetGlass, SetLaunchOrigin, SetStageBadge -> return .Error(
+                protocolFailure(.InvalidArgument)
+            )
+    }
+    // The client's surface is the one number MosaicDisplay hands it.
+    if range.base != link.clientIndex || range.count != 1 {
+        return .Error(protocolFailure(.InvalidArgument))
+    }
+    let announced = try receiveDisplayMessage(link.channel)
+    let output = match announced {
+        Output(value) -> value
+        Hello, Welcome, Attach, Commit, Key, FrameDone, FrameRequest, FrameReady, FocusIn,
+            FocusOut, Configure, AckConfigure, SetMode, ModeChanged, InputCapability,
+            SurfaceCreated, SurfaceDestroyed, GrantFocus, InstallGrab, GrabFired, SetChannel,
+            ChannelChanged, PresentSystem, Verify, VerifyResult, InjectInput, Notify, Notification,
+            ActivateRequested, SetBar, PointerMotion, PointerButton, PointerAxis, PointerEnter, PointerLeave, SetDock, SurfacePressed, RequestWindow, WindowRequested, GrantMove, GrantResize, HoldInput, SetOverlay, PlaceSurface, SurfacePlaced, SetHidden, SetMargin, Insets, SetIdle, IdleChanged, BarBackdrop, SetGlass, SetLaunchOrigin, SetStageBadge -> return .Error(
+                protocolFailure(.InvalidArgument)
+            )
+    }
+    if output.width == 0 || output.height == 0 || output.scale == 0 {
+        return .Error(protocolFailure(.InvalidArgument))
+    }
+    let first = try receiveDisplayMessage(link.channel)
+    let configured = match first {
+        Configure(value) -> value
+        Hello, Welcome, Attach, Commit, Key, FrameDone, FrameRequest, FrameReady, FocusIn,
+            FocusOut, AckConfigure, SetMode, ModeChanged, InputCapability, SurfaceCreated,
+            SurfaceDestroyed, GrantFocus, InstallGrab, GrabFired, SetChannel, ChannelChanged,
+            PresentSystem, Verify, VerifyResult, InjectInput, Notify, Notification,
+            ActivateRequested, SetBar, PointerMotion, PointerButton, PointerAxis, PointerEnter, PointerLeave, SetDock, SurfacePressed, RequestWindow, WindowRequested, GrantMove, GrantResize, HoldInput, SetOverlay, PlaceSurface, SurfacePlaced, SetHidden, SetMargin, Insets, Output, SetIdle, IdleChanged, BarBackdrop, SetGlass, SetLaunchOrigin, SetStageBadge -> return .Error(
+                protocolFailure(.InvalidArgument)
+            )
+    }
+    let surface = DisplaySurfaceId(link.clientIndex)
+    // The serial travels back in a 32-bit word.
+    if configured.surface != surface || configured.width == 0 || configured.height == 0
+        || configured.serial == 0 || configured.serial > Word.last {
+        return .Error(protocolFailure(.InvalidArgument))
+    }
+    try sendDisplayMessage(
+        link.channel,
+        .AckConfigure(DisplayFrame { surface: surface, serial: configured.serial })
+    )
+    return .Ok(DisplayBeginning { output: output, configured: configured })
+}

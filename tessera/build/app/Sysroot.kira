@@ -1,0 +1,255 @@
+import Foundation
+import Build
+
+// The sysroot every compile links against and the release takes its C
+// library from: Debian's own packages for the architecture, as a Debian
+// system installs them, pinned by SHA-256 in sysroot/<arch> and fetched from
+// snapshot.debian.org, which keeps every file it served.
+//
+// Each package is a download, its ar archive unpacked and its data member
+// unpacked, all actions of the graph, so the store keeps each under its
+// digest: a package is fetched and unpacked once, and a changed pin redoes
+// that package and the union alone. libc6-dbg is among them because Valgrind
+// will not start without the symbols of the loader the release carries, and
+// only Debian's native glibc ships them, matched by build ID.
+
+namespace SysrootLayout {
+    // The pins, from the project root, followed by the architecture's name.
+    let pins: String = "sysroot"
+    // Where the `sysroot` step links the staged tree, from the build root,
+    // for what reads it outside the graph: the guest GPU stack's build, the
+    // kernel's host tools and `knvm valgrind install`.
+    let staged: String = "sysroot"
+    // Where the data member of a Debian package is, in its ar archive.
+    let data: String = "data.tar.xz"
+}
+
+// The uapi headers of netfilter's target extensions, which linux-libc-dev
+// ships beside a match extension's of the same name in lower case: a macOS
+// volume, which folds case, holds only one of each pair. The lower-case match
+// headers are kept, and nothing Tessera builds includes either.
+function caseFoldedHeaders() -> [String] {
+    let netfilter = "usr/include/linux/netfilter"
+    return [
+        "\(netfilter)/xt_CONNMARK.h", "\(netfilter)/xt_DSCP.h", "\(netfilter)/xt_MARK.h",
+        "\(netfilter)/xt_RATEEST.h", "\(netfilter)/xt_TCPMSS.h",
+        "\(netfilter)_ipv4/ipt_ECN.h", "\(netfilter)_ipv4/ipt_TTL.h",
+        "\(netfilter)_ipv6/ip6t_HL.h"
+    ]
+}
+
+// The packages `sysroot/<arch>` pins, unpacked and joined.
+struct Sysroot {
+    // Every package's files, and the links a Debian base system adds that a
+    // link step follows.
+    let tree: Artifact
+    // `tree` with the Vulkan loader the applications link: what a compile
+    // reads.
+    let compiled: Artifact
+    // The guest GPU stack built against `tree` (GuestGraphics.kira).
+    let graphics: Artifact
+}
+
+// A package as the pins name it.
+struct SysrootPin {
+    let sha256: String
+    // Its path under the archive, `pool/...`.
+    let path: String
+}
+
+// The staged sysroot for `architecture`, or why the pins cannot be read.
+function debianSysroot(
+    graph: borrow mut Graph,
+    host: borrow Host,
+    architecture: Architecture
+) -> Result<Sysroot, String> {
+    let name = architecture.name()
+    var trees = [sysrootLinks(graph, architecture)]
+    match debianPackages(graph, name, "sysroot", caseFoldedHeaders()) {
+        Ok(packages) -> trees.appendAll(packages)
+        Error(problem) -> return .Error(problem)
+    }
+    let tree = graph.union("\(name)/sysroot/tree", trees)
+    let graphics = guestGraphics(graph, host, architecture, tree)
+    // The guest GPU stack's Vulkan loader where a link finds it, beside the C
+    // library: the one native library a Tessera program links.
+    let loader = librariesFrom(
+        graph,
+        "\(name)/sysroot/vulkan",
+        graphics,
+        "usr/lib/\(architecture.multiarch())",
+        ["libvulkan.so"]
+    )
+    let compiled = graph.union(
+        "\(name)/sysroot/compiled",
+        [copy tree, loader, webkitLinkLibraries(graph, architecture)]
+    )
+    return .Ok(Sysroot { tree: tree, compiled: compiled, graphics: graphics })
+}
+
+// The files of each package `sysroot/<pins>` pins, unpacked as a tree, but
+// for the paths `excluded` names. Each is a download, its ar archive
+// unpacked and its data member unpacked, labelled under `<pins>/`.
+function debianPackages(
+    graph: borrow mut Graph,
+    pins: borrow String,
+    label: borrow String,
+    excluded: borrow [String]
+) -> Result<[Artifact], String> {
+    let pinFile = "\(SysrootLayout.pins)/\(pins)"
+    let text = match readFile(joinedPath(graph.root, pinFile)) {
+        Ok(contents) -> contents.text
+        Error(failure) -> {
+            absorb failure
+            return .Error("no \(pinFile)")
+        }
+    }
+    var mirror = ""
+    var found: [SysrootPin] = []
+    for line in text.split("\n") {
+        let entry = line.trim()
+        if entry.count == 0 || entry.startsWith("#") { continue }
+        if mirror.count == 0 {
+            mirror = entry
+            continue
+        }
+        let fields = entry.split(" ")
+        if fields.count != 2 { return .Error("\(pinFile): not a SHA-256 and a path: \(entry)") }
+        found.append(SysrootPin { sha256: copy fields[0], path: copy fields[1] })
+    }
+    if found.count == 0 { return .Error("\(pinFile) pins no packages") }
+    let prefix = "\(pins)/\(label)"
+    var trees: [Artifact] = []
+    for pin in found {
+        let file = lastNameOf(pin.path)
+        let package = file.split("_")[0]
+        let deb = graph.download("\(prefix)/\(file)", "\(mirror)/\(pin.path)", pin.sha256)
+        trees.append(unpackedPackage(graph, "\(prefix)/\(package)/files", move deb, excluded))
+    }
+    return .Ok(trees)
+}
+
+// The files of the package `deb`, but for `excluded`, unpacked by the host's
+// tar, which reads the ar archive and the data member inside it alike: a
+// command, so only the package and the paths left out key it, never the
+// build's own code.
+function unpackedPackage(
+    graph: borrow mut Graph,
+    label: borrow String,
+    deb: Artifact,
+    excluded: borrow [String]
+) -> Artifact {
+    var arguments: [Argument] = [
+        .Text("-c"),
+        .Text(debianUnpackScript()),
+        .Input(deb),
+        .Text(SysrootLayout.data),
+        .Output("files")
+    ]
+    for path in excluded { arguments.append(.Text(copy path)) }
+    return graph.command(
+        CommandAction {
+            label: "unpack \(label)",
+            tool: "sh",
+            arguments: arguments,
+            outputs: [Output { name: "files", kind: .Tree }]
+        }
+    )[0]
+}
+
+// `sh -c` hands it the package, its data member's name, the output tree and
+// the paths to leave out, as $0, $1, $2 and the rest. The data member's paths
+// begin `./`.
+function debianUnpackScript() -> String {
+    let lines = [
+        "set -e",
+        "deb=$0 data=$1 files=$2",
+        "shift 2",
+        "set -- $(for path in \"$@\"; do printf -- '--exclude\\n./%s\\n' \"$path\"; done)",
+        "mkdir -p \"$files\"",
+        "tar -xOf \"$deb\" \"$data\" | tar -xf - -C \"$files\" \"$@\""
+    ]
+    return textLines(lines)
+}
+
+// What a Debian base system adds that the packages' own files lean on: `lib`
+// and `lib64` as links into `usr`, where glibc's linker scripts and the
+// loader path in an ELF header say `/lib`, and the linker names of the
+// libraries glibc absorbed. Since glibc 2.34 librt, libdl and libpthread are
+// stubs inside libc, which Debian ships without a `.so`; meson, looking for
+// `-lrt` by that name, reports the library missing.
+function sysrootLinks(graph: borrow mut Graph, architecture: Architecture) -> Artifact {
+    let multiarch = architecture.multiarch()
+    var parts: [TreePart] = [.Link(TreeLink { path: "lib", target: "usr/lib" })]
+    if architecture.libraryDirectory() != "lib" {
+        let directory = architecture.libraryDirectory()
+        parts.append(.Link(TreeLink { path: directory, target: "usr/\(directory)" }))
+    }
+    let stubs = [("librt.so", "librt.so.1"), ("libdl.so", "libdl.so.2"), (
+        "libpthread.so",
+        "libpthread.so.0"
+    )]
+    for (stub, library) in stubs {
+        parts.append(.Link(TreeLink { path: "usr/lib/\(multiarch)/\(stub)", target: library }))
+    }
+    return graph.tree("\(architecture.name())/sysroot/links", parts)
+}
+
+// The file at `path` in the sysroot, as a file of its own.
+function sysrootFile(
+    graph: borrow mut Graph,
+    context: borrow BuildContext,
+    path: borrow String
+) -> Artifact {
+    return graph.member(
+        "\(context.architecture.name())/sysroot/files/\(path)",
+        context.sysroot.tree,
+        path
+    )
+}
+
+// Where the `sysroot` step links the staged tree for `architecture`.
+function stagedSysroot(host: borrow Host, architecture: Architecture) -> String {
+    return "\(host.buildRoot)/\(SysrootLayout.staged)/\(architecture.multiarch())"
+}
+
+// Links `link` to the staged tree the `sysroot` step built, replacing a link
+// already there. A directory there is a sysroot staged some other way, which
+// is left for its owner to move.
+function linkSysroot(link: borrow String, run: borrow StepRun) -> Number {
+    match linkStatus(link) {
+        Ok(status) -> match status.kind {
+            Link -> match removePath(link) {
+                Ok -> {}
+                Error(failure) -> {
+                    log fault("the old sysroot link cannot be removed", traceText(failure))
+                    return 1
+                }
+            }
+            else -> {
+                log fault("a sysroot staged some other way is in the way; move it away", link)
+                return 1
+            }
+        }
+        Error(failure) -> {
+            absorb failure
+        }
+    }
+    let parent = parentOf(link)
+    if !isDirectory(parent) {
+        match makeDirectory(parent) {
+            Ok -> {}
+            Error(failure) -> {
+                log fault("the directory of the sysroot link cannot be made", traceText(failure))
+                return 1
+            }
+        }
+    }
+    return match makeSymbolicLink(run.paths[0], link) {
+        Ok -> 0
+        Error(failure) -> {
+            log fault("the sysroot cannot be linked", traceText(failure))
+            1
+        }
+    }
+}

@@ -1,0 +1,211 @@
+import Foundation
+import LibTessera
+
+// Connections (17 §8): an opened device, the Ref a family's calls take.
+//
+// `Device.open` asks the manager, which checks the family's entitlement,
+// opens the node and passes the descriptor back. The answer is in hand when
+// the call returns, so the `Open` completion is posted at once.
+
+// What every connection keeps besides its object.
+struct Connection {
+    var object: Number
+    // A uevent socket of its own, made the first time a wait asks for a
+    // kernel-reported event (Changed, Reset, Suspending, Resumed).
+    var uevents: Descriptor?
+    // The claiming driver's manifest may detach a kernel driver (Usb).
+    var detachAllowed: Bool
+}
+
+function connectionOf(object: Number) -> Number? {
+    for (index, connection) in deviceLibrary.connections.enumerated() {
+        if connection.object == object { return .Some(index) }
+    }
+    return .None
+}
+
+namespace OpenReply {
+    // The manager's reply flags: the claiming driver's manifest may detach
+    // a kernel driver.
+    let detachAllowed: U32 = U32(1)
+}
+
+public function deviceOpen(
+    entry: EntryId,
+    family: borrow Family,
+    options: OpenOptions,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    if family == .None { return .Error(failure(.InvalidArgument)) }
+    if !OpenOptions.all.has(options) { return .Error(failure(.InvalidArgument)) }
+    var request = managerRequest(.Open)
+    request.kind = code(family)
+    request.entry = entry.raw
+    request.options = U64(options.raw)
+    let outcome = match managerCall(request, .None) {
+        Ok(answer) -> openedConnection(answer, entry, family, options)
+        Error(failed) -> .Error(failed)
+    }
+    let reply = Reply { port: port, key: key }
+    return match outcome {
+        Ok(ref) -> reply.post(.Ok(Answer { result0: ref.raw, result1: U64(code(family)) }), .Open)
+        Error(failed) -> reply.post(.Error(failed), .Open)
+    }
+}
+
+// Whether a family is driven through sysfs files rather than a node the
+// manager opens.
+function drivenThroughSysfs(family: borrow Family) -> Bool {
+    return match family {
+        PowerSource -> true
+        Thermal -> true
+        Backlight -> true
+        None -> false
+        Gpu -> false
+        Display -> false
+        Input -> false
+        Audio -> false
+        Camera -> false
+        Sensor -> false
+        Haptic -> false
+        Block -> false
+        Hid -> false
+        Usb -> false
+        Rtc -> false
+    }
+}
+
+// A connection object around what the manager answered, set up the way its
+// family needs.
+function openedConnection(
+    answer: borrow ManagerReply,
+    entry: EntryId,
+    family: borrow Family,
+    options: OpenOptions
+) -> Result<Ref, TesseraError> {
+    if answer.passed.isNone() && !drivenThroughSysfs(family) { return .Error(failure(.Internal)) }
+    let path = try entryPath(entry)
+    let object = createObject(.Connection, family, answer.passed)
+    deviceLibrary.objects[object].entry = entry
+    deviceLibrary.objects[object].path = path
+    deviceLibrary.connections.append(
+        Connection {
+            object: object,
+            uevents: .None,
+            detachAllowed: (answer.flags & OpenReply.detachAllowed) != U32(0)
+        }
+    )
+    return match prepareConnection(object, family, options) {
+        Ok(rights) -> .Ok(mintRef(object, rights))
+        Error(failed) -> {
+            destroyObject(object)
+            return .Error(failed)
+        }
+    }
+}
+
+// The rights a new connection's Ref carries, once its family has set it up.
+function prepareConnection(
+    object: Number,
+    family: borrow Family,
+    options: OpenOptions
+) -> Result<RefRights, TesseraError> {
+    var rights = defaultRights(.Connection)
+    if options.has(OpenOptions.readOnly) { rights = rights & ~(RefRights.write | RefRights.manage) }
+    match family {
+        Display -> {
+            try displayPrepare(object)
+            if options.has(OpenOptions.master) { rights = rights | RefRights.master }
+        }
+        Input -> {
+            try inputPrepare(object)
+            if options.has(OpenOptions.grab) { rights = rights | try grabDevice(object) }
+        }
+        Haptic -> {
+            if options.has(OpenOptions.grab) { rights = rights | try grabDevice(object) }
+        }
+        Gpu -> try gpuPrepare(object)
+        // These families need nothing past the descriptor the manager opened.
+        None -> {}
+        Audio -> {}
+        Camera -> {}
+        Sensor -> {}
+        PowerSource -> {}
+        Thermal -> {}
+        Backlight -> {}
+        Block -> {}
+        Hid -> {}
+        Usb -> {}
+        Rtc -> {}
+    }
+    return .Ok(rights)
+}
+
+// `EVIOCGRAB`: this connection alone sees the device's events.
+function grabDevice(object: Number) -> Result<RefRights, TesseraError> {
+    let device = try deviceOf(object)
+    return match device.controlValue(Evdev.grab, 1) {
+        Ok(value) -> .Ok(RefRights.grab)
+        Error(failed) -> {
+            absorb failed
+            // Another process holds the grab.
+            return .Error(failure(.DeviceBusy))
+        }
+    }
+}
+
+// `power/control` on the entry's device: `auto`, or `on` for On. Suspended is
+// what the kernel's runtime power management does with `auto` once the
+// device is idle.
+public function deviceSetPowerState(
+    connection: Ref,
+    state: borrow PowerState
+) -> Result<Void, TesseraError> {
+    let object = try resolve(connection, .Connection, RefRights.manage)
+    let path = try sysfsPath(object) + "/device/power/control"
+    let setting = match state {
+        On -> "on"
+        Auto -> "auto"
+        Suspended -> "auto"
+    }
+    return writeText(path, setting)
+}
+
+public function deviceEntry(connection: Ref) -> Result<EntryId, TesseraError> {
+    let object = try resolve(connection, .Connection, RefRights.inspect)
+    return .Ok(deviceLibrary.objects[object].entry)
+}
+
+function connectionRelease(object: Number) {
+    match deviceLibrary.objects[object].family {
+        Display -> displayConnectionRelease(object)
+        Audio -> audioRelease(object)
+        Camera -> cameraRelease(object)
+        Sensor -> sensorRelease(object)
+        Usb -> usbConnectionRelease(object)
+        Input -> inputRelease(object)
+        Gpu -> gpuRelease(object)
+        Block -> blockRelease(object)
+        // These hold nothing past the object's own descriptor.
+        None -> {}
+        Haptic -> {}
+        PowerSource -> {}
+        Thermal -> {}
+        Backlight -> {}
+        Hid -> {}
+        Rtc -> {}
+    }
+    var kept: [Connection] = []
+    for connection in deviceLibrary.connections {
+        if connection.object != object {
+            kept.append(connection)
+            continue
+        }
+        match connection.uevents {
+            Some(socket) -> socket.close()
+            None -> {}
+        }
+    }
+    deviceLibrary.connections = kept
+}

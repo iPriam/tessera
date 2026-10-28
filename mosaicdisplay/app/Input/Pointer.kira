@@ -1,0 +1,433 @@
+import Foundation
+import Heap
+import LibTessera
+import DeviceKit
+import TesseraDisplayClient
+
+// The pointer, through DeviceKit (roadmap/06-devices-and-input.md, "The
+// pointer"; roadmap/08-display-server.md, "Input").
+//
+// The registry says which input devices move a pointer; the device manager
+// opens the first for this program, and its records arrive as HID usages:
+// motion on the generic desktop page, buttons on the button page. Motion is
+// summed into a position held on the output, the cursor is moved there, and
+// what happened between two input frames goes to the focused surface, in its
+// own pixels, and to no other.
+
+namespace Pointer {
+    // `InputDevice.inputKinds` bit 1: a pointer.
+    let inputKind: UNumber = UNumber(2)
+    let buttonPage: UN32 = UN32(9)
+    // A record's timestamp is in nanoseconds; the protocol's in milliseconds.
+    let nanosecondsPerMillisecond: Number = 1000000
+}
+
+// What the pointer did since the last input frame.
+struct PendingPointer {
+    var dx: Number = 0
+    var dy: Number = 0
+    var wheel: Number = 0
+    var pan: Number = 0
+    var buttons: [PendingKey] = []
+    var time: Number = 0
+    // Where a tablet put the pointer, in points (Tablet.kira).
+    var x: Number? = .None
+    var y: Number? = .None
+}
+
+// Whether the entry moves the pointer. A failure to say what it is is the
+// caller's.
+function movesPointer(entry: EntryId) -> Result<Bool, TesseraError> {
+    let kinds = try numberProperty(entry, "inputKinds")
+    return .Ok((kinds & Pointer.inputKind) == Pointer.inputKind)
+}
+
+// Asks the port for one completion when the pointer has records.
+function armPointer(
+    server: borrow Server,
+    pointer: borrow HeldInput
+) -> Result<Void, TesseraError> {
+    return refWaitAsync(
+        pointer.device,
+        DeviceEvents.readable,
+        .Once,
+        server.port,
+        UNumber(PortKey.pointer + pointer.serial)
+    )
+}
+
+// One record: motion and buttons are gathered, a frame delivers them, and a
+// dropped report discards them.
+function takePointerRecord(
+    server: borrow mut Server,
+    axes: borrow PointerAxes,
+    out: borrow ByteBlock,
+    at: Number
+) -> Result<Void, TesseraError> {
+    let record: InputEventRecord = heapLoad(out.pointer(), at)
+    let kind = match inputEventKindOf(record.kind) {
+        Some(value) -> value
+        None -> return .Ok
+    }
+    server.pointing.time = trunc(Number(record.timestamp) / Pointer.nanosecondsPerMillisecond)
+    let usage = UN32(record.usage)
+    let value = Number(record.value)
+    match kind {
+        Relative -> {
+            match fromCode<PointerAxis>(usage) {
+                X -> server.pointing.dx += value
+                Y -> server.pointing.dy += value
+                Wheel -> server.pointing.wheel += value
+                Pan -> server.pointing.pan += value
+                // Any other axis moves nothing the protocol carries.
+                else -> {}
+            }
+        }
+        Key -> {
+            if (usage >> Keyboard.usageShift) == Pointer.buttonPage {
+                server.pointing.buttons.append(
+                    PendingKey {
+                        code: UNumber(usage & Keyboard.usageMask),
+                        state: keyStateOf(UN32(record.value)),
+                    }
+                )
+            }
+        }
+        Frame -> return flushPointer(server)
+        Dropped -> {
+            log warn("a pointer sync was dropped; the pending motion is discarded")
+            server.pointing = PendingPointer {}
+            server.pointerResync = true
+        }
+        Absolute -> takeAbsolute(server, axes, Number(usage), value)
+        Switch -> {}
+    }
+    return .Ok
+}
+
+// Delivers what the pointer did since the last frame: the cursor moves, a
+// window being dragged follows it, and the client the pointer goes to hears
+// of the motion, the buttons and the scroll (Windows.kira).
+//
+// Buttons that wake a blanked output only wake it, and reach no client
+// (Idle.kira); the cursor still moves.
+function flushPointer(server: borrow mut Server) -> Result<Void, TesseraError> {
+    let woke = try wakeForInput(server)
+    var pending = server.pointing
+    server.pointing = PendingPointer {}
+    settleAbsolute(server, pending)
+    if woke { pending.buttons = [] }
+    let time = UNumber(max(pending.time, 0))
+    if pending.dx != 0 || pending.dy != 0 {
+        server.pointerX = clamp(
+            server.pointerX + pending.dx,
+            0,
+            server.display.scanout.pointWidth() - 1
+        )
+        server.pointerY = clamp(
+            server.pointerY + pending.dy,
+            0,
+            server.display.scanout.pointHeight() - 1
+        )
+        server.cursorShape = cursorShapeFor(server)
+        match moveCursor(
+            server.display,
+            server.port,
+            server.pointerX,
+            server.pointerY,
+            server.cursorShape
+        ) {
+            Ok -> {}
+            Error(failed) -> log warn("the cursor could not be moved", error: errorName(failed))
+        }
+        if !followHome(server, time) && !followMove(server) && !followResize(server) {
+            retarget(server)
+            tellPointer(server, .Motion(time))
+            if cursorComposed(server) { server.cursorOwed = true }
+        }
+    }
+    for button in pending.buttons { try changeButton(server, button, time) }
+    if pending.buttons.count > 0 { reshapeCursor(server) }
+    // A wheel turned away from the person scrolls up, and the protocol's
+    // positive scroll is down.
+    if pending.wheel != 0 {
+        tellPointer(
+            server,
+            .Scroll(PointerScroll { axis: .Vertical, value: -pending.wheel, time: time })
+        )
+    }
+    if pending.pan != 0 {
+        tellPointer(
+            server,
+            .Scroll(PointerScroll { axis: .Horizontal, value: pending.pan, time: time })
+        )
+    }
+    return .Ok
+}
+
+namespace HeldRecord {
+    let header: Number = 8
+    let bytes: Number = 4
+    let most: Number = 768
+}
+
+// After a dropped report the device is asked which buttons it holds: one
+// down here that it no longer holds came up in what was dropped, and is let
+// go, so a lost release leaves no press that holds every client off.
+function resyncButtons(server: borrow mut Server, pointer: Ref) -> Result<Void, TesseraError> {
+    server.pointerResync = false
+    let length = HeldRecord.header + HeldRecord.most * HeldRecord.bytes
+    let out = zeroedBlock(count: length, alignment: 16)
+    let count = min(
+        try inputState(pointer, Buffer { address: out.pointer(), length: length }),
+        HeldRecord.most
+    )
+    var held: [UNumber] = []
+    for index in 0..count {
+        let usage = UN32(heapLoad<U32>(out.pointer(), HeldRecord.header + index * HeldRecord.bytes))
+        if (usage >> Keyboard.usageShift) == Pointer.buttonPage {
+            held.append(UNumber(usage & Keyboard.usageMask))
+        }
+    }
+    let time = UNumber(max(server.pointing.time, 0))
+    let down = copy server.buttonsHeld
+    var released = false
+    for code in down {
+        if !held.contains(code) {
+            log info("a button came up in a dropped report", button: code)
+            try changeButton(server, PendingKey { code: code, state: .Released }, time)
+            released = true
+        }
+    }
+    if released { reshapeCursor(server) }
+    return .Ok
+}
+
+// A button went down or up. The first to go down picks the client every
+// pointer event goes to until the last comes up; one that lands on a surface
+// without focus picks none (`pressLands`).
+function changeButton(
+    server: borrow mut Server,
+    button: borrow PendingKey,
+    time: UNumber
+) -> Result<Void, TesseraError> {
+    log info("a pointer button", button: button.code, state: displayKeyStateName(button.state))
+    match button.state {
+        Pressed -> {
+            if server.buttonsHeld.contains(button.code) { return .Ok }
+            if server.buttonsDown == 0 {
+                server.pressedOn = !beginHomeFlight(server, time) && !beginResize(
+                    server
+                ) && pressLands(server)
+                ? pointerTarget(server) : .None
+            }
+            server.buttonsHeld.append(button.code)
+            server.buttonsDown = server.buttonsHeld.count
+            tellPressed(server, button, time)
+        }
+        Released -> {
+            if !server.buttonsHeld.contains(button.code) { return .Ok }
+            tellPressed(server, button, time)
+            var kept: [UNumber] = []
+            for code in server.buttonsHeld {
+                if code != button.code { kept.append(code) }
+            }
+            server.buttonsHeld = kept
+            server.buttonsDown = kept.count
+            if server.buttonsDown == 0 {
+                try endHomeFlight(server, time)
+                endMove(server)
+                endResize(server)
+                server.pressedOn = .None
+                retarget(server)
+            }
+        }
+        Repeated -> {}
+    }
+    return .Ok
+}
+
+// Tells the client a press went down on of a button, if it went down on one.
+function tellPressed(server: borrow mut Server, button: borrow PendingKey, time: UNumber) {
+    match server.pressedOn {
+        Some(index) -> tellClientPointer(
+            server,
+            index,
+            .Button(PointerButtonChange { button: copy button, time: time })
+        )
+        None -> {}
+    }
+}
+
+struct PointerButtonChange {
+    var button: PendingKey
+    var time: UNumber
+}
+
+struct PointerScroll {
+    var axis: DisplayPointerAxisKind
+    var value: Number
+    var time: UNumber
+}
+
+// What a client is told of the pointer.
+enum PointerNews {
+    Motion(UNumber)
+    Button(PointerButtonChange)
+    Scroll(PointerScroll)
+}
+
+// Tells the client the pointer goes to `news`; a press that went to no client
+// keeps the pointer from every client until it comes up.
+function tellPointer(server: borrow mut Server, news: borrow PointerNews) {
+    if server.buttonsDown > 0 && server.pressedOn.isNone() { return }
+    match pointerTarget(server) {
+        Some(index) -> tellClientPointer(server, index, news)
+        None -> {}
+    }
+}
+
+// Tells the client at `index` `news`, positions in its own buffer's pixels,
+// where its window starts at its margin.
+function tellClientPointer(server: borrow mut Server, index: Number, news: borrow PointerNews) {
+    let client = server.clients[index]
+    if !client.alive { return }
+    let message: DisplayMessage = match news {
+        Motion(time) -> .PointerMotion(
+            DisplayPointerMotion {
+                surface: client.surface,
+                x: server.pointerX - client.frame.x + client.margin,
+                y: server.pointerY - client.frame.y + client.margin,
+                time: time,
+            }
+        )
+        Button(change) -> .PointerButton(
+            DisplayPointerButton {
+                surface: client.surface,
+                button: change.button.code,
+                state: change.button.state,
+                time: change.time,
+                token: buttonToken(server, client.surface, change),
+            }
+        )
+        Scroll(scroll) -> .PointerAxis(
+            DisplayPointerAxis {
+                surface: client.surface,
+                axis: scroll.axis,
+                value: scroll.value,
+                time: scroll.time,
+            }
+        )
+    }
+    tell(client.channel, message)
+}
+
+// Opens the pointer, draws the cursor at the middle of the output, and tells
+// every client the machine has a pointer. A machine without one goes on
+// without: the keyboard drives everything.
+function showPointer(server: borrow mut Server) {
+    // The first pointer starts the cursor in the middle of the output; one
+    // plugged in later picks it up where the last left it.
+    if !server.cursorShown {
+        server.cursorShown = true
+        server.pointerX = trunc(server.display.scanout.pointWidth() / 2)
+        server.pointerY = trunc(server.display.scanout.pointHeight() / 2)
+        server.display.cursor = makeCursor(server.display)
+    }
+    match moveCursor(
+        server.display,
+        server.port,
+        server.pointerX,
+        server.pointerY,
+        server.cursorShape
+    ) {
+        Ok -> {}
+        Error(failed) -> log warn("the cursor could not be shown", error: errorName(failed))
+    }
+    broadcastInputCapability(server, [DisplayInputKind.Pointer], true)
+    retarget(server)
+}
+
+// Reads every record the pointer has ready. False once the pointer is gone.
+// An error other than none being ready is the pointer going: a device pulled
+// out stops answering before the registry says it went (Hotplug.kira), and
+// the caller lets it go.
+function readPointer(
+    server: borrow mut Server,
+    pointer: Ref,
+    axes: borrow PointerAxes
+) -> Result<Void, TesseraError> {
+    let length = InputRecord.batch * InputRecord.bytes
+    let out = zeroedBlock(count: length, alignment: 16)
+    while true {
+        let count = match inputRead(
+            pointer,
+            Buffer { address: out.pointer(), length: Number(length) }
+        ) {
+            Ok(value) -> value
+            Error(reason) -> if reason.code == .ShouldWait {
+                if server.pointerResync { try resyncButtons(server, pointer) }
+                return .Ok
+            } else {
+                return .Error(reason)
+            }
+        }
+        for index in 0..count {
+            try takePointerRecord(server, axes, out, index * InputRecord.bytes)
+        }
+    }
+    return .Ok
+}
+
+// The pointer has records. A pointer that stops answering is closed, and the
+// machine goes on without one. Input off the pointer is real hardware, as the
+// keyboard's is.
+function servePointer(server: borrow mut Server, serial: Number) {
+    let index = match servingIndex(server.pointers, serial) {
+        Some(value) -> value
+        // A pointer already let go.
+        None -> return
+    }
+    let pointer = server.pointers[index]
+    let reading = readPointer(server, pointer.device, pointer.axes)
+    if server.cursorOwed {
+        server.cursorOwed = false
+        redraw(server, "the cursor")
+    }
+    match reading {
+        Ok -> {}
+        Error(reason) -> pointerStopped(server, index, reason)
+    }
+    match armPointer(server, pointer) {
+        Ok -> {
+            server.lastInputHardware = true
+            return
+        }
+        Error(failed) -> log warn("the pointer cannot be listened to", error: errorName(failed))
+    }
+    losePointer(server, index)
+}
+
+function pointerStopped(server: borrow mut Server, index: Number, reason: borrow TesseraError) {
+    log info("the pointer stopped answering", error: errorName(reason))
+    losePointer(server, index)
+}
+
+// A button changed: the cursor takes the shape it now has where it is, as a
+// resize ending over no edge gives the arrow back.
+function reshapeCursor(server: borrow mut Server) {
+    let shape = cursorShapeFor(server)
+    if shape == server.cursorShape { return }
+    server.cursorShape = shape
+    match moveCursor(
+        server.display,
+        server.port,
+        server.pointerX,
+        server.pointerY,
+        server.cursorShape
+    ) {
+        Ok -> {}
+        Error(failed) -> log warn("the cursor could not be reshaped", error: errorName(failed))
+    }
+    if cursorComposed(server) { redraw(server, "the cursor") }
+}

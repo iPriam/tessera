@@ -1,0 +1,204 @@
+//! The `date` command: prints the time, or sets the clock, after macOS's date.
+import Foundation
+import ArgumentParser
+import LibTessera
+
+// date: the time, and setting the clock, after macOS's date.
+//
+//     date                            Tue Jan  1 01:00:00 CET 2030
+//     date -u                         Tue Jan  1 00:00:00 UTC 2030
+//     date mmddHHMM[[cc]yy][.ss]      sets the clock, then prints it
+//
+// Tessera keeps the clock in UTC; `date` reads and sets it in the time zone
+// chosen in Settings, and in UTC with `-u`. A year of two digits is 19yy from 69 and
+// 20yy below, as macOS reads it, and no year keeps this one. It exits 0,
+// or 1 when the time was not understood or could not be set.
+
+/// The exit status of `date`: 0 when it printed or set the time, 1 when it failed.
+@Derive(Copy)
+enum DateExit: UN8 {
+    Done = 0
+    Failed = 1
+}
+
+/// The calendar's fixed names and years: the weekday and month names, and the epoch and pivot years.
+namespace Calendar {
+    // A two-digit year from this one is 19yy, below it 20yy, as macOS reads it.
+    let pivotYear: Number = 69
+    let epochYear: Number = 1970
+    let weekdays: [String] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+    let months: [String] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+}
+
+/// The current time as whole seconds since 1970, or the error that stopped the clock being read.
+function now() -> Result<Number, TesseraError> {
+    match timeRead(.Realtime) {
+        Ok(nanoseconds) -> return .Ok(trunc(nanoseconds / CivilTime.nanosecondsPerSecond))
+        Error(failed) -> return .Error(failed)
+    }
+}
+
+/// The time `utc` seconds since 1970 names, in `zone`, as `date` prints it.
+function formatted(utc: Number, zone: borrow TimeZone) -> String {
+    let seconds = utc + zone.offsetAt(utc)
+    let days = trunc(seconds / CivilTime.secondsPerDay)
+    let rest = seconds % CivilTime.secondsPerDay
+    let civil = civilDate(days)
+    let weekday = Calendar.weekdays[weekdayOf(days)]
+    let month = Calendar.months[civil.month - 1]
+    let day = civil.day < 10 ? " \(civil.day)" : "\(civil.day)"
+    return "\(weekday) \(month) \(day) \(zeroPadded(trunc(rest / CivilTime.secondsPerHour), 2)):\(zeroPadded(trunc(rest % CivilTime.secondsPerHour / CivilTime.secondsPerMinute), 2)):\(zeroPadded(rest % CivilTime.secondsPerMinute, 2)) \(zone.abbreviationAt(utc)) \(civil.year)"
+}
+
+/// The two-digit numbers `text` holds, as a list, or none when it holds anything else or an odd count of digits.
+function pairs(text: borrow String) -> [Number]? {
+    if text.count % 2 != 0 { return .None }
+    var values: [Number] = []
+    for index in 0..text.count / 2 {
+        let high = storedByte(text, index * 2)
+        let low = storedByte(text, index * 2 + 1)
+        if !isAsciiDigit(high) || !isAsciiDigit(low) { return .None }
+        values.append(Number(high - Ascii.zero) * 10 + Number(low - Ascii.zero))
+    }
+    return .Some(values)
+}
+
+/// A time as `mmddHHMM[[cc]yy][.ss]` names it, before the fields are checked.
+struct NamedTime {
+    let year: Number
+    let month: Number
+    let day: Number
+    let hour: Number
+    let minute: Number
+    let second: Number
+
+    /// Seconds since 1970 for the named time, when every field is in its range and the day exists in its month.
+    function seconds(borrow self) -> Number? {
+        if self.month < 1 || self.month > 12 || self.day < 1 || self.day > 31 { return .None }
+        if self.hour > 23 || self.minute > 59 || self.second > 59 || self.year < Calendar.epochYear {
+            return .None
+        }
+        let date = CivilDate { year: self.year, month: self.month, day: self.day }
+        let days = date.days()
+        // A day past the month's end, such as 0231, rolls into the next
+        // month, which this refuses.
+        if civilDate(days).day != self.day { return .None }
+        return .Some(
+            days * CivilTime.secondsPerDay + self.hour * CivilTime.secondsPerHour + self.minute * CivilTime.secondsPerMinute + self.second
+        )
+    }
+}
+
+/// The time `text` names as seconds since 1970, or none when it is not a time; a time without a year is in `year`.
+function parsedTime(text: borrow String, year: Number) -> Number? {
+    var digits = text
+    var second = 0
+    match text.indexOf(".") {
+        Some(dot) -> {
+            if text.count - dot != 3 { return .None }
+            digits = text.substring(0, dot)
+            match pairs(text.substring(dot + 1, text.count)) {
+                Some(values) -> second = values[0]
+                None -> return .None
+            }
+        }
+        // Without seconds, the time is on the minute.
+        None -> {}
+    }
+    let values = try pairs(digits) otherwise return .None
+    var fullYear = year
+    match values.count {
+        // No year keeps this one.
+        4 -> {}
+        5 -> fullYear = values[4] >= Calendar.pivotYear ? 1900 + values[4] : 2000 + values[4]
+        6 -> fullYear = values[4] * 100 + values[5]
+        else -> return .None
+    }
+    let named = NamedTime {
+        year: fullYear,
+        month: values[0],
+        day: values[1],
+        hour: values[2],
+        minute: values[3],
+        second: second
+    }
+    return named.seconds()
+}
+
+/// The command `date` takes: the `-u` flag for UTC and the optional time to set.
+function dateCommand() -> CommandRouter {
+    let configuration = CommandConfiguration {
+        name: "date",
+        abstract: "Prints the time, or sets the clock"
+    }
+    return CommandRouter {
+        root: Command {
+            configuration: configuration,
+            arguments: [flag(
+                name: "utc",
+                help: "The time in UTC rather than the time zone chosen in Settings"
+            ).short("u"), argument(
+                name: "time",
+                help: "The time to set: mmddHHMM[[cc]yy][.ss]"
+            ).optional(),]
+        }
+    }
+}
+
+/// Runs `date`: prints the time, or sets the clock to the time given, and returns the exit status.
+function date() -> DateExit {
+    let router = dateCommand()
+    let tokens = commandLineArguments()
+    let parsed = match router.parse(tokens) {
+        Ok(value) -> value
+        Error(error) -> {
+            router.explain(error, tokens)
+            return error.isCleanExit() ? DateExit.Done : DateExit.Failed
+        }
+    }
+    let zone = parsed.flag("utc") ? utcTimeZone() : currentTimeZone()
+    let current = match now() {
+        Ok(seconds) -> seconds
+        Error(failed) -> {
+            log warn("cannot read the clock", failed)
+            printError("date: the clock cannot be read: \(errorName(failed))")
+            return DateExit.Failed
+        }
+    }
+    let time = match parsed.text("time") {
+        Some(text) -> text
+        None -> {
+            print(formatted(current, zone))
+            return DateExit.Done
+        }
+    }
+    let today = current + zone.offsetAt(current)
+    let wanted = match parsedTime(time, civilDate(trunc(today / CivilTime.secondsPerDay)).year) {
+        // The time named is the zone's: the clock is set to the UTC it is.
+        Some(seconds) -> seconds - zone.offsetAt(seconds - zone.offsetAt(seconds))
+        None -> {
+            printError("date: illegal time format")
+            printError(router.help())
+            return DateExit.Failed
+        }
+    }
+    // Setting the clock takes `tessera.time.set` (roadmap/16-libtessera.md
+    // §8.1), which a system tool holds and no application does.
+    match timeSetRealtime(wanted * CivilTime.nanosecondsPerSecond) {
+        Ok -> {}
+        Error(failed) -> {
+            log warn("the clock was not set", failed)
+            let reason = failed.code == .NotEntitled ? "Operation not permitted" : errorName(failed)
+            printError("date: settimeofday (timeval): \(reason)")
+            return DateExit.Failed
+        }
+    }
+    print(formatted(wanted, zone))
+    return DateExit.Done
+}
+
+/// Runs `date` and returns its exit status to the shell.
+@Main
+function main() -> UN8 {
+    return code(date())
+}

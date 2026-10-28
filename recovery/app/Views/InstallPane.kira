@@ -1,0 +1,243 @@
+import Foundation
+import KiraUI
+
+// Install Tessera, as a Mac's installer walks it: what is installed, the
+// licence, the disk to install on, the copy, and the restart.
+
+namespace InstallStep {
+    let welcome: Number = 0
+    let licence: Number = 1
+    let disk: Number = 2
+    let copying: Number = 3
+    let done: Number = 4
+    let failed: Number = 5
+}
+
+let installLicence: [String] = [
+    "TESSERA SOFTWARE LICENCE",
+    "",
+    "Tessera is installed on the disk you choose. Everything on that disk is",
+    "erased first: its partitions are removed and a new GUID partition map is",
+    "written, holding one Tessera volume.",
+    "",
+    "Every file of the system is sealed with fs-verity as it is written, and",
+    "the system refuses to start from a volume whose seal does not hold.",
+    "",
+    "The installed system has no recovery mode of its own. To repair it, start",
+    "from this installer again.",
+]
+
+// The bottom row of every step: Back, when there is a step to go back to,
+// and the step's own button.
+function installButtons(
+    back: Bool,
+    title: String,
+    enabled: Bool,
+    goBack: () -> Void,
+    goOn: () -> Void
+) -> Any Widget {
+    return HStack(spacing = .Small, alignment = .Center) {
+        Spacer()
+        if back {
+            Button(action = goBack) {
+                Text("Back")
+            }
+        }
+        Button(action = goOn) {
+            Text(copy title)
+        }
+        .buttonStyle(.BorderedProminent)
+        .disabled(!enabled)
+    }
+}
+
+// The step's picture and title, centred over its content.
+function installHeader(title: String, detail: String) -> Any Widget {
+    return VStack(spacing = .Small, alignment = .Center) {
+        TesseraIcon(size = 64.0)
+        Text(copy title)
+        .font(size = resolvedLength(22.0), weight = .Bold)
+        Text(copy detail)
+        .font(size = resolvedLength(13.0))
+        .foregroundColor(.Secondary)
+    }
+    .fillWidth()
+}
+
+construct DiskTile(disk: RecoveryDisk, selected: Bool, choose: () -> Void) extends Widget {
+    body {
+        VStack(spacing = .ExtraSmall, alignment = .Center) {
+            DriveIcon(size = 56.0, external = disk.external)
+            Text(diskTitle(disk))
+            .font(size = resolvedLength(13.0), weight = .SemiBold)
+            Text(byteText(disk.bytes))
+            .font(size = resolvedLength(11.0))
+            .foregroundColor(.Secondary)
+        }
+        .frame(width = 150.0, height = 130.0)
+        .background(fill = BackgroundFill(style = selected ? .Selection : .Clear, radius = .Large))
+        .onClick(choose)
+    }
+}
+
+// A disk as the installer names it: what the disk calls itself and its node.
+public function diskTitle(disk: borrow RecoveryDisk) -> String {
+    return disk.external ? "External Disk (" + disk.name + ")" : "Internal Disk (" + disk.name + ")"
+}
+
+public construct InstallPane(
+    model: RecoveryModel,
+    install: RecoveryInstall = RecoveryInstall {},
+    actions: RecoveryActions = idleRecoveryActions()
+) extends Widget {
+    @State var step: Number = 0
+    @State var target: Number = 0
+    @State var targetSelected: Bool = false
+
+    body {
+        let goBack: () -> Void = { in
+            step = step - 1
+            return
+        }
+        let goOn: () -> Void = { in
+            step = step + 1
+            return
+        }
+        let chosen = chosenDiskName(model, targetSelected, target)
+        let start: () -> Void = { in
+            match chosen {
+                Some(name) -> {
+                    actions.install(move name)
+                    step = InstallStep.copying
+                }
+                None -> {}
+            }
+            return
+        }
+        let retry: () -> Void = { in
+            step = InstallStep.disk
+            return
+        }
+        let restart = copy actions.restart
+        // The copy ends when the service says it did, in either way.
+        var shown = step
+        if step == InstallStep.copying && install.phase == InstallPhase.installed {
+            shown = InstallStep.done
+        }
+        if step == InstallStep.copying && install.phase == InstallPhase.failed {
+            shown = InstallStep.failed
+        }
+        let progress = install.total > 0 ? install.done / install.total : 0.0
+        VStack(spacing = .Large) {
+            if shown == InstallStep.welcome {
+                Spacer()
+                installHeader(
+                    "Tessera " + model.version,
+                    "The system, its applications and its drivers are installed on a disk you choose."
+                )
+                Spacer()
+                installButtons(false, "Continue", true, copy goBack, copy goOn)
+            }
+            if shown == InstallStep.licence {
+                Text("Software Licence Agreement")
+                .font(size = resolvedLength(17.0), weight = .Bold)
+                ScrollView {
+                    VStack(spacing = .None, alignment = .Leading, children = licenceLines())
+                    .edgePadding(EdgeSet.all, resolvedLength(14.0))
+                }
+                .fillWidth()
+                .fillHeight()
+                .background(fill = BackgroundFill(style = .Surface, radius = .Medium))
+                installButtons(true, "Agree", true, copy goBack, copy goOn)
+            }
+            if shown == InstallStep.disk {
+                installHeader(
+                    "Select the disk to install Tessera on",
+                    "Everything on the disk you choose will be erased."
+                )
+                diskTiles(model.disks, targetSelected, target, $target, $targetSelected)
+                Spacer()
+                installButtons(true, "Install", targetSelected && target < model.disks.count, copy goBack, copy start)
+            }
+            if shown == InstallStep.copying {
+                Spacer()
+                installHeader("Installing Tessera", "on " + chosenDiskTitle(model, targetSelected, target))
+                ProgressView(value = progress)
+                .frame(width = 380.0, height = 8.0)
+                Text(copyingText(install))
+                .font(size = resolvedLength(12.0))
+                .foregroundColor(.Secondary)
+                Spacer()
+            }
+            if shown == InstallStep.done {
+                Spacer()
+                installHeader(
+                    "Tessera is installed",
+                    "Restart to start from " + chosenDiskTitle(model, targetSelected, target) + "."
+                )
+                Spacer()
+                installButtons(false, "Restart", true, copy goBack, copy restart)
+            }
+            if shown == InstallStep.failed {
+                Spacer()
+                installHeader("Tessera could not be installed", copy install.problem)
+                Spacer()
+                installButtons(false, "Back", true, copy goBack, copy retry)
+            }
+        }
+        .fillWidth()
+        .fillHeight()
+        .scenePadding()
+    }
+}
+
+function licenceLines() -> [Any Widget] {
+    var lines: [Any Widget] = []
+    for line in installLicence {
+        lines.append(Text(copy line).font(size = resolvedLength(12.0)))
+    }
+    return lines
+}
+
+// What the copy is doing, as the installer's status line says it.
+function copyingText(install: borrow RecoveryInstall) -> String {
+    if install.total == 0 { return "Preparing the disk" }
+    return "Writing the system volume: " + String(install.done) + " of " + String(
+        install.total
+    ) + " files"
+}
+
+function chosenDiskName(model: borrow RecoveryModel, selected: Bool, target: Number) -> String? {
+    if !selected || target >= model.disks.count { return .None }
+    return .Some(copy model.disks[target].name)
+}
+
+function chosenDiskTitle(model: borrow RecoveryModel, selected: Bool, target: Number) -> String {
+    if !selected || target >= model.disks.count { return "a disk" }
+    return diskTitle(model.disks[target])
+}
+
+function diskTiles(
+    disks: borrow [RecoveryDisk],
+    hasChoice: Bool,
+    target: Number,
+    choice: Binding<Number>,
+    selected: Binding<Bool>
+) -> Any Widget {
+    var tiles: [Any Widget] = []
+    for index in 0..disks.count {
+        let at = index
+        tiles.append(
+            DiskTile(
+                disk = copy disks[index],
+                selected = hasChoice && target == index,
+                choose = { in
+                    choice.set(at)
+                    selected.set(true)
+                    return
+                }
+            )
+        )
+    }
+    return HStack(spacing = .Large, alignment = .Center, children = tiles)
+}

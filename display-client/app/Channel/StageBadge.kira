@@ -1,0 +1,49 @@
+import Foundation
+
+// The platform paints each window's badge into a tile outside its visible
+// surface. The compositor attaches that tile to the window's presentation.
+// The icon is painted as large as a home screen's, `icon` points across: a
+// window going home becomes that picture of its icon, and lands as the home
+// screen's icon at the same size, so the picture is never enlarged on the way;
+// Stage Manager's badge is the same picture made smaller. A `tile` is the icon
+// and `padding` round it, and the atlas is `slots` tiles, `height` points, tall.
+public namespace StageBadgeAtlas {
+    let icon: Number = 68
+    let tile: Number = 100
+    let padding: Number = 16
+    let slots: Number = 16
+    let height: Number = 1600
+}
+
+// Where the window's application has its icon on the platform's surface,
+// in points, and the icon's corner: on a touch screen a window going home
+// flies into it and one coming back grows out of it. Empty where the
+// application shows no icon.
+@Derive(Copy)
+public struct DisplayStageBadge {
+    let surface: DisplaySurfaceId
+    let slot: UNumber
+    let home: StageFrame = StageFrame { x: 0, y: 0, width: 0, height: 0 }
+    let homeCorner: Number = 0
+    // Whether `home` is the application's icon on the home screen's page,
+    // which the home screen leaves out while the window flies by it, rather
+    // than the Dock's.
+    let homeScreen: Bool = false
+}
+
+// Where on its surface the home screen has the icon it is opening an
+// application from, in points, and the icon's corner: the application's first
+// picture grows out of it, and the icon is left out of the home screen until
+// the picture has grown.
+@Derive(Copy)
+public struct DisplayLaunchOrigin {
+    let surface: DisplaySurfaceId
+    let icon: StageFrame
+    let corner: Number = 0
+}
+
+// The badge's frame crosses the channel in sixteenths of a point, so a Dock
+// laid out on half points lands where it is drawn.
+namespace BadgeWire {
+    let fraction: Number = 16
+}

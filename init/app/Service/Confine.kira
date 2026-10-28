@@ -1,0 +1,71 @@
+import Foundation
+import LibTessera
+
+// Applications run confined (roadmap/12-apps.md, "The sandbox"): each in a
+// mount namespace that holds the platform's runtime, read-only, its own
+// bundle, read-only, and its data folder, `/data/appdata/<Name>`, which it
+// writes. Another application, another's data and the system's own state
+// are not in it to be named.
+//
+// The system's own tools that manage the machine are the exception: Inlay
+// installs and moves applications, Settings changes the machine's settings
+// and Disk Utility works on every disk. They are the system's, on the
+// sealed volume, and their work is what the sandbox keeps from the rest.
+
+function confinedByDefault(service: borrow Service) -> Bool {
+    match service.displayRole {
+        Application -> {}
+        None, Platform, Desktop, Presence -> return false
+    }
+    let tools = "/" + SystemDirectory.systemApplications
+    for exempt in ["Inlay", "Settings", "Disk Utility"] {
+        if service.path == "\(tools)/\(exempt).app/Contents/MacOS/\(exempt)" { return false }
+    }
+    return true
+}
+
+// The bundle an executable is in: its path up to the `.app` it is inside,
+// or the directory it is in when it is in none.
+function bundleOf(path: borrow String) -> String {
+    var walked = ""
+    for part in path.split("/") {
+        if part.count == 0 { continue }
+        walked = walked + "/" + part
+        if part.endsWith(".app") { return walked }
+    }
+    return directoryOf(path)
+}
+
+// The entries a confined launch of `service` adds: its bundle and its data
+// folder, which is made when missing. A machine without a data volume gives
+// no data folder.
+function confinedEntries(
+    calls: Handle,
+    service: borrow Service
+) -> Result<[StartupEntry], TesseraError> {
+    var entries: [StartupEntry] = []
+    let bundle = bundleOf(service.path)
+    let read = Rights.read | Rights.enumerate | Rights.traverse | Rights.inspect | Rights.transfer
+    let bundleNode = try lookup(calls, bundle, read | Rights.duplicate)
+    entries.append(StartupEntry { tag: StartupTag.bundle, rights: .None, handle: bundleNode })
+    let bundleName = nameOf(bundle)
+    let name = bundleName.endsWith(".app") ? bundleName.substring(
+        0,
+        bundleName.count - 4
+    ) : copy bundleName
+    ensureApplicationData(calls, name)
+    let data = "/" + SystemDirectory.applicationData + "/" + name
+    let hasData = try pathPresent(calls, data)
+    if hasData {
+        match lookup(calls, data, directoryRights()) {
+            Ok(node) -> entries.append(
+                StartupEntry { tag: StartupTag.containerData, rights: .None, handle: node }
+            )
+            Error(failed) -> {
+                for entry in entries { release(entry.handle) }
+                return .Error(failed)
+            }
+        }
+    }
+    return .Ok(entries)
+}

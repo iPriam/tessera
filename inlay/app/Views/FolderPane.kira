@@ -1,0 +1,307 @@
+import Foundation
+import LibTessera
+import KiraUI
+import FileOperations
+
+// A folder in Inlay (roadmap/19-files-and-documents.md, "Manage files in
+// Inlay"): its entries by name, one chosen at a time. A folder opens with
+// its row's arrow. The bar has the enclosing folder, New Folder and Paste;
+// the chosen entry has Rename, Duplicate, Copy, Cut, and Move to Trash on the
+// data volume or Delete Immediately on any other. A folder on a volume that
+// cannot be written offers none of the changes, and says why.
+
+namespace FolderLook {
+    let icon: Number = 22
+}
+
+construct FolderPane(path: String, writable: Bool) extends Widget {
+    @State var chosen: String = ""
+    @State var renaming: Bool = false
+    @State var newName: String = ""
+    @State var deleting: Bool = false
+    @State var problem: String = ""
+
+    body {
+        advanceTransfer()
+        let entries = match entriesIn(path) {
+            Ok(found) -> found
+            Error(failure) -> {
+                log warn("a folder could not be read", path: copy path, failure)
+                []
+            }
+        }
+        var rows: [Any Widget] = []
+        for entry in entries { rows.append(self.row(entry)) }
+        if rows.count == 0 { rows.append(Text("This folder is empty").foregroundColor(.Secondary)) }
+        let sections: [Any Widget] = [
+            Section(children: rows, header: Text(lastPathPart(path)), footer: Text(self.footer())),
+            previewSection(chosen),
+            transferSection()
+        ]
+        let (transfer, collides) = transferShown()
+        let asking = collides.isSome() && transfer.isSome()
+        Form(children: sections)
+        .navigationTitle(lastPathPart(path))
+        .toolbar {
+            ToolbarItem(placement = .PrimaryAction) {
+                HStack(spacing = .Small, alignment = .Center) {
+                    self.folderButtons()
+                    self.entryButtons()
+                }
+            }
+        }
+        .alert(
+            title = "Delete “\(lastPathPart(chosen))” immediately?",
+            isPresented = deleting,
+            message = "This item will be deleted immediately. You can’t undo this action.",
+            actions = self.deleteActions()
+        )
+        .alert(
+            title = "An item named “\(collisionName(collides))” already exists here.",
+            isPresented = asking,
+            message = "Replacing a folder replaces everything in it.",
+            actions = collisionActions()
+        )
+        .alert(
+            title = problem,
+            isPresented = problem.count > 0,
+            message = "",
+            actions = [Button(action = { in problem = "" }) { Text("OK") }]
+        )
+    }
+
+    // What the footer says: why nothing can be changed here, or how many
+    // entries there are.
+    function footer() -> String {
+        if !writable { return "This volume can’t be written to, so its items can only be read." }
+        return "Choose an item to rename, duplicate, copy, cut or delete it."
+    }
+
+    // One entry: its icon and name, chosen when pressed; a folder has an
+    // arrow that opens it. The chosen entry being renamed is a field.
+    function row(entry: borrow Entry) -> Any Widget {
+        let picked = copy entry.path
+        let symbol: Symbol = match entry.kind {
+            Folder -> .FolderFill
+            File -> .DocText
+            Other -> .Doc
+        }
+        let isChosen = chosen == entry.path
+        if isChosen && renaming {
+            let renamed = copy entry.path
+            return TextField(title = "Name", text = $newName)
+            .onSubmit({ in self.rename(renamed) })
+        }
+        let label = Button(action = { in chosen = copy picked }) {
+            HStack(spacing = .Medium, alignment = .Center) {
+                Icon(symbol = symbol).font(size: resolvedLength(FolderLook.icon))
+                Text(copy entry.name).fontWeight(isChosen ? .SemiBold : .Regular)
+                Spacer()
+                Text(sizeText(entry)).foregroundColor(.Secondary)
+            }
+        }
+        .buttonStyle(.Plain)
+        match entry.kind {
+            Folder -> {
+                let opened = copy entry.path
+                return HStack(spacing = .Small, alignment = .Center) {
+                    label
+                    Button(action = { in showFolder(opened) }) {
+                        Icon(symbol = .ChevronRight)
+                    }
+                    .buttonStyle(.Plain)
+                }
+            }
+            File, Other -> return label
+        }
+    }
+
+    // The enclosing folder, New Folder and Paste.
+    function folderButtons() -> Any Widget {
+        let here = copy path
+        let pasting = held().sources.count > 0 && writable
+        return HStack(spacing = .Small, alignment = .Center) {
+            if here != "/" {
+                Button(action = { in showFolder(parentPath(here)) }) {
+                    Label(title = "Enclosing Folder", systemImage = .ArrowTurnLeftUp)
+                }
+            }
+            if writable {
+                Button(action = { in self.makeFolder() }) {
+                    Label(title = "New Folder", systemImage = .FolderBadgePlus)
+                }
+            }
+            if pasting {
+                Button(action = { in pasteInto(here) }) {
+                    Label(title = "Paste", systemImage = .DocOnClipboard)
+                }
+            }
+        }
+    }
+
+    // Rename, Duplicate, Copy, Cut and Delete Immediately, for the chosen
+    // entry while it is here.
+    function entryButtons() -> Any Widget {
+        if chosen.count == 0 || parentPath(chosen) != path || !pathExists(chosen) {
+            return EmptyView()
+        }
+        let picked = copy chosen
+        let cut = copy chosen
+        return HStack(spacing = .Small, alignment = .Center) {
+            Button(action = { in hold([copy picked], .Copy) }) {
+                Label(title = "Copy", systemImage = .DocOnDoc)
+            }
+            if writable {
+                Button(
+                    action = { in
+                        newName = lastPathPart(chosen)
+                        renaming = true
+                    }
+                ) {
+                    Label(title = "Rename", systemImage = .Pencil)
+                }
+                Button(action = { in self.duplicate() }) {
+                    Label(title = "Duplicate", systemImage = .DocOnDoc)
+                }
+                Button(action = { in hold([copy cut], .Move) }) {
+                    Label(title = "Cut", systemImage = .Scissors)
+                }
+                if trashPathFor(chosen).isSome() {
+                    Button(action = { in self.moveToTrash() }) {
+                        Label(title = "Move to Trash", systemImage = .Trash)
+                    }
+                } else {
+                    Button(role = .Destructive, action = { in deleting = true }) {
+                        Label(title = "Delete Immediately", systemImage = .Trash)
+                    }
+                }
+            }
+        }
+    }
+
+    function moveToTrash() {
+        let path = try trashPathFor(chosen) otherwise return
+        match trashMove(path) {
+            Ok(id) -> {
+                log info("moved an item to the Trash", id: id)
+                chosen = ""
+            }
+            Error(
+                failed
+            ) -> problem = "“\(lastPathPart(chosen))” couldn’t be moved to the Trash (\(errorName(failed)))."
+        }
+    }
+
+    function makeFolder() {
+        match makeNewFolder(path) {
+            Ok(made) -> {
+                chosen = copy made
+                newName = lastPathPart(made)
+                renaming = true
+            }
+            Error(failure) -> problem = changeProblem(failure)
+        }
+    }
+
+    function rename(from: borrow String) {
+        renaming = false
+        match renameEntry(from, newName) {
+            Ok(renamed) -> chosen = renamed
+            Error(failure) -> problem = changeProblem(failure)
+        }
+    }
+
+    function duplicate() {
+        match duplicateEntry(chosen) {
+            Ok(copied) -> chosen = copied
+            Error(failure) -> problem = changeProblem(failure)
+        }
+    }
+
+    function deleteActions() -> [Any Widget] {
+        let doomed = copy chosen
+        return [
+            Button(
+                role = .Destructive,
+                action = { in
+                    deleting = false
+                    match removeTree(doomed) {
+                        Ok -> chosen = ""
+                        Error(failure) -> problem = changeProblem(failure)
+                    }
+                }
+            ) {
+                Text("Delete")
+            },
+            Button(action = { in deleting = false }) { Text("Cancel").fontWeight(.SemiBold) }
+        ]
+    }
+}
+
+// An entry's size as Inlay lists it: a file's, rounded to the unit that
+// reads best; nothing for a folder.
+function sizeText(entry: borrow Entry) -> String {
+    return match entry.kind {
+        File -> byteCountText(entry.size)
+        Folder, Other -> ""
+    }
+}
+
+// What went wrong with a change, said to the person.
+function changeProblem(failure: borrow ChangeFailure) -> String {
+    return match failure {
+        InvalidName(name) -> "The name “\(name)” can’t be used."
+        AlreadyExists(path) -> "An item named “\(lastPathPart(path))” already exists here."
+        Missing(path) -> "“\(lastPathPart(path))” is no longer there."
+        Refused(
+            path
+        ) -> "“\(lastPathPart(path))” couldn’t be changed. The volume may be full or read-only."
+        IntoItself(path) -> "“\(lastPathPart(path))” can’t go inside itself."
+    }
+}
+
+function collisionName(collides: borrow String?) -> String {
+    return match collides {
+        Some(name) -> copy name
+        None -> ""
+    }
+}
+
+// Replace, Keep Both and Skip, for the collision the transfer waits on.
+function collisionActions() -> [Any Widget] {
+    return [
+        Button(role = .Destructive, action = { in answerCollision(.Replace) }) { Text("Replace") },
+        Button(action = { in answerCollision(.KeepBoth) }) { Text("Keep Both") },
+        Button(action = { in answerCollision(.Skip) }) { Text("Skip") }
+    ]
+}
+
+// The transfer under way, with its progress and Cancel, or what the last
+// one could not do; nothing otherwise.
+function transferSection() -> Any Widget {
+    let (shown, _) = transferShown()
+    match shown {
+        Some(transfer) -> {
+            let (done, total) = transfer.progress()
+            let verb = match transfer.kind {
+                Copy -> "Copying"
+                Move -> "Moving"
+            }
+            return Section(
+                children: [
+                    LabeledContent(label = "\(verb) \(done + 1) of \(total)") {
+                        Button(action = { in cancelTransfer() }) { Text("Cancel") }
+                    }
+                ],
+                header: Text("In Progress")
+            )
+        }
+        None -> {
+            let failures = transferFailures()
+            if failures.count == 0 { return EmptyView() }
+            var rows: [Any Widget] = []
+            for failure in failures { rows.append(Text(copy failure).foregroundColor(.Secondary)) }
+            return Section(children: rows, header: Text("Not Transferred"))
+        }
+    }
+}

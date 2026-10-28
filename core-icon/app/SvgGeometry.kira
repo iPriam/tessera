@@ -1,0 +1,165 @@
+import Foundation
+
+// The number lists SVG's attributes are made of, its lengths, and the affine
+// transforms it writes in `transform`, as Core Graphics transforms: a point
+// goes through the first function listed last.
+
+namespace NumberMark {
+    let zero: Number = 48
+    let nine: Number = 57
+    let dot: Number = 46
+    let minus: Number = 45
+    let plus: Number = 43
+    let lowerE: Number = 101
+    let upperE: Number = 69
+    let comma: Number = 44
+}
+
+namespace SvgAngle {
+    let degreesPerHalfTurn: Number = 180
+    let halfTurn: Number = 3.141592653589793238
+}
+
+function isDigit(code: Number) -> Bool {
+    return code >= NumberMark.zero && code <= NumberMark.nine
+}
+
+// The end of the exponent that starts at `at`, an `e` or `E`, or `at` itself
+// when no digits follow it.
+function exponentEnd(text: borrow String, at: Number) -> Number {
+    if at + 1 >= text.count {
+        return at
+    }
+    let next = text.charAt(at + 1)
+    if !isDigit(next) && next != NumberMark.minus && next != NumberMark.plus {
+        return at
+    }
+    var end = at + 2
+    for _ in end..text.count {
+        if !isDigit(text.charAt(end)) { break }
+        end += 1
+    }
+    return end
+}
+
+// The end of the number that starts at `start`: SVG runs numbers together,
+// `1.5.5` is two and `10-5` is two.
+function numberEnd(text: borrow String, start: Number) -> Number {
+    var at = start
+    let first = text.charAt(at)
+    if first == NumberMark.minus || first == NumberMark.plus { at += 1 }
+    var dotted = false
+    for _ in at..text.count {
+        let c = text.charAt(at)
+        if isDigit(c) {
+            at += 1
+            continue
+        }
+        if c == NumberMark.dot && !dotted {
+            dotted = true
+            at += 1
+            continue
+        }
+        if c == NumberMark.lowerE || c == NumberMark.upperE {
+            return exponentEnd(text, at)
+        }
+        break
+    }
+    return at
+}
+
+function separator(code: Number) -> Bool {
+    return svgSpace(code) || code == NumberMark.comma
+}
+
+function startsNumber(code: Number) -> Bool {
+    return isDigit(code) || code == NumberMark.dot || code == NumberMark.minus
+        || code == NumberMark.plus
+}
+
+// The numbers in `text`, as `points` and `viewBox` list them.
+public function svgNumbers(text: borrow String) -> [Number] {
+    var numbers: [Number] = []
+    var at = 0
+    for _ in 0..text.count {
+        if at >= text.count { break }
+        if !startsNumber(text.charAt(at)) {
+            at += 1
+            continue
+        }
+        let end = numberEnd(text, at)
+        if end == at {
+            at += 1
+            continue
+        }
+        numbers.append(try parseNumber(text.substring(at, end)) otherwise 0)
+        at = end
+    }
+    return numbers
+}
+
+// A length attribute: a number, with `px` or no unit; none when absent or
+// not a number.
+function svgLength(text: String?) -> Number? {
+    let written = try text otherwise return .None
+    let numbers = svgNumbers(written)
+    if numbers.count == 0 { return .None }
+    return .Some(numbers[0])
+}
+
+function radians(degrees: Number) -> Number {
+    return degrees * SvgAngle.halfTurn / SvgAngle.degreesPerHalfTurn
+}
+
+// The transform a `transform` attribute writes. SVG applies its functions
+// right to left, so each one listed goes after those that follow it.
+public function svgTransform(text: borrow String) -> AffineTransform {
+    var combined = AffineTransform {}
+    for piece in text.split(")") {
+        let parts = piece.split("(")
+        if parts.count != 2 { continue }
+        let values = svgNumbers(parts[1])
+        combined = transformFunction(parts[0].trim(), values).concatenating(combined)
+    }
+    return combined
+}
+
+function transformFunction(name: borrow String, values: borrow [Number]) -> AffineTransform {
+    let count = values.count
+    return match name {
+        "matrix" -> count == 6 ? AffineTransform {
+            a : values[0],
+            b: values[1],
+            c: values[2],
+            d: values[3],
+            tx: values[4],
+            ty: values[5]
+        }: AffineTransform {}
+        "translate" -> count >= 1 ? AffineTransform {
+            tx : values[0],
+            ty: count >= 2 ? values[1] : 0
+        }: AffineTransform {}
+        "scale" -> count >= 1 ? AffineTransform {
+            a : values[0],
+            d: count >= 2 ? values[1] : values[0]
+        }: AffineTransform {}
+        "rotate" -> rotateFunction(values)
+        "skewX" -> count >= 1 ? AffineTransform { c : tan(radians(values[0])) }: AffineTransform {}
+        "skewY" -> count >= 1 ? AffineTransform { b : tan(radians(values[0])) }: AffineTransform {}
+        else -> AffineTransform {}
+    }
+}
+
+function rotation(degrees: Number) -> AffineTransform {
+    let turn = radians(degrees)
+    return AffineTransform { a: cos(turn), b: sin(turn), c: -sin(turn), d: cos(turn) }
+}
+
+// `rotate(angle)`, or `rotate(angle cx cy)` about a point.
+function rotateFunction(values: borrow [Number]) -> AffineTransform {
+    if values.count == 0 { return AffineTransform {} }
+    if values.count < 3 { return rotation(values[0]) }
+    let toCentre = AffineTransform { tx: -values[1], ty: -values[2] }
+    let back = AffineTransform { tx: values[1], ty: values[2] }
+    return toCentre.concatenating(rotation(values[0])).concatenating(back)
+}

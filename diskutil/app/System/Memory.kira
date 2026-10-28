@@ -1,0 +1,8 @@
+import Foundation
+import Heap
+
+// Reading and writing foreign memory: the Volume service's messages.
+//
+// Kira's typed-memory builtins read and write them in place, `heapLoad<T>`
+// and `heapStore<T>` at a byte offset and unaligned; a block that lives as
+// long as the function using it is a `ByteBlock` from the Heap library.

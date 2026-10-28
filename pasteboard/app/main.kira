@@ -1,0 +1,26 @@
+//! The pasteboard service's entry point: the service that holds the shared clipboard for the platforms.
+import Foundation
+import LibTessera
+
+// pasteboard: the pasteboard service (roadmap/23 §5, decision in §5.1).
+//
+// It holds one text item for the whole system. One thread and one LibTessera
+// port: the listener and every connection are waited on with
+// `Object.waitAsync`, and the termination watch ends the loop.
+
+/// Starts the pasteboard service: listens for read and write requests, and serves until it is asked to stop.
+@Main
+function main() {
+    var service = match startService() {
+        Ok(value) -> value
+        Error(failed) -> {
+            log fault("the service could not start", error: errorName(failed))
+            return
+        }
+    }
+    log info("listening")
+    match run(service) {
+        Ok -> {}
+        Error(failed) -> log fault("the service stopped", error: errorName(failed))
+    }
+}

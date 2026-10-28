@@ -1,0 +1,87 @@
+import Foundation
+import Heap
+
+// A stream's bookkeeping: which object stands for it and the Memory slots the
+// Devices service sent for it (see `Stream.kira`).
+
+// The live stream `object`, a Stream object, stands for.
+function streamIndexOf(object: Number) -> Number? {
+    let index = match library.objects[object].state {
+        Stream(state) -> state.stream
+        None, Port, Event, EventPair, Timer, Channel, Memory, Thread, Process, Job, Node, File, Watch, Endpoint, WakeLock, Presence -> return .None
+    }
+    if index >= library.streams.count || !library.streams[index].live { return .None }
+    return .Some(index)
+}
+
+function streamClassOf(stream: Number) -> DeviceClass {
+    return library.streams[stream].descriptor.streamClass
+}
+
+function streamIsOutput(stream: Number) -> Bool {
+    let kind = streamClassOf(stream)
+    return kind == .AudioOutput || kind == .Haptic
+}
+
+function streamSlotOf(stream: Number, index: Number) -> Number? {
+    for at in 0..library.streamSlots.count {
+        if library.streamSlots[at].live && library.streamSlots[at].stream == stream && library.streamSlots[at].index == index {
+            return .Some(at)
+        }
+    }
+    return .None
+}
+
+// Keeps the Memory the service sent as the stream's slots. The stream holds
+// each object itself; `Stream.buffer` mints handles to it.
+function streamSlotsAdopt(stream: Number, handles: borrow [Handle]) {
+    let size = U64(library.streams[stream].descriptor.bufferSize)
+    for index in 0..handles.count {
+        match handleSlotOf(handles[index]) {
+            Some(slot) -> {
+                let memory = objectOfSlot(slot)
+                library.objects[memory].refs += 1
+                library.streamSlots.append(
+                    StreamSlot {
+                        live: true,
+                        stream: stream,
+                        index: index,
+                        memory: memory,
+                        size: size,
+                        queued: false
+                    }
+                )
+            }
+            None -> {}
+        }
+    }
+}
+
+function streamSlotsRelease(stream: Number) {
+    for at in 0..library.streamSlots.count {
+        if library.streamSlots[at].live && library.streamSlots[at].stream == stream {
+            let memory = library.streamSlots[at].memory
+            library.streamSlots[at].live = false
+            library.objects[memory].refs -= 1
+            if library.objects[memory].refs <= 0 { objectDestroy(memory) }
+        }
+    }
+}
+
+function streamDescriptorCheck(descriptor: borrow StreamDescriptor) -> Result<Void, TesseraError> {
+    if (descriptor.flags.raw | StreamFlags.all.raw) != StreamFlags.all.raw {
+        return .Error(failure(.InvalidArgument))
+    }
+    if descriptor.bufferCount < U32(2) || descriptor.bufferCount > U32(32) {
+        return .Error(failure(.InvalidArgument))
+    }
+    if descriptor.bufferSize > U32(64 * 1024 * 1024) { return .Error(failure(.OutOfRange)) }
+    return .Ok
+}
+
+function streamDescriptorBlock(descriptor: borrow StreamDescriptor) -> ByteBlock {
+    let blockBytes = zeroedBlock(count: Device.descriptorBytes, alignment: 16)
+    let block = blockBytes.pointer()
+    descriptorWrite(block, descriptor)
+    return move blockBytes
+}

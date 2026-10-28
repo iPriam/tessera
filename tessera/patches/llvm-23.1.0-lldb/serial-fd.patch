@@ -1,0 +1,16 @@
+ConnectionFileDescriptor: tell an fd:// socket from a file by getsockopt's
+answer. Socket::GetOption answers getsockopt's status, -1 for a descriptor that
+is no socket, and `!!-1` is true, so every handed-in descriptor (a serial port,
+a virtio port, a pipe) was read with recv(2), which fails with ENOTSOCK.
+
+--- a/lldb/source/Host/posix/ConnectionFileDescriptorPosix.cpp
++++ b/lldb/source/Host/posix/ConnectionFileDescriptorPosix.cpp
+@@ -683,7 +683,7 @@
+       // this is a socket and set m_is_socket accordingly.
+       int resuse;
+       bool is_socket =
+-          !!tcp_socket->GetOption(SOL_SOCKET, SO_REUSEADDR, resuse);
++          tcp_socket->GetOption(SOL_SOCKET, SO_REUSEADDR, resuse) == 0;
+       if (is_socket)
+         m_io_sp = std::move(tcp_socket);
+       else

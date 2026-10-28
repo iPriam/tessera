@@ -1,0 +1,155 @@
+import Foundation
+import LibTessera
+import KiraUI
+import PlatformKit
+import TesseraDisplayClient
+
+// The glass the compositor draws under the platform's surface with `SetGlass`
+// (roadmap/08-display-server.md, "Surfaces"): the Dock's, each of Control
+// Center's modules, the switcher's and each notification banner's, so that they refract the home
+// screen and the windows behind them. The platform's surface holds
+// only transparency there, which its own glass would refract as black, so
+// what sits on this glass is drawn without glass of its own.
+
+// One piece of the platform's glass, in points of the output, and the recipe
+// the compositor makes it of.
+public struct PlatformGlass {
+    let area: SurfaceFrame
+    let corner: Number
+    var recipe: DisplayGlassRecipe = .Regular
+}
+
+// Where the compositor was last asked to draw each piece of a platform's
+// glass, up to the last it holds. It is a struct because a `borrow mut [T]`
+// that crosses a library cannot change length (KLF-RIDL section 21).
+public struct PlatformGlassClaim {
+    var pieces: [SurfaceFrame] = []
+    // The appearance the pieces were asked for in.
+    var dark: Bool = false
+}
+
+// Where each of the platform's components stands on glass, in points of the
+// output; empty where it is not drawn.
+public struct PlatformGlassAreas {
+    var dock: SurfaceFrame = SurfaceFrame { x: 0, y: 0, width: 0, height: 0 }
+    var switcher: SurfaceFrame = SurfaceFrame { x: 0, y: 0, width: 0, height: 0 }
+    // Each banner's, newest first.
+    var banners: [SurfaceFrame] = []
+}
+
+// The platform's glass: the Dock's as piece 0, the switcher's as piece 1,
+// then each banner's, newest first, as the pieces after them.
+public function platformGlass(areas: borrow PlatformGlassAreas) -> [PlatformGlass] {
+    var pieces = [
+        PlatformGlass { area: copy areas.dock, corner: dockMetrics().corner, recipe: dockRecipe() },
+        PlatformGlass {
+            area: copy areas.switcher,
+            corner: SwitcherMetrics.corner,
+            recipe: dockRecipe()
+        },
+    ]
+    let corner = notificationBannerMetrics().corner
+    for banner in areas.banners {
+        pieces.append(
+            PlatformGlass { area: copy banner, corner: corner, recipe: .NotificationCenter }
+        )
+    }
+    return pieces
+}
+
+// Asks for each piece of `wanted` on `surface` that is not where `claimed`
+// says it was asked for last, and takes away each piece `claimed` holds past
+// the end of `wanted`. `claimed` remembers what the compositor was told.
+public function claimGlass(
+    claimed: borrow mut PlatformGlassClaim,
+    channel: Handle,
+    surface: DisplaySurfaceId,
+    wanted: borrow [PlatformGlass]
+) {
+    var told: [SurfaceFrame] = []
+    // The pieces up to the last the compositor holds glass for.
+    var held: Number = 0
+    // The compositor draws the glass in the appearance the platform is in,
+    // which it cannot know itself; every piece is asked for again when it
+    // changes.
+    let dark = interfaceDrawnDark()
+    let restyled = dark != claimed.dark
+    for piece in 0..max(claimed.pieces.count, wanted.count) {
+        let asked = piece < wanted.count ? copy wanted[piece] : PlatformGlass {
+            area: emptyFrame(),
+            corner: 0
+        }
+        let last = piece < claimed.pieces.count ? copy claimed.pieces[piece] : emptyFrame()
+        var now = copy last
+        if !sameFrame(asked.area, last) || (
+            restyled && asked.area.width > 0 && asked.area.height > 0
+        ) {
+            // The glass is in the surface's coordinates, which start at its
+            // top left: a piece partly above or before it, as a banner coming
+            // in from the top, is cut at that edge rather than moved in.
+            let shown = clippedToSurface(asked.area)
+            let glass = DisplayGlass {
+                surface: surface,
+                piece: piece,
+                x: shown.x,
+                y: shown.y,
+                width: shown.width,
+                height: shown.height,
+                corner: max(asked.corner, 0),
+                shape: .Continuous,
+                interface: glassInterface(),
+                recipe: asked.recipe,
+                dark: dark,
+            }
+            match sendSetGlass(channel, move glass) {
+                Ok -> now = copy asked.area
+                Error(failed) -> log warn(
+                    "the platform's glass could not be asked for",
+                    piece: piece,
+                    error: errorName(failed)
+                )
+            }
+        }
+        if now.width > 0 && now.height > 0 { held = piece + 1 }
+        told.append(move now)
+    }
+    var kept: [SurfaceFrame] = []
+    for piece in 0..held { kept.append(copy told[piece]) }
+    claimed.pieces = move kept
+    claimed.dark = dark
+}
+
+// The part of `area` at or after the surface's top left; empty when none is.
+function clippedToSurface(area: borrow SurfaceFrame) -> SurfaceFrame {
+    let x = max(area.x, 0)
+    let y = max(area.y, 0)
+    let width = area.x + area.width - x
+    let height = area.y + area.height - y
+    if width <= 0 || height <= 0 { return emptyFrame() }
+    return SurfaceFrame { x: x, y: y, width: width, height: height }
+}
+
+function emptyFrame() -> SurfaceFrame {
+    return SurfaceFrame { x: 0, y: 0, width: 0, height: 0 }
+}
+
+// The recipe the Dock's and the switcher's glass is made of on every
+// platform: the standard glass without its tint, as a Mac's Dock is.
+function dockRecipe() -> DisplayGlassRecipe {
+    return .DockRegular
+}
+
+// The toolkit's glass of `dockRecipe`, for a Dock or switcher that draws its
+// own glass.
+function dockGlassMaterial() -> Glass {
+    return .Platform(.DockRegular)
+}
+
+// The interface the platform's glass belongs to: a Mac's glass on a desktop,
+// the iOS kit's on a touch screen.
+function glassInterface() -> DisplayGlassInterface {
+    return match interfaceMode() {
+        AdaptiveDesktop -> .Desktop
+        AdaptiveMobile -> .Touch
+    }
+}

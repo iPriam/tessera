@@ -1,0 +1,28 @@
+import Foundation
+import Heap
+
+// Text and bits the library builds and reads in every subsystem.
+
+// The bits of `value` flipped, as a `U32`. Kira's `~` answers `Number` for an
+// operand narrower than 64 bits, so `mask & ~bits` on two `U32`s is an
+// out-of-range `Number` narrowed back to `U32`, which traps.
+function complement32(value: U32) -> U32 { return value ^ U32(0xFFFFFFFF) }
+
+// The bytes of `text` in a fresh block of their own, with no terminator.
+function bytesOfText(text: borrow String) -> ByteBlock {
+    let blockBytes = zeroedBlock(count: text.count + 1, alignment: 16)
+    let block = blockBytes.pointer()
+    if text.count > 0 { heapCopyBytes(block, text.data, text.count) }
+    return move blockBytes
+}
+
+// Decimal text as a number; zero for anything that is not one.
+function parseUnsigned(text: borrow String) -> U64 {
+    var value = U64(0)
+    for index in 0..text.count {
+        let byte = text.charAt(index)
+        if byte < 48 || byte > 57 { return value }
+        value = value * U64(10) + U64(byte - 48)
+    }
+    return value
+}

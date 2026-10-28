@@ -1,0 +1,224 @@
+import Foundation
+import Heap
+
+// Watches (§13.4): a kernel watch. A recursive watch watches each directory
+// beneath the node, and each directory created later; `watchDirectories`
+// maps the kernel's tag for each to its path below the node, so an event
+// names what changed relative to it.
+//
+// The Watch keeps a backing of its own for the node. Events read from the
+// kernel but not yet given to the caller wait in its event buffer.
+
+struct WatchDirectory {
+    var live: Bool
+    var object: Number
+    var tag: Number
+    var prefix: String
+}
+
+@Derive(Copy)
+public distinct WatchMask = UNumber
+
+public namespace WatchMask {
+    let none: WatchMask = WatchMask(0)
+    let created: WatchMask = WatchMask(1)
+    let deleted: WatchMask = WatchMask(2)
+    let modified: WatchMask = WatchMask(4)
+    let renamed: WatchMask = WatchMask(8)
+    let attributesChanged: WatchMask = WatchMask(16)
+    let recursive: WatchMask = WatchMask(256)
+    // Every change a watch can ask for.
+    let all: WatchMask = WatchMask(0x11F)
+}
+
+function watchTeardown(object: Number, watch: borrow WatchObject) {
+    if !isNull(watch.events) { deallocate(watch.events) }
+    match watch.node {
+        Some(node) -> kernelRelease(node)
+        None -> {}
+    }
+    for index in 0..library.watchDirectories.count {
+        if library.watchDirectories[index].object == object {
+            library.watchDirectories[index].live = false
+        }
+    }
+}
+
+function watchSignals(object: Number, watch: borrow WatchObject) -> U32 {
+    if watch.pending > U64(0) { return Signals.readable.raw }
+    let backing = try library.objects[object].backing otherwise return U32(0)
+    if (kernelReady(backing, Ready.readable) & Ready.readable) != 0 { return Signals.readable.raw }
+    return U32(0)
+}
+
+// Adds a watch on `directory` (relative to the watched node, `""` for the
+// node) and, when recursive, on every directory beneath it.
+function watchAdd(
+    object: Number,
+    root: Number,
+    mask: WatchMask,
+    directory: borrow String,
+    recursive: Bool
+) -> Result<Void, TesseraError> {
+    let node = try kernelNodeOpen(root, directory)
+    let added = watchAddOpen(object, root, node, mask, directory, recursive)
+    kernelRelease(node)
+    return added
+}
+
+function watchAddOpen(
+    object: Number,
+    root: Number,
+    node: Number,
+    mask: WatchMask,
+    directory: borrow String,
+    recursive: Bool
+) -> Result<Void, TesseraError> {
+    let backing = try backingOf(object)
+    let tag = try kernelWatchAdd(backing, node, mask)
+    library.watchDirectories.append(
+        WatchDirectory { live: true, object: object, tag: tag, prefix: directory }
+    )
+    if !recursive { return .Ok }
+    let names = try kernelDirectoryList(node)
+    for index in 0..names.count {
+        if names[index].kind == .Directory {
+            let child = directory.count == 0 ? names[index].name : directory + "/" + names[index].name
+            match watchAdd(object, root, mask, child, true) {
+                Ok -> {}
+                Error(failed) -> {
+                    // A directory removed since the listing has nothing to watch.
+                    if failed.code != .NotFound { return .Error(failed) }
+                }
+            }
+        }
+    }
+    return .Ok
+}
+
+public function nodeWatch(node: Handle, mask: WatchMask) -> Result<Handle, TesseraError> {
+    if mask.raw == U32(0) || (mask.raw | WatchMask.all.raw) != WatchMask.all.raw {
+        return .Error(failure(.InvalidArgument))
+    }
+    let slot = try resolve(node, .Node, Rights.none)
+    let nodeBacking = try backingOf(objectOfSlot(slot))
+    let stat = try kernelNodeStat(nodeBacking)
+    let directory = stat.kind == .Directory
+    var needed = Rights.read
+    if directory { needed = Rights.enumerate }
+    let recursive = mask.has(WatchMask.recursive)
+    if recursive { needed = needed | Rights.traverse }
+    if !library.handles[slot].rights.has(needed) { return .Error(failure(.AccessDenied)) }
+    let watcher = try kernelWatchCreate()
+    let keep = match kernelDuplicate(nodeBacking) {
+        Ok(value) -> value
+        Error(failed) -> {
+            kernelRelease(watcher)
+            return .Error(failed)
+        }
+    }
+    let watch = WatchObject {
+        pending: U64(0),
+        mask: mask,
+        node: .Some(keep),
+        events: nullPointer()
+    }
+    let object = objectCreate(.Watch(move watch), watcher)
+    match watchAdd(object, keep, mask, "", recursive && directory) {
+        Ok -> {}
+        Error(failed) -> {
+            objectDestroy(object)
+            return .Error(failed)
+        }
+    }
+    return handleForNew(object, Rights.processDefault)
+}
+
+function watchPrefix(object: Number, tag: Number) -> String? {
+    for directory in library.watchDirectories {
+        if directory.live && directory.object == object && directory.tag == tag {
+            return .Some(directory.prefix)
+        }
+    }
+    return .None
+}
+
+// Packed `WatchEvent`s, as many as fit; `ShouldWait` when there are none,
+// and `Overrun` once after the kernel dropped some.
+public function watchRead(watch: Handle, out: borrow Buffer) -> Result<UNumber, TesseraError> {
+    let object = try resolveObject(watch, .Watch, Rights.read)
+    var watch = try watchOf(object)
+    if watch.pending == U64(0) {
+        if isNull(watch.events) {
+            watch.events = allocateZeroed(memoryLayout(65536, 16))
+            if isNull(watch.events) { return .Error(failure(.OutOfMemory)) }
+        }
+        let backing = try backingOf(object)
+        let got = match kernelWatchRead(backing, watch.events, U64(65536)) {
+            Ok(value) -> value
+            Error(failed) -> {
+                // The buffer stays with the watch for the next read.
+                setWatch(object, move watch)
+                return .Error(failed)
+            }
+        }
+        watch.pending = got
+    }
+    let events = watch.events
+    let total = watch.pending
+    let recursive = watch.mask.has(WatchMask.recursive)
+    var at = U64(0)
+    var written = U64(0)
+    while at < total {
+        let event = kernelWatchEventAt(events, at)
+        if event.overrun {
+            watch.pending = U64(0)
+            setWatch(object, move watch)
+            return .Error(failure(.Overrun))
+        }
+        var name = event.name
+        match watchPrefix(object, event.tag) {
+            Some(prefix) -> name = event.name.count == 0 ? prefix : prefix + "/" + event.name
+            // The watched node itself: names are already its own.
+            None -> {}
+        }
+        let size = (U64(16) + U64(name.count) + U64(7)) & ~U64(7)
+        let mask = event.mask
+        if mask != U16(0) && written + size > out.length { break }
+        if mask != U16(0) {
+            let entry = heapOffset(out.address, written)
+            zeroBytes(entry, size)
+            heapStore<U16>(entry, 0, U16(size))
+            heapStore<U16>(entry, 2, mask)
+            heapStore<U16>(entry, 4, U16(name.count))
+            heapStore<U16>(entry, 6, U16(event.cookie & U32(0xFFFF)))
+            if name.count > 0 { copyBytes(heapOffset(entry, 16), name.data, name.count) }
+            written += size
+        }
+        if recursive && event.directoryCreated {
+            match watch.node {
+                Some(root) -> {
+                    // A directory that cannot be watched, gone again or past
+                    // the kernel's limit, still shows as created; changes
+                    // inside it do not.
+                    match watchAdd(object, root, watch.mask, name, true) {
+                        Ok -> {}
+                        Error(failed) -> absorb failed
+                    }
+                }
+                None -> {}
+            }
+        }
+        at += event.bytes
+    }
+    // Events left over with none written: the first did not fit.
+    if written == U64(0) && at < total {
+        setWatch(object, move watch)
+        return .Error(failureDetail(.BufferTooSmall, U64(16 + 4096)))
+    }
+    let left = total - at
+    if left > U64(0) { moveBytes(events, heapOffset(events, at), left) }
+    watch.pending = left
+    setWatch(object, move watch)
+    return .Ok(written)
+}

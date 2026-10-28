@@ -1,0 +1,284 @@
+//! What a session waits on beside the display: PID 1, which hands over new
+//! links; the links to the platform (AppKit); the answer PID 1 owes the last
+//! request; what the application asked to watch; and, for a platform, the platform's
+//! own waits. All of it on one port, with a time limit, so the application can
+//! redraw when time moves on without an event.
+
+import Foundation
+import KiraUI
+import LibTessera
+import TesseraDisplayClient
+import AppKit
+
+/// The keys completions carry on the session's wait port. A platform's own keys
+/// start at `DynamicPlatformWaitKey.base`, and AppKit's links' at `PlatformLinkKey.base`.
+@Derive(Copy)
+enum WaitKey: UN32 {
+    Display = 1
+    Volumes = 2
+    Answer = 3
+    Parent = 4
+    Applications = 5
+    System = 6
+}
+
+/// The keys the session's own waits carry, in the order `woken` looks them up.
+let waitKeys: [WaitKey] = [.Display, .Volumes, .Answer, .Parent, .Applications, .System]
+
+/// What woke a session's wait.
+enum Woke {
+    Time
+    Message
+    Volumes
+    Applications
+    Answer
+    // PID 1 sent something on the channel it started the process with.
+    Parent
+    // An event arrived on an application's System channel.
+    System
+    // Something arrived on a link to the platform; its completion's key.
+    Link(Number)
+    // One of the platform's own waits; its completion's key.
+    Platform(Number)
+}
+
+/// Time units for the session's waits.
+namespace Nanoseconds {
+    let perMillisecond: Number = 1000000
+}
+
+/// The session's waits: one port that every wait completes on, and the state of each wait.
+struct Waits {
+    var port: Handle
+    // Whether a wait on the display channel is armed. A wait the time ran out
+    // on stays armed for the next.
+    var displayArmed: Bool = false
+    // The channel PID 1 started the process with, until PID 1 closes it, and
+    // whether a wait on it is armed.
+    var parent: Handle? = .None
+    var parentArmed: Bool = false
+    // The channel the last request's answer comes on, if one is awaited, and
+    // whether a wait on it is armed.
+    var answer: Handle? = .None
+    var answerArmed: Bool = false
+    // An application's System channel, which settings changes arrive on,
+    // and whether a wait on it is armed. A platform reads its own.
+    var system: Handle? = .None
+    var systemArmed: Bool = false
+    var volumes: DirectoryWatch = DirectoryWatch { path: SystemDirectory.volumes, key: .Volumes }
+    var applications: DirectoryWatch = DirectoryWatch {
+        path: SystemDirectory.applications,
+        key: .Applications
+    }
+}
+
+/// Makes the waits for a session: a port to complete on, the display service channel, and the application's watches.
+function makeWaits(watches: borrow [ApplicationWatch]) -> Result<Waits, TesseraError> {
+    let port = try portCreate(.None)
+    var waits = Waits { port: port }
+    match displayServiceChannel() {
+        Ok(channel) -> waits.parent = .Some(channel)
+        Error(failure) -> log warn("there is no channel to PID 1", error: errorName(failure))
+    }
+    for watch in watches {
+        match watch {
+            Volumes -> waits.volumes.open()
+            Applications -> waits.applications.open()
+            // The minute is a time limit on each wait, not a wait of its own.
+            Minute -> {}
+        }
+    }
+    return .Ok(waits)
+}
+
+extend Waits {
+    /// Closes the answer, the volume and application waits, and the port.
+    function close(borrow mut self) {
+        forgetAnswer()
+        volumes.close()
+        applications.close()
+        closeHandle(port)
+    }
+
+    /// What arrives first within `milliseconds`, or with no limit: a message
+    /// on `channel`, a link, a change in /Volumes or /Applications, PID 1's
+    /// answer or a platform's
+    /// own wait, or none, and the time ran out.
+    function next(
+        borrow mut self,
+        channel: Handle,
+        milliseconds: Number?,
+        bridge: borrow BridgeHandle
+    ) -> Result<Woke, TesseraError> {
+        try arm(channel, bridge)
+        let deadline = try deadlineAfter(milliseconds)
+        let completions = match portWait(port, 1, deadline) {
+            Ok(value) -> value
+            Error(failure) -> return failure.code == .Timeout ? .Ok(.Time) : .Error(failure)
+        }
+        if completions.count == 0 { return .Ok(.Time) }
+        return .Ok(woken(completions[0].key))
+    }
+
+    /// The deadline `milliseconds` from now, or an infinite one when no time is given.
+    function deadlineAfter(
+        borrow self,
+        milliseconds: borrow Number?
+    ) -> Result<Number, TesseraError> {
+        let limit = try milliseconds otherwise return .Ok(Deadline.infinite)
+        let now = try timeRead(.Monotonic)
+        return .Ok(now + limit * Nanoseconds.perMillisecond)
+    }
+
+    /// Arms every wait not armed already.
+    function arm(
+        borrow mut self,
+        channel: Handle,
+        bridge: borrow BridgeHandle
+    ) -> Result<Void, TesseraError> {
+        let signals = Signals.readable | Signals.peerClosed
+        if !displayArmed {
+            try objectWaitAsync(channel, signals, .Once, port, Number(code(WaitKey.Display)))
+            displayArmed = true
+        }
+        if !parentArmed {
+            match parent {
+                Some(service) -> {
+                    try objectWaitAsync(service, signals, .Once, port, Number(code(WaitKey.Parent)))
+                    parentArmed = true
+                }
+                // PID 1 has gone, or never gave a channel.
+                None -> {}
+            }
+        }
+        if !systemArmed {
+            match system {
+                Some(channel) -> {
+                    try objectWaitAsync(channel, signals, .Once, port, Number(code(WaitKey.System)))
+                    systemArmed = true
+                }
+                None -> {}
+            }
+        }
+        match armPlatformLinks(copy bridge, port) {
+            Ok -> {}
+            Error(failure) -> log warn(
+                "a link to the platform could not be waited on",
+                failure: failure
+            )
+        }
+        try armAnswer()
+        try applications.arm(port)
+        return volumes.arm(port)
+    }
+
+    /// What the completion carrying `key` says, with its wait disarmed.
+    function woken(borrow mut self, key: Number) -> Woke {
+        if isPlatformLinkKey(key) { return .Link(key) }
+        if key >= DynamicPlatformWaitKey.base { return .Platform(key) }
+        let waited = match caseWithCode(waitKeys, key) {
+            Some(value) -> value
+            None -> {
+                log warn("a completion with an unknown key arrived", key: key)
+                return .Message
+            }
+        }
+        match waited {
+            Display -> {
+                displayArmed = false
+                return .Message
+            }
+            Volumes -> {
+                volumes.changed()
+                return .Volumes
+            }
+            Applications -> {
+                applications.changed()
+                return .Applications
+            }
+            Answer -> {
+                answerArmed = false
+                return .Answer
+            }
+            Parent -> {
+                parentArmed = false
+                return .Parent
+            }
+            System -> {
+                systemArmed = false
+                return .System
+            }
+        }
+    }
+
+    /// Follows the System channel's events, for an application.
+    function watchSystem(borrow mut self) {
+        match startupHandle(StartupTag.system) {
+            Some(channel) -> system = .Some(channel)
+            None -> log warn("there is no System channel; settings are read once")
+        }
+    }
+
+    /// Applies what the System channel holds now; whether the window must be
+    /// drawn again.
+    function takeSystem(borrow mut self) -> Bool {
+        let channel = try system otherwise return false
+        return takeSystemMessages(channel)
+    }
+
+    /// PID 1 closed the channel it started the process with: nothing more will
+    /// come on it.
+    function parentGone(borrow mut self) {
+        parent = .None
+        parentArmed = false
+    }
+
+    /// Waits for the answer on `channel`, the one a request was just sent
+    /// with. An answer still awaited for an earlier request is given up.
+    function awaitAnswer(borrow mut self, channel: Handle) {
+        forgetAnswer()
+        answer = .Some(channel)
+    }
+
+    /// Closes the awaited answer's channel and stops awaiting it.
+    function forgetAnswer(borrow mut self) {
+        match answer {
+            Some(channel) -> closeHandle(channel)
+            // No answer awaited.
+            None -> {}
+        }
+        answer = .None
+        answerArmed = false
+    }
+
+    /// Arms the wait for the answer unless none is awaited or it is armed
+    /// already.
+    function armAnswer(borrow mut self) -> Result<Void, TesseraError> {
+        if answerArmed { return .Ok }
+        let channel = try answer otherwise return .Ok
+        let signals = Signals.readable | Signals.peerClosed
+        try objectWaitAsync(channel, signals, .Once, port, Number(code(WaitKey.Answer)))
+        answerArmed = true
+        return .Ok
+    }
+
+    /// What PID 1 answered. The channel is done with once the answer is read,
+    /// or could not be.
+    function readAnswer(borrow mut self) -> Result<WorkspaceAnswer, WorkspaceAnswerFailure> {
+        let channel = try answer otherwise return .Ok(.NotYet)
+        match readWorkspaceAnswer(channel) {
+            Ok(answered) -> {
+                match answered {
+                    // Still to come: wait for it again.
+                    NotYet -> answerArmed = false
+                    Said, Silent -> forgetAnswer()
+                }
+                return .Ok(answered)
+            }
+            Error(failure) -> {
+                forgetAnswer()
+                return .Error(failure)
+            }
+        }
+    }
+}

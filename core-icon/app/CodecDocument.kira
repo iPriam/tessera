@@ -1,0 +1,151 @@
+import Foundation
+import Kten
+
+// A whole `.tessicon` document in Kten: `TessIcon { fill: …, groups: [Group
+// { …, layers: [Layer { … }] }] }`.
+
+namespace DocumentTag {
+    let document: String = "TessIcon"
+    let group: String = "Group"
+    let layer: String = "Layer"
+}
+
+function layerIn(value: borrow Kten) -> Result<IconLayer, IconReadFailure> {
+    let defaults = IconLayer {}
+    let position = match try fieldIn(value, "position") {
+        Some(placed) -> try positionIn(placed)
+        None -> IconPosition {}
+    }
+    return .Ok(
+        IconLayer {
+            name: try textField(value, "name", defaults.name),
+            image: try textField(value, "image", defaults.image),
+            visible: try boolChoiceField(value, "visible", defaults.visible),
+            opacity: try numberChoiceField(value, "opacity", defaults.opacity),
+            blend: try blendChoiceField(value, "blend", defaults.blend),
+            fill: try fillChoiceField(value, "fill", defaults.fill),
+            glass: try boolChoiceField(value, "glass", defaults.glass),
+            position: position
+        }
+    )
+}
+
+function layerKten(layer: borrow IconLayer) -> Kten {
+    return ktenObject(
+        DocumentTag.layer,
+        [
+            ktenField("name", .Text(copy layer.name)),
+            ktenField("image", .Text(copy layer.image)),
+            ktenField("visible", boolChoiceKten(layer.visible)),
+            ktenField("opacity", numberChoiceKten(layer.opacity)),
+            ktenField("blend", blendChoiceKten(layer.blend)),
+            ktenField("fill", fillChoiceKten(layer.fill)),
+            ktenField("glass", boolChoiceKten(layer.glass)),
+            ktenField("position", positionKten(layer.position))
+        ]
+    )
+}
+
+function layersIn(value: borrow Kten) -> Result<[IconLayer], IconReadFailure> {
+    var layers: [IconLayer] = []
+    let listed = match try fieldIn(value, "layers") {
+        Some(items) -> try itemsIn(items)
+        None -> []
+    }
+    for item in listed { layers.append(try layerIn(item)) }
+    return .Ok(layers)
+}
+
+// A group's glass: how it is lit, its edge, frost, bend, see-through and
+// shadow.
+function groupGlassIn(
+    value: borrow Kten,
+    group: borrow mut IconGroup
+) -> Result<Void, IconReadFailure> {
+    let defaults = IconGroup {}
+    group.lighting = match try fieldIn(value, "lighting") {
+        Some(named) -> try lightingIn(named)
+        None -> defaults.lighting
+    }
+    group.specular = try specularChoiceField(value, "specular", defaults.specular)
+    group.blur = try blurChoiceField(value, "blur", defaults.blur)
+    group.refraction = try refractionChoiceField(value, "refraction", defaults.refraction)
+    group.translucency = try translucencyChoiceField(value, "translucency", defaults.translucency)
+    group.shadow = try shadowChoiceField(value, "shadow", defaults.shadow)
+    return .Ok
+}
+
+function groupIn(value: borrow Kten) -> Result<IconGroup, IconReadFailure> {
+    let defaults = IconGroup {}
+    var group = IconGroup {
+        name: try textField(value, "name", defaults.name),
+        layers: try layersIn(value),
+        visible: try boolChoiceField(value, "visible", defaults.visible),
+        opacity: try numberChoiceField(value, "opacity", defaults.opacity),
+        blend: try blendChoiceField(value, "blend", defaults.blend)
+    }
+    try groupGlassIn(value, group)
+    group.position = match try fieldIn(value, "position") {
+        Some(placed) -> try positionIn(placed)
+        None -> IconPosition {}
+    }
+    return .Ok(group)
+}
+
+function groupKten(group: borrow IconGroup) -> Kten {
+    var layers: [Kten] = []
+    for layer in group.layers { layers.append(layerKten(layer)) }
+    return ktenObject(
+        DocumentTag.group,
+        [
+            ktenField("name", .Text(copy group.name)),
+            ktenField("visible", boolChoiceKten(group.visible)),
+            ktenField("opacity", numberChoiceKten(group.opacity)),
+            ktenField("blend", blendChoiceKten(group.blend)),
+            ktenField("lighting", lightingKten(group.lighting)),
+            ktenField("specular", specularChoiceKten(group.specular)),
+            ktenField("blur", blurChoiceKten(group.blur)),
+            ktenField("refraction", refractionChoiceKten(group.refraction)),
+            ktenField("translucency", translucencyChoiceKten(group.translucency)),
+            ktenField("shadow", shadowChoiceKten(group.shadow)),
+            ktenField("position", positionKten(group.position)),
+            ktenField("layers", .List(move layers))
+        ]
+    )
+}
+
+// The document `text` spells.
+public function parsedIconDocument(text: borrow String) -> Result<IconDocument, IconFileFailure> {
+    let value = match parseKten(text) {
+        Ok(value) -> value
+        Error(failure) -> return .Error(.NotKten(failure))
+    }
+    return match documentIn(value) {
+        Ok(document) -> .Ok(document)
+        Error(failure) -> .Error(.Malformed(failure))
+    }
+}
+
+function documentIn(value: borrow Kten) -> Result<IconDocument, IconReadFailure> {
+    let defaults = IconDocument {}
+    var groups: [IconGroup] = []
+    let listed = match try fieldIn(value, "groups") {
+        Some(items) -> try itemsIn(items)
+        None -> []
+    }
+    for item in listed { groups.append(try groupIn(item)) }
+    return .Ok(
+        IconDocument { fill: try fillChoiceField(value, "fill", defaults.fill), groups: groups }
+    )
+}
+
+// The document's text, a field or element to a line.
+public function iconDocumentText(document: borrow IconDocument) -> String {
+    var groups: [Kten] = []
+    for group in document.groups { groups.append(groupKten(group)) }
+    let value = ktenObject(
+        DocumentTag.document,
+        [ktenField("fill", fillChoiceKten(document.fill)), ktenField("groups", .List(move groups))]
+    )
+    return value.writtenLines() + "\n"
+}

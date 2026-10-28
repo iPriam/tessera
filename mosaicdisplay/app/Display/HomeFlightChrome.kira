@@ -1,0 +1,164 @@
+import Foundation
+import KiraUI
+import LibTessera
+import TesseraDisplayClient
+
+// What stays with a window swiped home, as on an iPad: the status bar over
+// everything, the card too, and the home indicator riding the card's bottom
+// edge as it is lifted, gone once the card has flown into its icon; and the
+// icon itself, which the card becomes as it nears it.
+
+// The home indicator as the platform draws it over an application
+// (platform-ui's `HomeIndicatorMetrics`): the bar, and how far above the
+// bottom edge it floats.
+namespace CardIndicator {
+    let width: Number = 140
+    let height: Number = 5
+    let margin: Number = 8
+    let ink: RGBAColor = RGBAColor { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }
+}
+
+// The platform's status bar over the card in flight: its picture again, cut
+// to the band the bar takes, so the card passes under it.
+function drawPlatformBarOverFlight(
+    composer: borrow Composer,
+    server: borrow Server,
+    progress: Number
+) {
+    if server.homeFlight.isNone() || server.bar <= 0 { return }
+    let index = try platformIndex(server) otherwise return
+    let client = server.clients[index]
+    let content = try client.content otherwise return
+    let texture = try content.texture otherwise return
+    let scale = server.display.scanout.scale
+    let frame = try placedFrame(server, index, client, content, scale, progress) otherwise return
+    let band = Geometry {
+        x: client.frame.x,
+        y: client.frame.y,
+        width: client.frame.width,
+        height: server.bar,
+    }
+    drawSurface(composer, texture, frame, .Some(band), 1, content.extentX(), content.extentY())
+}
+
+// The home indicator on the card's bottom edge, at the card's scale: whole
+// while the finger holds the card or it springs back, fading as the card
+// flies into its icon, and none on a card opening out of one.
+function drawCardIndicator(
+    composer: borrow Composer,
+    card: borrow Geometry,
+    scale: Number,
+    phase: borrow HomePhase
+) {
+    let strength = match phase {
+        Tracking, Returning -> 1.0
+        Leaving -> clamp((scale - 1 + HomeMotion.reach) / HomeMotion.reach, 0.0, 1.0)
+        Opening -> 0.0
+    }
+    if strength <= 0 { return }
+    let width = CardIndicator.width * scale
+    let height = CardIndicator.height * scale
+    let x = card.x + (card.width - width) / 2
+    let y = card.y + card.height - (CardIndicator.margin * scale) - height
+    var ink = CardIndicator.ink
+    ink.a = ink.a * strength
+    composer.batch.pushRect(
+        x,
+        y,
+        width,
+        height,
+        ink,
+        RGBAColor { r: 0.0, g: 0.0, b: 0.0, a: 0.0 },
+        0.0,
+        height / 2,
+        card.x,
+        card.y,
+        card.x + card.width,
+        card.y + card.height
+    )
+}
+
+// The live client in `role`, the first.
+function clientIn(server: borrow Server, role: borrow DisplayRole) -> Number? {
+    for index in 0..server.clients.count {
+        if server.clients[index].alive && server.clients[index].role == role { return .Some(index) }
+    }
+    return .None
+}
+
+// The icon over the card, faded in as the card nears it: the platform's
+// picture of it, cut to the icon and scaled onto the card, so the window
+// becomes its icon rather than landing as a small picture of itself, and
+// grows out of it the same way.
+function drawIconOverCard(
+    composer: borrow Composer,
+    server: borrow Server,
+    flight: borrow HomeFlight,
+    card: borrow Geometry,
+    corner: Number
+) {
+    let strength = homeNearness(server, flight)
+    if strength <= 0 { return }
+    let index = try clientIn(server, .Platform) otherwise return
+    let client = server.clients[index]
+    let content = try client.content otherwise return
+    let texture = try content.texture otherwise return
+    let icon = try flightIconPicture(server, client, flight) otherwise return
+    let density = server.display.scanout.scale
+    let scaleX = card.width / icon.width
+    let scaleY = card.height / icon.height
+    let picture = Geometry {
+        x: card.x - icon.x * scaleX,
+        y: card.y - icon.y * scaleY,
+        width: content.width / density * scaleX,
+        height: content.height / density * scaleY,
+    }
+    drawSurface(
+        composer,
+        texture,
+        picture,
+        .Some(copy card),
+        strength,
+        content.extentX(),
+        content.extentY(),
+        corner,
+        1
+    )
+}
+
+// Where on the platform's surface, in its points, it draws the icon the
+// flight's window flies by. The home screen leaves out the icon a window
+// opened from it flies by, so that one is the platform's own picture of the
+// application's icon, beside its interface (`StageBadgeAtlas`); the Dock's
+// icon is where the Dock draws it.
+function flightIconPicture(
+    server: borrow Server,
+    platform: borrow Client,
+    flight: borrow HomeFlight
+) -> Geometry? {
+    if !flight.homeScreen {
+        let home = flight.badge.home
+        if home.width <= 0 || home.height <= 0 { return .None }
+        return .Some(
+            Geometry {
+                x: home.x - platform.frame.x,
+                y: home.y - platform.frame.y,
+                width: home.width,
+                height: home.height,
+            }
+        )
+    }
+    let surface = server.clients[flight.index].surface
+    for badge in platform.badges {
+        if badge.surface != surface { continue }
+        return .Some(
+            Geometry {
+                x: platform.frame.width + StageBadgeAtlas.padding,
+                y: Number(badge.slot) * StageBadgeAtlas.tile + StageBadgeAtlas.padding,
+                width: StageBadgeAtlas.icon,
+                height: StageBadgeAtlas.icon,
+            }
+        )
+    }
+    return .None
+}

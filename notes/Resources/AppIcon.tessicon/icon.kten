@@ -1,0 +1,26 @@
+TessIcon {
+    fill: .Automatic,
+    groups: [
+        Group {
+            name: "Group",
+            layers: [
+                Layer { name: "3.sash", image: "3.sash.svg", position: Position { scale: 1.15039, x: 0, y: 39 } }
+            ],
+            lighting: .Individual,
+            specular: .Inside,
+            translucency: Translucency { enabled: false, amount: 0 },
+            shadow: Shadow { kind: .Chromatic, opacity: 0.4 },
+            opacity: 0.95
+        },
+        Group {
+            name: "Group 2",
+            layers: [
+                Layer { name: "2.lines", image: "2.lines.svg", glass: false, fill: Choice { light: .Solid(Color { space: .Srgb, red: 0.757, green: 0.757, blue: 0.757, alpha: 1 }), dark: .Solid(Color { space: .Srgb, red: 0.455, green: 0.455, blue: 0.455, alpha: 1 }) } }
+            ],
+            lighting: .Individual,
+            specular: .Inside,
+            translucency: Translucency { enabled: true, amount: 0.5 },
+            shadow: Shadow { kind: .None, opacity: 0.5 }
+        }
+    ]
+}

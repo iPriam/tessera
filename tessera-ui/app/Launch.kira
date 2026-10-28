@@ -1,0 +1,50 @@
+//! How long the process took to show its first frame, phase by phase, on the monotonic clock every process shares.
+import Foundation
+import LibTessera
+
+// How long the process took to show its first frame, phase by phase, in
+// milliseconds on the monotonic clock every process shares. Printed once,
+// when the display says the first frame is shown, so a slow launch says
+// where it waited.
+
+/// The launch marks of one process, shared by the session and the renderer, so every copy records into the same timeline.
+public class LaunchTimeline {
+    // The first mark's time, none until a mark is taken.
+    var began: Number? = .None
+    // The marks taken so far, each as its phase and its time after the first.
+    var marks: String = ""
+    // Whether the first frame was shown, after which marks are not taken.
+    var said: Bool = false
+}
+
+/// Records a launch mark for `phase` at the current monotonic time, unless the first frame was already shown.
+function launchMark(timeline: borrow LaunchTimeline, phase: String) {
+    if timeline.said { return }
+    let now = match timeRead(.Monotonic) {
+        Ok(value) -> trunc(value / 1000000)
+        Error(failed) -> {
+            absorb failed
+            return
+        }
+    }
+    let began = match timeline.began {
+        Some(value) -> value
+        None -> {
+            timeline.began = .Some(now)
+            now
+        }
+    }
+    timeline.marks.append(" \(phase) \(now - began)")
+}
+
+/// Records that the first frame is shown, prints the launch timeline once, and stops further marks.
+function launchShown(timeline: borrow LaunchTimeline) {
+    if timeline.said { return }
+    launchMark(timeline, "shown")
+    timeline.said = true
+    let origin = match timeline.began {
+        Some(value) -> "\(value)"
+        None -> "an unknown time"
+    }
+    print("launch timeline, ms after \(origin):\(timeline.marks)")
+}

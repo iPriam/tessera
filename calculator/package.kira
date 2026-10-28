@@ -1,0 +1,14 @@
+//! Calculator: arithmetic on exact decimals, typed or pressed, with a history
+//! that reuses a result exactly.
+//!
+//! Kira UI draws it and puts it on Tessera's display.
+/// The Calculator app package: arithmetic on exact decimals, with a history that reuses results.
+construct CalculatorApp extends Package {
+    let version: String = "0.1.0"
+    let kind: PackageKind = .App
+    let assets: [String] = ["Resources/AppIcon.tessicon"]
+    let moduleRoot: String = "Calculator"
+    let dependencies: [Dependency] = [
+        Dependency { name: "Calculation", path: "../calculation" }
+    ]
+}

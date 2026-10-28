@@ -1,0 +1,339 @@
+import Foundation
+import Heap
+import LibTessera
+
+// Mapped block devices (17 §16) over device-mapper.
+//
+// A mapper object holds `/dev/mapper/control` as its descriptor; its
+// device's name, whether it is active and its `dev_t` are in
+// `library.mappers`.
+//
+// `struct dm_ioctl` (312 bytes): `version` @0 (4.0.0), `data_size` @12,
+// `data_start` @16, `target_count` @20, `open_count` @24, `flags` @28,
+// `event_nr` @32, `dev` @40, `name` @48 (128), `uuid` @176 (129). A table
+// follows it as `struct dm_target_spec` records (40 bytes: `sector_start`
+// @0, `length` @8, `status` @16, `next` @20, `target_type` @24 (16)), each
+// with its parameters as text after it.
+//
+// A `MapperTarget` the caller passes is `kind` u32 @0, `start` u64 @8 and
+// `length` u64 @16 in bytes, `argumentLength` u32 @24, then the arguments at
+// @32; the next target starts at the next 8-byte boundary. The arguments are
+// the kernel's own table parameters for the target, as text.
+
+namespace DeviceMapper {
+    let control: String = "/dev/mapper/control"
+    let headerBytes: Number = 312
+    let specBytes: Number = 40
+    let targetHeader: Number = 32
+    let sector: Number = 512
+    let nameLimit: Number = 127
+    // `version` 4.0.0.
+    let major: U32 = U32(4)
+    // `_IOWR(0xfd, nr, struct dm_ioctl)`.
+    let create: U64 = U64(0xC138FD03)
+    let remove: U64 = U64(0xC138FD04)
+    let suspend: U64 = U64(0xC138FD06)
+    let status: U64 = U64(0xC138FD07)
+    let tableLoad: U64 = U64(0xC138FD09)
+}
+
+// `struct dm_ioctl` flags: `DM_READONLY_FLAG`, `DM_SUSPEND_FLAG`,
+// `DM_ACTIVE_PRESENT_FLAG`, `DM_DEFERRED_REMOVE`.
+namespace DeviceMapperFlag {
+    let none: U32 = U32(0)
+    let readOnly: U32 = U32(1)
+    let suspend: U32 = U32(2)
+    let activePresent: U32 = U32(32)
+    let deferredRemove: U32 = U32(0x20000)
+}
+
+struct MapperRecord {
+    var object: Number
+    var name: String
+    var active: Bool
+    // The device's `dev_t` as the kernel encodes it, once asked.
+    var device: U64
+}
+
+// One `MapperTarget` from the caller's buffer.
+struct MapperTargetSpec {
+    var kind: MapperTargetKind
+    var start: Number
+    var length: Number
+    var arguments: Number
+    var argumentLength: Number
+
+    function targetType(borrow self) -> String {
+        return match self.kind {
+            Linear -> "linear"
+            Verity -> "verity"
+            Crypt -> "crypt"
+        }
+    }
+
+    // The bytes its `dm_target_spec` and NUL-terminated parameters take.
+    function specBytes(borrow self) -> Number {
+        return Number(alignRecord(DeviceMapper.specBytes + self.argumentLength + 1))
+    }
+}
+
+let targetKinds: [MapperTargetKind] = [MapperTargetKind.Linear, MapperTargetKind.Verity, MapperTargetKind.Crypt]
+
+function knownTargetKind(raw: U32) -> MapperTargetKind? {
+    return caseWithCode(targetKinds, raw)
+}
+
+// The caller's targets; `InvalidArgument` with the target's index for one
+// that is malformed.
+function readTargets(targets: borrow Buffer) -> Result<[MapperTargetSpec], TesseraError> {
+    var specs: [MapperTargetSpec] = []
+    var at: Number = 0
+    while at + DeviceMapper.targetHeader <= targets.length {
+        let index = specs.count
+        let kind = try knownTargetKind(heapLoad<U32>(targets.address, at)) otherwise return .Error(
+            failure(.InvalidArgument, index)
+        )
+        let start = Number(heapLoad<U64>(targets.address, at + 8))
+        let length = Number(heapLoad<U64>(targets.address, at + 16))
+        let argumentLength = Number(heapLoad<U32>(targets.address, at + 24))
+        if start % DeviceMapper.sector != 0 || length % DeviceMapper.sector != 0 || length == 0 {
+            return .Error(failure(.InvalidArgument, index))
+        }
+        if at + DeviceMapper.targetHeader + argumentLength > targets.length {
+            return .Error(failure(.InvalidArgument, index))
+        }
+        specs.append(
+            MapperTargetSpec {
+                kind: kind,
+                start: start,
+                length: length,
+                arguments: at + DeviceMapper.targetHeader,
+                argumentLength: argumentLength
+            }
+        )
+        at = Number(alignRecord(at + DeviceMapper.targetHeader + argumentLength))
+    }
+    if specs.count == 0 { return .Error(failure(.InvalidArgument)) }
+    return .Ok(specs)
+}
+
+// A request block for device `name`, `extra` bytes of table after it.
+function requestBlock(name: borrow String, flags: U32, extra: Number) -> ByteBlock {
+    let size = DeviceMapper.headerBytes + extra
+    let blockBytes = zeroedBlock(count: size, alignment: 16)
+    let block = blockBytes.pointer()
+    heapStore<U32>(block, 0, DeviceMapper.major)
+    heapStore<U32>(block, 12, U32(size))
+    heapStore<U32>(block, 16, U32(DeviceMapper.headerBytes))
+    heapStore<U32>(block, 28, flags)
+    copyBytes(heapOffset(block, 48), name.data, name.count)
+    return move blockBytes
+}
+
+// Writes the table after the request header at `out`.
+function writeTable(specs: borrow [MapperTargetSpec], targets: borrow Buffer, out: RawPtr) {
+    var written = DeviceMapper.headerBytes
+    for spec in specs {
+        let record = spec.specBytes()
+        let at = heapOffset(out, written)
+        heapStore<U64>(at, 0, U64(spec.start / DeviceMapper.sector))
+        heapStore<U64>(at, 8, U64(spec.length / DeviceMapper.sector))
+        heapStore<U32>(at, 20, U32(record))
+        let targetType = spec.targetType()
+        copyBytes(heapOffset(at, 24), targetType.data, targetType.count)
+        copyBytes(
+            heapOffset(at, DeviceMapper.specBytes),
+            heapOffset(targets.address, spec.arguments),
+            spec.argumentLength
+        )
+        written += record
+    }
+}
+
+// One device-mapper call on device `name`.
+function mapperCall(
+    control: borrow Descriptor,
+    request: U64,
+    name: borrow String,
+    flags: U32
+) -> Result<Void, TesseraError> {
+    let blockBytes = requestBlock(name, flags, 0)
+    let called = try control.control(request, blockBytes.pointer())
+    return .Ok
+}
+
+// Loads the table; the request block, which may carry a crypt key, is wiped
+// before it goes.
+function loadTable(
+    control: borrow Descriptor,
+    name: borrow String,
+    flags: MapperFlags,
+    specs: borrow [MapperTargetSpec],
+    targets: borrow Buffer
+) -> Result<Void, TesseraError> {
+    var tableBytes: Number = 0
+    for spec in specs { tableBytes += spec.specBytes() }
+    let loadFlags = flags.has(
+        MapperFlags.readOnly
+    ) ? DeviceMapperFlag.readOnly : DeviceMapperFlag.none
+    let loadBytes = requestBlock(name, loadFlags, tableBytes)
+    let load = loadBytes.pointer()
+    heapStore<U32>(load, 20, U32(specs.count))
+    writeTable(specs, targets, load)
+    let loaded = control.control(DeviceMapper.tableLoad, load)
+    zeroBytes(load, DeviceMapper.headerBytes + tableBytes)
+    return match loaded {
+        Ok(value) -> .Ok
+        Error(failed) -> .Error(failed)
+    }
+}
+
+// Creates the device and loads its table, inactive until `activate`.
+public function mapperCreate(
+    name: borrow String,
+    targets: borrow Buffer,
+    flags: MapperFlags
+) -> Result<Ref, TesseraError> {
+    if name.count == 0 || name.count > DeviceMapper.nameLimit || name.contains("/") {
+        return .Error(failure(.InvalidArgument))
+    }
+    if !MapperFlags.readOnly.has(flags) || (targets.length > 0 && isNull(targets.address)) {
+        return .Error(failure(.InvalidArgument))
+    }
+    let specs = try readTargets(targets)
+    let control = try openPath(DeviceMapper.control, OpenFlags.readWrite)
+    match mapperCall(control, DeviceMapper.create, name, DeviceMapperFlag.none) {
+        Ok -> {}
+        Error(failed) -> {
+            control.close()
+            return .Error(failed)
+        }
+    }
+    match loadTable(control, name, flags, specs, targets) {
+        Ok -> {}
+        Error(failed) -> {
+            match mapperCall(control, DeviceMapper.remove, name, DeviceMapperFlag.none) {
+                Ok -> {}
+                Error(removal) -> log warn(
+                    "a mapper device whose table failed was not removed",
+                    name: name,
+                    error: errorName(removal)
+                )
+            }
+            control.close()
+            return .Error(failed)
+        }
+    }
+    let object = createObject(.Mapper, .Block, .Some(control))
+    deviceLibrary.objects[object].name = name
+    deviceLibrary.mappers.append(
+        MapperRecord { object: object, name: name, active: false, device: U64(0) }
+    )
+    return .Ok(mintRef(object, defaultRights(.Mapper)))
+}
+
+function mapperOf(object: Number) -> Result<Number, TesseraError> {
+    for (index, mapper) in deviceLibrary.mappers.enumerated() {
+        if mapper.object == object { return .Ok(index) }
+    }
+    return .Error(failure(.InvalidHandle))
+}
+
+function resolveMapper(mapper: Ref, rights: RefRights) -> Result<Number, TesseraError> {
+    let object = try resolve(mapper, .Mapper, rights)
+    return mapperOf(object)
+}
+
+// The device's state; keeps its `dev_t`.
+function readStatus(index: Number) -> Result<MapperStatus, TesseraError> {
+    let control = try deviceOf(deviceLibrary.mappers[index].object)
+    let blockBytes = requestBlock(deviceLibrary.mappers[index].name, DeviceMapperFlag.none, 0)
+    let block = blockBytes.pointer()
+    let asked = try control.control(DeviceMapper.status, block)
+    let flags = heapLoad<U32>(block, 28)
+    let opens = heapLoad<U32>(block, 24)
+    deviceLibrary.mappers[index].device = heapLoad<U64>(block, 40)
+    var status = MapperStatus.none
+    if (flags & DeviceMapperFlag.activePresent) != 0 { status = status | MapperStatus.active }
+    if (flags & DeviceMapperFlag.suspend) != 0 { status = status | MapperStatus.suspended }
+    if (flags & DeviceMapperFlag.readOnly) != 0 { status = status | MapperStatus.readOnly }
+    return .Ok(status | MapperStatus(opens << openCountShift))
+}
+
+// Where `Mapper.status` keeps the device's open count.
+let openCountShift = U32(16)
+
+// The registry entry of the device: `dm-<minor>`, where the minor is the
+// low byte of the encoded `dev_t` and bits 20 up.
+function mapperEntryOf(index: Number) -> Result<EntryId, TesseraError> {
+    let device = deviceLibrary.mappers[index].device
+    let minor = (device & U64(0xFF)) | ((device >> U64(12)) & U64(0xFFFFF00))
+    let path = try canonicalPath("/sys/class/block/dm-\(minor)")
+    return .Ok(entryIdOf(path))
+}
+
+// Resumes the device and answers its new entry.
+function activateNow(index: Number) -> Result<Answer, TesseraError> {
+    let control = try deviceOf(deviceLibrary.mappers[index].object)
+    try mapperCall(
+        control,
+        DeviceMapper.suspend,
+        deviceLibrary.mappers[index].name,
+        DeviceMapperFlag.none
+    )
+    let status = try readStatus(index)
+    let entry = try mapperEntryOf(index)
+    deviceLibrary.mappers[index].active = true
+    deviceLibrary.objects[deviceLibrary.mappers[index].object].entry = entry
+    return .Ok(Answer { result0: entry.raw, result1: U64(code(Family.Block)) })
+}
+
+// Resumes the device, which makes the loaded table live. The completion is
+// `Open` with the new `BlockDevice` entry in `result0`.
+public function mapperActivate(
+    mapper: Ref,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    let index = try resolveMapper(mapper, RefRights.manage)
+    return Reply { port: port, key: key }.post(activateNow(index), .Open)
+}
+
+public function mapperEntry(mapper: Ref) -> Result<EntryId, TesseraError> {
+    let index = try resolveMapper(mapper, RefRights.inspect)
+    if !deviceLibrary.mappers[index].active { return .Error(failure(.BadState)) }
+    return .Ok(deviceLibrary.objects[deviceLibrary.mappers[index].object].entry)
+}
+
+public function mapperStatus(mapper: Ref) -> Result<MapperStatus, TesseraError> {
+    let index = try resolveMapper(mapper, RefRights.inspect)
+    return readStatus(index)
+}
+
+// Removal is deferred: the device goes once nothing has it open.
+function mapperRelease(object: Number) {
+    var kept: [MapperRecord] = []
+    for mapper in deviceLibrary.mappers {
+        if mapper.object != object {
+            kept.append(mapper)
+            continue
+        }
+        match deviceLibrary.objects[object].device {
+            Some(control) -> match mapperCall(
+                control,
+                DeviceMapper.remove,
+                mapper.name,
+                DeviceMapperFlag.deferredRemove
+            ) {
+                Ok -> {}
+                Error(failed) -> log warn(
+                    "a mapper device was not removed",
+                    name: mapper.name,
+                    error: errorName(failed)
+                )
+            }
+            None -> {}
+        }
+    }
+    deviceLibrary.mappers = kept
+}

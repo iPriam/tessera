@@ -1,0 +1,104 @@
+import Foundation
+import TesseraDisplayClient
+
+// What the display server tells its clients about each other and the machine.
+
+function isPlatform(client: borrow Client) -> Bool {
+    return client.alive && client.role == .Platform
+}
+
+// Tells every live platform session `message`. An application is never told
+// about another's surfaces.
+function tellPlatforms(server: borrow Server, message: borrow DisplayMessage) {
+    for client in server.clients {
+        if isPlatform(client) { tell(client.channel, message) }
+    }
+}
+
+// Tells the platform one application surface exists, so it can place and focus
+// it. Its role is how the platform knows the desktop from an application. A
+// surface told again to a platform that started late has drawn already and
+// will not fly out of an icon, so the platform, keeping its Dock up for the
+// flight of a surface that appears, hears it landed at once.
+function tellPlatformSurface(server: borrow Server, index: Number) {
+    let client = server.clients[index]
+    if !client.alive || client.role == .Platform { return }
+    tellPlatforms(
+        server,
+        .SurfaceCreated(DisplaySurface { surface: client.surface, role: client.role })
+    )
+    tellPlaced(server, index)
+    let flying = match server.homeFlight {
+        Some(flight) -> flight.index == index
+        None -> false
+    }
+    if client.content.isSome() && !flying { tellFlight(server, client.surface, .Landed) }
+}
+
+// Tells the platform every application surface there is.
+function tellPlatformSurfaces(server: borrow Server) {
+    for index in 0..server.clients.count { tellPlatformSurface(server, index) }
+}
+
+// Tells the platform an application surface is gone, so it drops it and moves
+// focus off it.
+function tellPlatformSurfaceDestroyed(server: borrow Server, surface: DisplaySurfaceId) {
+    tellPlatforms(server, .SurfaceDestroyed(surface))
+}
+
+// Tells the platform PID 1 asked for `surface` to come to the front. The platform
+// owns focus, so it decides, and grants focus as the switcher does.
+function tellPlatformActivate(server: borrow Server, surface: DisplaySurfaceId) {
+    tellPlatforms(server, .ActivateRequested(surface))
+    log info("asked the platform to bring a surface forward", surface: surface.raw)
+}
+
+// Tells every client the mode now in force, so a client can lay itself out for
+// the geometry its next Configure carries: an application's window draws its
+// own frame where windows float free, and none where it fills the screen.
+function broadcastModeChanged(server: borrow Server) {
+    for client in server.clients {
+        if client.alive { tellMode(server, client) }
+    }
+}
+
+// Tells `client` the mode now in force; a client that arrives hears it once
+// its session is open, as the others heard it change.
+function tellMode(server: borrow Server, client: borrow Client) {
+    tell(
+        client.channel,
+        .ModeChanged(
+            DisplayModeChange {
+                surface: client.surface,
+                mode: DisplayMode { mode: server.mode, split: server.split }
+            }
+        )
+    )
+}
+
+// Tells a client what input the machine has. Capability is a fact about the
+// machine broadcast to all clients, so a platform choosing a navigation model and
+// an application choosing button prompts over touch decide from the same
+// information.
+function tellInputCapability(
+    client: borrow Client,
+    kinds: borrow [DisplayInputKind],
+    present: Bool
+) {
+    tell(
+        client.channel,
+        .InputCapability(
+            DisplayInputCapability { surface: client.surface, kinds: kinds, present: present }
+        )
+    )
+}
+
+function broadcastInputCapability(
+    server: borrow Server,
+    kinds: borrow [DisplayInputKind],
+    present: Bool
+) {
+    for client in server.clients {
+        if client.alive { tellInputCapability(client, kinds, present) }
+    }
+}

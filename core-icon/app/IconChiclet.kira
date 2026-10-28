@@ -1,0 +1,106 @@
+import Foundation
+import RenderBox
+
+// The chiclet: the rounded square every icon is drawn in, the shadow it
+// casts, the highlights along its edge and the hairline just inside it.
+
+function chicletRect() -> Rect {
+    return Rect { width: IconGeometry.canvas, height: IconGeometry.canvas }
+}
+
+function chicletShape() -> Shape {
+    var shape = Shape()
+    shape.setRoundedRect(chicletRect(), IconGeometry.cornerRadius, .Continuous)
+    return shape
+}
+
+// The chiclet stroked `lineWidth` wide along its edge.
+function chicletStroke(lineWidth: Number) -> Shape {
+    var shape = Shape()
+    shape.setStrokedRoundedRect(chicletRect(), IconGeometry.cornerRadius, .Continuous, lineWidth)
+    return shape
+}
+
+function colorFill(color: RGBAColor, space: ColorSpace) -> Fill {
+    var fill = Fill()
+    fill.setColor(move color, space)
+    return fill
+}
+
+function black() -> RGBAColor {
+    return RGBAColor { r: 0, g: 0, b: 0, a: 1 }
+}
+
+function white() -> RGBAColor {
+    return RGBAColor { r: 1, g: 1, b: 1, a: 1 }
+}
+
+function clear() -> RGBAColor {
+    return RGBAColor { r: 0, g: 0, b: 0, a: 0 }
+}
+
+// `FUN_1ccb1553c`: the chiclet's shadow alone, under where it is drawn.
+function drawChicletShadow(
+    list: borrow DisplayList,
+    size: IconSizeClass
+) -> Result<Void, DisplayListFailure> {
+    list.save()
+    list.addShadow(
+        ChicletShadowDefaults.radius.at(size),
+        0.5,
+        Size {
+            width: ChicletShadowDefaults.offsetX.at(size),
+            height: ChicletShadowDefaults.offsetY.at(size)
+        },
+        ColorFill {
+            color: RGBAColor { r: 0, g: 0, b: 0, a: ChicletShadowDefaults.opacity.at(size) },
+            colorSpace: .Device
+        },
+        0,
+        .Normal,
+        ShadowFlags.only
+    )
+    list.drawShape(chicletShape(), colorFill(black(), .DisplayP3), 1, .Normal)
+    return list.restore()
+}
+
+// `FUN_1ccad2a90`: highlights alike but for where they are lit from become
+// one, lit by all their lights.
+function mergedHighlights(specs: borrow [HighlightSpec]) -> [HighlightSpec] {
+    var merged: [HighlightSpec] = []
+    for spec in specs {
+        var joined = false
+        for index in 0..merged.count {
+            if !alikeButLit(merged[index], spec) { continue }
+            var lights = copy merged[index].longitudes
+            lights.appendAll(copy spec.longitudes)
+            merged[index] = litBy(merged[index], move lights)
+            joined = true
+            break
+        }
+        if !joined { merged.append(copy spec) }
+    }
+    return merged
+}
+
+function alikeButLit(a: borrow HighlightSpec, b: borrow HighlightSpec) -> Bool {
+    return a.brightness == b.brightness && a.bias == b.bias && a.diffuse == b.diffuse &&
+        a.darklight == b.darklight && sameSizes(a.opacity, b.opacity) &&
+        sameSizes(a.outsetOpacity, b.outsetOpacity) && sameSizes(a.distance, b.distance) &&
+        sameSizes(a.minDistancePixels, b.minDistancePixels) && sameSizes(a.spread, b.spread)
+}
+
+function litBy(spec: borrow HighlightSpec, longitudes: [Number]) -> HighlightSpec {
+    return HighlightSpec {
+        brightness: spec.brightness,
+        opacity: copy spec.opacity,
+        outsetOpacity: copy spec.outsetOpacity,
+        distance: copy spec.distance,
+        minDistancePixels: copy spec.minDistancePixels,
+        spread: copy spec.spread,
+        bias: spec.bias,
+        diffuse: spec.diffuse,
+        darklight: spec.darklight,
+        longitudes: longitudes
+    }
+}

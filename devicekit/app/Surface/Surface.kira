@@ -1,0 +1,461 @@
+import Foundation
+import Heap
+import LibTessera
+
+// Surfaces (17 §9): image buffers the CPU, the GPU and the display reach
+// without a copy. On Linux a surface is a dma-buf, the object's descriptor,
+// and its layout lives beside it in `library.surfaces`.
+
+// Where a surface is mapped into this process.
+@Derive(Copy)
+struct Mapping {
+    var address: RawPtr
+    var length: Number
+}
+
+struct SurfaceRecord {
+    var object: Number
+    var info: SurfaceInfo
+    var locks: SurfaceAccess
+    var purgeable: Bool
+    var mapping: Mapping?
+    // A display scans it out; the display sets and clears this.
+    var onScreen: Bool
+}
+
+namespace SurfaceLimit {
+    let side: U32 = U32(16384)
+    let planes: U32 = U32(4)
+    let modifiers: U32 = U32(4)
+    // `Surface.inUse`'s bit for a surface on screen.
+    let onScreen: U32 = U32(0x80000000)
+}
+
+namespace SurfaceDetail {
+    // `InvalidArgument`'s `detail`: the byte offset of the field at fault.
+    let size: Number = 0
+    let planeCount: Number = 24
+    let layout: Number = 32
+}
+
+// A four-character code, its first character in the low byte.
+function fourCc(text: borrow String) -> FourCc {
+    let bytes = text.utf8()
+    return FourCc(
+        U32(bytes[0]) | (U32(bytes[1]) << U32(8)) | (U32(bytes[2]) << U32(16)) | (
+            U32(bytes[3]) << U32(24)
+        )
+    )
+}
+
+// Bytes per pixel of the single-plane formats DeviceKit lays out itself.
+function bytesPerPixel(format: FourCc) -> U32? {
+    let fourBytes = ["XR24", "AR24", "XB24", "AB24"]
+    for name in fourBytes {
+        if format == fourCc(name) { return .Some(U32(4)) }
+    }
+    if format == fourCc("RG16") { return .Some(U32(2)) }
+    return .None
+}
+
+let noPlane: SurfacePlane = SurfacePlane {
+    offset: UNumber(0),
+    stride: UNumber(0),
+    size: UNumber(0)
+}
+
+// The planes the info uses.
+function planesOf(info: borrow SurfaceInfo) -> [SurfacePlane] {
+    let all = [info.plane0, info.plane1, info.plane2, info.plane3]
+    var used: [SurfacePlane] = []
+    for index in 0..info.planeCount { used.append(all[index]) }
+    return used
+}
+
+// The bytes the layout reaches.
+function surfaceBytes(info: borrow SurfaceInfo) -> Number {
+    var end = U64(0)
+    for plane in planesOf(info) {
+        if plane.offset + plane.size > end { end = plane.offset + plane.size }
+    }
+    return Number(end)
+}
+
+function surfaceOf(object: Number) -> Result<Number, TesseraError> {
+    for (index, surface) in deviceLibrary.surfaces.enumerated() {
+        if surface.object == object { return .Ok(index) }
+    }
+    return .Error(failure(.InvalidHandle))
+}
+
+// A surface object around a dma-buf descriptor this process owns.
+function surfaceFrom(
+    buffer: borrow Descriptor,
+    info: borrow SurfaceInfo,
+    rights: RefRights
+) -> Ref {
+    let object = createObject(.Surface, .None, .Some(buffer))
+    deviceLibrary.surfaces.append(
+        SurfaceRecord {
+            object: object,
+            info: info,
+            locks: SurfaceAccess.none,
+            purgeable: false,
+            mapping: .None,
+            onScreen: false
+        }
+    )
+    return mintRef(object, rights)
+}
+
+// The process's display connection, which dumb buffers are allocated on.
+function displayCard() -> Result<Descriptor, TesseraError> {
+    for object in deviceLibrary.objects {
+        if object.live && object.kind == .Connection && object.family == .Display {
+            match object.device {
+                Some(card) -> return .Ok(card)
+                None -> {}
+            }
+        }
+    }
+    return .Error(failure(.Unsupported))
+}
+
+// Whether the modifiers allow a linear layout, the only one dumb buffers
+// have: no modifiers at all, or `LINEAR` (0) among them.
+function allowsLinear(descriptor: borrow SurfaceDescriptor) -> Bool {
+    if descriptor.modifierCount == 0 { return true }
+    let modifiers = [descriptor.modifier0, descriptor.modifier1, descriptor.modifier2, descriptor.modifier3]
+    for index in 0..descriptor.modifierCount {
+        if modifiers[index] == Modifier(0) { return true }
+    }
+    return false
+}
+
+public function surfaceCreate(descriptor: borrow SurfaceDescriptor) -> Result<Ref, TesseraError> {
+    if descriptor.width == 0 || descriptor.height == 0 || descriptor.width > SurfaceLimit.side || descriptor.height > SurfaceLimit.side {
+        return .Error(failure(.InvalidArgument, SurfaceDetail.size))
+    }
+    let cpuOnly = SurfaceUsage.scanout | SurfaceUsage.cpuRead | SurfaceUsage.cpuWrite
+    if !cpuOnly.has(descriptor.usage) { return .Error(failure(.Unsupported)) }
+    let bytes = try bytesPerPixel(descriptor.format) otherwise return .Error(
+        failure(.FormatUnsupported)
+    )
+    if descriptor.modifierCount > SurfaceLimit.modifiers {
+        return .Error(failure(.InvalidArgument, SurfaceDetail.planeCount))
+    }
+    if !allowsLinear(descriptor) { return .Error(failure(.IncompatibleModifier)) }
+    let card = try displayCard()
+    // `struct drm_mode_create_dumb`: height, width, bpp, flags; handle,
+    // pitch, size.
+    let blockBytes = zeroedBlock(count: 32, alignment: 16)
+    let block = blockBytes.pointer()
+    heapStore<U32>(block, 0, descriptor.height)
+    heapStore<U32>(block, 4, descriptor.width)
+    heapStore<U32>(block, 8, bytes * U32(8))
+    let created = try card.control(Drm.modeCreateDumb, block)
+    let handle = heapLoad<U32>(block, 16)
+    let pitch = heapLoad<U32>(block, 20)
+    let size = heapLoad<U64>(block, 24)
+    let exported = primeExport(card, handle)
+    destroyDumb(card, handle)
+    let buffer = try exported
+    let info = SurfaceInfo {
+        width: descriptor.width,
+        height: descriptor.height,
+        format: descriptor.format,
+        usage: descriptor.usage,
+        modifier: Modifier(0),
+        planeCount: U32(1),
+        flags: descriptor.flags & SurfaceFlags.purgeable,
+        plane0: SurfacePlane { offset: UNumber(0), stride: pitch, size: size },
+        plane1: noPlane,
+        plane2: noPlane,
+        plane3: noPlane,
+    }
+    return .Ok(surfaceFrom(buffer, info, defaultRights(.Surface)))
+}
+
+// A GEM handle on `card` as a dma-buf descriptor.
+function primeExport(card: borrow Descriptor, handle: U32) -> Result<Descriptor, TesseraError> {
+    let blockBytes = zeroedBlock(count: 12, alignment: 16)
+    let block = blockBytes.pointer()
+    heapStore<U32>(block, 0, handle)
+    heapStore<U32>(block, 4, Drm.primeFlags)
+    let exported = try card.control(Drm.primeHandleToFd, block)
+    return .Ok(Descriptor { number: Number(heapLoad<U32>(block, 8)) })
+}
+
+// A dma-buf as a GEM handle on `card`.
+function primeImport(
+    card: borrow Descriptor,
+    buffer: borrow Descriptor
+) -> Result<U32, TesseraError> {
+    let blockBytes = zeroedBlock(count: 12, alignment: 16)
+    let block = blockBytes.pointer()
+    heapStore<U32>(block, 8, U32(buffer.number))
+    let imported = try card.control(Drm.primeFdToHandle, block)
+    return .Ok(heapLoad<U32>(block, 0))
+}
+
+// Gives back a GEM handle with `request` (`MODE_DESTROY_DUMB` or
+// `GEM_CLOSE`). The buffer lives on in its dma-buf, so a failure leaks a
+// handle until the card closes and nothing more.
+function releaseHandle(card: borrow Descriptor, request: U64, handle: U32) {
+    match card.controlWord(request, handle) {
+        Ok(value) -> {}
+        Error(failed) -> log warn("a GEM handle was not released", error: errorName(failed))
+    }
+}
+
+function destroyDumb(card: borrow Descriptor, handle: U32) {
+    releaseHandle(card, Drm.modeDestroyDumb, handle)
+}
+
+function gemClose(card: borrow Descriptor, handle: U32) {
+    releaseHandle(card, Drm.gemClose, handle)
+}
+
+namespace Seek {
+    let start: U64 = U64(0)
+    let end: U64 = U64(2)
+}
+
+function checkAdoptable(
+    native: borrow NativeHandle,
+    info: borrow SurfaceInfo
+) -> Result<Void, TesseraError> {
+    if native.kind != .DmaBufFd { return .Error(failure(.Unsupported)) }
+    if info.planeCount == 0 || info.planeCount > SurfaceLimit.planes {
+        return .Error(failure(.InvalidArgument, SurfaceDetail.planeCount))
+    }
+    if info.width == 0 || info.height == 0 {
+        return .Error(failure(.InvalidArgument, SurfaceDetail.size))
+    }
+    if native.value > U64(0x7FFFFFFF) { return .Error(failure(.InvalidArgument)) }
+    return .Ok
+}
+
+public function surfaceAdopt(
+    native: borrow NativeHandle,
+    info: borrow SurfaceInfo
+) -> Result<Ref, TesseraError> {
+    try checkAdoptable(native, info)
+    let given = Descriptor { number: Number(native.value) }
+    let buffer = try given.duplicate()
+    // `SEEK_END` on a dma-buf is its size.
+    match buffer.seek(0, Seek.end) {
+        Ok(size) -> {
+            if size < surfaceBytes(info) {
+                buffer.close()
+                return .Error(failure(.InvalidArgument, SurfaceDetail.layout))
+            }
+        }
+        Error(failed) -> {
+            buffer.close()
+            return .Error(failed)
+        }
+    }
+    match buffer.seek(0, Seek.start) {
+        Ok(offset) -> {}
+        Error(failed) -> log debug(
+            "a dma-buf did not seek back to its start",
+            error: errorName(failed)
+        )
+    }
+    var adopted = info
+    adopted.flags = (info.flags & SurfaceFlags.purgeable) | SurfaceFlags.adopted
+    return .Ok(surfaceFrom(buffer, adopted, defaultRights(.Surface)))
+}
+
+// The surface record behind `surface`.
+function resolveSurface(surface: Ref, rights: RefRights) -> Result<Number, TesseraError> {
+    let object = try resolve(surface, .Surface, rights)
+    return surfaceOf(object)
+}
+
+public function surfaceInfo(surface: Ref) -> Result<SurfaceInfo, TesseraError> {
+    let index = try resolveSurface(surface, RefRights.inspect)
+    return .Ok(deviceLibrary.surfaces[index].info)
+}
+
+// `DMA_BUF_IOCTL_SYNC`, which waits for the device's fences itself.
+function bufferSync(
+    buffer: borrow Descriptor,
+    access: SurfaceAccess,
+    phase: U64
+) -> Result<Void, TesseraError> {
+    var flags = phase
+    if access.has(SurfaceAccess.read) { flags = flags | DmaBuf.syncRead }
+    if access.has(SurfaceAccess.write) { flags = flags | DmaBuf.syncWrite }
+    let blockBytes = zeroedBlock(count: 8, alignment: 16)
+    let block = blockBytes.pointer()
+    heapStore<U64>(block, 0, flags)
+    let synced = try buffer.control(DmaBuf.sync, block)
+    return .Ok
+}
+
+function checkLock(
+    record: borrow SurfaceRecord,
+    access: SurfaceAccess
+) -> Result<Void, TesseraError> {
+    if access == SurfaceAccess.none || !(SurfaceAccess.read | SurfaceAccess.write).has(access) {
+        return .Error(failure(.InvalidArgument))
+    }
+    let usage = record.info.usage
+    if access.has(SurfaceAccess.read) && !usage.has(SurfaceUsage.cpuRead) {
+        return .Error(failure(.AccessDenied))
+    }
+    if access.has(SurfaceAccess.write) && !usage.has(SurfaceUsage.cpuWrite) {
+        return .Error(failure(.AccessDenied))
+    }
+    if record.locks.has(SurfaceAccess.write) { return .Error(failure(.Busy)) }
+    return .Ok
+}
+
+public function surfaceLock(
+    surface: Ref,
+    access: SurfaceAccess,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    let index = try resolveSurface(surface, RefRights.map)
+    try checkLock(deviceLibrary.surfaces[index], access)
+    let reply = Reply { port: port, key: key }
+    let buffer = try deviceOf(deviceLibrary.surfaces[index].object)
+    match bufferSync(buffer, access, DmaBuf.syncStart) {
+        Ok -> {}
+        Error(failed) -> return reply.post(.Error(failed), .Event)
+    }
+    deviceLibrary.surfaces[index].locks = deviceLibrary.surfaces[index].locks | access
+    return reply.post(.Ok(Answer { result0: U64(DeviceEvents.idle.raw), result1: U64(0) }), .Event)
+}
+
+public function surfaceUnlock(surface: Ref) -> Result<Void, TesseraError> {
+    let index = try resolveSurface(surface, RefRights.map)
+    let held = deviceLibrary.surfaces[index].locks
+    if held == SurfaceAccess.none { return .Error(failure(.BadState)) }
+    deviceLibrary.surfaces[index].locks = SurfaceAccess.none
+    return bufferSync(try deviceOf(deviceLibrary.surfaces[index].object), held, DmaBuf.syncEnd)
+}
+
+namespace MapFlags {
+    let readWrite: U64 = U64(3)
+    let shared: U64 = U64(1)
+}
+
+public function surfaceMap(surface: Ref) -> Result<RawPtr, TesseraError> {
+    let index = try resolveSurface(surface, RefRights.map)
+    match deviceLibrary.surfaces[index].mapping {
+        Some(mapping) -> return .Ok(mapping.address)
+        None -> {}
+    }
+    let length = surfaceBytes(deviceLibrary.surfaces[index].info)
+    let buffer = try deviceOf(deviceLibrary.surfaces[index].object)
+    let address = try buffer.map(length, MapFlags.readWrite, MapFlags.shared, 0)
+    deviceLibrary.surfaces[index].mapping = .Some(Mapping { address: address, length: length })
+    return .Ok(address)
+}
+
+public function surfaceUnmap(surface: Ref) -> Result<Void, TesseraError> {
+    let index = try resolveSurface(surface, RefRights.map)
+    return match deviceLibrary.surfaces[index].mapping {
+        Some(mapping) -> {
+            unmap(mapping.address, mapping.length)
+            deviceLibrary.surfaces[index].mapping = .None
+            return .Ok
+        }
+        None -> .Error(failure(.BadState))
+    }
+}
+
+// Linux reclaims no dma-buf behind its owner's back, so a purgeable surface
+// always keeps its contents.
+public function surfaceSetPurgeable(surface: Ref, purgeable: Bool) -> Result<Bool, TesseraError> {
+    let index = try resolveSurface(surface, RefRights.write)
+    deviceLibrary.surfaces[index].purgeable = purgeable
+    return .Ok(true)
+}
+
+// The count of users, with bit 31 set while a display scans it out.
+public function surfaceInUse(surface: Ref) -> Result<UN32, TesseraError> {
+    let index = try resolveSurface(surface, RefRights.inspect)
+    var count = U32(1)
+    if deviceLibrary.surfaces[index].onScreen { count = count | SurfaceLimit.onScreen }
+    return .Ok(count)
+}
+
+public function surfaceNativeHandle(
+    surface: Ref,
+    plane: Number
+) -> Result<NativeHandle, TesseraError> {
+    let index = try resolveSurface(surface, RefRights.native)
+    if plane < 0 || plane >= Number(deviceLibrary.surfaces[index].info.planeCount) {
+        return .Error(failure(.InvalidArgument))
+    }
+    let buffer = try deviceOf(deviceLibrary.surfaces[index].object)
+    let duplicate = try buffer.duplicate()
+    return .Ok(NativeHandle { kind: .DmaBufFd, value: U64(duplicate.number) })
+}
+
+function surfaceRelease(object: Number) {
+    var kept: [SurfaceRecord] = []
+    for surface in deviceLibrary.surfaces {
+        if surface.object != object {
+            kept.append(surface)
+            continue
+        }
+        match surface.mapping {
+            Some(mapping) -> unmap(mapping.address, mapping.length)
+            None -> {}
+        }
+    }
+    deviceLibrary.surfaces = kept
+}
+
+// `SurfaceInfo` as its 128-byte record, for the token payload: the fixed
+// fields, then the four planes from @32, 24 bytes each.
+function writePlane(block: RawPtr, at: Number, plane: borrow SurfacePlane) {
+    heapStore<U64>(block, at, plane.offset)
+    heapStore<U32>(block, at + 8, plane.stride)
+    heapStore<U32>(block, at + 12, U32(0))
+    heapStore<U64>(block, at + 16, plane.size)
+}
+
+function readPlane(block: RawPtr, at: Number) -> SurfacePlane {
+    return SurfacePlane {
+        offset: heapLoad<U64>(block, at),
+        stride: heapLoad<U32>(block, at + 8),
+        size: heapLoad<U64>(block, at + 16)
+    }
+}
+
+function writeSurfaceInfo(block: RawPtr, at: Number, info: borrow SurfaceInfo) {
+    heapStore<U32>(block, at, info.width)
+    heapStore<U32>(block, at + 4, info.height)
+    heapStore<U32>(block, at + 8, info.format.raw)
+    heapStore<U32>(block, at + 12, info.usage.raw)
+    heapStore<U64>(block, at + 16, info.modifier.raw)
+    heapStore<U32>(block, at + 24, info.planeCount)
+    heapStore<U32>(block, at + 28, info.flags.raw)
+    writePlane(block, at + 32, info.plane0)
+    writePlane(block, at + 56, info.plane1)
+    writePlane(block, at + 80, info.plane2)
+    writePlane(block, at + 104, info.plane3)
+}
+
+function readSurfaceInfo(block: RawPtr, at: Number) -> SurfaceInfo {
+    return SurfaceInfo {
+        width: heapLoad<U32>(block, at),
+        height: heapLoad<U32>(block, at + 4),
+        format: FourCc(heapLoad<U32>(block, at + 8)),
+        usage: SurfaceUsage(heapLoad<U32>(block, at + 12)),
+        modifier: Modifier(heapLoad<U64>(block, at + 16)),
+        planeCount: heapLoad<U32>(block, at + 24),
+        flags: SurfaceFlags(heapLoad<U32>(block, at + 28)),
+        plane0: readPlane(block, at + 32),
+        plane1: readPlane(block, at + 56),
+        plane2: readPlane(block, at + 80),
+        plane3: readPlane(block, at + 104),
+    }
+}

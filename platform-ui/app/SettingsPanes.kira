@@ -1,0 +1,170 @@
+import Foundation
+import LibTessera
+import TesseraUI
+
+// Settings' panes as places others can open it at (roadmap/26-system-search.md,
+// "Ownership and interfaces"): system search finds a pane by its name and
+// the words a person would look for it by, and opening one asks Settings to
+// show it. The request is a setting, `settings.destination`, holding the
+// pane's word: Settings reads it when it starts and whenever Settings change,
+// goes to the pane, and forgets it.
+
+/// A pane of Settings that can be opened directly.
+public enum SettingsPane {
+    General
+    About
+    Display
+    AutoLock
+    HomeScreen
+    Notifications
+    Focus
+    Wallpaper
+    Battery
+    Passcode
+    Storage
+    Apps
+    DateTime
+    TimeZone
+    Keyboard
+}
+
+public namespace SettingsDestinationSetting {
+    let key: String = "settings.destination"
+}
+
+/// The name Settings is installed under.
+public namespace SettingsApplication {
+    let name: String = "Settings"
+}
+
+let settingsPanes: [SettingsPane] = [
+    .General, .About, .Display, .AutoLock, .HomeScreen, .Notifications, .Focus, .Wallpaper, .Battery, .Passcode, .Storage, .Apps,
+    .DateTime, .TimeZone, .Keyboard,
+]
+
+extend SettingsPane {
+    /// The word the pane is asked for by, which `settingsPaneNamed` reads back.
+    function word(borrow self) -> String {
+        return match self {
+            General -> "general"
+            About -> "about"
+            Display -> "display"
+            AutoLock -> "autoLock"
+            HomeScreen -> "homeScreen"
+            Notifications -> "notifications"
+            Focus -> "focus"
+            Wallpaper -> "wallpaper"
+            Battery -> "battery"
+            Passcode -> "passcode"
+            Storage -> "storage"
+            Apps -> "apps"
+            DateTime -> "dateTime"
+            TimeZone -> "timeZone"
+            Keyboard -> "keyboard"
+        }
+    }
+
+    /// The pane's title, as Settings shows it.
+    function title(borrow self) -> String {
+        return match self {
+            General -> "General"
+            About -> "About"
+            Display -> "Display & Brightness"
+            AutoLock -> "Auto-Lock"
+            HomeScreen -> "Home Screen & App Library"
+            Notifications -> "Notifications"
+            Focus -> "Focus"
+            Wallpaper -> "Wallpaper"
+            Battery -> "Battery"
+            Passcode -> "Passcode"
+            Storage -> "Storage"
+            Apps -> "Apps"
+            DateTime -> "Date & Time"
+            TimeZone -> "Time Zone"
+            Keyboard -> "Language & Keyboard"
+        }
+    }
+
+    /// Where the pane stands in Settings, for a search result to say.
+    function section(borrow self) -> String {
+        return match self {
+            General, About, Display, HomeScreen, Notifications, Focus, Wallpaper, Battery, Passcode, Storage, Apps -> "Settings"
+            AutoLock -> "Settings › Display & Brightness"
+            DateTime, Keyboard -> "Settings › General"
+            TimeZone -> "Settings › General › Date & Time"
+        }
+    }
+
+    /// Other words a person looks for the pane by, lower case.
+    function keywords(borrow self) -> [String] {
+        return match self {
+            General -> ["settings", "preferences"]
+            About -> ["version", "tessera", "system", "machine"]
+            Display -> ["brightness", "appearance", "dark", "light", "screen", "text size"]
+            AutoLock -> ["lock", "sleep", "screen off"]
+            HomeScreen -> ["home", "app library", "dock", "layout", "reset"]
+            Notifications -> ["banners", "alerts", "history"]
+            Focus -> ["do not disturb", "schedule", "notifications", "banners", "quiet"]
+            Wallpaper -> ["background", "picture", "lock screen"]
+            Battery -> ["power", "charge", "low power"]
+            Passcode -> ["lock", "password", "security", "unlock"]
+            Storage -> ["disk", "space", "free"]
+            Apps -> ["applications", "uninstall", "installed"]
+            DateTime -> ["date", "time", "clock", "24-hour"]
+            TimeZone -> ["zone", "region", "city"]
+            Keyboard -> ["language", "layout", "input", "typing"]
+        }
+    }
+}
+
+/// The pane `word` names, none when it names none.
+public function settingsPaneNamed(word: borrow String) -> SettingsPane? {
+    for pane in settingsPanes {
+        if pane.word() == word { return .Some(pane) }
+    }
+    return .None
+}
+
+/// Every pane that can be opened directly.
+public function allSettingsPanes() -> [SettingsPane] {
+    return copy settingsPanes
+}
+
+/// Changes `key` to `value` in Settings, or forgets it when `value` is none.
+///
+/// # Errors
+///
+/// The service's failure when it cannot be reached or refuses the change.
+public function storeSetting(key: borrow String, value: String?) -> Result<Void, TesseraError> {
+    let channel = try settingsConnect()
+    let changed = match value {
+        Some(text) -> settingsWrite(channel, key, text)
+        None -> settingsRemove(channel, key)
+    }
+    match handleClose(channel) {
+        Ok -> {}
+        // The change is made or refused already; a channel that will not
+        // close leaks one descriptor and changes nothing.
+        Error(failed) -> absorb failed
+    }
+    return changed
+}
+
+/// Opens Settings at `pane`.
+public function openSettingsPane(pane: SettingsPane, installed: borrow [Application]) {
+    match storeSetting(SettingsDestinationSetting.key, .Some(pane.word())) {
+        Ok -> {}
+        Error(failed) -> log warn(
+            "Settings could not be asked to show a pane",
+            pane: pane.word(),
+            error: errorName(failed)
+        )
+    }
+    for application in installed {
+        if application.name == SettingsApplication.name {
+            openApplication(application)
+            return
+        }
+    }
+    log warn("Settings is not installed")
+}

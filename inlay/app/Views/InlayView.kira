@@ -1,0 +1,289 @@
+import LibTessera
+import KiraUI
+import TesseraUI
+
+// The applications installed from a disk image, the only ones Inlay
+// uninstalls.
+function installedFromImages() -> [Application] {
+    var kept: [Application] = []
+    for application in installedApplications() {
+        match application.place {
+            InstalledImage -> kept.append(copy application)
+            System, Applications, DiskImage -> {}
+        }
+    }
+    return kept
+}
+
+// Why PID 1 was not asked, said in the log: Inlay offers each request only
+// where it applies, so a refusal is a fault in Inlay.
+function report(refused: Result<Void, WorkspaceRefusal>, name: borrow String) {
+    match refused {
+        Ok -> {}
+        Error(refusal) -> match refusal {
+            NotOnDiskImage -> log fault(
+                "only an application on a disk image is installed",
+                application: copy name
+            )
+            NotInstalledImage -> log fault(
+                "only an application installed from a disk image is uninstalled",
+                application: copy name
+            )
+        }
+    }
+}
+
+// One row for an application on a disk image: it opens from the image, or
+// installs in /Applications. One installed already says so, as installing it
+// again would change nothing.
+function imageRow(application: Application, installed: Bool) -> Any Widget {
+    if installed { return installedImageRow(move application) }
+    return installableRow(move application)
+}
+
+// A row for an application on an image that is installed already.
+function installedImageRow(application: Application) -> Any Widget {
+    let name = copy application.name
+    return LabeledContent(label = name) {
+        openButton(copy application)
+        Text("Installed").foregroundColor(.Secondary)
+    }
+}
+
+// A row for an application on an image that is not installed yet.
+function installableRow(application: Application) -> Any Widget {
+    let name = copy application.name
+    return LabeledContent(label = name) {
+        openButton(copy application)
+        installButton(copy application)
+    }
+}
+
+// The button that installs `application` in /Applications.
+function installButton(application: Application) -> Any Widget {
+    return Button(
+        action = { in
+            report(installApplication(application), application.name)
+            return
+        }
+    ) {
+        Text("Install")
+    }
+}
+
+// The button that opens `application` where it is.
+function openButton(application: Application) -> Any Widget {
+    return Button(
+        action = { in
+            openApplication(application)
+            return
+        }
+    ) {
+        Text("Open")
+    }
+}
+
+// One row for an installed image: it opens, or uninstalls. Its documents are
+// kept.
+function installedRow(application: Application) -> Any Widget {
+    let name = copy application.name
+    return LabeledContent(label = name) {
+        openButton(copy application)
+        uninstallButton(copy application)
+    }
+}
+
+// The button that uninstalls `application`, keeping its documents.
+function uninstallButton(application: Application) -> Any Widget {
+    return Button(
+        action = { in
+            report(uninstallApplication(application), application.name)
+            return
+        }
+    ) {
+        Text("Uninstall")
+    }
+}
+
+// The applications on one opened disk image, each opening from the image or
+// installing in /Applications, and its place in /Volumes under them.
+function imageSection(image: borrow DiskImage) -> Any Widget {
+    var rows: [Any Widget] = []
+    for application in image.applications {
+        rows.append(imageRow(copy application, image.isInstalled(application)))
+    }
+    if rows.count == 0 {
+        rows.append(Text("No application on this image").foregroundColor(.Secondary))
+    }
+    return Section(children: rows, header: Text("Applications"), footer: Text(copy image.path))
+}
+
+// The applications installed from a disk image, and what uninstalling keeps.
+function installedSection(installed: borrow [Application]) -> Any Widget {
+    var rows: [Any Widget] = []
+    for application in installed {
+        rows.append(installedRow(copy application))
+    }
+    if rows.count == 0 {
+        rows.append(Text("Nothing is installed from a disk image").foregroundColor(.Secondary))
+    }
+    return Section(
+        children: rows,
+        header: Text("Installed from Disk Images"),
+        footer: Text("Uninstalling keeps the application's documents")
+    )
+}
+
+// What PID 1 said about the last request, if it said anything, as an alert
+// shows it on a Mac: the first sentence as the title, and what follows it, a
+// sentence saying what to do, as the message.
+function noticeTitle(notice: borrow String?) -> String {
+    let said = noticeText(notice)
+    return match said.indexOf(NoticeText.sentenceEnd) {
+        Some(end) -> said.substring(0, end + 1)
+        None -> said
+    }
+}
+
+function noticeMessage(notice: borrow String?) -> String {
+    let said = noticeText(notice)
+    return match said.indexOf(NoticeText.sentenceEnd) {
+        Some(end) -> said.substring(end + NoticeText.sentenceEnd.count, said.count)
+        None -> ""
+    }
+}
+
+namespace NoticeText {
+    let sentenceEnd: String = ". "
+}
+
+function noticeText(notice: borrow String?) -> String {
+    return match notice {
+        Some(said) -> copy said
+        None -> ""
+    }
+}
+
+// The sidebar: Documents and the installed applications under Favorites,
+// and each volume and opened disk image under Locations, as a Mac's Finder
+// lists its places.
+construct InlaySidebar(images: [DiskImage], volumes: [Volume]) extends Widget {
+    body {
+        List {
+            Section {
+                NavigationLink(value = FolderRoute(path: documentsFolder())) {
+                    Label(title = "Documents", systemImage = .Folder)
+                }
+                NavigationLink(value = FolderRoute(path: "/" + SystemDirectory.desktopItems)) {
+                    Label(title = "Desktop", systemImage = .Desktopcomputer)
+                }
+                NavigationLink(value = ApplicationsRoute()) {
+                    Label(title = "Applications", systemImage = .RectangleGrid2x2)
+                }
+                NavigationLink(value = TrashRoute()) {
+                    Label(title = "Trash", systemImage = .Trash)
+                }
+            } header: {
+                Text("Favorites")
+            }
+
+            Section {
+                For(volume in volumes) {
+                    NavigationLink(value = FolderRoute(path: copy volume.path)) {
+                        Label(title = copy volume.name, systemImage = .Folder)
+                    }
+                }
+                For(image in images) {
+                    NavigationLink(value = ImageRoute(name: copy image.name)) {
+                        Label(title = copy image.name, systemImage = .CubeBox)
+                    }
+                }
+            } header: {
+                Text("Locations")
+            }
+        }
+        .navigationTitle("Inlay")
+    }
+}
+
+// The person's documents.
+function documentsFolder() -> String {
+    return "/" + SystemDirectory.documents
+}
+
+// The volumes Inlay lists as places: those in /Volumes that are not opened
+// disk images, which Locations lists by their applications.
+function browsableVolumes(images: borrow [DiskImage]) -> [Volume] {
+    var kept: [Volume] = []
+    for volume in mountedVolumes() {
+        if !imageAt(images, volume.path) { kept.append(copy volume) }
+    }
+    return kept
+}
+
+function imageAt(images: borrow [DiskImage], path: borrow String) -> Bool {
+    for image in images {
+        if image.path == path { return true }
+    }
+    return false
+}
+
+// Whether the folder at `path` can be written: a volume that says it is
+// read-only cannot, and one that cannot say is treated as read-only.
+function folderWritable(path: borrow String) -> Bool {
+    return match pathReadOnly(path) {
+        Ok(readOnly) -> !readOnly
+        Error(failed) -> {
+            log info(
+                "a folder's volume did not say whether it can be written",
+                path: copy path,
+                error: errorName(failed)
+            )
+            false
+        }
+    }
+}
+
+// The place chosen in the sidebar: a folder, an opened disk image's
+// applications, or the ones installed from disk images.
+function placeDetail(images: borrow [DiskImage], installed: borrow [Application]) -> Any Widget {
+    let place = chosenPlace(images)
+    match place {
+        Folder(path) -> return FolderPane(path = copy path, writable = folderWritable(path))
+        Trash -> return TrashPane()
+        Applications, Image -> {}
+    }
+    match chosenImage(images, place) {
+        Some(image) -> return Form(children: [imageSection(image)]).navigationTitle(copy image.name)
+        None -> return Form(children: [installedSection(installed)]).navigationTitle("Applications")
+    }
+}
+
+// Inlay's window: its places in the sidebar and the chosen one beside them,
+// as on a Mac. What PID 1 says about a request is an alert, as a Mac's Finder
+// says why an application cannot be opened; OK puts it away.
+construct InlayView(images: [DiskImage], installed: [Application], notice: String?) extends Widget {
+    body {
+        NavigationSplitView(path = NavigationPath {}) {
+            InlaySidebar(images = images, volumes = browsableVolumes(images))
+        } detail: {
+            placeDetail(images, installed)
+        }
+        .alert(
+            title = noticeTitle(notice),
+            isPresented = notice != .None,
+            message = noticeMessage(notice),
+            actions = [
+                Button(
+                    action = { in
+                        dismissWorkspaceNotice()
+                        return
+                    }
+                ) {
+                    Text("OK")
+                }
+                .buttonStyle(.BorderedProminent)
+            ]
+        )
+    }
+}

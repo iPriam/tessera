@@ -1,0 +1,77 @@
+//! The timer: its countdown, its presets, and the text they show.
+import Foundation
+import KiraUI
+import TesseraUI
+
+// Clock's timer, as the Timers in a Mac's and an iPhone's Clock: a length
+// chosen from the presets, a countdown, and a notification when it ends,
+// which the platform shows as a banner while Clock is not in front.
+
+/// The timer's preset lengths, and the banner the platform shows when a timer ends while Clock is not in front.
+namespace TimerPresets {
+    // The lengths offered, in seconds, as the Clock's recents start out.
+    let lengths: [UNumber] = [60, 180, 300, 600, 900]
+}
+
+/// The timer: when it ends, in milliseconds since 1970, while it runs, and the length it was started with.
+class ClockTimer {
+    var endsAt: Number? = .None
+    var length: UNumber = 0
+}
+
+extend ClockTimer {
+    // Starts a countdown of `seconds`, replacing one already running.
+    function start(borrow mut self, seconds: UNumber) {
+        endsAt = .Some(unixMillis() + seconds * Millis.second)
+        length = seconds
+        log info("a timer started", seconds: seconds)
+        redrawAfter(1)
+    }
+
+    function cancel(borrow mut self) {
+        if endsAt.isNone() { return }
+        endsAt = .None
+        log info("the timer was cancelled")
+    }
+
+    // Whole seconds left, rounded up as the Clock shows them; none while no
+    // timer runs.
+    function remaining(borrow self, now: Number) -> UNumber? {
+        let ends = try endsAt otherwise return .None
+        let left = ends - now
+        if left <= 0 { return .Some(0) }
+        return .Some(ceil(left / Millis.second))
+    }
+
+    // Ends a timer whose time has come: it posts its notification and stops.
+    // A running one asks to be drawn again when its next second turns.
+    function follow(borrow mut self, now: Number) {
+        let ends = match endsAt {
+            Some(value) -> value
+            // No timer is running.
+            None -> return
+        }
+        if now < ends {
+            let toNext = (ends - now) % Millis.second
+            redrawAfter((toNext == 0 ? Millis.second : toNext) / Millis.second)
+            return
+        }
+        endsAt = .None
+        addNotification(NotificationContent { title: "Timer", body: "Timer Done" })
+        log info("a timer ended", seconds: length)
+    }
+}
+
+/// The preset `seconds` names, as `5 min` or `1 min`.
+function presetName(seconds: UNumber) -> String {
+    return "\(trunc(seconds / CivilTime.secondsPerMinute)) min"
+}
+
+/// The countdown `seconds` reads as, `4:59`, or `1:04:59` past an hour.
+function countdownText(seconds: UNumber) -> String {
+    let hours = trunc(seconds / CivilTime.secondsPerHour)
+    let minutes = trunc(seconds % CivilTime.secondsPerHour / CivilTime.secondsPerMinute)
+    let rest = seconds % CivilTime.secondsPerMinute
+    if hours > 0 { return "\(hours):\(zeroPadded(minutes, 2)):\(zeroPadded(rest, 2))" }
+    return "\(minutes):\(zeroPadded(rest, 2))"
+}

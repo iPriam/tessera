@@ -1,0 +1,147 @@
+import Foundation
+import Heap
+import LibTessera
+
+// Transfer tokens (17 §9.6, §10.3): the only way a surface or a fence leaves
+// a process. The exporter hands the manager its descriptor and the rights it
+// allows; the manager answers a 128-bit random token, single use, that
+// expires. The importer hands the token back and receives the descriptor.
+// Both answers are in hand when the call returns, so the completion is
+// posted at once.
+
+namespace TokenLifetime {
+    let standard: Number = 10 * Time.nanosecondsPerSecond
+    let longest: Number = 60 * Time.nanosecondsPerSecond
+    let payloadBytes: Number = 128
+}
+
+// Token lifetimes: 0 means ten seconds, sixty is the most.
+function tokenLifetime(lifetime: Number) -> Number {
+    if lifetime <= 0 { return TokenLifetime.standard }
+    if lifetime > TokenLifetime.longest { return TokenLifetime.longest }
+    return lifetime
+}
+
+// The rights an export allows: `same` is every right the Ref holds, and no
+// export allows more than that.
+function exportRights(ref: Ref, rights: RefRights) -> Result<RefRights, TesseraError> {
+    let held = rightsOf(ref)
+    var allowed = rights
+    if allowed == RefRights.same { allowed = held }
+    if !held.has(allowed) { return .Error(failure(.AccessDenied)) }
+    return .Ok(allowed)
+}
+
+// The export request for `kind` @4, the rights @24 and the lifetime @32,
+// with `info` as the payload when it is a surface's.
+function exportTo(
+    object: Number,
+    kind: borrow DeviceObject,
+    rights: RefRights,
+    lifetime: Number,
+    info: borrow SurfaceInfo?,
+    reply: borrow Reply
+) -> Result<Void, TesseraError> {
+    var request = managerRequest(.Export)
+    request.kind = code(kind)
+    request.rights = rights.raw
+    request.lifetime = U64(tokenLifetime(lifetime))
+    let requestBytes = request.encode()
+    match info {
+        Some(surface) -> writeSurfaceInfo(requestBytes.pointer(), Wire.payload, surface)
+        None -> {}
+    }
+    return match exchange(requestBytes.pointer(), .Some(try deviceOf(object))) {
+        Ok(answer) -> reply.post(
+            .Ok(Answer { result0: answer.token.high, result1: answer.token.low }),
+            .Token
+        )
+        Error(failed) -> reply.post(.Error(failed), .Token)
+    }
+}
+
+public function surfaceExport(
+    surface: Ref,
+    rights: RefRights,
+    lifetime: Number,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    let index = try resolveSurface(surface, RefRights.export)
+    let allowed = try exportRights(surface, rights)
+    let record = deviceLibrary.surfaces[index]
+    return exportTo(
+        record.object,
+        .Surface,
+        allowed,
+        lifetime,
+        .Some(record.info),
+        Reply { port: port, key: key }
+    )
+}
+
+public function fenceExport(
+    fence: Ref,
+    rights: RefRights,
+    lifetime: Number,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    let object = try resolve(fence, .Fence, RefRights.export)
+    let allowed = try exportRights(fence, rights)
+    return exportTo(object, .Fence, allowed, lifetime, .None, Reply { port: port, key: key })
+}
+
+// Redeems `token` for an object of `kind`: the kind @4, the token @40 and
+// @48. The reply carries the kind found @4 and the rights @16.
+function importAs(token: borrow Token, kind: borrow DeviceObject) -> Result<Ref, TesseraError> {
+    var request = managerRequest(.Import)
+    request.kind = code(kind)
+    request.token = token
+    let answer = try managerCall(request, .None)
+    let received = try answer.passed otherwise return .Error(failure(.Internal))
+    if answer.kind != code(kind) {
+        received.close()
+        return .Error(failure(.WrongType))
+    }
+    let rights = RefRights(answer.rights)
+    if kind == .Surface {
+        var info = readSurfaceInfo(answer.payload.pointer(), 0)
+        info.flags = info.flags | SurfaceFlags.imported
+        return .Ok(surfaceFrom(received, info, rights))
+    }
+    return match fenceFrom(received, rights) {
+        Ok(ref) -> .Ok(ref)
+        Error(failed) -> {
+            received.close()
+            return .Error(failed)
+        }
+    }
+}
+
+function postImport(
+    outcome: borrow Result<Ref, TesseraError>,
+    kind: borrow DeviceObject,
+    reply: borrow Reply
+) -> Result<Void, TesseraError> {
+    return match outcome {
+        Ok(ref) -> reply.post(.Ok(Answer { result0: ref.raw, result1: U64(code(kind)) }), .Import)
+        Error(failed) -> reply.post(.Error(failed), .Import)
+    }
+}
+
+public function surfaceImport(
+    token: borrow Token,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    return postImport(importAs(token, .Surface), .Surface, Reply { port: port, key: key })
+}
+
+public function fenceImport(
+    token: borrow Token,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    return postImport(importAs(token, .Fence), .Fence, Reply { port: port, key: key })
+}

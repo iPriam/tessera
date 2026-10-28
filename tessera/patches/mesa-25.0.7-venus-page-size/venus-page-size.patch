@@ -1,0 +1,62 @@
+Round venus's host-visible allocations up to the guest's page size.
+
+A host-visible VkDeviceMemory reaches the guest as a virtio-gpu blob: venus
+asks the host driver for the memory, the renderer exports it as a dma-buf, and
+the guest kernel creates a blob over it. The kernel rounds a blob's size up to
+its own pages; the renderer then refuses any blob larger than the dma-buf it
+was given:
+
+    vkr: mem dma_buf_size 4096 < blob_size 16384
+    virgl_cmd_resource_create_blob: virgl blob create error: Invalid argument
+
+An aarch64 Tessera kernel uses 16K pages and an x86_64 Linux host 4K ones, so
+every small mappable allocation fails, and the first thing to fail in the guest
+is whatever needed it -- Ember's frame synchronisation objects, reported as
+"could not create frame synchronization objects". An Apple-silicon host has 16K
+pages too and never sees it.
+
+Rounding the allocation up in the guest makes the host's dma-buf as large as the
+blob. Imports are left alone: their size is the imported object's.
+
+--- a/src/virtio/vulkan/vn_device_memory.c
++++ b/src/virtio/vulkan/vn_device_memory.c
+@@ -10,6 +10,8 @@
+ 
+ #include "vn_device_memory.h"
+ 
++#include "util/os_misc.h"
++
+ #include "venus-protocol/vn_protocol_driver_device_memory.h"
+ #include "venus-protocol/vn_protocol_driver_transport.h"
+ 
+@@ -373,6 +375,30 @@
+       }
+    }
+ 
++   /* Tessera: a blob is made of the guest's pages, so the kernel rounds its
++    * size up to them, and the renderer refuses a blob larger than the memory
++    * the host driver exported for it. A guest whose pages are larger than the
++    * host's -- 16K on aarch64 over a 4K host -- asks for 4096 bytes, gets a
++    * 4096-byte dma-buf from the host and a 16384-byte blob from its kernel,
++    * and the blob is refused with nothing in the guest saying why. Rounding a
++    * host-visible allocation up to the guest's page size makes the two agree;
++    * the extra bytes are never handed to the caller as anything but slack. */
++   VkMemoryAllocateInfo page_aligned_info;
++   if (!import_fd_info) {
++      const VkMemoryType *mem_type =
++         &dev->physical_device->memory_properties
++             .memoryTypes[pAllocateInfo->memoryTypeIndex];
++      uint64_t page_size = 4096;
++      os_get_page_size(&page_size);
++      if ((mem_type->propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
++          pAllocateInfo->allocationSize % page_size) {
++         page_aligned_info = *pAllocateInfo;
++         page_aligned_info.allocationSize =
++            align64(pAllocateInfo->allocationSize, page_size);
++         pAllocateInfo = &page_aligned_info;
++      }
++   }
++
+    struct vn_device_memory *mem = vk_device_memory_create(
+       &dev->base.base, pAllocateInfo, pAllocator, sizeof(*mem));
+    if (!mem)

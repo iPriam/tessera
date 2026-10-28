@@ -1,0 +1,259 @@
+//! The Dock's state: the applications it keeps, in order, and each running application after them.
+import Foundation
+
+// What the Dock holds (roadmap/11-adaptive-desktop.md, "The Dock"): the
+// applications kept in it, in order, then each running application that is
+// not kept, or on a touch platform the few used last that are not kept, as an
+// iPad's recent applications. An application is known by the name PID 1 gave it when it linked
+// it to the platform, so every window of one application is one entry.
+
+/// How many recently used applications the Dock remembers.
+namespace DockRecent {
+    // How many applications used last are remembered, enough that the few
+    // shown are there however many of them the Dock keeps.
+    let remembered: Number = 16
+}
+
+/// One application in the Dock: its name, the running application it is if it is running, and whether it is kept there when it is not.
+public struct DockEntry {
+    /// The application's name, as its window's name reached the platform.
+    var name: String
+    /// The running application this entry is, or `.None` when the application is not running.
+    var application: PlatformApplicationId?
+    /// Whether the Dock keeps the application when it is not running.
+    var kept: Bool
+}
+
+extend DockEntry {
+    /// Whether the application is running: it has an application open.
+    function running(borrow self) -> Bool {
+        return application.isSome()
+    }
+}
+
+extend PlatformState {
+    /// Keeps `names` in the Dock, in that order.
+    function keepInDock(borrow mut self, names: [String]) {
+        kept = names
+    }
+
+    /// The running application named `name`, if there is one.
+    function applicationNamed(borrow self, name: borrow String) -> PlatformApplicationId? {
+        for application in applications {
+            if application.running && application.kind == .Application && application.name == name {
+                return .Some(application.id)
+            }
+        }
+        return .None
+    }
+
+    /// An identity no application has yet.
+    function unusedApplicationId(borrow self) -> PlatformApplicationId {
+        var highest: UNumber = 0
+        for application in applications {
+            if application.id.raw > highest { highest = application.id.raw }
+        }
+        return PlatformApplicationId(highest + 1)
+    }
+
+    /// A window of the application named `name` opened as `surface`, in front
+    /// of the others. A second window of a running application joins it; the
+    /// first starts it. The application it is.
+    function windowOpened(
+        borrow mut self,
+        surface: PlatformSurfaceId,
+        name: String,
+        kind: ApplicationKind,
+    ) -> PlatformApplicationId {
+        let known: PlatformApplicationId? = match kind {
+            // A window not yet named is its own application until it is.
+            Application -> name.count > 0 ? applicationNamed(name) : .None
+            Platform, Desktop -> .None
+        }
+        let application = match known {
+            Some(value) -> value
+            None -> {
+                let fresh = unusedApplicationId()
+                registerApplication(fresh, move name, move kind)
+                fresh
+            }
+        }
+        let frame = SurfaceFrame { x: 0, y: 0, width: 0, height: 0 }
+        registerSurface(surface, application, move frame, frontZOrder())
+        return application
+    }
+
+    /// The window `surface` closed. The application it was ends with its last
+    /// window, and focus it held goes back to the platform.
+    function windowClosed(
+        borrow mut self,
+        surface: PlatformSurfaceId,
+    ) -> Result<Void, PlatformStateFailure> {
+        let index = try surfaceIndexOrFail(self, surface)
+        let application = surfaces[index].application
+        let heldFocus = surfaces[index].focused
+        var remaining: [PlatformSurface] = []
+        var others = false
+        for kept in surfaces {
+            if kept.id == surface { continue }
+            if kept.application == application { others = true }
+            remaining.append(kept)
+        }
+        surfaces = move remaining
+        if !others { return applicationEnded(application) }
+        if heldFocus { returnFocusToPlatform() }
+        return .Ok
+    }
+
+    /// The window `surface` opened before PID 1's name for its application
+    /// reached the platform, and now it is `name`. It joins the running
+    /// application of that name, or its own application takes the name. A
+    /// window the platform does not know has nothing to name; ending the
+    /// application it leaves behind can fail, and that failure is returned.
+    function nameWindow(
+        borrow mut self,
+        surface: PlatformSurfaceId,
+        name: String
+    ) -> Result<Void, PlatformStateFailure> {
+        let index = try surfaceIndex(self, surface) otherwise return .Ok
+        let unnamed = surfaces[index].application
+        match applicationNamed(name) {
+            Some(named) -> {
+                if named == unnamed { return .Ok }
+                surfaces[index].application = named
+                var others = false
+                for other in surfaces {
+                    if other.application == unnamed { others = true }
+                }
+                if !others { return applicationEnded(unnamed) }
+            }
+            None -> match applicationIndex(self, unnamed) {
+                Some(application) -> {
+                    applications[application].name = copy name
+                    if applications[application].kind == .Application { noteUsed(name) }
+                }
+                None -> {}
+            }
+        }
+        return .Ok
+    }
+
+    /// The application `surface` is a window of.
+    function applicationOfSurface(
+        borrow self,
+        surface: PlatformSurfaceId
+    ) -> PlatformApplicationId? {
+        return match surfaceIndex(self, surface) {
+            Some(index) -> .Some(surfaces[index].application)
+            None -> .None
+        }
+    }
+
+    /// The name of the application `id`.
+    function applicationName(borrow self, id: PlatformApplicationId) -> String? {
+        return match applicationIndex(self, id) {
+            Some(index) -> .Some(copy applications[index].name)
+            None -> .None
+        }
+    }
+
+    /// A minimized window of `application`, the one furthest in front, if it
+    /// has one.
+    function minimizedSurfaceOf(
+        borrow self,
+        application: PlatformApplicationId
+    ) -> PlatformSurfaceId? {
+        var target: PlatformSurface? = .None
+        for surface in surfaces {
+            if surface.application == application && surface.visible == .Hidden
+                && isAtOrAbove(surface, target) { target = .Some(surface) }
+        }
+        return idOf(target)
+    }
+
+    /// Every window of an application that is shown, which going home puts
+    /// away.
+    function shownApplicationSurfaces(borrow self) -> [PlatformSurfaceId] {
+        return applicationSurfaces(self, .Visible)
+    }
+
+    /// Every window of an application that is put away, which Stage Manager
+    /// shows again in the strip.
+    function hiddenApplicationSurfaces(borrow self) -> [PlatformSurfaceId] {
+        return applicationSurfaces(self, .Hidden)
+    }
+
+    /// An application named `name` was used: it is the latest of the recent.
+    function noteUsed(borrow mut self, name: borrow String) {
+        if name.count == 0 { return }
+        var latest: [String] = [copy name]
+        for each in recent {
+            if each != name && latest.count < DockRecent.remembered { latest.append(copy each) }
+        }
+        recent = move latest
+    }
+
+    /// What a touch platform's Dock holds: every kept application, then the
+    /// `count` used last that are not kept, the latest first, open or not.
+    function dockEntriesRecent(borrow self, count: Number) -> [DockEntry] {
+        var entries: [DockEntry] = []
+        for name in kept {
+            entries.append(
+                DockEntry { name: copy name, application: applicationNamed(name), kept: true }
+            )
+        }
+        var shown: Number = 0
+        for name in recent {
+            if shown >= count { break }
+            if kept.contains(name) { continue }
+            entries.append(
+                DockEntry { name: copy name, application: applicationNamed(name), kept: false }
+            )
+            shown = shown + 1
+        }
+        return entries
+    }
+
+    /// What the Dock holds: every kept application, then every running one
+    /// that is not kept, in the order it started.
+    function dockEntries(borrow self) -> [DockEntry] {
+        var entries: [DockEntry] = []
+        for name in kept {
+            entries.append(
+                DockEntry { name: copy name, application: applicationNamed(name), kept: true }
+            )
+        }
+        for application in applications {
+            if !application.running || application.kind != .Application { continue }
+            // A window whose name has not reached the platform is not shown.
+            if application.name.count == 0 { continue }
+            if kept.contains(application.name) { continue }
+            entries.append(
+                DockEntry {
+                    name: copy application.name,
+                    application: .Some(application.id),
+                    kept: false
+                }
+            )
+        }
+        return entries
+    }
+}
+
+/// Every window of an application whose visibility is `visibility`.
+function applicationSurfaces(
+    state: borrow PlatformState,
+    visibility: SurfaceVisibility
+) -> [PlatformSurfaceId] {
+    var found: [PlatformSurfaceId] = []
+    for surface in state.surfaces {
+        if surface.visible != visibility { continue }
+        match applicationIndex(state, surface.application) {
+            Some(index) -> if state.applications[index].kind == .Application {
+                found.append(surface.id)
+            }
+            None -> {}
+        }
+    }
+    return found
+}

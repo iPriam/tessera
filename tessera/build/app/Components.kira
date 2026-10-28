@@ -1,0 +1,292 @@
+import Foundation
+
+// Tessera's components (roadmap/18-components.md): each a Kira package in a
+// checkout of its own beside this repository in the release train workspace.
+
+enum ComponentKind {
+    // A framework: a shared binary and the `.ridl` contract dependents
+    // build against.
+    Library
+    Program
+    // A DriverKit-style bundle devicekitd matches devices against.
+    Driver
+    // An application bundle, drawn with Kira UI.
+    Application
+}
+
+struct Component {
+    let name: String
+    let kind: ComponentKind
+    // The checkout, from this repository's root.
+    let location: String
+}
+
+function tesseraComponent(name: borrow String, kind: ComponentKind) -> Component {
+    return Component { name: copy name, kind: kind, location: "../" + name }
+}
+
+function kiraComponent(name: borrow String) -> Component {
+    return Component { name: copy name, kind: .Library, location: "../" + name }
+}
+
+// Every component, each library after the libraries it links. The system
+// volume's init and the installer's formatter are the /init of other images.
+function tesseraComponents() -> [Component] {
+    var components: [Component] = []
+    for name in ["libtessera", "devicekit", "platform-kit", "display-client", "appkit"] {
+        components.append(tesseraComponent(name, .Library))
+    }
+    for name in ["kira-layout", "ember", "kcoreanimation", "kcoreui", "kira-ui"] {
+        components.append(kiraComponent(name))
+    }
+    for name in ["core-icon", "tessera-ui", "calculation", "platform-ui"] {
+        components.append(tesseraComponent(name, .Library))
+    }
+    let programs = [
+        "init", "installer", "bootstrap", "devicekitd", "devices", "power", "volume", "pasteboard",
+        "presence", "trash",
+        "diskutil", "pmset", "caffeinate", "ioreg", "date", "mosaicdisplay", "adaptive-desktop",
+        "media", "adaptive-mobile", "devroot", "recovery", "settingsd", "reportcrash", "debugserver"
+    ]
+    for name in programs {
+        components.append(tesseraComponent(name, .Program))
+    }
+    for name in ["ccid-driver", "tablet-driver"] {
+        components.append(tesseraComponent(name, .Driver))
+    }
+    let applications = [
+        "desktop", "inlay", "disk-utility", "notes", "welcome", "clock", "calculator", "about", "settings", "display-check",
+        "tessera-browser"
+    ]
+    for name in applications {
+        components.append(tesseraComponent(name, .Application))
+    }
+    return components
+}
+
+// Whether framework `module` is private: one only the system's own components
+// use, left out of the public SDK.
+function privateFramework(module: borrow String) -> Bool {
+    return match module {
+        "DeviceKit" -> true
+        "AppKit" -> true
+        "PlatformUI" -> true
+        else -> false
+    }
+}
+
+// Where framework `module` is installed, from a release's root. Its binary has
+// the module's name; a dependent finds it through the run path its link
+// records, so this path is part of every dependent's binary.
+function frameworkDirectory(module: borrow String) -> String {
+    let frameworks = privateFramework(module) ? "PrivateFrameworks" : "Frameworks"
+    return "System/Library/\(frameworks)/\(module).framework"
+}
+
+// Application `name`'s bundle, from a release's root and without `.app`: the
+// desktop and the boot check are the system's own, in CoreServices; the rest
+// are in /System/Applications, where the desktop lists them.
+function applicationBundle(name: borrow String) -> String {
+    return match name {
+        "desktop" -> "System/Library/CoreServices/Desktop"
+        "display-check" -> "System/Library/CoreServices/Display Check"
+        "inlay" -> "System/Applications/Inlay"
+        "disk-utility" -> "System/Applications/Disk Utility"
+        "notes" -> "System/Applications/Notes"
+        "welcome" -> "System/Applications/Welcome"
+        "clock" -> "System/Applications/Clock"
+        "calculator" -> "System/Applications/Calculator"
+        "settings" -> "System/Applications/Settings"
+        "tessera-browser" -> "System/Applications/Browser"
+        else -> "System/Applications/About"
+    }
+}
+
+// The category application `name`'s bundle is listed under in App Library,
+// which its Info.plist names. Empty for a component that is no application.
+function applicationCategory(name: borrow String) -> String {
+    return match name {
+        "notes" -> "Productivity"
+        "tessera-browser" -> "Utilities"
+        "clock", "calculator", "welcome", "settings", "inlay", "disk-utility", "about" -> "Utilities"
+        else -> ""
+    }
+}
+
+// What a component's manifest and sources say, read while the graph is
+// described.
+struct PackageFacts {
+    // The module a library exports: its manifest's `moduleRoot`, else the
+    // name of its construct.
+    let module: String
+    // The modules its sources import.
+    let imports: [String]
+    // The files it declares it reads at run time, from its own root.
+    let assets: [String]
+}
+
+function readPackage(root: borrow String, location: borrow String) -> Result<PackageFacts, String> {
+    let manifest = match readFile(joinedPath(root, location) + "/package.kira") {
+        Ok(contents) -> contents.text
+        Error(failure) -> {
+            absorb failure
+            return .Error("no package at \(location)")
+        }
+    }
+    var imports: [String] = []
+    var visited: [String] = []
+    collectPackageImports(joinedPath(root, location), manifest, imports, visited)
+    return .Ok(
+        PackageFacts {
+            module: manifestModule(manifest),
+            imports: imports,
+            assets: quotedList(manifest, "let assets")
+        }
+    )
+}
+
+// The module a manifest names.
+function manifestModule(manifest: borrow String) -> String {
+    for line in manifest.split("\n") {
+        let trimmed = line.trim()
+        if trimmed.startsWith("let moduleRoot") {
+            let named = quotedList(trimmed, "let moduleRoot")
+            if named.count > 0 { return copy named[0] }
+        }
+        if trimmed.startsWith("construct ") {
+            let rest = trimmed.substring(10, trimmed.count)
+            match rest.indexOf(" ") {
+                Some(space) -> {
+                    if manifest.indexOf("moduleRoot").isNone() { return rest.substring(0, space) }
+                }
+                None -> {}
+            }
+        }
+    }
+    return ""
+}
+
+// The quoted strings on the line of `manifest` that starts with `prefix`.
+function quotedList(manifest: borrow String, prefix: borrow String) -> [String] {
+    var found: [String] = []
+    for line in manifest.split("\n") {
+        let trimmed = line.trim()
+        if trimmed.startsWith(prefix) {
+            let parts = trimmed.split("\"")
+            var index = 1
+            while index < parts.count {
+                found.append(copy parts[index])
+                index += 2
+            }
+        }
+    }
+    return found
+}
+
+// Adds every module the package at `directory` imports, and every module the
+// packages its manifest names by path import. A dependency that is a
+// framework on the system is linked from the SDK rather than compiled in (KLF
+// section 27.7 rule 3), so a component needs the contract of each framework
+// any package it compiles in imports, not only the ones it imports itself.
+function collectPackageImports(
+    directory: borrow String,
+    manifest: borrow String,
+    imports: borrow mut [String],
+    visited: borrow mut [String]
+) {
+    visited.append(copy directory)
+    collectImports(directory + "/app", imports)
+    for path in dependencyPaths(manifest) {
+        let dependency = joinedPath(directory, path)
+        if visited.contains(dependency) { continue }
+        match readFile(dependency + "/package.kira") {
+            Ok(contents) -> collectPackageImports(dependency, contents.text, imports, visited)
+            Error(failure) -> absorb failure
+        }
+    }
+}
+
+// The `path:` of every dependency `manifest` declares.
+function dependencyPaths(manifest: borrow String) -> [String] {
+    var paths: [String] = []
+    for line in manifest.split("\n") {
+        match line.indexOf("path: \"") {
+            Some(at) -> {
+                let rest = line.substring(at + 7, line.count)
+                match rest.indexOf("\"") {
+                    Some(end) -> paths.append(rest.substring(0, end))
+                    None -> {}
+                }
+            }
+            None -> {}
+        }
+    }
+    return paths
+}
+
+// Adds every module the Kira files under `directory` import, each once.
+function collectImports(directory: borrow String, imports: borrow mut [String]) {
+    let names = match listDirectory(directory) {
+        Ok(listing) -> listing.entries
+        Error(failure) -> {
+            absorb failure
+            return
+        }
+    }
+    for name in names {
+        let path = directory + "/" + name
+        if isDirectory(path) {
+            collectImports(path, imports)
+        } else if name.endsWith(".kira") {
+            let text = match readFile(path) {
+                Ok(contents) -> contents.text
+                Error(failure) -> {
+                    absorb failure
+                    ""
+                }
+            }
+            for line in text.split("\n") {
+                if line.startsWith("import ") {
+                    let module = line.substring(7, line.count).trim().split(" ")[0]
+                    if module.count > 0 && !imports.contains(module) { imports.append(copy module) }
+                }
+            }
+        }
+    }
+}
+
+// `relative` read from `directory`; an absolute `relative` stands alone.
+function joinedPath(directory: borrow String, relative: borrow String) -> String {
+    if relative.startsWith("/") { return copy relative }
+    return normalPath(directory + "/" + relative)
+}
+
+// `path` without `.` names, and with each `..` taking the name before it away
+// where there is one.
+function normalPath(path: borrow String) -> String {
+    var names: [String] = []
+    for name in path.split("/") {
+        match name {
+            "" -> {}
+            "." -> {}
+            ".." -> {
+                if names.count > 0 && names[names.count - 1] != ".." {
+                    names = names.prefix(names.count - 1)
+                } else {
+                    names.append("..")
+                }
+            }
+            else -> names.append(copy name)
+        }
+    }
+    let joined = joinedNames(names)
+    return path.startsWith("/") ? "/" + joined : joined
+}
+
+function joinedNames(names: borrow [String]) -> String {
+    var text = ""
+    for (index, name) in names.enumerated() {
+        text += index == 0 ? name : "/" + name
+    }
+    return text
+}

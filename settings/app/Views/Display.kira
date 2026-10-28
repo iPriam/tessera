@@ -1,0 +1,209 @@
+import Foundation
+import KiraUI
+import TesseraUI
+import LibTessera
+import PlatformKit
+
+// Display & Brightness: the appearance every window is drawn in, and how
+// soon the display sleeps when nothing is touched.
+
+// The appearance choices.
+namespace AppearanceChoice {
+    let automatic: String = "automatic"
+    let light: String = "light"
+    let dark: String = "dark"
+}
+
+// How soon the display sleeps, in seconds, as Auto-Lock offers it; 0 is
+// never.
+function sleepChoices() -> [Number] {
+    return [60, 120, 300, 600, 900, 1800, 0]
+}
+
+// The choices as the Settings service last held them, read once as the
+// application starts and kept as each is written.
+class SettingsChoices {
+    var appearance: String = AppearanceChoice.automatic
+    var sleep: Number = 600
+    var zone: String = TimeZoneSetting.automatic
+}
+
+function readChoices() -> SettingsChoices {
+    return SettingsChoices {
+        appearance: storedAppearance(),
+        sleep: storedSleep(),
+        zone: storedSetting(TimeZoneSetting.key, TimeZoneSetting.automatic)
+    }
+}
+
+construct DisplayPane(choices: SettingsChoices) extends Widget {
+    @State var appearance: String = copy choices.appearance
+
+    body {
+        let automatic = appearance == AppearanceChoice.automatic
+        Form {
+            Section {
+                HStack(spacing = .Large, alignment = .Center) {
+                    Spacer()
+                    AppearanceTile(
+                        title = "Light",
+                        dark = false,
+                        chosen = appearance == AppearanceChoice.light,
+                        choose = { in
+                            appearance = AppearanceChoice.light
+                            chooseAppearance(choices, AppearanceChoice.light)
+                            return
+                        }
+                    )
+                    AppearanceTile(
+                        title = "Dark",
+                        dark = true,
+                        chosen = appearance == AppearanceChoice.dark,
+                        choose = { in
+                            appearance = AppearanceChoice.dark
+                            chooseAppearance(choices, AppearanceChoice.dark)
+                            return
+                        }
+                    )
+                    Spacer()
+                }
+
+                Toggle(
+                    title = "Automatic",
+                    isOn = automatic,
+                    onChange = { on in
+                        let chosen = on ? AppearanceChoice.automatic : AppearanceChoice.dark
+                        appearance = copy chosen
+                        chooseAppearance(choices, chosen)
+                        return
+                    }
+                )
+            } header: {
+                Text("Appearance")
+            } footer: {
+                Text(
+                    "Every window follows the appearance at once. Automatic draws each in its style's own."
+                )
+            }
+
+            Section {
+                NavigationLink(value = AutoLockRoute(choices = choices)) {
+                    LabeledContent(label = "Auto-Lock") {
+                        Text(sleepText(choices.sleep))
+                    }
+                }
+            }
+        }
+        .navigationTitle("Display & Brightness")
+    }
+}
+
+// One appearance as an iPad's Display & Brightness shows it: a small window
+// in it, its name, and a check under the one chosen.
+construct AppearanceTile(
+    title: String,
+    dark: Bool,
+    chosen: Bool,
+    choose: () -> Void
+) extends Widget {
+    body {
+        Button(action = choose) {
+            VStack(spacing = .Small, alignment = .Center) {
+                RoundedRectangle(cornerRadius = 10.0, style = .Continuous)
+                .foregroundColor(dark ? .Black : .White)
+                .frame(width = 72.0, height = 104.0)
+
+                Text(title)
+
+                Icon(symbol = .Checkmark)
+                .foregroundColor(chosen ? .Accent : .Clear)
+            }
+        }
+        .buttonStyle(.Plain)
+    }
+}
+
+// Auto-Lock: how soon the display sleeps, a checked list of the choices.
+construct AutoLockPane(choices: SettingsChoices) extends Widget {
+    @State var sleep: Number = choices.sleep
+
+    body {
+        var rows: [Any Widget] = []
+        for seconds in sleepChoices() {
+            let target = seconds
+            rows.append(
+                Button(
+                    action = { in
+                        sleep = target
+                        choices.sleep = target
+                        changeSetting(SettingKeys.displaySleep, .Some(String(target)))
+                        return
+                    }
+                ) {
+                    HStack(spacing = .Medium, alignment = .Center) {
+                        Text(sleepText(target))
+                        Spacer()
+                        Icon(symbol = .Checkmark)
+                        .foregroundColor(sleep == target ? .Accent : .Clear)
+                    }
+                }.buttonStyle(.Plain)
+            )
+        }
+        Form(
+            children: [
+                Section(
+                    children: rows,
+                    footer: Text(
+                        "The display sleeps after this long without a touch, a key or the pointer."
+                    )
+                )
+            ]
+        )
+        .navigationTitle("Auto-Lock")
+    }
+}
+
+function chooseAppearance(choices: SettingsChoices, chosen: borrow String) {
+    choices.appearance = copy chosen
+    changeSetting(AppearanceSetting.key, appearanceValue(chosen))
+}
+
+function storedAppearance() -> String {
+    return match storedSetting(AppearanceSetting.key, "") {
+        "light" -> AppearanceChoice.light
+        "dark" -> AppearanceChoice.dark
+        else -> AppearanceChoice.automatic
+    }
+}
+
+function appearanceValue(choice: borrow String) -> String? {
+    if choice == AppearanceChoice.light { return .Some(copy AppearanceSetting.light) }
+    if choice == AppearanceChoice.dark { return .Some(copy AppearanceSetting.dark) }
+    return .None
+}
+
+// The stored sleep, the platform's own when none is: an iPad's two minutes,
+// a Mac's ten. One Auto-Lock does not offer reads as the nearest it does not
+// pass.
+function storedSleep() -> Number {
+    let platform = interfaceMode() == .AdaptiveMobile ? IdlePolicy.mobileBlank : IdlePolicy.desktopBlank
+    let seconds = match storedDisplaySleep(storedSetting(SettingKeys.displaySleep, "")) {
+        Some(found) -> found
+        None -> platform
+    }
+    for choice in sleepChoices() {
+        if choice == seconds { return seconds }
+    }
+    if seconds == 0 { return 0 }
+    var nearest = sleepChoices()[0]
+    for choice in sleepChoices() {
+        if choice > 0 && choice <= seconds { nearest = choice }
+    }
+    return nearest
+}
+
+function sleepText(seconds: Number) -> String {
+    if seconds == 0 { return "Never" }
+    let minutes = seconds / 60
+    return minutes == 1 ? "1 Minute" : "\(minutes) Minutes"
+}

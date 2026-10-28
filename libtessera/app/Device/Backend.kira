@@ -1,0 +1,214 @@
+import Foundation
+
+// The backend seam's object calls (17 §6.3, §20.4).
+//
+// DeviceKit's backend and its device manager are rewritten for each kernel
+// and are the only code besides this library's backend that knows one.
+// They make no system calls of their own: they ask for these, which take
+// and answer the backend's own numbers and layouts, as `portAttachSource`
+// takes the backend's own number for an object. A failure carries the
+// backend's code for it in `detail` (§4). On another kernel these are that
+// kernel's calls and DeviceKit's backend is written against them.
+//
+// Like `portAttachSource`, these are in `LibTessera` because a Kira package
+// exports one RIDL module, and no application binding uses them.
+
+// Opens the backend object at the absolute `path`.
+public function backendOpen(
+    path: borrow String,
+    flags: UNumber,
+    mode: UNumber
+) -> Result<UNumber, TesseraError> { return .Ok(try kernelSeamOpen(path, flags, mode)) }
+
+// Closes a backend object.
+public function backendClose(number: UNumber) -> Result<Void, TesseraError> {
+    return kernelSeamClose(number)
+}
+
+// Reads into `length` bytes at `address`.
+public function backendRead(
+    number: UNumber,
+    address: RawPtr,
+    length: UNumber
+) -> Result<UNumber, TesseraError> { return .Ok(try kernelSeamRead(number, address, length)) }
+
+// Writes `length` bytes from `address`.
+public function backendWrite(
+    number: UNumber,
+    address: RawPtr,
+    length: UNumber
+) -> Result<UNumber, TesseraError> { return .Ok(try kernelSeamWrite(number, address, length)) }
+
+// Reads at `offset`, leaving the object's position.
+public function backendReadAt(
+    number: UNumber,
+    address: RawPtr,
+    length: UNumber,
+    offset: UNumber
+) -> Result<UNumber, TesseraError> {
+    return .Ok(try kernelSeamReadAt(number, address, length, offset))
+}
+
+// Writes at `offset`, leaving the object's position.
+public function backendWriteAt(
+    number: UNumber,
+    address: RawPtr,
+    length: UNumber,
+    offset: UNumber
+) -> Result<UNumber, TesseraError> {
+    return .Ok(try kernelSeamWriteAt(number, address, length, offset))
+}
+
+// The object's own control request, with its argument laid out as the backend reads it.
+public function backendControl(
+    number: UNumber,
+    request: UNumber,
+    argument: RawPtr
+) -> Result<UNumber, TesseraError> { return .Ok(try kernelSeamControl(number, request, argument)) }
+
+// A request about the backend object itself rather than the device behind it.
+public function backendObjectControl(
+    number: UNumber,
+    command: UNumber,
+    argument: UNumber
+) -> Result<UNumber, TesseraError> {
+    return .Ok(try kernelSeamObjectControl(number, command, argument))
+}
+
+// The next entries of a directory object, as the backend lays them out.
+public function backendDirectoryRead(
+    number: UNumber,
+    address: RawPtr,
+    length: UNumber
+) -> Result<UNumber, TesseraError> {
+    return .Ok(try kernelSeamDirectoryRead(number, address, length))
+}
+
+// What the link at `path` names, into `length` bytes at `address`.
+public function backendReadLink(
+    path: borrow String,
+    address: RawPtr,
+    length: UNumber
+) -> Result<UNumber, TesseraError> { return .Ok(try kernelSeamReadLink(path, address, length)) }
+
+// Maps `length` bytes of the object into this process; the address.
+public function backendMap(
+    address: RawPtr,
+    length: UNumber,
+    protection: UNumber,
+    flags: UNumber,
+    number: UNumber,
+    offset: UNumber
+) -> Result<UNumber, TesseraError> {
+    return .Ok(try kernelSeamMap(address, length, protection, flags, number, offset))
+}
+
+// Unmaps what `backendMap` mapped.
+public function backendUnmap(address: RawPtr, length: UNumber) -> Result<Void, TesseraError> {
+    return kernelSeamUnmap(address, length)
+}
+
+// Moves the object's position.
+public function backendSeek(
+    number: UNumber,
+    offset: UNumber,
+    whence: UNumber
+) -> Result<UNumber, TesseraError> { return .Ok(try kernelSeamSeek(number, offset, whence)) }
+
+// Writes the object's data through to its device.
+public function backendSyncData(number: UNumber) -> Result<Void, TesseraError> {
+    return kernelSeamSyncData(number)
+}
+
+// Waits until one of `count` readiness records is ready or `timeout` passes; how many are.
+public function backendPoll(
+    records: RawPtr,
+    count: UNumber,
+    timeout: RawPtr
+) -> Result<UNumber, TesseraError> { return .Ok(try kernelSeamPoll(records, count, timeout)) }
+
+// A counter object, ready while its count is not zero.
+public function backendEventObject(
+    initial: UNumber,
+    flags: UNumber
+) -> Result<UNumber, TesseraError> {
+    return .Ok(try kernelSeamEventObject(initial, flags))
+}
+
+// An anonymous memory object.
+public function backendMemoryObject(
+    name: borrow String,
+    flags: UNumber
+) -> Result<UNumber, TesseraError> { return .Ok(try kernelSeamMemoryObject(name, flags)) }
+
+// A timer object, ready once it has fired.
+public function backendTimerObject(
+    clock: UNumber,
+    flags: UNumber
+) -> Result<UNumber, TesseraError> {
+    return .Ok(try kernelSeamTimerObject(clock, flags))
+}
+
+// Arms or disarms a timer object.
+public function backendTimerSet(
+    number: UNumber,
+    flags: UNumber,
+    value: RawPtr,
+    old: RawPtr
+) -> Result<Void, TesseraError> { return kernelSeamTimerSet(number, flags, value, old) }
+
+// A socket.
+public function backendSocket(
+    family: UNumber,
+    kind: UNumber,
+    protocol: UNumber
+) -> Result<UNumber, TesseraError> { return .Ok(try kernelSeamSocket(family, kind, protocol)) }
+
+// Binds a socket to `length` bytes of address at `address`.
+public function backendBind(
+    number: UNumber,
+    address: RawPtr,
+    length: UNumber
+) -> Result<Void, TesseraError> { return kernelSeamBind(number, address, length) }
+
+// Lets a socket accept connections.
+public function backendListen(number: UNumber, backlog: UNumber) -> Result<Void, TesseraError> {
+    return kernelSeamListen(number, backlog)
+}
+
+// The next connection on a listening socket.
+public function backendAccept(number: UNumber, flags: UNumber) -> Result<UNumber, TesseraError> {
+    return .Ok(try kernelSeamAccept(number, flags))
+}
+
+// Connects a socket to `length` bytes of address at `address`.
+public function backendConnect(
+    number: UNumber,
+    address: RawPtr,
+    length: UNumber
+) -> Result<Void, TesseraError> { return kernelSeamConnect(number, address, length) }
+
+// Sends one message, laid out as the backend reads it.
+public function backendSendMessage(
+    number: UNumber,
+    message: RawPtr,
+    flags: UNumber
+) -> Result<UNumber, TesseraError> { return .Ok(try kernelSeamSendMessage(number, message, flags)) }
+
+// Receives one message into a layout the backend fills.
+public function backendReceiveMessage(
+    number: UNumber,
+    message: RawPtr,
+    flags: UNumber
+) -> Result<UNumber, TesseraError> {
+    return .Ok(try kernelSeamReceiveMessage(number, message, flags))
+}
+
+// Reads a socket option.
+public function backendGetOption(
+    number: UNumber,
+    level: UNumber,
+    name: UNumber,
+    value: RawPtr,
+    length: RawPtr
+) -> Result<Void, TesseraError> { return kernelSeamGetOption(number, level, name, value, length) }

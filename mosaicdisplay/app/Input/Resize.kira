@@ -1,0 +1,270 @@
+import Foundation
+import LibTessera
+import TesseraDisplayClient
+
+// Windows resized from their edges (roadmap/11-adaptive-desktop.md, "The
+// window model"; roadmap/08-display-server.md, "Windows").
+//
+// A window's edges are outside what its application draws, so the
+// application does not ask for a resize as it asks for a move: a button going
+// down in the band along a freeform window's edge asks the platform here, and
+// the press goes to no client. Once the platform grants it, the edges the
+// band named follow the pointer until the button goes up, with no round trip
+// per motion. The application is configured at each size it passes through,
+// one configure at a time: the next is sent once it acknowledged the last, so
+// a slow application is never asked for sizes it can no longer catch up with.
+// Its buffers are drawn at their own size until it draws at the new one.
+
+// A resize under way: the window, the edges that follow the pointer, the
+// window as it was and where the button went down, whether the platform
+// granted it, and the frame last configured and whether that is still
+// unacknowledged.
+struct Resizing {
+    var index: Number
+    var edges: DisplayEdges
+    var start: Geometry
+    var pressX: Number
+    var pressY: Number
+    var granted: Bool
+    var sent: Geometry
+    var awaiting: Bool
+}
+
+namespace ResizeBand {
+    // How far outside a window's edge, and how far inside it, a press takes
+    // the edge, as on a Mac, where the band lies mostly over the shadow.
+    let outside: Number = 6
+    let inside: Number = 2
+    // How far along an edge from a corner a press takes the corner.
+    let corner: Number = 14
+}
+
+namespace ResizeLimits {
+    // The smallest a window is made by a drag on its edges.
+    let width: Number = 280
+    let height: Number = 180
+}
+
+function sameFrame(left: borrow Geometry, right: borrow Geometry) -> Bool {
+    return left.x == right.x && left.y == right.y && left.width == right.width
+        && left.height == right.height
+}
+
+// The application window whose edge band the pointer is in, and the edges it
+// names, when the topmost window round the pointer is one and the pointer is
+// on its edge rather than inside it. Only freeform windows have edges.
+function edgeUnderPointer(server: borrow Server) -> (Number, DisplayEdges)? {
+    if !windowed(server.mode) || inPlatformBand(server) || server.stageMotion.count > 0 {
+        return .None
+    }
+    let x = server.pointerX
+    let y = server.pointerY
+    var chosen: Number? = .None
+    var highest = 0
+    for index in 0..server.clients.count {
+        let client = server.clients[index]
+        if !hittable(client) || client.role != .Application || inStrip(server, index) { continue }
+        let frame = client.frame
+        let reach = ResizeBand.outside
+        let around = Geometry {
+            x: frame.x - reach,
+            y: frame.y - reach,
+            width: frame.width + reach * 2,
+            height: frame.height + reach * 2,
+        }
+        if contains(around, x, y) && (chosen.isNone() || client.zOrder >= highest) {
+            chosen = .Some(index)
+            highest = client.zOrder
+        }
+    }
+    let index = try chosen otherwise return .None
+    let frame = server.clients[index].frame
+    let inside = ResizeBand.inside
+    let right = frame.x + frame.width
+    let bottom = frame.y + frame.height
+    var edges = DisplayEdges {
+        top: y < frame.y + inside,
+        leading: x < frame.x + inside,
+        bottom: y >= bottom - inside,
+        trailing: x >= right - inside,
+    }
+    if !edges.any() { return .None }
+    // Near a corner along one edge, the press takes the corner.
+    let corner = ResizeBand.corner
+    if edges.top || edges.bottom {
+        if x < frame.x + corner { edges.leading = true }
+        if x >= right - corner { edges.trailing = true }
+    }
+    if edges.leading || edges.trailing {
+        if y < frame.y + corner { edges.top = true }
+        if y >= bottom - corner { edges.bottom = true }
+    }
+    return .Some((index, edges))
+}
+
+// A button went down with none down before: on a window's edge band, the
+// platform is asked for a resize and the press goes to no client. True when
+// the press took an edge.
+function beginResize(server: borrow mut Server) -> Bool {
+    let platform = platformIndex(server)
+    if platform.isSome() && (server.inputHeld || server.focus == platform) { return false }
+    let (index, edges) = match edgeUnderPointer(server) {
+        Some(found) -> found
+        None -> return false
+    }
+    startResizing(server, index, edges)
+    let client = server.clients[index]
+    tellPlatforms(
+        server,
+        .WindowRequested(
+            DisplayWindowRequest { surface: client.surface, action: .Resize, edges: edges }
+        )
+    )
+    log info(
+        "a press took a window's edge",
+        surface: client.surface.raw,
+        top: edges.top,
+        leading: edges.leading,
+        bottom: edges.bottom,
+        trailing: edges.trailing
+    )
+    return true
+}
+
+// Holds a resize of the window at `index` by `edges` from where the pointer
+// is, until the platform grants it.
+function startResizing(server: borrow mut Server, index: Number, edges: borrow DisplayEdges) {
+    let client = server.clients[index]
+    server.resizing = .Some(
+        Resizing {
+            index: index,
+            edges: copy edges,
+            start: client.frame,
+            pressX: server.pointerX,
+            pressY: server.pointerY,
+            granted: false,
+            sent: client.frame,
+            awaiting: false,
+        }
+    )
+}
+
+// The platform granted the resize `surface`'s edge was pressed for.
+function grantResize(server: borrow mut Server, surface: DisplaySurfaceId) {
+    match server.resizing {
+        Some(resizing) -> {
+            if server.clients[resizing.index].surface != surface {
+                log info("the platform granted a resize no surface is making", surface: surface.raw)
+                return
+            }
+            var granted = resizing
+            granted.granted = true
+            server.resizing = .Some(granted)
+            log info("the platform granted a resize", surface: surface.raw)
+        }
+        None -> log info(
+            "the platform granted a resize that had already ended",
+            surface: surface.raw
+        )
+    }
+}
+
+// The window a resize makes for the pointer where it is now: each edge it
+// holds moved as far as the pointer, no smaller than `ResizeLimits`, its top
+// below the bar and its bottom above the Dock.
+function resizedFrame(server: borrow Server, resizing: borrow Resizing) -> Geometry {
+    let start = resizing.start
+    let dx = server.pointerX - resizing.pressX
+    let dy = server.pointerY - resizing.pressY
+    let width = server.display.scanout.pointWidth()
+    let floor = server.display.scanout.pointHeight() - server.dock
+    var left = start.x
+    var right = start.x + start.width
+    var top = start.y
+    var bottom = start.y + start.height
+    if resizing.edges.leading {
+        left = clamp(start.x + dx, min(start.x, 0), right - ResizeLimits.width)
+    }
+    if resizing.edges.trailing {
+        right = clamp(right + dx, left + ResizeLimits.width, max(start.x + start.width, width))
+    }
+    if resizing.edges.top {
+        top = clamp(start.y + dy, server.bar, bottom - ResizeLimits.height)
+    }
+    if resizing.edges.bottom {
+        bottom = clamp(bottom + dy, top + ResizeLimits.height, max(start.y + start.height, floor))
+    }
+    return Geometry { x: left, y: top, width: right - left, height: bottom - top }
+}
+
+// The pointer moved during a granted resize: the window's edges follow it.
+// True when a resize took the motion.
+function followResize(server: borrow mut Server) -> Bool {
+    let resizing = try server.resizing otherwise return false
+    if !resizing.granted { return true }
+    let frame = resizedFrame(server, resizing)
+    if sameFrame(frame, server.clients[resizing.index].frame) { return true }
+    placeFrame(server, resizing.index, frame)
+    if !resizing.awaiting { configureResized(server) }
+    redraw(server, "a window being resized")
+    return true
+}
+
+// Configures the window being resized at the size it has now, and waits for
+// the application to acknowledge it before sending another.
+function configureResized(server: borrow mut Server) {
+    var resizing = match server.resizing {
+        Some(value) -> value
+        None -> return
+    }
+    let index = resizing.index
+    match sendConfigure(server, index, Relayout.serial) {
+        Ok -> {}
+        Error(reason) -> configurationFailed(server, index, reason)
+    }
+    if !server.clients[index].alive {
+        server.resizing = .None
+        return
+    }
+    resizing.sent = server.clients[index].frame
+    resizing.awaiting = true
+    server.resizing = .Some(resizing)
+}
+
+// The client at `index` acknowledged a configure: a resize under way sends
+// the size the window reached meanwhile, if it moved on.
+function resizeAcknowledged(server: borrow mut Server, index: Number) {
+    var resizing = match server.resizing {
+        Some(value) -> value
+        None -> return
+    }
+    if resizing.index != index || !resizing.awaiting { return }
+    resizing.awaiting = false
+    server.resizing = .Some(resizing)
+    if !sameFrame(resizing.sent, server.clients[index].frame) { configureResized(server) }
+}
+
+// Every button went up: a granted resize ends at the size the window has,
+// which the application is configured at if it was not yet, and the platform
+// is told where it is.
+function endResize(server: borrow mut Server) {
+    let resizing = try server.resizing otherwise return
+    server.resizing = .None
+    let index = resizing.index
+    if !resizing.granted || !server.clients[index].alive { return }
+    if !sameFrame(resizing.sent, server.clients[index].frame) {
+        match sendConfigure(server, index, Relayout.serial) {
+            Ok -> {}
+            Error(reason) -> configurationFailed(server, index, reason)
+        }
+        if !server.clients[index].alive { return }
+    }
+    let frame = server.clients[index].frame
+    log info(
+        "a resize ended",
+        surface: server.clients[index].surface.raw,
+        width: frame.width,
+        height: frame.height
+    )
+    tellPlaced(server, index)
+}

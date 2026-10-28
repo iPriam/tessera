@@ -1,0 +1,769 @@
+import Foundation
+import Heap
+import LibTessera
+
+// The display protocol's codec: a `DisplayMessage` laid out as the fixed
+// message the wire carries, and read back from one.
+
+// A failure of the display protocol itself, rather than of the channel.
+function protocolFailure(code: ErrorCode) -> TesseraError {
+    return TesseraError { code: code, subsystem: .Display, flags: ErrorFlags.none, detail: 0 }
+}
+
+// A message as the wire lays it out: the opcode, the object and up to four
+// 32-bit words, and the wide word. Only the codec here sees this form.
+struct Laid {
+    var opcode: DisplayProtocolOpcode
+    var object: UNumber = 0
+    var words: [UNumber] = []
+    var wide: UNumber = 0
+}
+
+function flagWord(value: Bool) -> UNumber { return value ? 1 : 0 }
+
+// `kinds` as `InputCapability`'s bitmask.
+function kindsWord(kinds: borrow [DisplayInputKind]) -> UNumber {
+    var mask = UN32(0)
+    for kind in kinds { mask = mask | kind.rawValue() }
+    return UNumber(mask)
+}
+
+namespace KeyFlags {
+    // A key's second word: the state in its low two bits, the provenance in
+    // the next three, the modifiers above them.
+    let stateMask: UNumber = 3
+    let provenanceScale: UNumber = 4
+    let provenanceMask: UNumber = 7
+    let modifiersScale: UNumber = 32
+}
+
+// The state, provenance and modifiers of a key, as its second word.
+function keyFlagsWord(key: borrow DisplayKey) -> UNumber {
+    return UNumber(key.state.rawValue())
+        + UNumber(key.provenance.rawValue()) * KeyFlags.provenanceScale
+        + modifiersWord(key.modifiers) * KeyFlags.modifiersScale
+}
+
+// A key: its usage, flags and text in the words, its interaction token after
+// them, and its time in the wide one.
+function keyLaid(opcode: DisplayProtocolOpcode, key: borrow DisplayKey) -> Laid {
+    return Laid {
+        opcode: opcode,
+        object: key.surface.raw,
+        words: withToken([key.key, keyFlagsWord(key), textWord(key.text)], key.token),
+        wide: key.time
+    }
+}
+
+// An interaction token's four words: its high 64 bits in two 32-bit words,
+// most significant first, then its low 64 bits the same way.
+function tokenWords(token: borrow DisplayInteractionToken) -> [UNumber] {
+    return [
+        trunc(token.idHigh / Word.span),
+        token.idHigh - trunc(token.idHigh / Word.span) * Word.span,
+        trunc(token.idLow / Word.span),
+        token.idLow - trunc(token.idLow / Word.span) * Word.span,
+    ]
+}
+
+// `words` with an interaction token's four words after them.
+function withToken(words: [UNumber], token: borrow DisplayInteractionToken) -> [UNumber] {
+    var all = words
+    for word in tokenWords(token) { all.append(word) }
+    return all
+}
+
+// The interaction token whose four words start at `at`.
+function tokenOf(words: borrow [UNumber], at: Number) -> DisplayInteractionToken {
+    return DisplayInteractionToken {
+        idHigh: words[at] * Word.span + words[at + 1],
+        idLow: words[at + 2] * Word.span + words[at + 3],
+    }
+}
+
+namespace ModifierBits {
+    let shift: UNumber = 1
+    let control: UNumber = 2
+    let option: UNumber = 4
+    let command: UNumber = 8
+    let capsLock: UNumber = 16
+}
+
+// `modifiers` as a key's fourth word.
+function modifiersWord(modifiers: borrow DisplayModifiers) -> UNumber {
+    return (modifiers.shift ? ModifierBits.shift : 0)
+        + (modifiers.control ? ModifierBits.control : 0)
+        + (modifiers.option ? ModifierBits.option : 0)
+        + (modifiers.command ? ModifierBits.command : 0)
+        + (modifiers.capsLock ? ModifierBits.capsLock : 0)
+}
+
+// The modifiers a key's fourth word names.
+function modifiersOf(word: UNumber) -> DisplayModifiers {
+    return DisplayModifiers {
+        shift: (word & ModifierBits.shift) != 0,
+        control: (word & ModifierBits.control) != 0,
+        option: (word & ModifierBits.option) != 0,
+        command: (word & ModifierBits.command) != 0,
+        capsLock: (word & ModifierBits.capsLock) != 0,
+    }
+}
+
+namespace KeyText {
+    // A key's text is one character, at most four bytes of UTF-8, which is
+    // what a keymap resolves a key to.
+    let bytes: Number = 4
+    let byte: UNumber = 256
+}
+
+// `text` as a key's fifth word: its UTF-8 bytes, the first in the low byte,
+// the rest zero. Text longer than a word is not a key's, and is sent empty.
+function textWord(text: borrow String) -> UNumber {
+    if text.count > KeyText.bytes { return 0 }
+    var word: UNumber = 0
+    var scale: UNumber = 1
+    for index in 0..text.count {
+        word += UNumber(text.byteAt(index)) * scale
+        scale *= KeyText.byte
+    }
+    return word
+}
+
+// The text a key's fifth word holds; `InvalidArgument` when it is not UTF-8.
+function textOf(word: UNumber) -> Result<String, TesseraError> {
+    var bytes: [UN8] = []
+    var rest = word
+    while rest != 0 {
+        bytes.append(UN8(rest % KeyText.byte))
+        rest = trunc(rest / KeyText.byte)
+    }
+    return match textFromBytes(bytes) {
+        Some(text) -> .Ok(text)
+        None -> .Error(protocolFailure(.InvalidArgument))
+    }
+}
+
+function frameLaid(opcode: DisplayProtocolOpcode, frame: borrow DisplayFrame) -> Laid {
+    return Laid { opcode: opcode, object: frame.surface.raw, words: [frame.serial] }
+}
+
+function channelLaid(opcode: DisplayProtocolOpcode, value: borrow DisplayChannelValue) -> Laid {
+    return Laid {
+        opcode: opcode,
+        object: value.surface.raw,
+        words: [UNumber(value.channel.rawValue()), value.value]
+    }
+}
+
+function notificationLaid(
+    opcode: DisplayProtocolOpcode,
+    notification: borrow DisplayNotification
+) -> Laid {
+    return Laid {
+        opcode: opcode,
+        object: notification.surface.raw,
+        words: [notification.id, notification.priority]
+    }
+}
+
+function modeWords(mode: borrow DisplayMode) -> [UNumber] {
+    return [UNumber(mode.mode.rawValue()), flagWord(mode.split)]
+}
+
+function laidOf(message: borrow DisplayMessage) -> Laid {
+    return match message {
+        Hello -> Laid { opcode: .Hello, words: [DisplayProtocol.version] }
+        Welcome(range) -> Laid {
+            opcode: .Welcome,
+            words: [range.base, range.count, DisplayProtocol.version]
+        }
+        Output(output) -> Laid {
+            opcode: .Output,
+            object: output.id,
+            words: [output.width, output.height, output.refresh, output.scale]
+        }
+        // The token's high word's halves first, then the low word's, most
+        // significant first.
+        Attach(attach) -> Laid {
+            opcode: .Attach,
+            object: attach.surface.raw,
+            words: [trunc(attach.token.high / Word.span), attach.token.high - trunc(
+                attach.token.high / Word.span
+            ) * Word.span, trunc(attach.token.low / Word.span), attach.token.low - trunc(
+                attach.token.low / Word.span
+            ) * Word.span, attach.width, attach.height],
+            wide: attach.slot
+        }
+        Commit(frame) -> frameLaid(.Commit, frame)
+        Key(key) -> keyLaid(.Key, key)
+        FrameDone(frame) -> frameLaid(.FrameDone, frame)
+        FrameRequest(frame) -> frameLaid(.FrameRequest, frame)
+        FrameReady(frame) -> frameLaid(.FrameReady, frame)
+        FocusIn(surface) -> Laid { opcode: .FocusIn, object: surface.raw }
+        FocusOut(surface) -> Laid { opcode: .FocusOut, object: surface.raw }
+        // The serial rides the wide word; the acknowledgement carries it back
+        // in a 32-bit one.
+        Configure(configured) -> Laid {
+            opcode: .Configure,
+            object: configured.surface.raw,
+            words: [
+                signedWord(configured.x),
+                signedWord(configured.y),
+                configured.width,
+                configured.height,
+            ],
+            wide: configured.serial
+        }
+        AckConfigure(frame) -> frameLaid(.AckConfigure, frame)
+        SetMode(mode) -> Laid { opcode: .SetMode, words: modeWords(mode) }
+        ModeChanged(change) -> Laid {
+            opcode: .ModeChanged,
+            object: change.surface.raw,
+            words: modeWords(change.mode)
+        }
+        InputCapability(capability) -> Laid {
+            opcode: .InputCapability,
+            object: capability.surface.raw,
+            words: [kindsWord(capability.kinds), flagWord(capability.present)]
+        }
+        SurfaceCreated(created) -> Laid {
+            opcode: .SurfaceCreated,
+            object: created.surface.raw,
+            words: [UNumber(created.role.rawValue())]
+        }
+        SurfaceDestroyed(surface) -> Laid { opcode: .SurfaceDestroyed, object: surface.raw }
+        GrantFocus(surface) -> Laid { opcode: .GrantFocus, object: surface.raw }
+        InstallGrab(key) -> Laid { opcode: .InstallGrab, words: [key] }
+        GrabFired(key) -> keyLaid(.GrabFired, key)
+        SetChannel(value) -> channelLaid(.SetChannel, value)
+        ChannelChanged(value) -> channelLaid(.ChannelChanged, value)
+        PresentSystem -> Laid { opcode: .PresentSystem }
+        Verify -> Laid { opcode: .Verify }
+        VerifyResult(trusted) -> Laid { opcode: .VerifyResult, words: [flagWord(trusted)] }
+        InjectInput(press) -> Laid {
+            opcode: .InjectInput,
+            words: [press.key, UNumber(press.state.rawValue())]
+        }
+        Notify(notification) -> notificationLaid(.Notify, notification)
+        Notification(notification) -> notificationLaid(.Notification, notification)
+        ActivateRequested(surface) -> Laid { opcode: .ActivateRequested, object: surface.raw }
+        SetBar(height) -> Laid { opcode: .SetBar, words: [height] }
+        PointerMotion(motion) -> Laid {
+            opcode: .PointerMotion,
+            object: motion.surface.raw,
+            words: [signedWord(motion.x), signedWord(motion.y)],
+            wide: motion.time
+        }
+        PointerButton(pressed) -> Laid {
+            opcode: .PointerButton,
+            object: pressed.surface.raw,
+            words: withToken(
+                [pressed.button, UNumber(pressed.state.rawValue())],
+                pressed.token
+            ),
+            wide: pressed.time
+        }
+        PointerAxis(scrolled) -> Laid {
+            opcode: .PointerAxis,
+            object: scrolled.surface.raw,
+            words: [UNumber(scrolled.axis.rawValue()), signedWord(scrolled.value)],
+            wide: scrolled.time
+        }
+        PointerEnter(surface) -> Laid { opcode: .PointerEnter, object: surface.raw }
+        PointerLeave(surface) -> Laid { opcode: .PointerLeave, object: surface.raw }
+        SetDock(height) -> Laid { opcode: .SetDock, words: [height] }
+        SurfacePressed(surface) -> Laid { opcode: .SurfacePressed, object: surface.raw }
+        RequestWindow(request) -> windowLaid(.RequestWindow, request)
+        WindowRequested(request) -> windowLaid(.WindowRequested, request)
+        GrantMove(surface) -> Laid { opcode: .GrantMove, object: surface.raw }
+        GrantResize(surface) -> Laid { opcode: .GrantResize, object: surface.raw }
+        HoldInput(held) -> Laid { opcode: .HoldInput, words: [flagWord(held)] }
+        PlaceSurface(placement) -> placementLaid(.PlaceSurface, placement)
+        SetOverlay(overlay) -> Laid {
+            opcode: .SetOverlay,
+            words: [overlay.x, overlay.y, overlay.width, overlay.height]
+        }
+        SurfacePlaced(placement) -> placementLaid(.SurfacePlaced, placement)
+        SetHidden(visibility) -> Laid {
+            opcode: .SetHidden,
+            object: visibility.surface.raw,
+            words: [flagWord(visibility.hidden)]
+        }
+        SetMargin(margin) -> Laid {
+            opcode: .SetMargin,
+            object: margin.surface.raw,
+            words: [margin.margin, margin.corner]
+        }
+        Insets(insets) -> Laid {
+            opcode: .Insets,
+            object: insets.surface.raw,
+            words: [insets.top, insets.leading, insets.bottom, insets.trailing]
+        }
+        SetIdle(idle) -> Laid { opcode: .SetIdle, words: [idle.dim, idle.blank] }
+        IdleChanged(state) -> Laid { opcode: .IdleChanged, words: [UNumber(state.rawValue())] }
+        SetGlass(glass) -> glassLaid(glass)
+        SetStageBadge(badge) -> Laid {
+            opcode: .SetStageBadge,
+            object: badge.surface.raw,
+            words: [
+                badge.slot,
+                signedWord(badge.home.x * BadgeWire.fraction),
+                signedWord(badge.home.y * BadgeWire.fraction),
+                signedWord(badge.home.width * BadgeWire.fraction),
+                signedWord(badge.home.height * BadgeWire.fraction),
+                signedWord(badge.homeCorner * BadgeWire.fraction),
+            ],
+            wide: flagWord(badge.homeScreen)
+        }
+        BarBackdrop(backdrop) -> Laid {
+            opcode: .BarBackdrop,
+            words: [backdrop.bar, backdrop.bottom]
+        }
+        SetLaunchOrigin(origin) -> Laid {
+            opcode: .SetLaunchOrigin,
+            object: origin.surface.raw,
+            words: [
+                signedWord(origin.icon.x * BadgeWire.fraction),
+                signedWord(origin.icon.y * BadgeWire.fraction),
+                signedWord(origin.icon.width * BadgeWire.fraction),
+                signedWord(origin.icon.height * BadgeWire.fraction),
+                signedWord(origin.corner * BadgeWire.fraction),
+            ]
+        }
+    }
+}
+
+function windowLaid(opcode: DisplayProtocolOpcode, request: borrow DisplayWindowRequest) -> Laid {
+    return Laid {
+        opcode: opcode,
+        object: request.surface.raw,
+        words: [UNumber(request.action.rawValue()), edgesWord(request.edges)]
+    }
+}
+
+namespace EdgeBits {
+    let top: UNumber = 1
+    let leading: UNumber = 2
+    let bottom: UNumber = 4
+    let trailing: UNumber = 8
+}
+
+// `edges` as the window request's second word.
+function edgesWord(edges: borrow DisplayEdges) -> UNumber {
+    return (edges.top ? EdgeBits.top : 0) + (edges.leading ? EdgeBits.leading : 0)
+        + (edges.bottom ? EdgeBits.bottom : 0) + (edges.trailing ? EdgeBits.trailing : 0)
+}
+
+// The edges a window request's second word names.
+function edgesOf(word: UNumber) -> DisplayEdges {
+    return DisplayEdges {
+        top: (word & EdgeBits.top) != 0,
+        leading: (word & EdgeBits.leading) != 0,
+        bottom: (word & EdgeBits.bottom) != 0,
+        trailing: (word & EdgeBits.trailing) != 0,
+    }
+}
+
+function placementLaid(opcode: DisplayProtocolOpcode, placement: borrow DisplayPlacement) -> Laid {
+    return Laid {
+        opcode: opcode,
+        object: placement.surface.raw,
+        words: [
+            signedWord(placement.x),
+            signedWord(placement.y),
+            placement.width,
+            placement.height,
+        ]
+    }
+}
+
+// A signed value as a 32-bit word, in two's complement; one the word cannot
+// hold is held at its nearest end.
+function signedWord(value: Number) -> UNumber {
+    let held = clamp(trunc(value), -Word.signedSpan, Word.signedSpan - 1)
+    return held < 0 ? UNumber(held + Word.span) : UNumber(held)
+}
+
+// A 32-bit word read back as the signed value it carries.
+function signedOf(word: UNumber) -> Number {
+    return word >= Word.signedSpan ? Number(word) - Word.span : Number(word)
+}
+
+namespace Word {
+    // The largest value a message's 32-bit word carries.
+    let last: UNumber = 4294967295
+    // One past it: what a wide value's high half counts in.
+    let span: UNumber = 4294967296
+    // Half of it: where a signed word's negative values begin.
+    let signedSpan: UNumber = 2147483648
+    // The largest value the wide word carries.
+    let wideLast: UNumber = 0xffffffffffffffff
+}
+
+// `value` as one of a message's 32-bit words; `InvalidArgument` when it does
+// not fit.
+function wireWord(value: UNumber) -> Result<UN32, TesseraError> {
+    if value > Word.last { return .Error(protocolFailure(.InvalidArgument)) }
+    return .Ok(UN32(value))
+}
+
+function wideWord(value: UNumber) -> Result<UNumber, TesseraError> {
+    if value > Word.wideLast { return .Error(protocolFailure(.InvalidArgument)) }
+    return .Ok(UNumber(value))
+}
+
+// Writes `message` on `channel`. `InvalidArgument` when a value it carries
+// does not fit its word; nothing is written then.
+public function sendDisplayMessage(
+    channel: Handle,
+    message: borrow DisplayMessage
+) -> Result<Void, TesseraError> {
+    let laid = laidOf(message)
+    if laid.words.count > DisplayProtocol.words { return .Error(protocolFailure(.Internal)) }
+    let object = try wireWord(laid.object)
+    let wide = try wideWord(laid.wide)
+    let body = zeroedBlock(count: DisplayProtocol.messageSize, alignment: 16)
+    blockStore<U32>(body, DisplayProtocol.opcodeAt, laid.opcode.rawValue())
+    blockStore<U32>(body, DisplayProtocol.sizeAt, UN32(DisplayProtocol.messageSize))
+    blockStore<U32>(body, DisplayProtocol.versionAt, UN32(DisplayProtocol.version))
+    blockStore<U32>(body, DisplayProtocol.objectAt, object)
+    for index in 0..laid.words.count {
+        blockStore<U32>(
+            body,
+            DisplayProtocol.wordsAt + index * DisplayProtocol.wordBytes,
+            try wireWord(laid.words[index])
+        )
+    }
+    blockStore<U64>(body, DisplayProtocol.wideAt, wide)
+    let none: [Handle] = []
+    return channelWrite(
+        channel,
+        Buffer { address: body.pointer(), length: DisplayProtocol.messageSize },
+        none
+    )
+}
+
+// A message's words as the wire carried them, before they are read as one
+// message.
+struct WireRead {
+    var object: DisplaySurfaceId
+    var words: [UNumber]
+    var wide: UNumber
+}
+
+// The case of `cases` word `raw` names; `InvalidArgument` when it names none.
+function wordCase<Case>(cases: borrow [Case], raw: UNumber) -> Result<Case, TesseraError> {
+    return match caseWithCode(cases, raw) {
+        Some(value) -> .Ok(value)
+        None -> .Error(protocolFailure(.InvalidArgument))
+    }
+}
+
+function keyRead(read: borrow WireRead) -> Result<DisplayKey, TesseraError> {
+    let flags = read.words[1]
+    return .Ok(
+        DisplayKey {
+            surface: read.object,
+            key: read.words[0],
+            state: try wordCase(displayKeyStates, flags & KeyFlags.stateMask),
+            provenance: try wordCase(
+                displayProvenances,
+                trunc(flags / KeyFlags.provenanceScale) & KeyFlags.provenanceMask
+            ),
+            modifiers: modifiersOf(trunc(flags / KeyFlags.modifiersScale)),
+            text: try textOf(read.words[2]),
+            token: tokenOf(read.words, 3),
+            time: read.wide,
+        }
+    )
+}
+
+function frameRead(read: borrow WireRead) -> DisplayFrame {
+    return DisplayFrame { surface: read.object, serial: read.words[0] }
+}
+
+function channelValueRead(read: borrow WireRead) -> Result<DisplayChannelValue, TesseraError> {
+    return .Ok(
+        DisplayChannelValue {
+            surface: read.object,
+            channel: try wordCase(displayChannels, read.words[0]),
+            value: read.words[1],
+        }
+    )
+}
+
+function notificationRead(read: borrow WireRead) -> DisplayNotification {
+    return DisplayNotification { surface: read.object, id: read.words[0], priority: read.words[1] }
+}
+
+function modeRead(read: borrow WireRead) -> Result<DisplayMode, TesseraError> {
+    return .Ok(
+        DisplayMode {
+            mode: try wordCase(compositorModes, read.words[0]),
+            split: read.words[1] != 0,
+        }
+    )
+}
+
+// The kinds `InputCapability`'s bitmask names.
+function kindsRead(mask: UNumber) -> [DisplayInputKind] {
+    let bits = UN32(mask)
+    var kinds: [DisplayInputKind] = []
+    for kind in displayInputKinds {
+        if (bits & kind.rawValue()) != UN32(0) { kinds.append(kind) }
+    }
+    return kinds
+}
+
+function messageOf(
+    opcode: DisplayProtocolOpcode,
+    read: borrow WireRead
+) -> Result<DisplayMessage, TesseraError> {
+    let message: DisplayMessage = match opcode {
+        Hello -> .Hello
+        Welcome -> .Welcome(DisplayIdRange { base: read.words[0], count: read.words[1] })
+        Output -> .Output(
+            DisplayOutput {
+                id: read.object.raw,
+                width: read.words[0],
+                height: read.words[1],
+                refresh: read.words[2],
+                scale: read.words[3],
+            }
+        )
+        Attach -> .Attach(
+            DisplayAttach {
+                surface: read.object,
+                token: DisplayToken {
+                    high: read.words[0] * Word.span + read.words[1],
+                    low: read.words[2] * Word.span + read.words[3],
+                },
+                width: read.words[4],
+                height: read.words[5],
+                slot: read.wide,
+            }
+        )
+        Commit -> .Commit(frameRead(read))
+        Key -> .Key(try keyRead(read))
+        FrameDone -> .FrameDone(frameRead(read))
+        FrameRequest -> .FrameRequest(frameRead(read))
+        FrameReady -> .FrameReady(frameRead(read))
+        FocusIn -> .FocusIn(read.object)
+        FocusOut -> .FocusOut(read.object)
+        Configure -> .Configure(
+            DisplayConfiguration {
+                surface: read.object,
+                x: signedOf(read.words[0]),
+                y: signedOf(read.words[1]),
+                width: read.words[2],
+                height: read.words[3],
+                serial: read.wide,
+            }
+        )
+        AckConfigure -> .AckConfigure(frameRead(read))
+        SetMode -> .SetMode(try modeRead(read))
+        ModeChanged -> .ModeChanged(
+            DisplayModeChange { surface: read.object, mode: try modeRead(read) }
+        )
+        InputCapability -> .InputCapability(
+            DisplayInputCapability {
+                surface: read.object,
+                kinds: kindsRead(read.words[0]),
+                present: read.words[1] != 0,
+            }
+        )
+        SurfaceCreated -> .SurfaceCreated(
+            DisplaySurface { surface: read.object, role: try wordCase(displayRoles, read.words[0]) }
+        )
+        SurfaceDestroyed -> .SurfaceDestroyed(read.object)
+        GrantFocus -> .GrantFocus(read.object)
+        InstallGrab -> .InstallGrab(read.words[0])
+        GrabFired -> .GrabFired(try keyRead(read))
+        SetChannel -> .SetChannel(try channelValueRead(read))
+        ChannelChanged -> .ChannelChanged(try channelValueRead(read))
+        PresentSystem -> .PresentSystem
+        Verify -> .Verify
+        VerifyResult -> .VerifyResult(read.words[0] != 0)
+        InjectInput -> .InjectInput(
+            DisplayKeyPress {
+                key: read.words[0],
+                state: try wordCase(displayKeyStates, read.words[1])
+            }
+        )
+        Notify -> .Notify(notificationRead(read))
+        Notification -> .Notification(notificationRead(read))
+        ActivateRequested -> .ActivateRequested(read.object)
+        SetBar -> .SetBar(read.words[0])
+        PointerMotion -> .PointerMotion(
+            DisplayPointerMotion {
+                surface: read.object,
+                x: signedOf(read.words[0]),
+                y: signedOf(read.words[1]),
+                time: read.wide,
+            }
+        )
+        PointerButton -> .PointerButton(
+            DisplayPointerButton {
+                surface: read.object,
+                button: read.words[0],
+                state: try wordCase(displayKeyStates, read.words[1]),
+                time: read.wide,
+                token: tokenOf(read.words, 2),
+            }
+        )
+        PointerAxis -> .PointerAxis(
+            DisplayPointerAxis {
+                surface: read.object,
+                axis: try wordCase(displayPointerAxisKinds, read.words[0]),
+                value: signedOf(read.words[1]),
+                time: read.wide,
+            }
+        )
+        PointerEnter -> .PointerEnter(read.object)
+        PointerLeave -> .PointerLeave(read.object)
+        SetDock -> .SetDock(read.words[0])
+        SurfacePressed -> .SurfacePressed(read.object)
+        RequestWindow -> .RequestWindow(try windowRead(read))
+        WindowRequested -> .WindowRequested(try windowRead(read))
+        GrantMove -> .GrantMove(read.object)
+        GrantResize -> .GrantResize(read.object)
+        HoldInput -> .HoldInput(read.words[0] != 0)
+        PlaceSurface -> .PlaceSurface(placementRead(read))
+        SetOverlay -> .SetOverlay(
+            DisplayOverlay {
+                x: read.words[0],
+                y: read.words[1],
+                width: read.words[2],
+                height: read.words[3],
+            }
+        )
+        SurfacePlaced -> .SurfacePlaced(placementRead(read))
+        SetHidden -> .SetHidden(
+            DisplayVisibility { surface: read.object, hidden: read.words[0] != 0 }
+        )
+        SetMargin -> .SetMargin(
+            DisplayMargin { surface: read.object, margin: read.words[0], corner: read.words[1] }
+        )
+        Insets -> .Insets(
+            DisplayInsets {
+                surface: read.object,
+                top: read.words[0],
+                leading: read.words[1],
+                bottom: read.words[2],
+                trailing: read.words[3],
+            }
+        )
+        SetIdle -> .SetIdle(DisplayIdle { dim: read.words[0], blank: read.words[1] })
+        IdleChanged -> .IdleChanged(try wordCase(displayIdleStates, read.words[0]))
+        SetGlass -> .SetGlass(try glassRead(read))
+        SetStageBadge -> .SetStageBadge(
+            DisplayStageBadge {
+                surface: read.object,
+                slot: read.words[0],
+                home: StageFrame {
+                    x: signedOf(read.words[1]) / BadgeWire.fraction,
+                    y: signedOf(read.words[2]) / BadgeWire.fraction,
+                    width: signedOf(read.words[3]) / BadgeWire.fraction,
+                    height: signedOf(read.words[4]) / BadgeWire.fraction,
+                },
+                homeCorner: signedOf(read.words[5]) / BadgeWire.fraction,
+                homeScreen: read.wide != 0,
+            }
+        )
+        BarBackdrop -> .BarBackdrop(DisplayBackdrop { bar: read.words[0], bottom: read.words[1] })
+        SetLaunchOrigin -> .SetLaunchOrigin(
+            DisplayLaunchOrigin {
+                surface: read.object,
+                icon: StageFrame {
+                    x: signedOf(read.words[0]) / BadgeWire.fraction,
+                    y: signedOf(read.words[1]) / BadgeWire.fraction,
+                    width: signedOf(read.words[2]) / BadgeWire.fraction,
+                    height: signedOf(read.words[3]) / BadgeWire.fraction,
+                },
+                corner: signedOf(read.words[4]) / BadgeWire.fraction,
+            }
+        )
+    }
+    return .Ok(message)
+}
+
+function windowRead(read: borrow WireRead) -> Result<DisplayWindowRequest, TesseraError> {
+    return .Ok(
+        DisplayWindowRequest {
+            surface: read.object,
+            action: try wordCase(displayWindowActions, read.words[0]),
+            edges: edgesOf(read.words[1]),
+        }
+    )
+}
+
+function placementRead(read: borrow WireRead) -> DisplayPlacement {
+    return DisplayPlacement {
+        surface: read.object,
+        x: signedOf(read.words[0]),
+        y: signedOf(read.words[1]),
+        width: read.words[2],
+        height: read.words[3],
+    }
+}
+
+// The next message on `channel`, or why there is none: `PeerClosed` once the
+// other end has gone, `InvalidArgument` for one that is not a display
+// message — the wrong size or version, an opcode or value this does not know,
+// or a handle, which no display message carries and which is closed here.
+public function receiveDisplayMessage(channel: Handle) -> Result<DisplayMessage, TesseraError> {
+    let body = zeroedBlock(count: DisplayProtocol.messageSize, alignment: 16)
+    let received = try readMessage(channel, body.pointer(), DisplayProtocol.messageSize, 1)
+    return decodedMessage(body, received)
+}
+
+// The message waiting on `channel`, none when nothing is waiting, or why there
+// is none, as `receiveDisplayMessage` says. It never waits: a client that waits
+// on a port of its own reads what its wait said had arrived, and only that.
+public function pollDisplayMessage(channel: Handle) -> Result<DisplayMessage?, TesseraError> {
+    let body = zeroedBlock(count: DisplayProtocol.messageSize, alignment: 16)
+    let received = match channelRead(
+        channel,
+        Buffer { address: body.pointer(), length: DisplayProtocol.messageSize },
+        1
+    ) {
+        Ok(value) -> value
+        // An empty channel has no message yet; other failures retain their reason.
+        Error(failed) -> return failed.code == .ShouldWait ? .Ok(.None) : .Error(failed)
+    }
+    return .Ok(.Some(try decodedMessage(body, received)))
+}
+
+// The message `received` read into `body`.
+function decodedMessage(
+    body: borrow ByteBlock,
+    received: borrow ReceivedMessage
+) -> Result<DisplayMessage, TesseraError> {
+    if received.handles.count > 0 {
+        for handle in received.handles { release(handle) }
+        return .Error(protocolFailure(.InvalidArgument))
+    }
+    if received.bytes != DisplayProtocol.messageSize
+        || UNumber(blockLoad<U32>(body, DisplayProtocol.sizeAt)) != DisplayProtocol.messageSize
+        || UNumber(blockLoad<U32>(body, DisplayProtocol.versionAt)) != DisplayProtocol.version {
+        return .Error(protocolFailure(.InvalidArgument))
+    }
+    let opcode = try wordCase(
+        displayProtocolOpcodes,
+        UNumber(blockLoad<U32>(body, DisplayProtocol.opcodeAt))
+    )
+    var words: [UNumber] = []
+    for index in 0..DisplayProtocol.words {
+        words.append(
+            UNumber(
+                blockLoad<U32>(body, DisplayProtocol.wordsAt + index * DisplayProtocol.wordBytes)
+            )
+        )
+    }
+    let read = WireRead {
+        object: DisplaySurfaceId(UNumber(blockLoad<U32>(body, DisplayProtocol.objectAt))),
+        words: move words,
+        wide: UNumber(blockLoad<U64>(body, DisplayProtocol.wideAt)),
+    }
+    return messageOf(move opcode, read)
+}

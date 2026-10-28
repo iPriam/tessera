@@ -1,0 +1,372 @@
+import Foundation
+import Heap
+
+// A confined child's view of the file system, on Linux (§21: "user + mount
+// namespaces", "containers are the only mounts in the client's mount
+// namespace"). The child is cloned into a mount namespace of its own and,
+// before it execs, turns a new in-memory root into its `/`: the platform's
+// runtime bound into it read-only, then the bundle and the containers it was
+// given, each at the path it has in the parent's view, and an empty `/tmp`.
+// Everything else the parent can name, the child cannot: other
+// applications, their data, the system's own state. Its `/dev` holds the
+// few devices a program reads and the GPU, not the disks; it is in a PID
+// namespace of its own, so its `/proc` shows only itself and what it
+// starts; and it execs with no capabilities it could mount, trace or open
+// raw devices with.
+//
+// The steps are worked out here, in the parent, with every path already a
+// C string, because the child runs them between clone and exec, where
+// nothing may allocate. A step that fails ends the child with
+// `ConfineExit.failed` before it runs anything: a program is never started
+// unconfined because its view could not be made.
+
+namespace ConfineExit {
+    let failed: Number = 126
+}
+
+namespace ConfineMount {
+    let remount: U64 = U64(32)
+    let recursive: U64 = U64(16384)
+    let isPrivate: U64 = U64(262144)
+    // `PR_SET_NO_NEW_PRIVS`.
+    let noNewPrivileges: Number = 38
+    // `PR_CAPBSET_DROP`, and the capabilities it is asked about: every one
+    // Linux has numbered and some to spare, an unknown one answering EINVAL.
+    let dropBounding: Number = 24
+    let capabilities: Number = 64
+    // `PR_CAP_AMBIENT` with `PR_CAP_AMBIENT_CLEAR_ALL`.
+    let ambient: Number = 47
+    let clearAmbient: U64 = U64(4)
+}
+
+// The platform's runtime, which every program the system starts links
+// against: the loader and the C library, the libraries the platform ships
+// and the frameworks, with the kernel's own file systems beside them. A
+// link among them, `/lib64` to `/lib` on some layouts, is laid as a link.
+namespace ConfineView {
+    let stage: String = "/tmp"
+    // `etc/fonts` and `etc/ssl` are the two places under `/etc` a web engine's
+    // libraries read at fixed paths: the font configuration and the
+    // certificates. A directory the system does not have is left out.
+    let runtime: [String] = ["lib", "lib64", "usr", "System/Library", "etc/fonts", "etc/ssl"]
+    // The devices in its `/dev`: nothing that names a file system.
+    let devices: [String] = ["null", "zero", "full", "random", "urandom"]
+    let deviceDirectories: [String] = ["dri"]
+}
+
+enum ViewStepKind {
+    Directory
+    Link
+    Bind
+    Remount
+    Memory
+    // An empty file to bind a device over.
+    File
+    // A `/proc` of the child's own PID namespace.
+    Processes
+}
+
+// One step of building the view.
+struct ViewStep {
+    var kind: ViewStepKind
+    var source: CString
+    var target: CString
+    var flags: U64
+}
+
+// The steps a confined child takes before it pivots into `stage`.
+struct KernelView {
+    var stage: CString
+    // `/`, `.` and `tmpfs`, made before the clone.
+    var slash: CString
+    var dot: CString
+    var memory: CString
+    var procfs: CString
+    var steps: [ViewStep]
+    // The directories under the stage already made, as paths from it.
+    var made: [String]
+    // The paths bound so far: anything beneath one is visible already.
+    var bound: [String]
+}
+
+// A container or bundle handed to a confined child: its backing, and
+// whether the child may write it.
+struct ConfinedPlace {
+    var backing: Number
+    var writable: Bool
+}
+
+function nullCString() -> CString {
+    return CString { address: nullPointer() }
+}
+
+// The view for a child given `places`: the runtime, then each place where
+// the parent sees it.
+function kernelConfinedView(places: borrow [ConfinedPlace]) -> Result<KernelView, TesseraError> {
+    var view = KernelView {
+        stage: cStringFrom(ConfineView.stage),
+        slash: cStringFrom("/"),
+        dot: cStringFrom("."),
+        memory: cStringFrom("tmpfs"),
+        procfs: cStringFrom("proc"),
+        steps: [],
+        made: [],
+        bound: []
+    }
+    let readOnly = MountFlag.readOnly | MountFlag.noSetIdentity | MountFlag.noDevices
+    for path in ConfineView.runtime {
+        match linkTarget("/" + path) {
+            Ok(target) -> {
+                view.steps.append(
+                    ViewStep {
+                        kind: .Link,
+                        source: cStringFrom(target),
+                        target: cStringFrom(ConfineView.stage + "/" + path),
+                        flags: U64(0)
+                    }
+                )
+            }
+            // Not a link, or nothing there: a directory is bound where the
+            // parent has one. Any other failure leaves the view unknown, so the
+            // child is not started with it.
+            Error(errno) -> {
+                if errno != code(Errno.Invalid) && errno != code(Errno.NoEntry) {
+                    return .Error(errnoFailure(errno))
+                }
+                if directoryPresent("/" + path) { viewBind(view, path, readOnly) }
+            }
+        }
+    }
+    viewDevices(view)
+    viewDirectories(view, "proc")
+    view.steps.append(
+        ViewStep {
+            kind: .Processes,
+            source: nullCString(),
+            target: cStringFrom(ConfineView.stage + "/proc"),
+            flags: MountFlag.noSetIdentity | MountFlag.noDevices | MountFlag.noExecute
+        }
+    )
+    viewBind(view, "sys", readOnly | MountFlag.noExecute)
+    for place in places {
+        let path = try kernelDisplayPath(place.backing)
+        if place.writable {
+            viewBind(
+                view,
+                path,
+                MountFlag.noSetIdentity | MountFlag.noDevices | MountFlag.noExecute
+            )
+        } else {
+            viewBind(view, path, readOnly)
+        }
+    }
+    viewDirectories(view, "tmp")
+    view.steps.append(
+        ViewStep {
+            kind: .Memory,
+            source: cStringFrom("mode=1777"),
+            target: cStringFrom(ConfineView.stage + "/tmp"),
+            flags: MountFlag.noSetIdentity | MountFlag.noDevices | MountFlag.noExecute
+        }
+    )
+    return .Ok(view)
+}
+
+// A `/dev` of its own: an in-memory directory with `ConfineView.devices`
+// and `ConfineView.deviceDirectories` bound into it, those the root has.
+function viewDevices(view: borrow mut KernelView) {
+    viewDirectories(view, "dev")
+    view.steps.append(
+        ViewStep {
+            kind: .Memory,
+            source: cStringFrom("mode=755"),
+            target: cStringFrom(ConfineView.stage + "/dev"),
+            flags: MountFlag.noSetIdentity | MountFlag.noDevices | MountFlag.noExecute
+        }
+    )
+    let deviceFlags = MountFlag.noSetIdentity | MountFlag.noExecute
+    for name in ConfineView.devices {
+        let path = "dev/" + name
+        if !nodePresent("/" + path) { continue }
+        let target = cStringFrom(ConfineView.stage + "/" + path)
+        view.steps.append(
+            ViewStep { kind: .File, source: nullCString(), target: copy target, flags: U64(0) }
+        )
+        view.steps.append(
+            ViewStep {
+                kind: .Bind,
+                source: cStringFrom("/" + path),
+                target: copy target,
+                flags: MountFlag.bind
+            }
+        )
+        view.steps.append(
+            ViewStep {
+                kind: .Remount,
+                source: nullCString(),
+                target: target,
+                flags: MountFlag.bind | ConfineMount.remount | deviceFlags
+            }
+        )
+    }
+    for name in ConfineView.deviceDirectories {
+        let path = "dev/" + name
+        if directoryPresent("/" + path) { viewBind(view, path, deviceFlags) }
+    }
+}
+
+// Binds `path`, from the root, at the same path in the view, then mounts it
+// again with `flags`. A path beneath one bound already is in the view.
+function viewBind(view: borrow mut KernelView, path: borrow String, flags: U64) {
+    for earlier in view.bound {
+        if path == earlier || path.startsWith(earlier + "/") { return }
+    }
+    viewDirectories(view, path)
+    let target = ConfineView.stage + "/" + path
+    view.steps.append(
+        ViewStep {
+            kind: .Bind,
+            source: cStringFrom("/" + path),
+            target: cStringFrom(target),
+            flags: MountFlag.bind | ConfineMount.recursive
+        }
+    )
+    view.steps.append(
+        ViewStep {
+            kind: .Remount,
+            source: nullCString(),
+            target: cStringFrom(target),
+            flags: MountFlag.bind | ConfineMount.remount | flags
+        }
+    )
+    view.bound.append(copy path)
+}
+
+// Makes `path` and each directory above it under the stage, once.
+function viewDirectories(view: borrow mut KernelView, path: borrow String) {
+    var walked = ""
+    for part in path.split("/") {
+        if part.count == 0 { continue }
+        walked = walked.count == 0 ? copy part : walked + "/" + part
+        if view.made.contains(walked) { continue }
+        view.steps.append(
+            ViewStep {
+                kind: .Directory,
+                source: nullCString(),
+                target: cStringFrom(ConfineView.stage + "/" + walked),
+                flags: U64(0)
+            }
+        )
+        view.made.append(copy walked)
+    }
+}
+
+// What the link at `path` points at, or the errno it failed with: EINVAL when
+// the path is not a link, ENOENT when nothing is there.
+function linkTarget(path: borrow String) -> Result<String, Number> {
+    let blockBytes = zeroedBlock(count: 4097, alignment: 16)
+    let block = blockBytes.pointer()
+    let got = readlinkat(AtDirectory.current, cStringFrom(path), block, U64(4096))
+    if answerFailed(got) { return .Error(answerErrno(got)) }
+    return .Ok(stringFromCBytes(block, got))
+}
+
+function nodePresent(path: borrow String) -> Bool {
+    let fd = openat(
+        AtDirectory.current,
+        cStringFrom(path),
+        LinuxOpen.path | LinuxOpen.closeOnExec,
+        0
+    )
+    if answerFailed(fd) { return false }
+    closeBacking(fd)
+    return true
+}
+
+function directoryPresent(path: borrow String) -> Bool {
+    let fd = openat(
+        AtDirectory.current,
+        cStringFrom(path),
+        LinuxOpen.path | LinuxOpen.closeOnExec | openDirectoryFlag(),
+        0
+    )
+    if answerFailed(fd) { return false }
+    closeBacking(fd)
+    return true
+}
+
+// Turns the stage into the child's root, in the mount namespace it was
+// cloned into: whether every step held. Called between clone and exec, so
+// nothing here allocates.
+function enterView(view: borrow KernelView) -> Bool {
+    let none = nullCString()
+    // Nothing mounted from here on reaches the parent's namespace.
+    let shared = ConfineMount.recursive | ConfineMount.isPrivate
+    if !held(mount(none, view.slash, none, shared, nullPointer())) { return false }
+    let memoryFlags = MountFlag.noSetIdentity | MountFlag.noDevices
+    if !held(mount(view.memory, view.stage, view.memory, memoryFlags, nullPointer())) {
+        return false
+    }
+    for step in view.steps {
+        var answer = 0
+        match step.kind {
+            Directory -> {
+                answer = mkdirat(AtDirectory.current, step.target, 493)
+                // EEXIST: made already.
+                if answer == -17 { answer = 0 }
+            }
+            Link -> answer = symlinkat(step.source, AtDirectory.current, step.target)
+            Bind, Remount -> answer = mount(
+                step.source,
+                step.target,
+                none,
+                step.flags,
+                nullPointer()
+            )
+            Memory -> answer = mount(
+                view.memory,
+                step.target,
+                view.memory,
+                step.flags,
+                step.source.address
+            )
+            File -> {
+                answer = openat(
+                    AtDirectory.current,
+                    step.target,
+                    LinuxOpen.writeOnly | LinuxOpen.create | LinuxOpen.closeOnExec,
+                    420
+                )
+                if !answerFailed(answer) { answer = close(answer) }
+            }
+            Processes -> answer = mount(
+                view.procfs,
+                step.target,
+                view.procfs,
+                step.flags,
+                nullPointer()
+            )
+        }
+        if !held(answer) { return false }
+    }
+    // The stage over the old root, and the old root let go of:
+    // `pivot_root(".", ".")`, which needs no directory to put it in.
+    if !held(chdir(view.stage)) { return false }
+    if !held(pivotRoot(view.dot, view.dot)) { return false }
+    if !held(umount2(view.dot, MountFlag.detach)) { return false }
+    if !held(chdir(view.slash)) { return false }
+    let sealed = ConfineMount.remount | MountFlag.readOnly | MountFlag.noSetIdentity | MountFlag.noDevices
+    if !held(mount(none, view.slash, none, sealed, nullPointer())) { return false }
+    // No capability survives the exec: root's are bounded by an empty set.
+    for capability in 0..ConfineMount.capabilities {
+        let dropped = prctl(ConfineMount.dropBounding, U64(capability), U64(0), U64(0), U64(0))
+        // EINVAL: a capability this kernel does not have.
+        if !held(dropped) && dropped != -22 { return false }
+    }
+    if !held(prctl(ConfineMount.ambient, ConfineMount.clearAmbient, U64(0), U64(0), U64(0))) {
+        return false
+    }
+    return held(prctl(ConfineMount.noNewPrivileges, U64(1), U64(0), U64(0), U64(0)))
+}
+
+function held(answer: Number) -> Bool { return !answerFailed(answer) }

@@ -1,0 +1,262 @@
+import Foundation
+import LibTessera
+import PlatformKit
+import TesseraDisplayClient
+import PlatformUI
+import KiraUI
+
+// What a tap on a window or on a banner brings forward.
+
+/// A tap on a window that does not have the keyboard, or on a picture in the
+/// strip, brings it to the front.
+function surfacePressed(mobile: borrow mut Mobile, surface: DisplaySurfaceId) {
+    if mobile.lock.locked {
+        unlock(mobile)
+        return
+    }
+    mobile.front = .Some(surface)
+    focus(mobile, surface)
+    match mobile.state.activateSurface(PlatformSurfaceId(surface.raw)) {
+        // The window is in front and focused.
+        Ok -> {}
+        Error(failure) -> log warn("a tap could not bring a window forward", failure)
+    }
+    keepDock(mobile)
+    if mobile.mode == .Stage { redrawAfter(0) }
+    log info("a tap brought a window forward", surface: surface.raw)
+}
+
+/// A tap on a notification's banner opens the application that posted it,
+/// back from home if it was put away there, as on an iPhone.
+function bannerChose(mobile: borrow mut Mobile, client: Number) {
+    if mobile.lock.locked { return }
+    mobile.banners = bannersAfterChoosing(mobile.banners, client)
+    bringForward(mobile, DisplaySurfaceId(client))
+}
+
+/// Opening an application that is open already, from its icon on the home
+/// screen, brings its window forward, back from home if it was put away there,
+/// as on an iPad.
+function activateRequested(mobile: borrow mut Mobile, shown: DisplaySurfaceId) {
+    if mobile.lock.locked { return }
+    log info("asked to bring an open application forward", surface: shown.raw)
+    forgetDockOpening(mobile, shown)
+    bringForward(mobile, shown)
+}
+
+/// The application on `shown` was opened from its icon on the home screen, so
+/// it goes back into that icon rather than the Dock.
+function forgetDockOpening(mobile: borrow mut Mobile, shown: DisplaySurfaceId) {
+    let application = match mobile.state.applicationOfSurface(PlatformSurfaceId(shown.raw)) {
+        Some(value) -> value
+        None -> return
+    }
+    let name = match mobile.state.applicationName(application) {
+        Some(value) -> value
+        None -> return
+    }
+    var kept: [String] = []
+    for opened in mobile.fromDock {
+        if opened != name { kept.append(copy opened) }
+    }
+    mobile.fromDock = kept
+}
+
+/// Brings the window `shown` forward: a visible window comes to the front, and a hidden one resumes.
+function bringForward(mobile: borrow mut Mobile, shown: DisplaySurfaceId) {
+    let surface = PlatformSurfaceId(shown.raw)
+    match mobile.state.visibilityOf(surface) {
+        Some(visibility) -> match visibility {
+            Visible -> surfacePressed(mobile, shown)
+            Hidden -> resume(mobile, surface)
+        }
+        // Its window went since it was asked for.
+        None -> {}
+    }
+}
+
+/// An application asked for a window action on its own surface: with Windowed
+/// Apps or Stage Manager on, its title bar moves it and its edges resize it,
+/// its green button fills the room windows have and its yellow one puts it
+/// away to the Dock, as an iPad's do.
+function windowRequested(mobile: borrow mut Mobile, request: borrow DisplayWindowRequest) {
+    let channel = match mobile.channel {
+        Some(value) -> value
+        None -> return
+    }
+    match request.action {
+        // A window swiped up from the bottom edge goes home whatever the
+        // arrangement; MosaicDisplay is already flying it into its icon.
+        Home -> if !mobile.lock.locked { goHome(mobile) }
+        Peek -> mobile.peeking = true
+        Unpeek -> mobile.peeking = false
+        Fly -> {
+            mobile.flying = .Some(request.surface)
+            redrawAfter(0)
+        }
+        Landed -> if mobile.flying == .Some(request.surface) {
+            mobile.flying = .None
+            redrawAfter(0)
+        }
+        Move, Resize, Zoom, Minimize -> {
+            if mobile.lock.locked || mobile.mode != .Freeform && mobile.mode != .Stage { return }
+            windowArranged(mobile, channel, request)
+        }
+    }
+}
+
+/// A window action that only Windowed Apps and Stage Manager have.
+function windowArranged(
+    mobile: borrow mut Mobile,
+    channel: Handle,
+    request: borrow DisplayWindowRequest
+) {
+    match request.action {
+        Move -> match sendGrantMove(channel, request.surface) {
+            Ok -> {}
+            Error(failed) -> log warn(
+                "a display request failed",
+                request: "grant a move",
+                error: errorName(failed)
+            )
+        }
+        Resize -> match sendGrantResize(channel, request.surface) {
+            Ok -> {}
+            Error(failed) -> log warn(
+                "a display request failed",
+                request: "grant a resize",
+                error: errorName(failed)
+            )
+        }
+        Zoom -> zoom(mobile, channel, request.surface)
+        Minimize -> minimize(mobile, channel, request.surface)
+        // The swipe home and a window's flight are taken above.
+        Home, Peek, Unpeek, Fly, Landed -> {}
+    }
+}
+
+/// The room a zoomed window fills: the output below the status bar and above
+/// the band along the bottom.
+function windowRoom(mobile: borrow Mobile) -> SurfaceFrame {
+    let top = barHeight(mobile)
+    return SurfaceFrame {
+        x: 0,
+        y: top,
+        width: mobile.output.width,
+        height: mobile.output.height - top - max(mobile.dock, 0),
+    }
+}
+
+/// The green button: a window fills the room windows have, and zooming it
+/// again puts it back where it was.
+function zoom(mobile: borrow mut Mobile, channel: Handle, surface: DisplaySurfaceId) {
+    let frame = match mobile.state.zoomSurface(PlatformSurfaceId(surface.raw), windowRoom(mobile)) {
+        Ok(value) -> value
+        Error(failure) -> {
+            log warn("a window could not be zoomed", surface: surface.raw, failure)
+            return
+        }
+    }
+    let placement = DisplayPlacement {
+        surface: surface,
+        x: frame.x,
+        y: frame.y,
+        width: UNumber(frame.width),
+        height: UNumber(frame.height),
+    }
+    match sent(sendPlaceSurface(channel, move placement)) {
+        Ok(sent) -> if sent {
+            log info(
+                "zoomed a window",
+                surface: surface.raw,
+                width: frame.width,
+                height: frame.height
+            )
+        }
+        Error(failed) -> log warn(
+            "a display request failed",
+            request: "zoom a window",
+            error: errorName(failed)
+        )
+    }
+}
+
+/// The yellow button: the window leaves the screen for the Dock, from which
+/// its application brings it back, and the one behind it comes to the front.
+/// On the stage it goes to the strip instead, as an iPad's does, and leaves
+/// the screen only when no other application is shown.
+function minimize(mobile: borrow mut Mobile, channel: Handle, surface: DisplaySurfaceId) {
+    if mobile.mode == .Stage {
+        // The window in the strip most recently in front takes the stage.
+        let waiting = mobile.state.stripSurfaces(1)
+        if waiting.count > 0 {
+            match mobile.state.activateSurface(waiting[0].id) {
+                Ok -> {}
+                Error(failure) -> log warn("the strip could not bring a window forward", failure)
+            }
+            let next = DisplaySurfaceId(waiting[0].id.raw)
+            mobile.front = .Some(next)
+            focus(mobile, next)
+            keepDock(mobile)
+            log info("a window went to the strip", surface: surface.raw)
+            return
+        }
+    }
+    match sent(sendSetHidden(copy channel, surface, true)) {
+        Ok(sent) -> if !sent { return }
+        Error(failed) -> {
+            log warn(
+                "a display request failed",
+                request: "minimize a window",
+                error: errorName(failed)
+            )
+            return
+        }
+    }
+    match mobile.state.setSurfaceVisibility(PlatformSurfaceId(surface.raw), .Hidden) {
+        Ok -> {}
+        Error(failure) -> log warn(
+            "a minimized window was not tracked",
+            surface: surface.raw,
+            failure
+        )
+    }
+    log info("minimized a window", surface: surface.raw)
+    let next = match mobile.state.frontmostSurface(PlatformSurfaceId(surface.raw)) {
+        Some(value) -> DisplaySurfaceId(value.raw)
+        None -> match mobile.home {
+            Some(value) -> value
+            None -> return
+        }
+    }
+    mobile.front = .Some(next)
+    focus(mobile, next)
+    keepDock(mobile)
+}
+
+/// The compositor placed a surface; the platform records where, which a zoom
+/// puts the window back to.
+function surfacePlaced(mobile: borrow mut Mobile, placement: borrow DisplayPlacement) {
+    let frame = SurfaceFrame {
+        x: placement.x,
+        y: placement.y,
+        width: Number(placement.width),
+        height: Number(placement.height),
+    }
+    match mobile.state.placeSurface(PlatformSurfaceId(placement.surface.raw), move frame) {
+        Ok -> {}
+        Error(failure) -> log info(
+            "a surface was placed that the platform is not tracking",
+            surface: placement.surface.raw,
+            failure
+        )
+    }
+}
+
+/// Whether a display request went out, or why it did not.
+function sent(asked: borrow Result<Void, TesseraError>) -> Result<Bool, TesseraError> {
+    return match asked {
+        Ok -> .Ok(true)
+        Error(failed) -> .Error(failed)
+    }
+}

@@ -1,0 +1,158 @@
+import Foundation
+import Heap
+import LibTessera
+
+// Where the dev root keeps what it installed, and how it writes it down.
+//
+//     /var/db/devroots/stack                 the roots, bottom first, one a line
+//     /var/db/devroots/roots/<name>/archive  each root's archive, as it came
+//     /var/db/devroots/roots/<name>/manifest each root's manifest
+//     /var/db/devroots/base/                 the sealed system, read-only
+//
+// A manifest is a line per entry: kind (`d` or `f`), mode, SHA-256 (`-` for
+// a directory) and path, separated by tabs. The base layer, below every root,
+// is the sealed system the dev system was taken from, which PID 1 mounts
+// read-only at `base/` (roadmap/18-components.md §5). Nothing is backed up:
+// what a root replaced is always still there.
+//
+// The digests are SHA-256. The host packs none: the machine computes every
+// one itself, from the archive and from the disk, with LibTessera's
+// `digestSha256`.
+
+struct ManifestEntry {
+    let kind: EntryKind
+    let executable: Bool
+    // A file's digest; a directory has none.
+    let digest: String?
+    let path: String
+}
+
+// A root on the stack, with what its manifest says it installed.
+struct Layer {
+    let name: String
+    let entries: [ManifestEntry]
+}
+
+namespace StorePath {
+    let root: String = "/" + SystemDirectory.developerRoots
+    let stack: String = "/" + SystemDirectory.developerRoots + "/stack"
+    // The id of the last request carried out, kept for a dev root started
+    // again to load its own changes.
+    let handled: String = "/" + SystemDirectory.developerRoots + "/handled"
+    let base: String = "/" + SystemDirectory.developerRootsBase
+}
+
+namespace ManifestFormat {
+    let noDigest: String = "-"
+    let executableMode: String = "755"
+    let plainMode: String = "644"
+}
+
+function layerDirectory(name: borrow String) -> String { return "\(StorePath.root)/roots/\(name)" }
+
+// Where the base layer has `path`.
+function basePath(path: borrow String) -> String { return StorePath.base + path }
+
+function prepareStore(files: borrow Files) -> Result<Void, TesseraError> {
+    return files.ensureDirectories("\(StorePath.root)/roots")
+}
+
+// The lines of the file at `path`; a file that is not there has none.
+function storedLines(files: borrow Files, path: borrow String) -> Result<[String], TesseraError> {
+    match files.readTextIfPresent(path) {
+        Ok(found) -> {
+            match found {
+                Some(text) -> return .Ok(text.split("\n"))
+                None -> return .Ok([])
+            }
+        }
+        Error(failed) -> return .Error(failed)
+    }
+}
+
+// The stack, bottom first, with every root's manifest.
+function loadStack(files: borrow Files) -> Result<[Layer], TesseraError> {
+    let names = try storedLines(files, StorePath.stack)
+    var layers: [Layer] = []
+    for name in names {
+        if !name.isEmpty() {
+            let manifest = try storedLines(files, "\(layerDirectory(name))/manifest")
+            layers.append(Layer { name: copy name, entries: parseManifest(manifest) })
+        }
+    }
+    return .Ok(layers)
+}
+
+function saveStack(files: borrow Files, layers: borrow [Layer]) -> Result<Void, TesseraError> {
+    var text = ""
+    for layer in layers { text.append("\(layer.name)\n") }
+    return files.writeText(StorePath.stack, text)
+}
+
+// The SHA-256 of the file at `path`.
+function fileDigest(files: borrow Files, path: borrow String) -> Result<String, TesseraError> {
+    match files.load(path) {
+        Ok(block) -> return .Ok(
+            digestSha256(Buffer { address: block.pointer(), length: block.count })
+        )
+        Error(failed) -> return .Error(failed)
+    }
+}
+
+function formatManifest(entries: borrow [ManifestEntry]) -> String {
+    var text = ""
+    for entry in entries {
+        let kind = match entry.kind {
+            Directory -> "d"
+            File -> "f"
+        }
+        let runnable = entry.executable || entry.kind == .Directory
+        let mode = runnable ? ManifestFormat.executableMode : ManifestFormat.plainMode
+        let digest = match entry.digest {
+            Some(value) -> value
+            None -> ManifestFormat.noDigest
+        }
+        text.append("\(kind)\t\(mode)\t\(digest)\t\(entry.path)\n")
+    }
+    return text
+}
+
+function parseManifest(lines: borrow [String]) -> [ManifestEntry] {
+    var entries: [ManifestEntry] = []
+    for line in lines {
+        let fields = line.split("\t")
+        if fields.count == 4 {
+            let kind: EntryKind = fields[0] == "d" ? .Directory : .File
+            let digest: String? = kind == .Directory ? .None : .Some(copy fields[2])
+            entries.append(
+                ManifestEntry {
+                    kind: kind,
+                    executable: fields[1] == ManifestFormat.executableMode,
+                    digest: digest,
+                    path: copy fields[3]
+                }
+            )
+        }
+    }
+    return entries
+}
+
+// The entry for `path` in `entries`, if there is one.
+function manifestIndex(entries: borrow [ManifestEntry], path: borrow String) -> Number? {
+    for (index, entry) in entries.enumerated() {
+        if entry.path == path { return .Some(index) }
+    }
+    return .None
+}
+
+function manifestHas(entries: borrow [ManifestEntry], path: borrow String) -> Bool {
+    return manifestIndex(entries, path).isSome()
+}
+
+// The place of the root called `name` on the stack, if it is there.
+function stackIndex(layers: borrow [Layer], name: borrow String) -> Number? {
+    for (index, layer) in layers.enumerated() {
+        if layer.name == name { return .Some(index) }
+    }
+    return .None
+}

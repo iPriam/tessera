@@ -1,0 +1,101 @@
+//! Tests of the Trash store: which paths may be moved, and how records are read back.
+import Foundation
+import TrashStore
+
+// The Trash store's path rules and record format, run on the host with
+// `kira test tests/trash_kik`. The move and put-back round trip needs the data
+// volume, so it is checked by the Trash service on the device, not here.
+
+/// Whether a move from `path` is refused.
+function isRefusedPath(path: borrow String) -> Bool {
+    return match refusalOf(path) {
+        Ok -> false
+        Error(reason) -> true
+    }
+}
+
+/// The original path a record names, or "" when the record is refused.
+function originalPathOf(text: borrow String) -> String {
+    return match originalOf(text) {
+        Ok(path) -> path
+        Error(reason) -> ""
+    }
+}
+
+/// A path on the data volume may be moved to the Trash.
+@Test
+function pathsOnTheDataVolumeMayMove() {
+    expect!(!isRefusedPath("/data/Documents/note.txt"))
+}
+
+/// A path outside the data volume is refused.
+@Test
+function pathsOutsideTheDataVolumeAreRefused() {
+    expect!(isRefusedPath("/Users/someone/note.txt"))
+    expect!(isRefusedPath("/data"))
+}
+
+/// The system's state and the Trash itself are refused.
+@Test
+function theSystemStateAndTheTrashAreRefused() {
+    expect!(isRefusedPath("/data/system/settings.plist"))
+    expect!(isRefusedPath("/data/Trash/items/1"))
+}
+
+/// A path with a `..` segment is refused.
+@Test
+function dotDotSegmentsAreRefused() {
+    expect!(isRefusedPath("/data/a/../../etc/passwd"))
+    expect!(isRefusedPath("/data/a/.."))
+}
+
+/// A path with a newline is refused, since a record cannot hold one.
+@Test
+function aNewlineInThePathIsRefused() {
+    expect!(isRefusedPath("/data/a\nb"))
+}
+
+/// A record's original path is read back from its text.
+@Test
+function aRecordsOriginalPathIsRecovered() {
+    expect!(
+        originalPathOf("version 1\npath /data/Documents/note.txt\n") == "/data/Documents/note.txt"
+    )
+}
+
+/// A record of another version is refused.
+@Test
+function aRecordOfAnotherVersionIsRefused() {
+    expect!(originalPathOf("version 2\npath /data/a\n") == "")
+}
+
+/// A record without its final newline is refused.
+@Test
+function aRecordWithoutItsFinalNewlineIsRefused() {
+    expect!(originalPathOf("version 1\npath /data/a") == "")
+}
+
+/// An item id is digits only.
+@Test
+function itemIdsAreDigitsOnly() {
+    expect!(isItemId("1"))
+    expect!(isItemId("123456"))
+    expect!(!isItemId(""))
+    expect!(!isItemId("../1"))
+    expect!(!isItemId("1a"))
+}
+
+/// The parent of a path is the folder it lies in.
+@Test
+function theParentOfAPathIsItsFolder() {
+    expect!(parentOf("/data/Documents/note.txt") == "/data/Documents")
+    expect!(parentOf("/data") == "/")
+}
+
+/// A path lies within itself and within the folders above it.
+@Test
+function aPathIsWithinItselfAndItsFolders() {
+    expect!(within("/data/a", "/data"))
+    expect!(within("/data", "/data"))
+    expect!(!within("/database/a", "/data"))
+}

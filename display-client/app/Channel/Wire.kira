@@ -1,0 +1,172 @@
+import Foundation
+import LibTessera
+
+// The ParentChannel PID 1 started this process with (roadmap/16 §11.4);
+// `NotFound` when it was started without one.
+function serviceChannel() -> Result<Handle, TesseraError> {
+    return match startupHandle(StartupTag.parentChannel) {
+        Some(channel) -> .Ok(channel)
+        None -> .Error(protocolFailure(.NotFound))
+    }
+}
+
+// The next message on `channel` into `body`, waiting for one to arrive.
+// `PeerClosed` once the other end has gone and nothing is left to read.
+function readMessage(
+    channel: Handle,
+    body: RawPtr,
+    size: UNumber,
+    handleCapacity: Number
+) -> Result<ReceivedMessage, TesseraError> {
+    while true {
+        match channelRead(channel, Buffer { address: body, length: size }, handleCapacity) {
+            Ok(message) -> return .Ok(message)
+            // An empty channel is not a failure; wait for the next message.
+            Error(failed) -> if failed.code != .ShouldWait { return .Error(failed) }
+        }
+        try waitReadable(channel)
+    }
+    return .Error(protocolFailure(.Internal))
+}
+
+// Waits until `channel` can be read or its peer has gone, on a port made for
+// the wait and closed after it, so a client's own port never hears of it.
+function waitReadable(channel: Handle) -> Result<Void, TesseraError> {
+    let port = try portCreate(.None)
+    let waited = waitOn(channel, port)
+    release(port)
+    return waited
+}
+
+function waitOn(channel: Handle, port: Handle) -> Result<Void, TesseraError> {
+    try objectWaitAsync(channel, Signals.readable | Signals.peerClosed, .Once, port, 1)
+    try portWait(port, 1, Deadline.infinite)
+    return .Ok
+}
+
+// Closes `handle`. A close that fails is said; nothing else can be done
+// about it.
+function release(handle: Handle) {
+    match handleClose(handle) {
+        Ok -> {}
+        Error(failed) -> log warn("could not close a handle", error: errorName(failed))
+    }
+}
+
+// The display protocol's opcodes, as the wire carries them. What each
+// message means is `DisplayMessage`'s to say.
+@Derive(Copy)
+enum DisplayProtocolOpcode: UN32 {
+    Hello = 16
+    Welcome = 17
+    Attach = 18
+    Commit = 19
+    Key = 20
+    FrameDone = 21
+    FrameRequest = 22
+    FrameReady = 23
+    FocusIn = 24
+    FocusOut = 25
+    Configure = 26
+    AckConfigure = 27
+    SetMode = 28
+    ModeChanged = 29
+    InputCapability = 30
+    SurfaceCreated = 31
+    SurfaceDestroyed = 32
+    GrantFocus = 33
+    InstallGrab = 34
+    GrabFired = 35
+    SetChannel = 36
+    ChannelChanged = 37
+    PresentSystem = 38
+    Verify = 39
+    VerifyResult = 40
+    InjectInput = 41
+    Notify = 42
+    Notification = 43
+    ActivateRequested = 44
+    SetBar = 45
+    PointerMotion = 46
+    PointerButton = 47
+    PointerAxis = 48
+    PointerEnter = 49
+    PointerLeave = 50
+    SetDock = 51
+    SurfacePressed = 52
+    RequestWindow = 53
+    WindowRequested = 54
+    GrantMove = 55
+    PlaceSurface = 56
+    SurfacePlaced = 57
+    SetHidden = 58
+    SetMargin = 59
+    Insets = 60
+    GrantResize = 61
+    HoldInput = 62
+    Output = 63
+    SetOverlay = 64
+    SetIdle = 65
+    IdleChanged = 66
+    SetGlass = 67
+    SetStageBadge = 68
+    BarBackdrop = 69
+    SetLaunchOrigin = 70
+}
+
+let displayProtocolOpcodes: [DisplayProtocolOpcode] = [DisplayProtocolOpcode.Hello, DisplayProtocolOpcode.Welcome, DisplayProtocolOpcode.Attach, DisplayProtocolOpcode.Commit, DisplayProtocolOpcode.Key, DisplayProtocolOpcode.FrameDone, DisplayProtocolOpcode.FrameRequest, DisplayProtocolOpcode.FrameReady, DisplayProtocolOpcode.FocusIn, DisplayProtocolOpcode.FocusOut, DisplayProtocolOpcode.Configure, DisplayProtocolOpcode.AckConfigure, DisplayProtocolOpcode.SetMode, DisplayProtocolOpcode.ModeChanged, DisplayProtocolOpcode.InputCapability, DisplayProtocolOpcode.SurfaceCreated, DisplayProtocolOpcode.SurfaceDestroyed, DisplayProtocolOpcode.GrantFocus, DisplayProtocolOpcode.InstallGrab, DisplayProtocolOpcode.GrabFired, DisplayProtocolOpcode.SetChannel, DisplayProtocolOpcode.ChannelChanged, DisplayProtocolOpcode.PresentSystem, DisplayProtocolOpcode.Verify, DisplayProtocolOpcode.VerifyResult, DisplayProtocolOpcode.InjectInput, DisplayProtocolOpcode.Notify, DisplayProtocolOpcode.Notification, DisplayProtocolOpcode.ActivateRequested, DisplayProtocolOpcode.SetBar, DisplayProtocolOpcode.PointerMotion, DisplayProtocolOpcode.PointerButton, DisplayProtocolOpcode.PointerAxis, DisplayProtocolOpcode.PointerEnter, DisplayProtocolOpcode.PointerLeave, DisplayProtocolOpcode.SetDock, DisplayProtocolOpcode.SurfacePressed, DisplayProtocolOpcode.RequestWindow, DisplayProtocolOpcode.WindowRequested, DisplayProtocolOpcode.GrantMove, DisplayProtocolOpcode.PlaceSurface, DisplayProtocolOpcode.SurfacePlaced, DisplayProtocolOpcode.SetHidden, DisplayProtocolOpcode.SetMargin, DisplayProtocolOpcode.Insets, DisplayProtocolOpcode.GrantResize, DisplayProtocolOpcode.HoldInput, DisplayProtocolOpcode.Output, DisplayProtocolOpcode.SetOverlay, DisplayProtocolOpcode.SetIdle, DisplayProtocolOpcode.IdleChanged, DisplayProtocolOpcode.SetGlass, DisplayProtocolOpcode.SetStageBadge, DisplayProtocolOpcode.BarBackdrop, DisplayProtocolOpcode.SetLaunchOrigin]
+
+// The kinds of value a client declares on its surface with `SetChannel`.
+@Derive(Copy)
+public enum DisplayChannel: UN32 {
+    Badge = 1
+    // Whether the surface asks for the status bar to be hidden while it is in
+    // front: 1 hidden, 0 shown.
+    StatusBarHidden = 2
+    // Whether the home screen is being edited, so the platform gives the top
+    // of the screen to the home screen's edit bar: 1 edited, 0 not.
+    HomeEditing = 3
+}
+
+let displayChannels: [DisplayChannel] = [DisplayChannel.Badge, DisplayChannel.StatusBarHidden, DisplayChannel.HomeEditing]
+
+// The compositor modes a platform may ask for.
+@Derive(Copy)
+public enum CompositorMode: UN32 {
+    Exclusive = 1
+    Stack = 2
+    Freeform = 3
+    // Stage Manager: the window in front on a stage, and the other
+    // applications as small pictures in a strip down the leading edge
+    // (Stage.kira).
+    Stage = 4
+}
+
+// What a log line calls `mode`.
+public function compositorModeName(mode: borrow CompositorMode) -> String {
+    return match mode {
+        Exclusive -> "exclusive"
+        Stack -> "stack"
+        Freeform -> "freeform"
+        Stage -> "stage"
+    }
+}
+
+let compositorModes: [CompositorMode] = [CompositorMode.Exclusive, CompositorMode.Stack, CompositorMode.Freeform, CompositorMode.Stage]
+
+let displayRoles: [DisplayRole] = [DisplayRole.None, DisplayRole.Application, DisplayRole.Platform, DisplayRole.Desktop]
+
+// One message: 56 bytes, the opcode @0, its size @4, the version @8, the
+// object @12, eight 32-bit words from @16 and a wide one @48.
+namespace DisplayProtocol {
+    let messageSize: UNumber = 56
+    let version: UNumber = 4
+    let opcodeAt: UNumber = 0
+    let sizeAt: UNumber = 4
+    let versionAt: UNumber = 8
+    let objectAt: UNumber = 12
+    let wordsAt: UNumber = 16
+    let words: UNumber = 8
+    let wordBytes: UNumber = 4
+    let wideAt: UNumber = 48
+}

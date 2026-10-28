@@ -1,0 +1,268 @@
+import Foundation
+import Heap
+
+// Network addresses and endpoint options (§15.2).
+//
+// An Endpoint keeps its family, protocol, state and the bytes it moved in
+// its EndpointObject.
+
+public struct NetAddress {
+    var family: AddressFamily
+    var port: UNumber
+    var flags: AddressFlags
+    var bytes: [U8]
+    var scope: UNumber
+}
+
+@Derive(Copy)
+@Derive(CaseIterable)
+public enum AddressFamily: U32 {
+    Ipv4 = 0
+    Ipv6 = 1
+}
+
+@Derive(Copy)
+public enum Protocol: U32 {
+    Tcp = 0
+    Udp = 1
+    Raw = 2
+    Icmp = 3
+}
+
+let protocols: [Protocol] = [Protocol.Tcp, Protocol.Udp, Protocol.Raw, Protocol.Icmp]
+
+@Derive(Copy)
+public distinct AddressFlags = UNumber
+
+public namespace AddressFlags {
+    let none: AddressFlags = AddressFlags(0)
+    // `scope` holds the IPv6 scope.
+    let scopeValid: AddressFlags = AddressFlags(1)
+}
+
+@Derive(Copy)
+public distinct EndpointOptions = UNumber
+
+public namespace EndpointOptions {
+    let none: EndpointOptions = EndpointOptions(0)
+    let reuseAddress: EndpointOptions = EndpointOptions(1)
+    // An IPv6 endpoint that takes IPv4-mapped addresses too.
+    let dualStack: EndpointOptions = EndpointOptions(2)
+    let all: EndpointOptions = EndpointOptions(3)
+}
+
+// `EndpointInfo.state`.
+@Derive(Copy)
+enum EndpointState: U32 {
+    Unbound = 0
+    Bound = 1
+    Listening = 2
+    Connecting = 3
+    Connected = 4
+    Closed = 5
+}
+
+let endpointStates: [EndpointState] = [EndpointState.Unbound, EndpointState.Bound, EndpointState.Listening, EndpointState.Connecting, EndpointState.Connected, EndpointState.Closed]
+
+@Derive(Copy)
+public distinct SendFlags = UNumber
+
+public namespace SendFlags {
+    let none: SendFlags = SendFlags(0)
+    let push: SendFlags = SendFlags(1)
+    // Cork: more follows.
+    let more: SendFlags = SendFlags(2)
+}
+
+@Derive(Copy)
+public distinct ReceiveFlags = UNumber
+
+public namespace ReceiveFlags {
+    let none: ReceiveFlags = ReceiveFlags(0)
+    let peek: ReceiveFlags = ReceiveFlags(1)
+    let waitAll: ReceiveFlags = ReceiveFlags(2)
+}
+
+@Derive(Copy)
+public enum ShutdownHow: U32 {
+    Read = 0
+    Write = 1
+    Both = 2
+}
+
+// `Datagram.flags` and the `aux` of a receive.
+@Derive(Copy)
+public distinct DatagramFlags = UNumber
+
+public namespace DatagramFlags {
+    let none: DatagramFlags = DatagramFlags(0)
+    let truncated: DatagramFlags = DatagramFlags(1)
+}
+
+// A new endpoint of `family` and `protocol`, in `state`.
+function endpointFresh(
+    family: borrow AddressFamily,
+    protocol: borrow Protocol,
+    state: borrow EndpointState
+) -> EndpointObject {
+    return EndpointObject {
+        family: family,
+        protocol: protocol,
+        timestamps: false,
+        state: state,
+        sent: U64(0),
+        received: U64(0),
+    }
+}
+
+function endpointStream(endpoint: borrow EndpointObject) -> Bool {
+    return endpoint.protocol == .Tcp
+}
+
+function endpointSetState(object: Number, state: EndpointState) {
+    match library.objects[object].state {
+        Endpoint(held) -> {
+            var endpoint = move held
+            endpoint.state = state
+            setEndpoint(object, move endpoint)
+        }
+        None, Port, Event, EventPair, Timer, Channel, Memory, Thread, Process, Job, Node, File, Watch, Stream, WakeLock, Presence -> {}
+    }
+}
+
+// Counts `moved` bytes sent, or received, on `object`.
+function endpointMoved(object: Number, direction: TransferDirection, moved: U64) {
+    match library.objects[object].state {
+        Endpoint(held) -> {
+            var endpoint = move held
+            match direction {
+                Send -> endpoint.sent += moved
+                Receive -> endpoint.received += moved
+            }
+            setEndpoint(object, move endpoint)
+        }
+        None, Port, Event, EventPair, Timer, Channel, Memory, Thread, Process, Job, Node, File, Watch, Stream, WakeLock, Presence -> {}
+    }
+}
+
+// The endpoint a pending operation is on; an operation on anything else
+// ends with the failure.
+function endpointPending(index: Number) -> EndpointObject? {
+    return match endpointOf(library.pending[index].object) {
+        Ok(endpoint) -> .Some(endpoint)
+        Error(failed) -> {
+            pendingFinish(index, .Error(failed), U64(0), U64(0), U64(0))
+            return .None
+        }
+    }
+}
+
+// `address` in the 32-byte `NetAddress` layout at `block`.
+function netAddressWrite(address: borrow NetAddress, block: RawPtr) {
+    zeroBytes(block, 32)
+    heapStore<U32>(block, 0, code(address.family))
+    heapStore<U16>(block, 4, address.port)
+    heapStore<U16>(block, 6, address.flags.raw)
+    for index in 0..address.bytes.count {
+        if index < 16 { heapStore<U8>(block, (8 + index), address.bytes[index]) }
+    }
+    heapStore<U32>(block, 24, address.scope)
+}
+
+// Which way a transfer moves data: out of the endpoint, or into it.
+@Derive(Copy)
+enum TransferDirection {
+    Send
+    Receive
+}
+
+// A 32-byte `NetAddress` in caller memory, read back as one; nothing when
+// its family is none this library knows.
+function netAddressLoad(block: RawPtr) -> NetAddress? {
+    let family = try caseWithCode(
+        allCases_AddressFamily(),
+        heapLoad<U32>(block, 0)
+    ) otherwise return .None
+    var bytes: [U8] = []
+    for index in 0..16 { bytes.append(heapLoad<U8>(block, 8 + index)) }
+    return .Some(
+        NetAddress {
+            family: family,
+            port: heapLoad<U16>(block, 4),
+            flags: AddressFlags(heapLoad<U16>(block, 6)),
+            bytes: bytes,
+            scope: heapLoad<U32>(block, 24),
+        }
+    )
+}
+
+function addressIsLoopback(address: borrow NetAddress) -> Bool {
+    if address.bytes.count != 16 { return false }
+    if address.family == .Ipv4 { return address.bytes[0] == U8(127) }
+    var zeros = true
+    for index in 0..15 {
+        if address.bytes[index] != U8(0) { zeros = false }
+    }
+    if zeros && address.bytes[15] == U8(1) { return true }
+    var mapped = true
+    for index in 0..10 {
+        if address.bytes[index] != U8(0) { mapped = false }
+    }
+    return mapped && address.bytes[10] == U8(0xFF) && address.bytes[11] == U8(
+        0xFF
+    ) && address.bytes[12] == U8(127)
+}
+
+@Derive(Copy)
+public enum EndpointOption: U32 {
+    NoDelay = 0
+    KeepAlive = 1
+    KeepAliveIdle = 2
+    KeepAliveInterval = 3
+    KeepAliveCount = 4
+    ReceiveBuffer = 5
+    SendBuffer = 6
+    Ttl = 7
+    HopLimit = 8
+    Broadcast = 9
+    MulticastJoin = 10
+    MulticastLeave = 11
+    MulticastTtl = 12
+    MulticastLoop = 13
+    Linger = 14
+    ReceiveTimestamps = 15
+    TcpUserTimeout = 16
+    TypeOfService = 17
+    BindToInterface = 18
+    ReceiveErrorQueue = 19
+    TcpFastOpen = 20
+    IpV6Only = 21
+}
+
+// `EndpointOption.Linger`'s value that turns lingering off; any other is
+// seconds.
+public namespace Linger {
+    let off: UNumber = 0xFFFFFFFF
+}
+
+// `EndpointInfo`, 96 bytes.
+function endpointInfoWrite(
+    object: Number,
+    endpoint: borrow EndpointObject,
+    block: RawPtr
+) -> Result<U64, TesseraError> {
+    zeroBytes(block, 96)
+    heapStore<U32>(block, 0, code(endpoint.family))
+    heapStore<U32>(block, 4, code(endpoint.protocol))
+    heapStore<U32>(block, 8, code(endpoint.state))
+    match library.objects[object].backing {
+        Some(backing) -> {
+            try kernelEndpointAddress(backing, false, heapOffset(block, 16))
+            try kernelEndpointAddress(backing, true, heapOffset(block, 48))
+        }
+        None -> {}
+    }
+    heapStore<U64>(block, 80, endpoint.sent)
+    heapStore<U64>(block, 88, endpoint.received)
+    return .Ok(96)
+}

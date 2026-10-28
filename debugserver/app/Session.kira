@@ -1,0 +1,277 @@
+import Foundation
+import LibTessera
+
+// One debugger's hold on one process, and running it: every thread runs
+// together and stops together, as lldb's all-stop mode has it, and the stop
+// lldb is told of is the first thread's that has a reason to stop.
+
+namespace LinuxSignal {
+    let trap: Number = 5
+    let kill: Number = 9
+    let stop: Number = 19
+}
+
+namespace ServerTiming {
+    // How long a read of the port waits while the process runs. ptrace tells
+    // of a stop only through `wait4`, which no descriptor wakes, so the
+    // server looks for one between reads.
+    let runningWait: U64 = U64(10000000)
+    // While the process is stopped nothing happens but what the debugger
+    // sends, which wakes the read at once.
+    let stoppedWait: U64 = U64(1000000000)
+    // How long the server waits between looks while no debugger is
+    // connected, which the port tells only by reading as closed at once.
+    let unconnectedWait: Number = 250000000
+}
+
+struct TracedThread {
+    let id: Number
+    var running: Bool = false
+    // A signal it stopped for while the server was stopping the others,
+    // passed on when it next runs.
+    var held: Number = 0
+}
+
+struct Session {
+    let port: DebugPort
+    let architecture: Architecture
+    let table: [RegisterSpec]
+    var reader: PacketReader = PacketReader {}
+    var acknowledging: Bool = true
+    var process: Number? = .None
+    var threads: [TracedThread] = []
+    // The thread `g`, `p` and `s` act on, which `Hg` sets.
+    var selected: Number = 0
+    // The thread whose stop lldb was last told of.
+    var reported: Number = 0
+    // Each breakpoint's address and the bytes its trap replaced.
+    var breakpoints: Map<U64, [UN8]> = Map {}
+}
+
+function threadIndex(session: borrow Session, thread: Number) -> Number? {
+    for (index, traced) in session.threads.enumerated() {
+        if traced.id == thread { return .Some(index) }
+    }
+    return .None
+}
+
+// The trap a breakpoint writes: `brk #0` on arm64, `int3` on x86-64.
+function breakpointTrap(architecture: Architecture) -> [UN8] {
+    return match architecture {
+        Arm64 -> [UN8(0), UN8(0), UN8(32), UN8(212)]
+        X64 -> [UN8(204)]
+        // Tessera does not run on RISC-V.
+        RiscV64 -> []
+    }
+}
+
+// `int3` leaves the program counter after itself; lldb wants it on the
+// breakpoint, as `brk` leaves it on arm64.
+function rewindBreakpoint(session: borrow Session, thread: Number) -> Result<Void, TesseraError> {
+    if session.architecture != .X64 { return .Ok }
+    let word = try programCounterWord(session.table) otherwise return .Ok
+    var words = try debugRegisters(thread)
+    let after = words[word]
+    if !session.breakpoints.contains(after - U64(1)) { return .Ok }
+    words[word] = after - U64(1)
+    return debugSetRegisters(thread, words)
+}
+
+// Every stopped thread runs again, the one reported with `signal`, each
+// other with the signal it holds.
+function resumeAll(session: borrow mut Session, signal: Number) -> Result<Void, TesseraError> {
+    for index in 0..session.threads.count {
+        if session.threads[index].running { continue }
+        let thread = session.threads[index].id
+        let deliver = thread == session.reported ? signal : session.threads[index].held
+        try debugContinue(thread, deliver)
+        session.threads[index].running = true
+        session.threads[index].held = 0
+    }
+    return .Ok
+}
+
+// Runs `thread` alone for one instruction; the stop reply.
+function stepThread(
+    session: borrow mut Session,
+    thread: Number,
+    signal: Number
+) -> Result<String, TesseraError> {
+    let index = try threadIndex(session, thread) otherwise return .Ok("E10")
+    try debugStep(thread, signal)
+    session.threads[index].running = true
+    while true {
+        let event = try debugWait()
+        let reply = try eventReply(session, event)
+        match reply {
+            Some(text) -> return .Ok(text)
+            // A new thread's first stop, or a clone, which the step goes on
+            // past.
+            None -> {}
+        }
+    }
+}
+
+// Runs every thread until one stops for a reason lldb is told of, or the
+// process ends; the stop reply. A 0x03 from the debugger stops it, and so
+// does the debugger going, after which the process is let go.
+function runUntilStop(session: borrow mut Session, signal: Number) -> Result<String, TesseraError> {
+    try resumeAll(session, signal)
+    while true {
+        let read = try debugPortRead(session.port, ServerTiming.runningWait)
+        let arrived = match read {
+            Some(bytes) -> bytes
+            None -> return stopAbandoned(session)
+        }
+        for inbound in takeInbound(session.reader, arrived) {
+            match inbound {
+                Interrupt -> {
+                    try interruptRunning(session)
+                }
+                // In all-stop mode lldb sends nothing but 0x03 while the
+                // process runs.
+                Packet -> {}
+                Corrupt -> {}
+            }
+        }
+        let polled = try debugPoll()
+        match polled {
+            Some(event) -> {
+                let reply = try eventReply(session, event)
+                match reply {
+                    Some(text) -> return .Ok(text)
+                    // Nothing to report: the thread is running again.
+                    None -> {}
+                }
+            }
+            // Nothing has changed yet.
+            None -> {}
+        }
+    }
+}
+
+// The debugger went while the process ran: it is stopped, at whatever stop
+// comes first, for the server to let it go. A stop lldb is not told of lets
+// the thread run on, so each is followed by another interrupt.
+function stopAbandoned(session: borrow mut Session) -> Result<String, TesseraError> {
+    while true {
+        try interruptRunning(session)
+        let event = try debugWait()
+        let reply = try eventReply(session, event)
+        match reply {
+            Some(text) -> return .Ok(text)
+            None -> {}
+        }
+    }
+}
+
+function interruptRunning(session: borrow Session) -> Result<Void, TesseraError> {
+    for traced in session.threads {
+        if traced.running { try debugInterrupt(traced.id) }
+    }
+    return .Ok
+}
+
+// What lldb is told of `event`, after stopping every other thread; none for
+// an event it is not told of, after which the thread runs on.
+function eventReply(
+    session: borrow mut Session,
+    event: borrow DebugEvent
+) -> Result<String?, TesseraError> {
+    let thread = event.thread
+    match event.change {
+        Stopped(stop) -> {
+            let index = match threadIndex(session, thread) {
+                Some(value) -> value
+                None -> {
+                    // A thread the process started, stopped as it begins.
+                    session.threads.append(TracedThread { id: thread, running: true })
+                    try debugContinue(thread, 0)
+                    return .Ok(.None)
+                }
+            }
+            session.threads[index].running = false
+            let signal = match stop.cause {
+                Signal -> stop.signal
+                Interrupt -> LinuxSignal.stop
+                // A clone or an exit to come: nothing lldb is told of.
+                else -> {
+                    try debugContinue(thread, 0)
+                    session.threads[index].running = true
+                    return .Ok(.None)
+                }
+            }
+            try stopOthers(session, thread)
+            if signal == LinuxSignal.trap { try rewindBreakpoint(session, thread) }
+            session.reported = thread
+            session.selected = thread
+            return .Ok(.Some("T\(hexByte(signal))thread:\(hexNumber(U64(thread)));"))
+        }
+        Exited(status) -> {
+            if !removeThread(session, thread) { return .Ok(.None) }
+            return .Ok(.Some("W\(hexByte(status))"))
+        }
+        Killed(signal) -> {
+            if !removeThread(session, thread) { return .Ok(.None) }
+            return .Ok(.Some("X\(hexByte(signal))"))
+        }
+    }
+}
+
+// The thread is gone; whether it was the process's own, and so the process
+// is.
+function removeThread(session: borrow mut Session, thread: Number) -> Bool {
+    var left: [TracedThread] = []
+    for traced in session.threads {
+        if traced.id != thread { left.append(traced) }
+    }
+    session.threads = left
+    if session.process != .Some(thread) { return false }
+    session.process = .None
+    session.threads = []
+    session.breakpoints = Map {}
+    return true
+}
+
+// Stops every running thread but `except`, keeping a signal one of them
+// took meanwhile for when it runs again.
+function stopOthers(session: borrow mut Session, except: Number) -> Result<Void, TesseraError> {
+    for traced in session.threads {
+        if traced.running && traced.id != except { try debugInterrupt(traced.id) }
+    }
+    while othersRunning(session, except) {
+        let event = try debugWait()
+        match event.change {
+            Stopped(stop) -> {
+                match threadIndex(session, event.thread) {
+                    Some(index) -> {
+                        session.threads[index].running = false
+                        // A trap a breakpoint raised is raised again when the
+                        // thread runs back into it.
+                        if stop.cause == .Signal && stop.signal != LinuxSignal.trap {
+                            session.threads[index].held = stop.signal
+                        }
+                        if stop.signal == LinuxSignal.trap {
+                            try rewindBreakpoint(session, event.thread)
+                        }
+                    }
+                    None -> session.threads.append(TracedThread { id: event.thread })
+                }
+            }
+            Exited -> {
+                if removeThread(session, event.thread) { return .Ok }
+            }
+            Killed -> {
+                if removeThread(session, event.thread) { return .Ok }
+            }
+        }
+    }
+    return .Ok
+}
+
+function othersRunning(session: borrow Session, except: Number) -> Bool {
+    for traced in session.threads {
+        if traced.running && traced.id != except { return true }
+    }
+    return false
+}

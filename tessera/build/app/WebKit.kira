@@ -1,0 +1,86 @@
+import Foundation
+import Build
+
+// WebKit's WPE port, built Vulkan-only on its own machine and carried here as
+// a payload (tessera-browser/README.md): the web engine the Browser links, its
+// two helper processes, the libraries they load, and the fonts, certificates
+// and GIO modules they read. The payload is laid out as a release's root, so
+// placing it is a union with the system volume.
+//
+// WebKit takes hours to build and is not built by this graph. The payload is
+// what `tessera-browser/tools/stage-payload.sh` leaves under
+// `tessera-browser/payload/<architecture>`, or what `TESSERA_WEBKIT_PAYLOAD`
+// names. Without one, the release has no browser.
+//
+// A payload is only used when it says its engine is the one the Browser links:
+// `stage-payload.py` leaves `tessera-engine` in it when the library exports the
+// Tessera view the Browser calls. A payload without that file, or no payload,
+// leaves the Browser out of the release and the build says so; it is included
+// again as soon as a payload with the engine is there.
+
+// Where the payload for `architecture` is, or nothing when none was staged.
+function webkitPayloadPath(graph: borrow Graph, architecture: Architecture) -> String? {
+    let named = environmentIsSet("TESSERA_WEBKIT_PAYLOAD")
+    ? environmentValue("TESSERA_WEBKIT_PAYLOAD")
+    : joinedPath(graph.root, "../tessera-browser/payload/\(architecture.name())")
+    if isDirectory(named) { return .Some(named) }
+    return .None
+}
+
+// Whether the Browser can be built and carried: a payload is staged and its
+// engine is the Tessera one. Says why not when it is not.
+function webkitBrowserAvailable(graph: borrow Graph, architecture: Architecture) -> Bool {
+    match webkitPayloadPath(graph, architecture) {
+        Some(path) -> {
+            if fileExists(joinedPath(path, "tessera-engine")) { return true }
+            log warn(
+                "the Browser is left out: the WebKit payload has no Tessera engine (restage it with stage-payload.py from a build that has the Tessera backend)",
+                payload: path
+            )
+        }
+        None -> log warn("the Browser is left out: no WebKit payload is staged", architecture: architecture.name())
+    }
+    return false
+}
+
+// The payload as the system volume carries it, or an empty tree.
+function platformWebKit(graph: borrow mut Graph, context: borrow BuildContext) -> Artifact {
+    let architecture = context.architecture
+    if webkitBrowserAvailable(graph, architecture) {
+        match webkitPayloadPath(graph, architecture) {
+            Some(path) -> return graph.sourceTree(path, [])
+            None -> {}
+        }
+    }
+    return graph.tree("\(architecture.name())/webkit-none", [])
+}
+
+// What the Browser's link needs of the payload: the web engine's library, laid
+// where a link finds it, beside the C library, with GLib and GObject, which the
+// sysroot does not carry. The rest of what the engine names is for the loader
+// on the device.
+function webkitLinkLibraries(graph: borrow mut Graph, architecture: Architecture) -> Artifact {
+    if !webkitBrowserAvailable(graph, architecture) {
+        return graph.tree("\(architecture.name())/webkit-link-none", [])
+    }
+    match webkitPayloadPath(graph, architecture) {
+        Some(path) -> {
+            let libraries = joinedPath(path, "lib/\(architecture.multiarch())")
+            if isDirectory(libraries) {
+                let flat = graph.tree(
+                    "\(architecture.name())/webkit-link-source",
+                    [.Place(TreePlace { path: "lib", artifact: graph.sourceTree(libraries, []) })]
+                )
+                return librariesFrom(
+                    graph,
+                    "\(architecture.name())/sysroot/webkit",
+                    flat,
+                    "usr/lib/\(architecture.multiarch())",
+                    ["libWPEWebKit-2.0.so", "libglib-2.0.so", "libgobject-2.0.so"]
+                )
+            }
+        }
+        None -> {}
+    }
+    return graph.tree("\(architecture.name())/webkit-link-none", [])
+}

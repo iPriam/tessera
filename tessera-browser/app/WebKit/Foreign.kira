@@ -1,0 +1,158 @@
+// WebKit's WPE port, GLib and Tessera's WPE platform, as the browser reaches
+// them: each an `@FFI.Extern` here, and nowhere else (the WebKit exception in
+// tessera/AGENTS.md).
+//
+// Every object is an opaque `RawPtr`. GLib owns them by reference count, so a
+// pointer this program holds is one it took a reference on and gives back with
+// `g_object_unref`. The web engine is driven by polling: `g_main_context_iteration`
+// is called from the session's own turn, so no GLib code ever runs on a thread
+// of its own.
+
+// ---------------------------------------------------------------------------
+// GLib
+// ---------------------------------------------------------------------------
+
+// Runs what is ready on the default main context, and does not block unless
+// `mayBlock` is nonzero. Answers whether it ran anything.
+public @FFI.Extern { library: glib, symbol: g_main_context_iteration, abi: c }
+function glibMainContextIteration(context: RawPtr, mayBlock: I32): I32
+
+public @FFI.Extern { library: gobject, symbol: g_object_ref, abi: c }
+function glibObjectRef(object: RawPtr): RawPtr
+
+public @FFI.Extern { library: gobject, symbol: g_object_unref, abi: c }
+function glibObjectUnref(object: RawPtr): Void
+
+// ---------------------------------------------------------------------------
+// WPE platform, with Tessera's display
+// ---------------------------------------------------------------------------
+
+public @FFI.Extern { library: wpewebkit, symbol: wpe_display_tessera_new, abi: c }
+function wpeDisplayTesseraNew(): RawPtr
+
+public @FFI.Extern { library: wpewebkit, symbol: wpe_display_connect, abi: c }
+function wpeDisplayConnect(display: RawPtr, error: RawPtr): I32
+
+public @FFI.Extern { library: wpewebkit, symbol: wpe_display_set_primary, abi: c }
+function wpeDisplaySetPrimary(display: RawPtr): Void
+
+public @FFI.Extern { library: wpewebkit, symbol: wpe_view_tessera_take_frame, abi: c }
+function wpeViewTesseraTakeFrame(view: RawPtr): RawPtr
+
+public @FFI.Extern { library: wpewebkit, symbol: wpe_view_tessera_frame_importable, abi: c }
+function wpeViewTesseraFrameImportable(buffer: RawPtr): I32
+
+public @FFI.Extern { library: wpewebkit, symbol: wpe_view_tessera_frame_dup_fd, abi: c }
+function wpeViewTesseraFrameDupFd(buffer: RawPtr): I32
+
+public @FFI.Extern { library: wpewebkit, symbol: wpe_view_tessera_frame_dup_fence, abi: c }
+function wpeViewTesseraFrameDupFence(buffer: RawPtr): I32
+
+public @FFI.Extern { library: wpewebkit, symbol: wpe_view_tessera_frame_width, abi: c }
+function wpeViewTesseraFrameWidth(buffer: RawPtr): U32
+
+public @FFI.Extern { library: wpewebkit, symbol: wpe_view_tessera_frame_height, abi: c }
+function wpeViewTesseraFrameHeight(buffer: RawPtr): U32
+
+public @FFI.Extern { library: wpewebkit, symbol: wpe_view_tessera_frame_format, abi: c }
+function wpeViewTesseraFrameFormat(buffer: RawPtr): U32
+
+public @FFI.Extern { library: wpewebkit, symbol: wpe_view_tessera_frame_offset, abi: c }
+function wpeViewTesseraFrameOffset(buffer: RawPtr): U32
+
+public @FFI.Extern { library: wpewebkit, symbol: wpe_view_tessera_frame_stride, abi: c }
+function wpeViewTesseraFrameStride(buffer: RawPtr): U32
+
+public @FFI.Extern { library: wpewebkit, symbol: wpe_view_tessera_frame_modifier, abi: c }
+function wpeViewTesseraFrameModifier(buffer: RawPtr): U64
+
+public @FFI.Extern { library: wpewebkit, symbol: wpe_view_tessera_frame_presented, abi: c }
+function wpeViewTesseraFramePresented(view: RawPtr, buffer: RawPtr): Void
+
+public @FFI.Extern { library: wpewebkit, symbol: wpe_view_tessera_frame_released, abi: c }
+function wpeViewTesseraFrameReleased(view: RawPtr, buffer: RawPtr): Void
+
+public @FFI.Extern { library: wpewebkit, symbol: wpe_view_tessera_resize, abi: c }
+function wpeViewTesseraResize(view: RawPtr, width: I32, height: I32): Void
+
+public @FFI.Extern { library: wpewebkit, symbol: wpe_view_tessera_pointer_move, abi: c }
+function wpeViewTesseraPointerMove(view: RawPtr, time: U32, modifiers: U32, x: F64, y: F64): Void
+
+public @FFI.Extern { library: wpewebkit, symbol: wpe_view_tessera_pointer_button, abi: c }
+function wpeViewTesseraPointerButton(
+    view: RawPtr,
+    time: U32,
+    modifiers: U32,
+    pressed: I32,
+    button: U32,
+    x: F64,
+    y: F64
+): Void
+
+public @FFI.Extern { library: wpewebkit, symbol: wpe_view_tessera_scroll, abi: c }
+function wpeViewTesseraScroll(
+    view: RawPtr,
+    time: U32,
+    modifiers: U32,
+    dx: F64,
+    dy: F64,
+    x: F64,
+    y: F64
+): Void
+
+public @FFI.Extern { library: wpewebkit, symbol: wpe_view_tessera_key, abi: c }
+function wpeViewTesseraKey(
+    view: RawPtr,
+    time: U32,
+    modifiers: U32,
+    pressed: I32,
+    keycode: U32,
+    keyval: U32
+): Void
+
+public @FFI.Extern { library: wpewebkit, symbol: wpe_view_tessera_focus, abi: c }
+function wpeViewTesseraFocus(view: RawPtr, focused: I32): Void
+
+// ---------------------------------------------------------------------------
+// WebKit
+// ---------------------------------------------------------------------------
+
+public @FFI.Extern { library: wpewebkit, symbol: webkit_web_view_new_with_display, abi: c }
+function webkitWebViewNewWithDisplay(display: RawPtr): RawPtr
+
+public @FFI.Extern { library: wpewebkit, symbol: webkit_web_view_get_wpe_view, abi: c }
+function webkitWebViewGetWpeView(view: RawPtr): RawPtr
+
+public @FFI.Extern { library: wpewebkit, symbol: webkit_web_view_load_uri, abi: c }
+function webkitWebViewLoadUri(view: RawPtr, uri: CString): Void
+
+public @FFI.Extern { library: wpewebkit, symbol: webkit_web_view_reload, abi: c }
+function webkitWebViewReload(view: RawPtr): Void
+
+public @FFI.Extern { library: wpewebkit, symbol: webkit_web_view_stop_loading, abi: c }
+function webkitWebViewStopLoading(view: RawPtr): Void
+
+public @FFI.Extern { library: wpewebkit, symbol: webkit_web_view_go_back, abi: c }
+function webkitWebViewGoBack(view: RawPtr): Void
+
+public @FFI.Extern { library: wpewebkit, symbol: webkit_web_view_go_forward, abi: c }
+function webkitWebViewGoForward(view: RawPtr): Void
+
+public @FFI.Extern { library: wpewebkit, symbol: webkit_web_view_can_go_back, abi: c }
+function webkitWebViewCanGoBack(view: RawPtr): I32
+
+public @FFI.Extern { library: wpewebkit, symbol: webkit_web_view_can_go_forward, abi: c }
+function webkitWebViewCanGoForward(view: RawPtr): I32
+
+public @FFI.Extern { library: wpewebkit, symbol: webkit_web_view_is_loading, abi: c }
+function webkitWebViewIsLoading(view: RawPtr): I32
+
+public @FFI.Extern { library: wpewebkit, symbol: webkit_web_view_get_estimated_load_progress, abi: c }
+function webkitWebViewGetEstimatedLoadProgress(view: RawPtr): F64
+
+// A C string the view owns, null when it has none.
+public @FFI.Extern { library: wpewebkit, symbol: webkit_web_view_get_uri, abi: c }
+function webkitWebViewGetUri(view: RawPtr): CString
+
+public @FFI.Extern { library: wpewebkit, symbol: webkit_web_view_get_title, abi: c }
+function webkitWebViewGetTitle(view: RawPtr): CString

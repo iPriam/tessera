@@ -1,0 +1,144 @@
+import Foundation
+import Heap
+
+// SHA-256 (FIPS 180-4), for whatever has to know that bytes are the ones it
+// saw before: PID 1 records an installed application's image by its digest
+// and checks the file against it before every launch.
+//
+// Each 32-bit word is held in a U64 and masked after every sum, so no
+// addition can overflow.
+
+namespace Sha256 {
+    let wordMask: U64 = U64(0xFFFFFFFF)
+}
+
+function sha256Rotate(value: U64, count: U64) -> U64 {
+    return ((value >> count) | (value << (U64(32) - count))) & Sha256.wordMask
+}
+
+function sha256Constants() -> [U64] {
+    return [U64(0x428a2f98), U64(0x71374491), U64(0xb5c0fbcf), U64(0xe9b5dba5), U64(
+        0x3956c25b
+    ), U64(0x59f111f1), U64(0x923f82a4), U64(0xab1c5ed5), U64(0xd807aa98), U64(0x12835b01), U64(
+        0x243185be
+    ), U64(0x550c7dc3), U64(0x72be5d74), U64(0x80deb1fe), U64(0x9bdc06a7), U64(0xc19bf174), U64(
+        0xe49b69c1
+    ), U64(0xefbe4786), U64(0x0fc19dc6), U64(0x240ca1cc), U64(0x2de92c6f), U64(0x4a7484aa), U64(
+        0x5cb0a9dc
+    ), U64(0x76f988da), U64(0x983e5152), U64(0xa831c66d), U64(0xb00327c8), U64(0xbf597fc7), U64(
+        0xc6e00bf3
+    ), U64(0xd5a79147), U64(0x06ca6351), U64(0x14292967), U64(0x27b70a85), U64(0x2e1b2138), U64(
+        0x4d2c6dfc
+    ), U64(0x53380d13), U64(0x650a7354), U64(0x766a0abb), U64(0x81c2c92e), U64(0x92722c85), U64(
+        0xa2bfe8a1
+    ), U64(0xa81a664b), U64(0xc24b8b70), U64(0xc76c51a3), U64(0xd192e819), U64(0xd6990624), U64(
+        0xf40e3585
+    ), U64(0x106aa070), U64(0x19a4c116), U64(0x1e376c08), U64(0x2748774c), U64(0x34b0bcb5), U64(
+        0x391c0cb3
+    ), U64(0x4ed8aa4a), U64(0x5b9cca4f), U64(0x682e6ff3), U64(0x748f82ee), U64(0x78a5636f), U64(
+        0x84c87814
+    ), U64(0x8cc70208), U64(0x90befffa), U64(0xa4506ceb), U64(0xbef9a3f7), U64(0xc67178f2)]
+}
+
+// Folds the 64-byte block at `at` into the state `state`; `schedule` is the
+// message schedule's room, kept between blocks so it is not made again.
+function sha256Compress(
+    state: borrow mut [U64],
+    schedule: borrow mut [U64],
+    constants: borrow [U64],
+    at: RawPtr
+) {
+    let mask = Sha256.wordMask
+    for t in 0..16 {
+        schedule[t] = (U64(heapLoad<U8>(at, t * 4)) << U64(24)) | (
+            U64(heapLoad<U8>(at, t * 4 + 1)) << U64(16)
+        )
+            | (U64(heapLoad<U8>(at, t * 4 + 2)) << U64(8)) | U64(heapLoad<U8>(at, t * 4 + 3))
+    }
+    for t in 16..64 {
+        let early = schedule[t - 15]
+        let late = schedule[t - 2]
+        let s0 = sha256Rotate(early, U64(7)) ^ sha256Rotate(early, U64(18)) ^ (early >> U64(3))
+        let s1 = sha256Rotate(late, U64(17)) ^ sha256Rotate(late, U64(19)) ^ (late >> U64(10))
+        schedule[t] = (schedule[t - 16] + s0 + schedule[t - 7] + s1) & mask
+    }
+    var a = state[0]
+    var b = state[1]
+    var c = state[2]
+    var d = state[3]
+    var e = state[4]
+    var f = state[5]
+    var g = state[6]
+    var h = state[7]
+    for t in 0..64 {
+        let s1 = sha256Rotate(e, U64(6)) ^ sha256Rotate(e, U64(11)) ^ sha256Rotate(e, U64(25))
+        let choose = (e & f) ^ ((e ^ mask) & g)
+        let first = (h + s1 + choose + constants[t] + schedule[t]) & mask
+        let s0 = sha256Rotate(a, U64(2)) ^ sha256Rotate(a, U64(13)) ^ sha256Rotate(a, U64(22))
+        let majority = (a & b) ^ (a & c) ^ (b & c)
+        let second = (s0 + majority) & mask
+        h = g
+        g = f
+        f = e
+        e = (d + first) & mask
+        d = c
+        c = b
+        b = a
+        a = (first + second) & mask
+    }
+    state[0] = (state[0] + a) & mask
+    state[1] = (state[1] + b) & mask
+    state[2] = (state[2] + c) & mask
+    state[3] = (state[3] + d) & mask
+    state[4] = (state[4] + e) & mask
+    state[5] = (state[5] + f) & mask
+    state[6] = (state[6] + g) & mask
+    state[7] = (state[7] + h) & mask
+}
+
+// The SHA-256 of `count` bytes at `source`, in lowercase hexadecimal.
+function sha256(source: RawPtr, count: Number) -> String {
+    let constants = sha256Constants()
+    var state: [U64] = [U64(0x6a09e667), U64(0xbb67ae85), U64(0x3c6ef372), U64(0xa54ff53a), U64(
+        0x510e527f
+    ), U64(0x9b05688c), U64(0x1f83d9ab), U64(0x5be0cd19)]
+    var schedule: [U64] = []
+    for index in 0..64 { schedule.append(U64(0)) }
+    // The whole blocks are read where they are; what is left of the message,
+    // the 0x80 after it and its length in bits make one or two more.
+    let whole = trunc(count / 64)
+    let left = count - whole * 64
+    let tailBytes = zeroedBlock(count: 128, alignment: 16)
+    let tail = tailBytes.pointer()
+    copyBytes(tail, heapOffset(source, whole * 64), left)
+    heapStore<U8>(tail, left, U8(0x80))
+    var tailBlocks = 1
+    if left >= 56 { tailBlocks = 2 }
+    let bits = U64(count) * U64(8)
+    for index in 0..8 {
+        heapStore<U8>(tail, tailBlocks * 64 - 1 - index, U8((bits >> U64(index * 8)) & U64(0xFF)))
+    }
+    for block in 0..whole {
+        sha256Compress(state, schedule, constants, heapOffset(source, block * 64))
+    }
+    for block in 0..tailBlocks {
+        sha256Compress(state, schedule, constants, heapOffset(tail, block * 64))
+    }
+    let digits = "0123456789abcdef"
+    var text = ""
+    for index in 0..8 {
+        var shift = 28
+        while shift >= 0 {
+            let digit = Number((state[index] >> U64(shift)) & U64(15))
+            text.append(digits.substring(digit, digit + 1))
+            shift -= 4
+        }
+    }
+    return text
+}
+
+// The SHA-256 of the bytes in `data`, in lowercase hexadecimal, as
+// CommonCrypto's CC_SHA256 gives it on a Mac. Anyone may ask.
+public function digestSha256(data: borrow Buffer) -> String {
+    return sha256(data.address, data.length)
+}

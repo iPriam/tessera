@@ -1,0 +1,185 @@
+//! The caffeinate command's entry point: holds a wake lock for a while, or while a utility runs.
+import Foundation
+import ArgumentParser
+import LibTessera
+
+// caffeinate: keeps the machine from sleeping for a while, as macOS's
+// caffeinate creates a power assertion named "caffeinate command-line
+// tool" and holds it.
+//
+// Here the assertion is a LibTessera WakeLock (roadmap/16-libtessera.md
+// §18), which the Power service holds as a wake source for as long as the
+// lock is open. `-i`, `-s` and `-m` all keep the processor running, which
+// is the one kind of lock a command-line program takes; `-d` asks to keep
+// the display on, which the library refuses to anything but the front-most
+// application. `-t` is how many seconds to hold it; without it the library
+// lets go after ten minutes, its limit for a lock with no timeout. With a
+// utility, as in `caffeinate -i make`, the lock is held while the utility
+// runs and `-t` is not used, as on macOS; caffeinate then exits as the
+// utility did. Otherwise it exits 0 once it has held the lock for its time,
+// 1 when the lock was refused, and 2 when the command was wrong.
+
+/// How caffeinate ends: the lock was held for its time, refused, the command was wrong, or the utility it ran ended.
+enum CaffeinateExit {
+    // The lock was held for its time.
+    Held
+    // The lock was refused.
+    Refused
+    // The command was wrong.
+    Usage
+    // As the utility it ran ended.
+    Utility(UtilityEnd)
+}
+
+/// The status caffeinate exits with for `exit`.
+function exitStatus(exit: borrow CaffeinateExit) -> Number {
+    return match exit {
+        Held -> 0
+        Refused -> 1
+        Usage -> 2
+        Utility(end) -> utilityStatus(end)
+    }
+}
+
+/// The limits of `-t`: the longest it takes, and how many nanoseconds a second is.
+namespace Timeout {
+    // The longest `-t` taken, in seconds: past eleven days a lock is a
+    // setting, not a while.
+    let longest: Number = 999999
+    let nanosecondsPerSecond: Number = 1000000000
+}
+
+/// The keys the lock's, the release's and the utility's completions are told apart by.
+namespace CompletionKey {
+    let lock: Number = 1
+    let released: Number = 2
+    let utility: Number = 3
+}
+
+/// The command caffeinate takes: its assertion flags, the timeout, and the utility and arguments after it.
+function caffeinateCommand() -> CommandRouter {
+    // Every operand from the first, and everything after it, is the utility
+    // and its own arguments.
+    let configuration = CommandConfiguration {
+        name: "caffeinate",
+        abstract: "Keeps the machine from sleeping for a while",
+        allowsRemainder: true
+    }
+    return CommandRouter {
+        root: Command {
+            configuration: configuration,
+            arguments: [flag(
+                name: "display",
+                help: "Keep the display on; only the front-most application may"
+            ).short("d"), flag(name: "idle", help: "Keep the processor running").short("i"), flag(
+                name: "disk",
+                help: "Keep the processor running"
+            ).short("m"), flag(name: "system", help: "Keep the processor running").short(
+                "s"
+            ), option(name: "timeout", help: "How many seconds to hold the lock").short(
+                "t"
+            ).whole().placeholder("SECONDS").defaulting("600"),]
+        }
+    }
+}
+
+/// The monotonic clock's reading in nanoseconds, or no deadline when the clock cannot be read.
+function monotonicNow() -> Number {
+    match timeRead(.Monotonic) {
+        Ok(nanoseconds) -> return nanoseconds
+        Error(failed) -> {
+            log warn("no monotonic clock; the lock is held until it is let go", failed)
+            return Deadline.infinite
+        }
+    }
+}
+
+/// Lets the lock go; the Power service drops it anyway when this process ends, so a failure is only logged.
+function release(lock: Handle) {
+    match handleClose(lock) {
+        Ok -> {}
+        Error(failed) -> log warn("cannot let the wake lock go", failed)
+    }
+}
+
+/// Runs caffeinate: takes the wake lock, holds it for the time asked or while the utility runs, and returns how it ended.
+function caffeinate() -> CaffeinateExit {
+    let router = caffeinateCommand()
+    let tokens = commandLineArguments()
+    let parsed = match router.parse(tokens) {
+        Ok(value) -> value
+        Error(error) -> {
+            router.explain(error, tokens)
+            return error.isCleanExit() ? .Held : .Usage
+        }
+    }
+    let seconds = parsed.requiredNumber("timeout")
+    if seconds <= 0 || seconds > Timeout.longest {
+        printError("caffeinate: the timeout is a whole number of seconds from 1")
+        return .Usage
+    }
+    let utility = parsed.remainder
+    let port = match portCreate(.None) {
+        Ok(value) -> value
+        Error(failed) -> {
+            log fault("no port", failed)
+            return .Refused
+        }
+    }
+    let kind: WakeLockKind = parsed.flag("display") ? .Display : .Cpu
+    // No timeout under a utility: the library's ten minutes, and the lock
+    // closed when the utility ends.
+    let timeout: Number = utility.count > 0 ? 0 : seconds * Timeout.nanosecondsPerSecond
+    match wakeLockAcquire(
+        move kind,
+        "caffeinate command-line tool",
+        timeout,
+        port,
+        CompletionKey.lock
+    ) {
+        Ok -> {}
+        Error(failed) -> {
+            log warn("cannot ask for a wake lock", failed)
+            return .Refused
+        }
+    }
+    let lock = match answer(port) {
+        Ok(completion) -> Handle(completion.result0)
+        Error(failed) -> {
+            log warn("the wake lock was refused", failed)
+            return .Refused
+        }
+    }
+    if utility.count > 0 {
+        let end = runUtility(utility, port)
+        release(lock)
+        return .Utility(move end)
+    }
+    holdUntil(monotonicNow() + timeout, lock, port)
+    release(lock)
+    return .Held
+}
+
+/// Holds the lock until `deadline`, or until the Power service lets go first.
+function holdUntil(deadline: Number, lock: Handle, port: Handle) {
+    match objectWaitAsync(lock, Signals.peerClosed, .Once, port, CompletionKey.released) {
+        Ok -> {}
+        Error(failed) -> {
+            log warn("cannot watch the wake lock", failed)
+            return
+        }
+    }
+    match portWait(port, 1, deadline) {
+        // Let go early or the time is up: either way the hold is over.
+        Ok -> {}
+        Error(failed) -> {
+            if failed.code != .Timeout { log warn("could not wait for the wake lock", failed) }
+        }
+    }
+}
+
+/// Runs caffeinate and returns its exit status to the shell.
+@Main
+function main() -> UN8 {
+    return exitStatus(caffeinate())
+}

@@ -1,0 +1,38 @@
+// Browser: WebKit's WPE port, drawn by Kira UI on Tessera's display.
+//
+// WebKit is the one foreign engine Tessera carries (tessera/AGENTS.md), built
+// Vulkan-only so that nothing in it reaches for GL, EGL or a software raster.
+// The web process draws each frame into a linear DMA-BUF; this application
+// imports that memory through Ember and shows it as a texture in its window.
+construct BrowserApp extends Package {
+    let version: String = "0.1.0"
+    let kind: PackageKind = .App
+    let assets: [String] = ["Resources/AppIcon.tessicon"]
+    let moduleRoot: String = "Browser"
+    let nativeLibraries: [NativeLibrary] = [
+        NativeLibrary {
+            name: "wpewebkit",
+            linkMode: LinkMode.Dynamic,
+            availability: Availability.Optional,
+            nativeTargets: [
+                NativeTarget { triple: "aarch64-unknown-tessera", systemLibs: ["WPEWebKit-2.0"] }
+            ]
+        },
+        NativeLibrary {
+            name: "glib",
+            linkMode: LinkMode.Dynamic,
+            availability: Availability.Optional,
+            nativeTargets: [
+                NativeTarget { triple: "aarch64-unknown-tessera", systemLibs: ["glib-2.0"] }
+            ]
+        },
+        NativeLibrary {
+            name: "gobject",
+            linkMode: LinkMode.Dynamic,
+            availability: Availability.Optional,
+            nativeTargets: [
+                NativeTarget { triple: "aarch64-unknown-tessera", systemLibs: ["gobject-2.0"] }
+            ]
+        }
+    ]
+}

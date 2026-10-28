@@ -1,0 +1,114 @@
+import Foundation
+import Heap
+
+// The calls every handle answers (§3.5).
+
+public function handleClose(handle: Handle) -> Result<Void, TesseraError> {
+    let slot = try handleSlotOf(handle) otherwise return .Error(failure(.InvalidHandle))
+    handleRelease(slot)
+    return .Ok
+}
+
+// Closes every handle listed, going on past invalid ones; `InvalidHandle`
+// when there were any.
+public function handleCloseMany(handles: borrow [Handle]) -> Result<Void, TesseraError> {
+    var result: Result<Void, TesseraError> = .Ok
+    for index in 0..handles.count {
+        match handleSlotOf(handles[index]) {
+            Some(slot) -> handleRelease(slot)
+            None -> result = .Error(failure(.InvalidHandle))
+        }
+    }
+    return result
+}
+
+// Closes a handle this library made and still holds. Only a handle missing
+// from the table fails to close, and one of these is never missing.
+function handleDrop(handle: Handle) {
+    match handleSlotOf(handle) {
+        Some(slot) -> handleRelease(slot)
+        None -> {}
+    }
+}
+
+public function handleDuplicate(handle: Handle, rights: Rights) -> Result<Handle, TesseraError> {
+    let slot = try resolve(handle, .None, Rights.duplicate)
+    let wanted = try rightsWithin(rights, library.handles[slot].rights)
+    return handleMint(objectOfSlot(slot), wanted)
+}
+
+// A new handle with the same or fewer rights; the old one is closed. Needs no
+// `Duplicate`.
+public function handleReplace(handle: Handle, rights: Rights) -> Result<Handle, TesseraError> {
+    let slot = try handleSlotOf(handle) otherwise return .Error(failure(.InvalidHandle))
+    let wanted = try rightsWithin(rights, library.handles[slot].rights)
+    return handleRemint(slot, wanted)
+}
+
+public function handleInfo(handle: Handle) -> Result<HandleInfo, TesseraError> {
+    let slot = try handleSlotOf(handle) otherwise return .Error(failure(.InvalidHandle))
+    let object = objectOfSlot(slot)
+    return .Ok(
+        HandleInfo {
+            objectType: kindOf(library.objects[object].state),
+            rights: library.handles[slot].rights,
+            objectId: library.objects[object].id,
+        }
+    )
+}
+
+// Copies `size` bytes of `block` to `out`, or answers `BufferTooSmall` with
+// the size needed.
+function infoDeliver(block: RawPtr, size: U64, out: borrow Buffer) -> Result<U64, TesseraError> {
+    if out.length < size {
+        return .Error(failureDetail(.BufferTooSmall, size))
+    }
+    copyBytes(out.address, block, size)
+    return .Ok(size)
+}
+
+// The topic struct for the object, at `version`, written to `out` as the
+// specification lays it out. A topic is the object type it describes.
+public function objectInfo(
+    handle: Handle,
+    topic: ObjectType,
+    version: UNumber,
+    out: borrow Buffer
+) -> Result<UNumber, TesseraError> {
+    let object = try resolveObject(handle, .None, Rights.inspect)
+    let kind = kindOf(library.objects[object].state)
+    if kind != topic { return .Error(failure(.InvalidArgument)) }
+    let blockBytes = zeroedBlock(count: 256, alignment: 16)
+    let block = blockBytes.pointer()
+    let written = try objectInfoWrite(object, version, block)
+    return .Ok(try infoDeliver(block, written, out))
+}
+
+// Writes the topic struct and answers its size, 0 for a topic or version this
+// type does not have.
+function objectInfoWrite(object: Number, version: U32, block: RawPtr) -> Result<U64, TesseraError> {
+    // Every topic is at version 1.
+    if version != U32(1) { return .Error(failure(.Unsupported)) }
+    let state = library.objects[object].state
+    return match state {
+        Memory(memory) -> memoryInfoWrite(object, memory, block)
+        Thread(thread) -> .Ok(threadInfoWrite(thread, block))
+        Process(process) -> processInfoWrite(object, process, block)
+        Job(job) -> jobInfoWrite(object, job, block)
+        Node -> nodeInfoWrite(object, block)
+        File(opened) -> fileInfoWrite(object, opened, block)
+        Endpoint(endpoint) -> endpointInfoWrite(object, endpoint, block)
+        Stream -> streamInfoWrite(object, block)
+        None, Port, Event, EventPair, Timer, Channel, Watch, WakeLock, Presence -> .Error(
+            failure(.Unsupported)
+        )
+    }
+}
+
+// A diagnostic name of at most 64 bytes.
+public function objectSetName(handle: Handle, name: borrow String) -> Result<Void, TesseraError> {
+    let object = try resolveObject(handle, .None, Rights.setProperty)
+    if name.count > 64 { return .Error(failure(.InvalidArgument)) }
+    library.objects[object].name = name
+    return .Ok
+}

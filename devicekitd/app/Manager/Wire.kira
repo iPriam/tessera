@@ -1,0 +1,248 @@
+import Foundation
+import Heap
+import LibTessera
+import DeviceKit
+
+// The manager's socket (17 §20.1): `SOCK_SEQPACKET` on the abstract name
+// `tessera.devicekit`. Every exchange is one request and one reply of 192
+// bytes, with at most one descriptor riding along as `SCM_RIGHTS`:
+//
+//     request   @0 op  @4 family/kind  @8 entry  @16 options  @24 rights
+//               @32 lifetime  @40 token high  @48 token low  @64 payload (128)
+//     reply     @0 code  @4 kind  @8 detail  @16 rights  @24 token high
+//               @32 token low  @40 entry  @48 flags  @64 payload (128)
+//
+// The layout is DeviceKit's `Device/Manager.kira`; the two change together.
+
+namespace Wire {
+    let bytes: Number = 192
+    let payloadAt: Number = 64
+    let payloadBytes: Number = 128
+    let address: String = "tessera.devicekit"
+}
+
+let managerOps: [ManagerOp] = [ManagerOp.Open, ManagerOp.Export, ManagerOp.Import, ManagerOp.Claim, ManagerOp.Publish, ManagerOp.Unpublish, ManagerOp.Published]
+
+// The operation a request names; DeviceKit's `ManagerOp`.
+function managerOperationOf(raw: U32) -> ManagerOp? {
+    return caseWithCode(managerOps, raw)
+}
+
+namespace RequestAt {
+    let operation: Number = 0
+    let kind: Number = 4
+    let entry: Number = 8
+    let options: Number = 16
+    let rights: Number = 24
+    let lifetime: Number = 32
+    let tokenHigh: Number = 40
+    let tokenLow: Number = 48
+}
+
+namespace ReplyAt {
+    let code: Number = 0
+    let kind: Number = 4
+    let detail: Number = 8
+    let rights: Number = 16
+    let tokenHigh: Number = 24
+    let tokenLow: Number = 32
+    let entry: Number = 40
+    let flags: Number = 48
+}
+
+// A request's fixed slots; what each holds depends on the operation.
+struct Request {
+    var operation: U32
+    var kind: U32
+    var entry: U64
+    var options: U64
+    var rights: U64
+    var lifetime: Number
+    var token: Token
+    var payload: [U8]
+}
+
+function decodeRequest(block: borrow ByteBlock) -> Request {
+    var payload: [U8] = []
+    for offset in 0..Wire.payloadBytes {
+        payload.append(blockLoad<U8>(block, Wire.payloadAt + offset))
+    }
+    return Request {
+        operation: blockLoad<U32>(block, RequestAt.operation),
+        kind: blockLoad<U32>(block, RequestAt.kind),
+        entry: blockLoad<U64>(block, RequestAt.entry),
+        options: blockLoad<U64>(block, RequestAt.options),
+        rights: blockLoad<U64>(block, RequestAt.rights),
+        lifetime: Number(blockLoad<U64>(block, RequestAt.lifetime)),
+        token: Token {
+            high: blockLoad<U64>(block, RequestAt.tokenHigh),
+            low: blockLoad<U64>(block, RequestAt.tokenLow)
+        },
+        payload: payload,
+    }
+}
+
+// `struct sockaddr_un` for an abstract name: the family, a NUL, the name.
+namespace UnixSocket {
+    let family: U64 = U64(1)
+    let seqPacket: U64 = U64(5)
+    let addressBytes: Number = 110
+    let nameAt: Number = 3
+    let backlog: Number = 64
+    // `SOL_SOCKET`, and its `SO_PEERCRED`: a `struct ucred`, the pid first.
+    let socketLevel: U64 = U64(1)
+    let peerCredentials: U64 = U64(17)
+    let credentialBytes: U32 = U32(12)
+    // `SCM_RIGHTS`, and a control message carrying one descriptor:
+    // `CMSG_LEN(4)` long, in a 24-byte buffer.
+    let rights: U32 = U32(1)
+    let rightsLength: U64 = U64(20)
+    let controlBytes: U64 = U64(24)
+}
+
+// The flags a message is sent or taken with.
+@Derive(Copy)
+distinct MessageFlags = U64
+
+namespace MessageFlags {
+    // `MSG_NOSIGNAL`: a client that went away is not a reason to die.
+    let noSignal: MessageFlags = MessageFlags(0x4000)
+    // `MSG_CMSG_CLOEXEC`.
+    let closeOnExec: MessageFlags = MessageFlags(0x40000000)
+}
+
+// `struct msghdr` and what it points to, in one block: the vector @56 and
+// the control buffer @72.
+namespace MessageHeader {
+    let bytes: Number = 96
+    let vectorAt: Number = 56
+    let controlAt: Number = 72
+    let vectorPointerAt: Number = 16
+    let vectorCountAt: Number = 24
+    let controlPointerAt: Number = 32
+    let controlLengthAt: Number = 40
+    let controlLevelAt: Number = 8
+    let controlTypeAt: Number = 12
+    let controlDescriptorAt: Number = 16
+}
+
+// The listening socket.
+function listen() -> Result<Descriptor, TesseraError> {
+    let number = try backendSocket(
+        UnixSocket.family,
+        UnixSocket.seqPacket | (LinuxOpen.closeOnExec | LinuxOpen.nonBlock).raw,
+        U64(0)
+    )
+    let socket = Descriptor { number: number }
+    let address = zeroedBlock(count: UnixSocket.addressBytes, alignment: 16)
+    blockStore<U16>(address, 0, U16(UnixSocket.family))
+    copyBytes(
+        heapOffset(address.pointer(), UnixSocket.nameAt),
+        Wire.address.data,
+        Wire.address.count
+    )
+    let length = Number(UnixSocket.nameAt + Wire.address.count)
+    let bound = bindAndListen(socket, address.pointer(), length)
+    match bound {
+        Some(failed) -> {
+            closeDescriptor(socket)
+            return .Error(failed)
+        }
+        None -> return .Ok(socket)
+    }
+}
+
+// Binds the socket to the service name and makes it listen; the reason it
+// could not, or none once it is listening.
+function bindAndListen(socket: borrow Descriptor, name: RawPtr, length: Number) -> TesseraError? {
+    match backendBind(socket.number, name, length) {
+        // Bound to the name; the socket needs nothing more before it listens.
+        Ok -> {}
+        Error(failed) -> return .Some(failed)
+    }
+    match backendListen(socket.number, UnixSocket.backlog) {
+        // Listening: the backlog holds connections until they are accepted.
+        Ok -> return .None
+        Error(failed) -> return .Some(failed)
+    }
+}
+
+// The pid at the other end of `socket`, from `SO_PEERCRED`.
+function peerPid(socket: borrow Descriptor) -> Result<Number, TesseraError> {
+    let block = zeroedBlock(count: 16, alignment: 16)
+    blockStore<U32>(block, 12, UnixSocket.credentialBytes)
+    try backendGetOption(
+        socket.number,
+        UnixSocket.socketLevel,
+        UnixSocket.peerCredentials,
+        block.pointer(),
+        heapOffset(block.pointer(), 12)
+    )
+    return .Ok(Number(blockLoad<U32>(block, 0)))
+}
+
+function messageHeader(message: RawPtr) -> ByteBlock {
+    let header = zeroedBlock(count: MessageHeader.bytes, alignment: 16)
+    let vector = heapOffset(header.pointer(), MessageHeader.vectorAt)
+    heapStore<RawPtr>(vector, 0, message)
+    heapStore<U64>(vector, 8, U64(Wire.bytes))
+    blockStore<RawPtr>(header, MessageHeader.vectorPointerAt, vector)
+    blockStore<U64>(header, MessageHeader.vectorCountAt, U64(1))
+    return move header
+}
+
+// One message on `socket`, with `passing` as `SCM_RIGHTS`.
+function send(
+    socket: borrow Descriptor,
+    message: borrow ByteBlock,
+    passing: borrow Descriptor?
+) -> Result<Void, TesseraError> {
+    let header = messageHeader(message.pointer())
+    match passing {
+        Some(passed) -> {
+            let control = heapOffset(header.pointer(), MessageHeader.controlAt)
+            heapStore<U64>(control, 0, UnixSocket.rightsLength)
+            heapStore<U32>(control, MessageHeader.controlLevelAt, U32(UnixSocket.socketLevel))
+            heapStore<U32>(control, MessageHeader.controlTypeAt, UnixSocket.rights)
+            heapStore<U32>(control, MessageHeader.controlDescriptorAt, U32(passed.number))
+            blockStore<RawPtr>(header, MessageHeader.controlPointerAt, control)
+            blockStore<U64>(header, MessageHeader.controlLengthAt, UnixSocket.controlBytes)
+        }
+        // Nothing rides along, so the message carries no descriptor.
+        None -> {}
+    }
+    try backendSendMessage(socket.number, header.pointer(), MessageFlags.noSignal.raw)
+    return .Ok
+}
+
+// One message taken off a socket: how many bytes, 0 once the peer has
+// gone, and the descriptor that came with it.
+struct Received {
+    var bytes: Number
+    var passed: Descriptor?
+}
+
+function receive(
+    socket: borrow Descriptor,
+    message: borrow ByteBlock
+) -> Result<Received, TesseraError> {
+    let header = messageHeader(message.pointer())
+    let control = heapOffset(header.pointer(), MessageHeader.controlAt)
+    blockStore<RawPtr>(header, MessageHeader.controlPointerAt, control)
+    blockStore<U64>(header, MessageHeader.controlLengthAt, UnixSocket.controlBytes)
+    let bytes = try backendReceiveMessage(
+        socket.number,
+        header.pointer(),
+        MessageFlags.closeOnExec.raw
+    )
+    var passed: Descriptor? = .None
+    let rights = blockLoad<U64>(header, MessageHeader.controlLengthAt) >= UnixSocket.rightsLength
+        && heapLoad<U32>(control, MessageHeader.controlLevelAt) == U32(UnixSocket.socketLevel)
+        && heapLoad<U32>(control, MessageHeader.controlTypeAt) == UnixSocket.rights
+    if rights {
+        passed = .Some(
+            Descriptor { number: Number(heapLoad<U32>(control, MessageHeader.controlDescriptorAt)) }
+        )
+    }
+    return .Ok(Received { bytes: bytes, passed: passed })
+}

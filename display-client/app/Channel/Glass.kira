@@ -1,0 +1,71 @@
+import Foundation
+import LibTessera
+
+// `SetGlass` on the wire (roadmap/08-display-server.md, "Surfaces").
+
+// A piece of glass: its number and its rectangle and corner in sixty-fourths
+// of a point in the words, and in the wide one its shape in the low byte, its
+// interface in the byte above, its recipe in the byte above that, and in the
+// byte above that whether its window is dark and whether it is behind.
+function glassLaid(glass: borrow DisplayGlass) -> Laid {
+    let shape = UNumber(glass.shape.rawValue())
+    let interface = UNumber(glass.interface.rawValue()) * GlassWide.interfaceUnit
+    let recipe = UNumber(glass.recipe.rawValue()) * GlassWide.recipeUnit
+    var appearance: UNumber = 0
+    if glass.dark { appearance = appearance + GlassWide.dark }
+    if !glass.active { appearance = appearance + GlassWide.behind }
+    return Laid {
+        opcode: .SetGlass,
+        object: glass.surface.raw,
+        words: [
+            glass.piece,
+            glassUnits(glass.x),
+            glassUnits(glass.y),
+            glassUnits(glass.width),
+            glassUnits(glass.height),
+            glassUnits(glass.corner),
+        ],
+        wide: shape + interface + recipe + appearance * GlassWide.appearanceUnit
+    }
+}
+
+function glassUnits(points: UNumber) -> UNumber {
+    return UNumber(trunc(points * GlassPieces.unitsPerPoint))
+}
+
+function glassRead(read: borrow WireRead) -> Result<DisplayGlass, TesseraError> {
+    return .Ok(
+        DisplayGlass {
+            surface: read.object,
+            piece: read.words[0],
+            x: read.words[1] / GlassPieces.unitsPerPoint,
+            y: read.words[2] / GlassPieces.unitsPerPoint,
+            width: read.words[3] / GlassPieces.unitsPerPoint,
+            height: read.words[4] / GlassPieces.unitsPerPoint,
+            corner: read.words[5] / GlassPieces.unitsPerPoint,
+            shape: try wordCase(displayGlassShapes, read.wide % GlassWide.interfaceUnit),
+            interface: try wordCase(
+                displayGlassInterfaces,
+                trunc(read.wide / GlassWide.interfaceUnit) % GlassWide.interfaceUnit
+            ),
+            recipe: try wordCase(
+                displayGlassRecipes,
+                trunc(read.wide / GlassWide.recipeUnit) % GlassWide.interfaceUnit
+            ),
+            dark: trunc(read.wide / GlassWide.appearanceUnit) % 2 == 1,
+            active: trunc(read.wide / GlassWide.appearanceUnit / GlassWide.behind) % 2 == 0,
+        }
+    )
+}
+
+namespace GlassWide {
+    // Where the interface sits in the wide word: the byte above the shape's.
+    let interfaceUnit: UNumber = 256
+    // Where the recipe sits: the byte above the interface's.
+    let recipeUnit: UNumber = 65536
+    // Where the appearance sits: the byte above the recipe's, its low bit
+    // dark and the next behind.
+    let appearanceUnit: UNumber = 16777216
+    let dark: UNumber = 1
+    let behind: UNumber = 2
+}

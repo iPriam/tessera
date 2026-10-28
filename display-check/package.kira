@@ -1,0 +1,10 @@
+//! The display check: two frames drawn with Kira UI and shown by MosaicDisplay,
+//! and the keys that arrive logged, for the boot tests.
+//!
+//! Kira UI draws it and puts it on Tessera's display.
+/// The Display Check app package: the boot-test check that draws frames and logs the keys that arrive.
+construct DisplayCheckApp extends Package {
+    let version: String = "0.1.0"
+    let kind: PackageKind = .App
+    let moduleRoot: String = "DisplayCheck"
+}

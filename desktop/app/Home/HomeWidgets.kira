@@ -1,0 +1,348 @@
+import Foundation
+import HomeLayout
+import LibTessera
+import KiraUI
+import TesseraUI
+import PlatformUI
+
+// Home's widgets (roadmap/24-home-and-personalisation.md, "Widgets"): a band
+// along the top of a page, two rows of icons tall, holding widgets side by
+// side, as an iPad's widgets take the top of its page. The system's own come
+// first, the Clock and the battery, each small or medium; a widget names its
+// kind, so one whose provider is gone is a placeholder saying so, which
+// stays removable. What a widget shows is read at most once a minute, and
+// only while it is drawn, so one taken away stops being read.
+
+namespace HomeWidgetBand {
+    // The gap between widgets, and their corners.
+    let gap: Number = 24
+    let corner: Number = 24
+    // How often what a widget shows is read again, in seconds.
+    let refresh: Number = 60
+}
+
+namespace HomeWidgetKind {
+    let clock: String = "Clock"
+    let battery: String = "Battery"
+}
+
+// The widgets the gallery offers.
+function homeWidgetKinds() -> [String] {
+    return [HomeWidgetKind.clock, HomeWidgetKind.battery]
+}
+
+// Where a page's icons begin: under its widget band when it has one.
+function homePageMetrics(
+    metrics: borrow LauncherMetrics,
+    page: borrow HomePage
+) -> LauncherMetrics {
+    if page.widgets.count == 0 { return copy metrics }
+    return LauncherMetrics {
+        icon: metrics.icon,
+        labelGap: metrics.labelGap,
+        column: metrics.column,
+        rowGap: metrics.rowGap,
+        label: metrics.label,
+        top: metrics.top + HomeWidgetRows.count * HomeScreenGrid.rowPitch,
+        columns: metrics.columns,
+        inset: metrics.inset,
+        pitch: metrics.pitch,
+    }
+}
+
+// What a widget asks of Home: to open what it is about, and while Home is
+// edited, to change its size, move it a page either way, or take it away.
+public struct HomeWidgetActions {
+    var open: (String) -> Void
+    var resize: (Number, Number) -> Void
+    var shift: (Number, Number, Number) -> Void
+    var remove: (Number, Number) -> Void
+}
+
+// A page's widget band.
+function homeWidgetBand(
+    page: Number,
+    widgets: borrow [HomeWidget],
+    pages: Number,
+    editing: Bool,
+    actions: borrow HomeWidgetActions
+) -> Any Widget {
+    var shown: [Any Widget] = []
+    for index in 0..widgets.count {
+        shown.append(homeWidgetTile(page, index, widgets[index], pages, editing, actions))
+    }
+    return HStack(spacing = .Length(HomeWidgetBand.gap), alignment = .Top, children = shown)
+    .height(resolvedLength(HomeWidgetRows.count * HomeScreenGrid.rowPitch - HomeWidgetBand.gap))
+    .edgePadding(
+        EdgeSet.horizontal,
+        resolvedLength(launcherMetrics().inset - HomeWidgetBand.gap / 2)
+    )
+    .fillWidth()
+}
+
+// The width a widget of `size` takes in the band.
+function homeWidgetWidth(size: HomeWidgetSize) -> Number {
+    let metrics = launcherMetrics()
+    let across = (viewportWidth() - 2 * metrics.inset + HomeWidgetBand.gap) / metrics.columns
+    return across * size.columns() - HomeWidgetBand.gap
+}
+
+// One widget: what it shows, which opens its application; while Home is
+// edited it wobbles, a press changes its size, and it has a badge to take it
+// away and arrows to move it a page.
+function homeWidgetTile(
+    page: Number,
+    index: Number,
+    widget: borrow HomeWidget,
+    pages: Number,
+    editing: Bool,
+    actions: borrow HomeWidgetActions
+) -> Any Widget {
+    let kind = copy widget.kind
+    let open = copy actions.open
+    let resize = copy actions.resize
+    let face = Button(
+        action = { in
+            if editing {
+                resize(page, index)
+            } else {
+                open(copy kind)
+            }
+        }
+    ) {
+        homeWidgetFace(widget)
+    }
+    .buttonStyle(.Plain)
+    let remove = copy actions.remove
+    let earlier = copy actions.shift
+    let later = copy actions.shift
+    // The same layers whether Home is edited or not, so the wobble eases to
+    // a stop and the badge shrinks away when the edit ends; the arrows come
+    // and go at once.
+    return ZStack(alignment = .TopLeading) {
+        // The badge wobbles with the widget whose corner it stands on.
+        EditWobble(phase: index * 2.1, active: editing) {
+            ZStack(alignment = .TopLeading) {
+                face
+                if editing {
+                    editRemovalBadge(
+                        HomePaging.badge,
+                        -HomePaging.badge / 3,
+                        -HomePaging.badge / 3,
+                        { in remove(page, index) }
+                    )
+                }
+            }
+        }
+        if editing {
+            HStack(spacing = .Small, alignment = .Center) {
+                folderMove(.ChevronLeft, page > 0, { in earlier(page, index, -1) })
+                folderMove(.ChevronRight, page < pages - 1, { in later(page, index, 1) })
+            }
+            .offset(
+                x = resolvedLength(8),
+                y = resolvedLength(
+                    HomeWidgetRows.count * HomeScreenGrid.rowPitch - HomeWidgetBand.gap - 34
+                )
+            )
+        }
+    }
+}
+
+// What a widget of `widget`'s kind shows, at its size, on glass.
+function homeWidgetFace(widget: borrow HomeWidget) -> Any Widget {
+    let content = match widget.kind {
+        "Clock" -> clockWidget(widget.size)
+        "Battery" -> batteryWidget(widget.size)
+        else -> missingWidget(widget.kind)
+    }
+    return content
+    .padding(resolvedLength(16))
+    .width(resolvedLength(homeWidgetWidth(widget.size)))
+    .height(resolvedLength(HomeWidgetRows.count * HomeScreenGrid.rowPitch - HomeWidgetBand.gap))
+    .glassEffect(shape: .Squircle(HomeWidgetBand.corner))
+}
+
+// The time and the date where the person is, the medium one with the
+// weekday's name in full.
+function clockWidget(size: HomeWidgetSize) -> Any Widget {
+    let read = homeWidgetRead()
+    redrawAfter(60 - (read.local / 1000) % 60)
+    return VStack(spacing = .Small, alignment = .Leading) {
+        Text(clockDate(read.local))
+        .font(size: resolvedLength(size == .Medium ? 17 : 14), weight: .SemiBold)
+        .textColor(tileInk)
+        Spacer()
+        Text(clockTime(read.local))
+        .font(size: resolvedLength(size == .Medium ? 56 : 44), weight: .Bold)
+        .textColor(tileInk)
+    }
+    .fillWidth()
+    .fillHeight()
+}
+
+// The battery's charge, and whether it charges.
+function batteryWidget(size: HomeWidgetSize) -> Any Widget {
+    let read = homeWidgetRead()
+    redrawAfter(HomeWidgetBand.refresh)
+    let line = match read.power {
+        Some(info) -> info.batteryPercent == PowerInfo.noBattery
+        ? "No battery" : "\(info.batteryPercent)%"
+        None -> "Unavailable"
+    }
+    let charging = match read.power {
+        Some(info) -> info.batteryState == .Charging
+        None -> false
+    }
+    let level = match read.power {
+        Some(info) -> info.batteryPercent == PowerInfo.noBattery ? 0 : Number(
+            info.batteryPercent
+        ) / 100
+        None -> 0
+    }
+    return VStack(spacing = .Small, alignment = .Leading) {
+        HStack(spacing = .Small, alignment = .Center) {
+            Icon(symbol = charging ? .BatteryCharging : batteryWidgetSymbol(level))
+            .font(size: resolvedLength(22))
+            .foregroundColor(level <= 0.2 && !charging ? .Red : .Green)
+            if charging {
+                Icon(symbol = .BoltFill)
+                .font(size: resolvedLength(16))
+                .foregroundColor(.Yellow)
+            }
+        }
+        Spacer()
+        Text(line)
+        .font(size: resolvedLength(size == .Medium ? 44 : 36), weight: .Bold)
+        .textColor(tileInk)
+        if size == .Medium {
+            ProgressView(value = level)
+            .tint(level <= 0.2 && !charging ? .Red : .Green)
+        }
+    }
+    .fillWidth()
+    .fillHeight()
+}
+
+// The battery symbol nearest `level`.
+function batteryWidgetSymbol(level: Number) -> Symbol {
+    if level >= 0.875 { return .Battery100 }
+    if level >= 0.5 { return .Battery75Percent }
+    if level >= 0.125 { return .Battery25Percent }
+    return .Battery0
+}
+
+// A widget whose provider is not on the system: its name and that it is
+// gone, which a press does nothing for and Home editing takes away.
+function missingWidget(kind: borrow String) -> Any Widget {
+    return VStack(spacing = .Small, alignment = .Center) {
+        Icon(symbol = .ExclamationmarkTriangleFill)
+        .font(size: resolvedLength(28))
+        .foregroundColor(.Secondary)
+        Text(copy kind)
+        .font(size: resolvedLength(15), weight: .SemiBold)
+        .textColor(tileInk)
+        Text("Not available")
+        .font(size: resolvedLength(13))
+        .foregroundColor(.Secondary)
+    }
+    .fillWidth()
+    .fillHeight()
+}
+
+// What the widgets show, read at most once a refresh: the wall clock where
+// the person is and the power service's report.
+struct HomeWidgetData {
+    var at: Number = 0
+    var zone: TimeZone = utcTimeZone()
+    var power: PowerInfo? = .None
+}
+
+struct HomeWidgetShown {
+    var local: Number
+    var power: PowerInfo?
+}
+
+namespace HomeWidgetSlot {
+    let key: PersistentStateKey = PersistentStateKey { name: "desktop.home.widgets" }
+}
+
+function homeWidgetRead() -> HomeWidgetShown {
+    if !ambientStateHas(HomeWidgetSlot.key) {
+        ambientStatePut(HomeWidgetSlot.key, nativeUserData(nativeState(HomeWidgetData {})))
+    }
+    var data = nativeRecover<HomeWidgetData>(ambientStateGet(HomeWidgetSlot.key))
+    let now = unixMillis()
+    if data.at == 0 || now - data.at >= HomeWidgetBand.refresh * 1000 {
+        data.at = now
+        data.zone = currentTimeZone()
+        data.power = match powerRead() {
+            Ok(info) -> .Some(info)
+            Error(failed) -> {
+                log warn(
+                    "the battery widget cannot read the power service",
+                    error: errorName(failed)
+                )
+                .None
+            }
+        }
+    }
+    return HomeWidgetShown { local: data.zone.local(now), power: copy data.power }
+}
+
+// The widget gallery, while Home is edited: each widget the system has, at
+// each size, to add to the page shown when it has room.
+function homeWidgetGallery(
+    widgets: borrow [HomeWidget],
+    add: (HomeWidget) -> Void,
+    done: () -> Void
+) -> Any Widget {
+    var rows: [Any Widget] = []
+    for kind in homeWidgetKinds() {
+        var sizes: [Any Widget] = []
+        for size in [HomeWidgetSize.Small, HomeWidgetSize.Medium] {
+            let offered = HomeWidget { kind: copy kind, size: size }
+            let fits = homeWidgetFits(widgets, size, launcherMetrics().columns)
+            let chosen = copy add
+            let taken = copy offered
+            sizes.append(
+                Button(action = { in if fits { chosen(copy taken) } }) {
+                    homeWidgetFace(offered)
+                    .scaleEffect(0.6)
+                    .frame(
+                        width = homeWidgetWidth(size) * 0.6,
+                        height = (
+                            HomeWidgetRows.count * HomeScreenGrid.rowPitch - HomeWidgetBand.gap
+                        ) * 0.6
+                    )
+                }.buttonStyle(.Plain).opacity(fits ? 1 : 0.4)
+            )
+        }
+        rows.append(
+            VStack(spacing = .Small, alignment = .Leading) {
+                Text(copy kind)
+                .font(size: resolvedLength(17), weight: .SemiBold)
+                .textColor(tileInk)
+                HStack(spacing = .Medium, alignment = .Center, children = sizes)
+            }
+        )
+    }
+    return VStack(spacing = .Large, alignment = .Leading) {
+        HStack(spacing = .None, alignment = .Center) {
+            Text("Widgets")
+            .font(size: resolvedLength(22), weight: .Bold)
+            .textColor(tileInk)
+            Spacer()
+            Button(action = done) {
+                Text("Done").font(size: resolvedLength(15), weight: .SemiBold).padding(
+                    resolvedLength(8)
+                )
+            }
+            .buttonStyle(.Plain)
+        }
+        VStack(spacing = .Large, alignment = .Leading, children = rows)
+    }
+    .padding(resolvedLength(24))
+    .width(resolvedLength(min(viewportWidth() - 64, 640)))
+    .glassEffect(shape: .Squircle(32))
+}

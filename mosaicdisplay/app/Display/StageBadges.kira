@@ -1,0 +1,83 @@
+import Foundation
+import TesseraDisplayClient
+
+// Only the platform may attach artwork, and the table becomes visible with
+// the buffer containing its pixels, through applyStaged.
+function setStageBadge(server: borrow mut Server, index: Number, badge: borrow DisplayStageBadge) {
+    if server.clients[index].role != .Platform { return }
+    if badge.surface.raw == 0 {
+        server.clients[index].staged.badges = []
+        return
+    }
+    if badge.slot >= UNumber(StageBadgeAtlas.slots) { return }
+    var kept: [DisplayStageBadge] = []
+    for entry in server.clients[index].staged.badges {
+        if entry.surface != badge.surface && entry.slot != badge.slot { kept.append(entry) }
+    }
+    kept.append(copy badge)
+    server.clients[index].staged.badges = move kept
+}
+
+function presentedBadge(server: borrow Server, index: Number, progress: Number) -> Number {
+    for motion in server.stageMotion {
+        if motion.index == index {
+            return motion.fromBadge + (motion.toBadge - motion.fromBadge) * progress
+        }
+    }
+    return inStrip(server, index) ? 1 : 0
+}
+
+// Both the window quad and this tile use the composition's single progress
+// value. No platform redraw or independently scheduled animation moves it.
+function drawStageBadge(
+    composer: borrow Composer,
+    server: borrow Server,
+    index: Number,
+    progress: Number
+) {
+    if !onStage(server.clients[index]) { return }
+    let opacity = presentedBadge(server, index, progress)
+    if opacity <= 0 { return }
+    let window = try presentedWindow(server, index, progress) otherwise return
+    let anchor = stageBadge(
+        StageFrame { x: window.x, y: window.y, width: window.width, height: window.height }
+    )
+    let scale = anchor.width / StageBadgeAtlas.icon
+    let tile = StageBadgeAtlas.tile
+    let padding = StageBadgeAtlas.padding
+    for platform in server.clients {
+        if !platform.alive || platform.hidden || platform.role != .Platform { continue }
+        let content = match platform.content { Some(value) -> value None -> continue }
+        let texture = match content.texture { Some(value) -> value None -> continue }
+        let density = server.display.scanout.scale
+        let width = content.width / density
+        let height = content.height / density
+        for badge in platform.badges {
+            if badge.surface != server.clients[index].surface { continue }
+            let sourceX = platform.frame.width
+            let sourceY = Number(badge.slot) * tile
+            if sourceX + tile > width || sourceY + tile > height { continue }
+            let clip = Geometry {
+                x: anchor.x - padding * scale,
+                y: anchor.y - padding * scale,
+                width: tile * scale,
+                height: tile * scale
+            }
+            let frame = Geometry {
+                x: clip.x - sourceX * scale,
+                y: clip.y - sourceY * scale,
+                width: width * scale,
+                height: height * scale
+            }
+            drawSurface(
+                composer,
+                texture,
+                frame,
+                .Some(clip),
+                opacity,
+                content.extentX(),
+                content.extentY()
+            )
+        }
+    }
+}

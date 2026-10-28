@@ -1,0 +1,127 @@
+//! Tests of the Stage Manager model and the lock screen's pull, on the platform state.
+import PlatformKit
+
+/// A platform state with four applications and four windows, the first on the desktop.
+function stageFixture() -> PlatformState {
+    var state = emptyPlatformState(.AdaptiveDesktop)
+    state.registerApplication(PlatformApplicationId(1), "Desktop", .Desktop)
+    state.registerApplication(PlatformApplicationId(2), "About", .Application)
+    state.registerApplication(PlatformApplicationId(3), "Settings", .Application)
+    state.registerApplication(PlatformApplicationId(4), "Platform", .Platform)
+    let frame = SurfaceFrame { x: 200, y: 80, width: 400, height: 300 }
+    for id in 1..5 {
+        state.registerSurface(
+            PlatformSurfaceId(UNumber(id)),
+            PlatformApplicationId(UNumber(id)),
+            copy frame,
+            id
+        )
+    }
+    return state
+}
+
+/// Whether the surface `id` is the one on stage.
+function isStaged(state: borrow PlatformState, id: PlatformSurfaceId) -> Bool {
+    match state.stagedSurface() {
+        Some(staged) -> return staged == id
+        None -> return false
+    }
+}
+
+@Test
+function focusedWindowIsOnStage() {
+    var state = stageFixture()
+    state.setFocus(PlatformSurfaceId(2))
+    expect!(isStaged(state, PlatformSurfaceId(2)))
+}
+
+@Test
+function activeWindowLeavesTheStrip() {
+    var state = stageFixture()
+    state.setFocus(PlatformSurfaceId(2))
+    let strip = state.stripSurfaces(4)
+    expect!(strip.count == 1)
+    expect!(strip[0].id == PlatformSurfaceId(3))
+}
+
+@Test
+function selectionExchangesTheStagedSurface() {
+    var state = stageFixture()
+    state.setFocus(PlatformSurfaceId(3))
+    expect!(isStaged(state, PlatformSurfaceId(3)))
+}
+
+@Test
+function previousWindowMovesToTheStrip() {
+    var state = stageFixture()
+    state.setFocus(PlatformSurfaceId(2))
+    state.setFocus(PlatformSurfaceId(3))
+    let strip = state.stripSurfaces(4)
+    expect!(strip.count == 1)
+    expect!(strip[0].id == PlatformSurfaceId(2))
+}
+
+@Test
+function desktopFocusClearsTheStage() {
+    var state = stageFixture()
+    state.setFocus(PlatformSurfaceId(2))
+    state.setFocus(PlatformSurfaceId(1))
+    match state.stagedSurface() {
+        Some(staged) -> expect!(false)
+        None -> expect!(true)
+    }
+}
+
+@Test
+function desktopPutsEveryWindowInTheStrip() {
+    var state = stageFixture()
+    state.setFocus(PlatformSurfaceId(1))
+    expect!(state.stripSurfaces(4).count == 2)
+}
+
+@Test
+function platformChromePreservesTheFrontApplication() {
+    var state = stageFixture()
+    state.setFocus(PlatformSurfaceId(3))
+    state.setFocus(PlatformSurfaceId(4))
+    expect!(isStaged(state, PlatformSurfaceId(3)))
+}
+
+@Test
+function minimizedWindowsLeaveTheStageAndTheStrip() {
+    var state = stageFixture()
+    state.setFocus(PlatformSurfaceId(3))
+    match state.setSurfaceVisibility(PlatformSurfaceId(3), .Hidden) {
+        Ok -> expect!(true)
+        Error(failure) -> expect!(false)
+    }
+    let strip = state.stripSurfaces(4)
+    expect!(isStaged(state, PlatformSurfaceId(2)))
+    expect!(strip.count == 0)
+}
+
+@Test
+function pulledLockScreenCovers() {
+    var lock = LockState { locked: false }
+    lock.follow(120)
+    expect!(lock.covers(1000))
+    expect!(lock.pulled(1000))
+}
+
+@Test
+function lockScreenLetGoCoversUntilItIsBackUp() {
+    var lock = LockState { locked: false }
+    lock.follow(120)
+    lock.letGo(1000, 0.3)
+    expect!(lock.covers(1200))
+    expect!(!lock.covers(1300))
+}
+
+@Test
+function lockingLeavesNoPull() {
+    var lock = LockState { locked: false }
+    lock.follow(40)
+    lock.lock()
+    expect!(lock.locked)
+    expect!(!lock.pulled(5000))
+}

@@ -1,0 +1,174 @@
+import Foundation
+
+// A `.tessicon` document: the icon's background, and its groups of layers,
+// frontmost first, as Icon Composer's sidebar lists them. Each group is one
+// piece of Liquid Glass; each layer is a drawing from the document's assets,
+// placed on the 1024-point canvas the icon is designed on.
+//
+// Most properties can differ in the dark and mono appearances, as Icon
+// Composer's inspector sets a value per appearance: each is a choice, its
+// light value with the dark and mono values that replace it there, when the
+// document sets them.
+
+public enum IconAppearance {
+    Light
+    Dark
+    // The tinted and clear icons: drawn in one ink, white on dark glass, in
+    // a light or a dark tone.
+    Mono
+    MonoDark
+}
+
+extend IconAppearance {
+    function mono() -> Bool {
+        return match self {
+            Light, Dark -> false
+            Mono, MonoDark -> true
+        }
+    }
+}
+
+public namespace IconCanvas {
+    // The side of the square every layer is placed on, in points.
+    let side: Number = 1024
+}
+
+public struct IconPoint {
+    var x: Number = 0
+    var y: Number = 0
+}
+
+// A gradient across the canvas, from `start` to `stop`, each a share of its
+// side.
+public struct IconGradient {
+    var from: IconColor = IconColor {}
+    var to: IconColor = IconColor {}
+    var start: IconPoint = IconPoint { x: 0.5, y: 0 }
+    var stop: IconPoint = IconPoint { x: 0.5, y: 0.7 }
+}
+
+public enum IconFill {
+    // The background the appearance gives an icon, or a layer's own colours.
+    Automatic
+    // The system's light or dark background whatever the appearance, as
+    // Icon Composer's `system-light` and `system-dark` fills: Terminal's
+    // is dark in the light appearance too. A layer filled with one draws
+    // its own colours.
+    SystemLight
+    SystemDark
+    None
+    Solid(IconColor)
+    // A gradient the system makes from one colour, lighter at the top.
+    AutomaticGradient(IconColor)
+    LinearGradient(IconGradient)
+}
+
+public enum IconBlendMode {
+    Normal
+    Darken
+    Multiply
+    PlusDarker
+    ColorBurn
+    Lighten
+    Screen
+    PlusLighter
+    ColorDodge
+    Overlay
+    SoftLight
+    HardLight
+    Difference
+    Exclusion
+    Hue
+    Saturation
+    Color
+    Luminosity
+}
+
+public enum IconShadowKind {
+    None
+    // A soft black shadow.
+    Neutral
+    // A shadow in the colours of what casts it.
+    Chromatic
+}
+
+public struct IconShadow {
+    var kind: IconShadowKind = .Neutral
+    var opacity: Number = 0.5
+}
+
+// How much of what lies under a piece of glass shows through it.
+public struct IconTranslucency {
+    var enabled: Bool = true
+    var amount: Number = 0.5
+}
+
+// How much what lies under a piece of glass is frosted.
+public struct IconBlur {
+    var enabled: Bool = false
+    var amount: Number = 0.5
+}
+
+// How the glass bends light at its edge: how deep the bend reaches in, and
+// how far it spreads, each a share of the piece.
+public struct IconRefraction {
+    var enabled: Bool = true
+    var depth: Number = 0.23
+    var spread: Number = 0.14
+}
+
+// Where the light catches a piece of glass's edge: along its inside rim, or
+// its outside.
+public enum IconSpecular {
+    Off
+    Inside
+    Outside
+}
+
+// Whether a group's layers are each their own piece of glass, or the group is
+// one piece.
+public enum IconLighting {
+    Combined
+    Individual
+}
+
+// Where a layer or group sits: scaled about the canvas's centre, then moved
+// by `x` and `y` points.
+public struct IconPosition {
+    var scale: Number = 1
+    var x: Number = 0
+    var y: Number = 0
+}
+
+public struct IconLayer {
+    var name: String = "Layer"
+    // The asset in the document's `Assets` folder it draws.
+    var image: String = ""
+    var visible: BoolChoice = BoolChoice { light: true }
+    var opacity: NumberChoice = NumberChoice { light: 1 }
+    var blend: BlendChoice = BlendChoice { light: .Normal }
+    var fill: FillChoice = FillChoice { light: .Automatic }
+    var glass: BoolChoice = BoolChoice { light: true }
+    var position: IconPosition = IconPosition {}
+}
+
+public struct IconGroup {
+    var name: String = "Group"
+    var layers: [IconLayer] = []
+    var visible: BoolChoice = BoolChoice { light: true }
+    var opacity: NumberChoice = NumberChoice { light: 1 }
+    var blend: BlendChoice = BlendChoice { light: .Normal }
+    var lighting: IconLighting = .Combined
+    var specular: SpecularChoice = SpecularChoice { light: .Inside }
+    var blur: BlurChoice = BlurChoice { light: IconBlur {} }
+    var refraction: RefractionChoice = RefractionChoice { light: IconRefraction {} }
+    var translucency: TranslucencyChoice = TranslucencyChoice { light: IconTranslucency {} }
+    var shadow: ShadowChoice = ShadowChoice { light: IconShadow {} }
+    var position: IconPosition = IconPosition {}
+}
+
+public struct IconDocument {
+    var fill: FillChoice = FillChoice { light: .Automatic }
+    // Frontmost first.
+    var groups: [IconGroup] = []
+}

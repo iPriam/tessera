@@ -1,0 +1,283 @@
+import Foundation
+import KiraUI
+import LibTessera
+import TesseraUI
+
+// Storage and Apps (roadmap/30-storage-management.md): how large each volume
+// is and how much of it is free, and each application with the space it and
+// its documents take. An application installed from a disk image can be
+// deleted here, keeping its documents or with them.
+
+// Storage: the system and data volumes and every volume in /Volumes, each
+// with whether it can be written and its space.
+construct StoragePane() extends Widget {
+    body {
+        var volumes = systemVolumes()
+        for mounted in mountedVolumes() { volumes.append(mounted) }
+        var rows: [Any Widget] = []
+        for volume in volumes {
+            rows.append(
+                LabeledContent(label = copy volume.name) {
+                    Text(volumeLine(volume)).foregroundColor(.Secondary)
+                }
+            )
+        }
+        if rows.count == 0 {
+            rows.append(Text("No volumes are mounted.").foregroundColor(.Secondary))
+        }
+        Form(
+            children: [
+                Section(
+                    children: rows,
+                    header: Text("Volumes"),
+                    footer: Text(
+                        "The system's own volume cannot be written. What you keep is on the data volume."
+                    )
+                )
+            ]
+        )
+        .navigationTitle("Storage")
+    }
+}
+
+// What a volume's row says: its space and whether it can be written.
+function volumeLine(volume: borrow Volume) -> String {
+    let access = accessText(volume.access)
+    return match volumeSpaceAt(volume.path) {
+        Ok(
+            space
+        ) -> "\(byteCountText(space.available)) free of \(byteCountText(space.total)) · \(access)"
+        Error(failed) -> {
+            log info(
+                "a volume's space could not be read",
+                volume: copy volume.name,
+                error: errorName(failed)
+            )
+            access
+        }
+    }
+}
+
+function accessText(access: borrow VolumeAccess) -> String {
+    return match access {
+        ReadOnly -> "Read Only"
+        Writable -> "Read & Write"
+        Unknown(reason) -> "Unknown (\(reason))"
+    }
+}
+
+// Apps: every application installed, the system's and those added since,
+// with the space each and its documents take.
+construct AppsPane() extends Widget {
+    body {
+        var rows: [Any Widget] = []
+        for application in installedApplications() {
+            let name = copy application.name
+            rows.append(
+                NavigationLink(value = AppRoute(name = copy name)) {
+                    LabeledContent(label = copy name) {
+                        Text(byteCountText(applicationBytes(application) + dataBytes(name)))
+                        .foregroundColor(.Secondary)
+                    }
+                }
+            )
+        }
+        Form(children: [Section(children: rows, header: Text("Installed"))])
+        .navigationTitle("Apps")
+    }
+}
+
+// One application: where it is from, the space it and its documents take,
+// and, for one installed from a disk image, Delete App.
+construct AppPane(name: String) extends Widget {
+    @State var asking: Bool = false
+    @State var deleted: Bool = false
+
+    body {
+        let found = installedNamed(name)
+        Form(children: appSections(found, name, deleted, { in asking = true }))
+        .navigationTitle(copy name)
+        .alert(
+            title = "Delete “\(name)”?",
+            isPresented = asking,
+            message = "Its documents can be kept, to use again if you install it later, or deleted with it.",
+            actions = self.deleteActions(found)
+        )
+    }
+
+    function deleteActions(found: borrow Application?) -> [Any Widget] {
+        let application = match found {
+            Some(value) -> value
+            None -> return []
+        }
+        let keeping = copy application
+        let removing = copy application
+        return [
+            Button(
+                role = .Destructive,
+                action = { in
+                    asking = false
+                    deleted = deletionSent(deleteApplication(keeping, .Keep))
+                }
+            ) {
+                Text("Delete App, Keep Documents")
+            },
+            Button(
+                role = .Destructive,
+                action = { in
+                    asking = false
+                    deleted = deletionSent(deleteApplication(removing, .Remove))
+                }
+            ) {
+                Text("Delete App and Documents")
+            },
+            Button(action = { in asking = false }) { Text("Cancel").fontWeight(.SemiBold) }
+        ]
+    }
+}
+
+// The rows of an application's pane.
+function appSections(
+    found: borrow Application?,
+    name: borrow String,
+    deleted: Bool,
+    ask: () -> Void
+) -> [Any Widget] {
+    let documents = dataBytes(name)
+    let application = match found {
+        Some(value) -> value
+        None -> return [
+            Section(
+                children: [
+                    LabeledContent(label = "Documents") { Text(byteCountText(documents)) }
+                ],
+                header: Text(deleted ? "Deleted" : "Not Installed"),
+                footer: Text("The documents it kept stay until they are deleted.")
+            )
+        ]
+    }
+    var rows: [Any Widget] = [
+        LabeledContent(label = "Kind") { Text(placeText(application.place)) },
+        LabeledContent(label = "App") { Text(byteCountText(applicationBytes(application))) },
+        LabeledContent(label = "Documents") { Text(byteCountText(documents)) }
+    ]
+    if application.place == .InstalledImage {
+        rows.append(Button(role = .Destructive, action = ask) { Text("Delete App") })
+    }
+    return [Section(children: rows, header: Text("Storage"))]
+}
+
+function placeText(place: borrow ApplicationPlace) -> String {
+    return match place {
+        System -> "System"
+        Applications -> "Installed"
+        InstalledImage -> "Installed from a Disk Image"
+        DiskImage(path) -> "On \(path)"
+    }
+}
+
+function installedNamed(name: borrow String) -> Application? {
+    for application in installedApplications() {
+        if application.name == name { return .Some(application) }
+    }
+    return .None
+}
+
+// Whether a deleted application's documents stay.
+enum KeptDocuments {
+    Keep
+    Remove
+}
+
+// Asks PID 1 to delete `application`, then deletes its documents when
+// `documents` says so.
+function deleteApplication(
+    application: borrow Application,
+    documents: KeptDocuments
+) -> Result<Void, WorkspaceRefusal> {
+    try uninstallApplication(application)
+    match documents {
+        Keep -> log info(
+            "an application is deleted and its documents kept",
+            application: copy application.name
+        )
+        Remove -> removeTreeAt(applicationDataPath(application.name))
+    }
+    return .Ok
+}
+
+// Whether the deletion asked for went out, saying in the log why not.
+function deletionSent(result: Result<Void, WorkspaceRefusal>) -> Bool {
+    match result {
+        Ok -> return true
+        Error(refusal) -> {
+            log warn("an application could not be deleted", refusal: traceText(refusal))
+            return false
+        }
+    }
+}
+
+// The folder holding application `name`'s documents.
+function applicationDataPath(name: borrow String) -> String {
+    return "/" + SystemDirectory.applicationData + "/" + name
+}
+
+// The space `application`'s bundle or image takes.
+function applicationBytes(application: borrow Application) -> Number {
+    return bytesUnder(application.path())
+}
+
+// The space application `name`'s documents take.
+function dataBytes(name: borrow String) -> Number {
+    return bytesUnder(applicationDataPath(name))
+}
+
+// The bytes of the files at and beneath `path`; a link counts as itself.
+function bytesUnder(path: borrow String) -> Number {
+    let status = match linkStatus(path) {
+        Ok(found) -> found
+        Error(failure) -> {
+            // Nothing there takes no space.
+            absorb failure
+            return 0
+        }
+    }
+    match status.kind {
+        File, Link, Other -> return status.size
+        Directory -> {}
+    }
+    let listing = match listDirectory(path) {
+        Ok(found) -> found
+        Error(failure) -> {
+            // A folder that cannot be read is counted as empty.
+            absorb failure
+            return 0
+        }
+    }
+    var total: Number = 0
+    for name in listing.entries {
+        if name == "." || name == ".." { continue }
+        total += bytesUnder(path + "/" + name)
+    }
+    return total
+}
+
+// Deletes `path` and everything beneath it, saying in the log what stayed.
+function removeTreeAt(path: borrow String) {
+    if isDirectory(path) {
+        match listDirectory(path) {
+            Ok(listing) -> for name in listing.entries {
+                if name != "." && name != ".." { removeTreeAt(path + "/" + name) }
+            }
+            Error(failure) -> log warn(
+                "a folder could not be listed to delete it",
+                path: copy path,
+                failure
+            )
+        }
+    }
+    match removePath(path) {
+        Ok -> {}
+        Error(failure) -> log warn("a document could not be deleted", path: copy path, failure)
+    }
+}

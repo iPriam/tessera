@@ -1,0 +1,68 @@
+import Foundation
+
+// How dark a point is, sampled rather than decided.
+//
+// The tile's corners are a circle's arc and both of the mark's strokes are
+// diagonals, and neither stops where a pixel does, so a test answering yes or
+// no per pixel puts a staircase on every curve and every slope in the drawing.
+// A pixel an edge crosses is asked `Splash.samples` squared times over a grid
+// inside itself, and the three levels are mixed in the proportion the samples
+// landed in. A pixel no edge comes near is wholly one of them, and is asked
+// once, at its centre.
+
+namespace Splash {
+    // Samples across a pixel an edge crosses.
+    let samples: Number = 4
+    // Half a pixel's diagonal: an edge further than this from a pixel's centre
+    // does not cross the pixel.
+    let corner: Number = 0.7072
+    // The greys: the tile's face, and the mark. The ground is the
+    // background's.
+    let face: Number = 222.0
+    let mark: Number = 16.0
+}
+
+// What a point of the splash shows.
+enum SplashInk {
+    Ground
+    Face
+    Mark
+}
+
+// What `(u, v)`, tile-local in pixels, shows. The mark is asked only of points
+// inside the tile, so a stroke that runs past the tile's edge is cut off by it.
+function splashInk(painter: borrow SplashPainter, u: Number, v: Number) -> SplashInk {
+    if tileDistance(painter, u, v) > 0.0 { return .Ground }
+    return markDistance(painter, u, v) <= 0.0 ? .Mark : .Face
+}
+
+// The grey a point that shows `ink` is.
+function inkLevel(ink: borrow SplashInk) -> Number {
+    return match ink {
+        Ground -> Background.level
+        Face -> Splash.face
+        Mark -> Splash.mark
+    }
+}
+
+// The grey of the tile's pixel at `(u, v)`: 25 for the ground, 222 for the
+// tile's face, 16 for the mark, and the mixtures of those the edges land on.
+function splashLevel(painter: borrow SplashPainter, u: Number, v: Number) -> Number {
+    let centreU = u + 0.5
+    let centreV = v + 0.5
+    let tile = abs(tileDistance(painter, centreU, centreV))
+    let mark = abs(markDistance(painter, centreU, centreV))
+    if tile > Splash.corner && mark > Splash.corner {
+        return inkLevel(splashInk(painter, centreU, centreV))
+    }
+    let samples = Splash.samples
+    var level: Number = 0.0
+    for row in 0..samples {
+        for column in 0..samples {
+            let sampleU = u + (column + 0.5) / samples
+            let sampleV = v + (row + 0.5) / samples
+            level += inkLevel(splashInk(painter, sampleU, sampleV))
+        }
+    }
+    return level / (samples * samples)
+}

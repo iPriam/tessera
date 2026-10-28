@@ -1,0 +1,642 @@
+import Foundation
+import Heap
+import LibTessera
+
+// A display controller's resources (17 §12.2), read from the DRM primary node
+// with universal planes and atomic turned on.
+
+// One property of a KMS object: its id, its name and the value it had when
+// read.
+struct KmsProperty {
+    var id: U32
+    var name: String
+    var value: U64
+}
+
+// A KMS object and its properties, read once per connection.
+struct KmsObject {
+    var id: U32
+    var properties: [KmsProperty]
+
+    function property(borrow self, name: borrow String) -> KmsProperty? {
+        for property in self.properties {
+            if property.name == name { return .Some(property) }
+        }
+        return .None
+    }
+
+    // The property's id, which a commit names it by.
+    function propertyId(borrow self, name: borrow String) -> U32? {
+        return match self.property(name) {
+            Some(property) -> .Some(property.id)
+            None -> .None
+        }
+    }
+
+    function value(borrow self, name: borrow String) -> U64? {
+        return match self.property(name) {
+            Some(property) -> .Some(property.value)
+            None -> .None
+        }
+    }
+
+    function has(borrow self, name: borrow String) -> Bool { return self.property(name).isSome() }
+}
+
+// The last flip the kernel reported on a CRTC.
+@Derive(Copy)
+struct Flip {
+    var crtc: U32
+    var sequence: U64
+    var time: U64
+    var serial: U64
+}
+
+// The out-fence of the last applied commit, and the CRTCs it covers.
+struct PendingFlip {
+    var fence: Descriptor
+    var mask: U32
+}
+
+// The surface object a plane scans out, when it shows one.
+struct ScanPlane {
+    var plane: U32
+    var surface: Number?
+}
+
+// What a Display connection keeps besides its object.
+struct DisplayRecord {
+    var object: Number
+    var crtcs: [U32]
+    var connectors: [U32]
+    var planes: [U32]
+    var kmsObjects: [KmsObject]
+    // The serial of the last applied commit.
+    var serial: U64
+    // The fence object every flip signals (§12.3); the display holds one
+    // reference to it.
+    var timeline: Number?
+    var outFences: [Descriptor]
+    var pending: PendingFlip?
+    var flips: [Flip]
+    var released: Bool
+    var scanned: [ScanPlane]
+}
+
+function displayOf(object: Number) -> Result<Number, TesseraError> {
+    for (index, display) in deviceLibrary.displays.enumerated() {
+        if display.object == object { return .Ok(index) }
+    }
+    return .Error(failure(.InvalidHandle))
+}
+
+// `DRM_IOCTL_SET_CLIENT_CAP`: the capability @0, the value @8.
+function setClientCapability(
+    card: borrow Descriptor,
+    capability: U64
+) -> Result<Void, TesseraError> {
+    let blockBytes = zeroedBlock(count: 16, alignment: 16)
+    let block = blockBytes.pointer()
+    heapStore<U64>(block, 0, capability)
+    heapStore<U64>(block, 8, U64(1))
+    let set = try card.control(Drm.setClientCap, block)
+    return .Ok
+}
+
+// The ids in a kernel-filled `u32` array.
+function readIds(block: RawPtr, count: Number) -> [U32] {
+    var ids: [U32] = []
+    for index in 0..count { ids.append(heapLoad<U32>(block, index * 4)) }
+    return ids
+}
+
+// A kernel count read back after the second call: never more than the room
+// the first call's count made.
+function boundedCount(block: RawPtr, at: Number, room: Number) -> Number {
+    let count = heapLoad<U32>(block, at)
+    if count > room { return room }
+    return count
+}
+
+struct CardIds {
+    var crtcs: [U32]
+    var connectors: [U32]
+}
+
+// `struct drm_mode_card_res`: the framebuffer, CRTC, connector and encoder
+// arrays @0–@24, their counts @32–@44. The first call counts, the second
+// fills.
+function cardResources(card: borrow Descriptor) -> Result<CardIds, TesseraError> {
+    let resBytes = zeroedBlock(count: 64, alignment: 16)
+    let res = resBytes.pointer()
+    let counted = try card.control(Drm.modeGetResources, res)
+    let crtcRoom = heapLoad<U32>(res, 36)
+    let connectorRoom = heapLoad<U32>(res, 40)
+    let crtcIdsBytes = zeroedBlock(count: (crtcRoom + 1) * 4, alignment: 16)
+    let crtcIds = crtcIdsBytes.pointer()
+    let connectorIdsBytes = zeroedBlock(count: (connectorRoom + 1) * 4, alignment: 16)
+    let connectorIds = connectorIdsBytes.pointer()
+    zeroBytes(res, 64)
+    heapStore<U64>(res, 8, U64(pointerAddress(crtcIds)))
+    heapStore<U64>(res, 16, U64(pointerAddress(connectorIds)))
+    heapStore<U32>(res, 36, U32(crtcRoom))
+    heapStore<U32>(res, 40, U32(connectorRoom))
+    let filled = try card.control(Drm.modeGetResources, res)
+    return .Ok(
+        CardIds {
+            crtcs: readIds(crtcIds, boundedCount(res, 36, crtcRoom)),
+            connectors: readIds(connectorIds, boundedCount(res, 40, connectorRoom)),
+        }
+    )
+}
+
+// `struct drm_mode_get_plane_res`: the plane array @0, its count @8.
+function cardPlanes(card: borrow Descriptor) -> Result<[U32], TesseraError> {
+    let blockBytes = zeroedBlock(count: 16, alignment: 16)
+    let block = blockBytes.pointer()
+    let counted = try card.control(Drm.modeGetPlaneResources, block)
+    let room = heapLoad<U32>(block, 8)
+    let idsBytes = zeroedBlock(count: (room + 1) * 4, alignment: 16)
+    let ids = idsBytes.pointer()
+    heapStore<U64>(block, 0, U64(pointerAddress(ids)))
+    heapStore<U32>(block, 8, U32(room))
+    let filled = try card.control(Drm.modeGetPlaneResources, block)
+    return .Ok(readIds(ids, boundedCount(block, 8, room)))
+}
+
+// A connection becoming a display: atomic and universal planes on, the
+// descriptor non-blocking so the flip events drain without waiting, the
+// resource ids read once, and the timeline its flips signal.
+function displayPrepare(object: Number) -> Result<Void, TesseraError> {
+    let card = try deviceOf(object)
+    try card.setNonBlocking()
+    for capability in [Drm.clientCapUniversalPlanes, Drm.clientCapAtomic] {
+        match setClientCapability(card, capability) {
+            Ok -> {}
+            Error(failed) -> {
+                // A driver without atomic modesetting cannot be driven.
+                log info(
+                    "a display controller refused an atomic capability",
+                    error: errorName(failed)
+                )
+                return .Error(failure(.Unsupported))
+            }
+        }
+    }
+    let ids = try cardResources(card)
+    let planes = try cardPlanes(card)
+    deviceLibrary.displays.append(
+        DisplayRecord {
+            object: object,
+            crtcs: ids.crtcs,
+            connectors: ids.connectors,
+            planes: planes,
+            kmsObjects: [],
+            serial: U64(0),
+            timeline: .None,
+            outFences: [],
+            pending: .None,
+            flips: [],
+            released: false,
+            scanned: [],
+        }
+    )
+    // The timeline every flip signals (§12.3), on the same DRM file. Without
+    // timeline syncobjs the display still flips; `timeline` answers
+    // `Unsupported`.
+    match newFence(U64(0)) {
+        Ok(fence) -> {
+            deviceLibrary.objects[fence].refs = 1
+            deviceLibrary.displays[deviceLibrary.displays.count - 1].timeline = .Some(fence)
+        }
+        Error(failed) -> log warn("a display has no flip timeline", error: errorName(failed))
+    }
+    return .Ok
+}
+
+// `struct drm_mode_get_property`: the id @16, the name @24.
+function propertyName(card: borrow Descriptor, id: U32) -> Result<String, TesseraError> {
+    let blockBytes = zeroedBlock(count: 64, alignment: 16)
+    let block = blockBytes.pointer()
+    heapStore<U32>(block, 16, id)
+    let read = try card.control(Drm.modeGetProperty, block)
+    return .Ok(stringFromCBytes(heapOffset(block, 24), 32))
+}
+
+// Every property of a KMS object, from `struct drm_mode_obj_get_properties`:
+// the id and value arrays @0 and @8, their count @16, the object @20 and its
+// type @24.
+function readKmsObject(
+    card: borrow Descriptor,
+    id: U32,
+    objectType: U32
+) -> Result<KmsObject, TesseraError> {
+    let blockBytes = zeroedBlock(count: 32, alignment: 16)
+    let block = blockBytes.pointer()
+    heapStore<U32>(block, 20, id)
+    heapStore<U32>(block, 24, objectType)
+    let counted = try card.control(Drm.modeObjectProperties, block)
+    let room = heapLoad<U32>(block, 16)
+    let idsBytes = zeroedBlock(count: (room + 1) * 4, alignment: 16)
+    let ids = idsBytes.pointer()
+    let valuesBytes = zeroedBlock(count: (room + 1) * 8, alignment: 16)
+    let values = valuesBytes.pointer()
+    heapStore<U64>(block, 0, U64(pointerAddress(ids)))
+    heapStore<U64>(block, 8, U64(pointerAddress(values)))
+    heapStore<U32>(block, 16, U32(room))
+    let filled = try card.control(Drm.modeObjectProperties, block)
+    var found = KmsObject { id: id, properties: [] }
+    for index in 0..boundedCount(block, 16, room) {
+        let property = heapLoad<U32>(ids, index * 4)
+        found.properties.append(
+            KmsProperty {
+                id: property,
+                name: try propertyName(card, property),
+                value: heapLoad<U64>(values, index * 8)
+            }
+        )
+    }
+    return .Ok(found)
+}
+
+// A KMS object's properties, read once per connection.
+function kmsObject(display: Number, id: U32, objectType: U32) -> Result<KmsObject, TesseraError> {
+    for known in deviceLibrary.displays[display].kmsObjects {
+        if known.id == id { return .Ok(known) }
+    }
+    let card = try deviceOf(deviceLibrary.displays[display].object)
+    let read = try readKmsObject(card, id, objectType)
+    deviceLibrary.displays[display].kmsObjects.append(read)
+    return .Ok(read)
+}
+
+// `struct drm_mode_modeinfo` (68 bytes), kept whole so a commit can hand it
+// back to the kernel as a mode blob.
+struct ModeInfo {
+    var clock: U32
+    var hDisplay: U16
+    var hSyncStart: U16
+    var hSyncEnd: U16
+    var hTotal: U16
+    var hSkew: U16
+    var vDisplay: U16
+    var vSyncStart: U16
+    var vSyncEnd: U16
+    var vTotal: U16
+    var vScan: U16
+    var refresh: U32
+    var flags: U32
+    var modeType: U32
+    var name: String
+
+    function write(borrow self, block: RawPtr, at: Number) {
+        zeroBytes(heapOffset(block, at), ModeLayout.kernel)
+        heapStore<U32>(block, at, self.clock)
+        heapStore<U16>(block, at + 4, self.hDisplay)
+        heapStore<U16>(block, at + 6, self.hSyncStart)
+        heapStore<U16>(block, at + 8, self.hSyncEnd)
+        heapStore<U16>(block, at + 10, self.hTotal)
+        heapStore<U16>(block, at + 12, self.hSkew)
+        heapStore<U16>(block, at + 14, self.vDisplay)
+        heapStore<U16>(block, at + 16, self.vSyncStart)
+        heapStore<U16>(block, at + 18, self.vSyncEnd)
+        heapStore<U16>(block, at + 20, self.vTotal)
+        heapStore<U16>(block, at + 22, self.vScan)
+        heapStore<U32>(block, at + 24, self.refresh)
+        heapStore<U32>(block, at + 28, self.flags)
+        heapStore<U32>(block, at + 32, self.modeType)
+        var length = self.name.count
+        if length > 31 { length = 31 }
+        copyBytes(heapOffset(block, at + 36), self.name.data, length)
+    }
+
+    // The refresh rate in millihertz, from the pixel clock in kHz.
+    function refreshMilliHz(borrow self) -> U32 {
+        let pixels = U64(self.hTotal) * U64(self.vTotal)
+        if pixels == U64(0) { return U32(0) }
+        return U32(U64(self.clock) * U64(1000000) / pixels)
+    }
+
+    // Its `Mode` record (48 bytes) at `at`.
+    function writeRecord(borrow self, out: borrow Buffer, at: Number) {
+        var flags = U32(0)
+        if (self.modeType & ModeLayout.typePreferred) != U32(0) {
+            flags = flags | ModeFlags.preferred
+        }
+        if (self.flags & ModeLayout.flagInterlace) != U32(0) {
+            flags = flags | ModeFlags.interlaced
+        }
+        put32(out, at, U32(self.hDisplay))
+        put32(out, at + 4, U32(self.vDisplay))
+        put32(out, at + 8, self.refreshMilliHz())
+        put32(out, at + 12, flags)
+        put32(out, at + 16, self.clock)
+        put32(out, at + 20, U32(self.hTotal))
+        put32(out, at + 24, U32(self.vTotal))
+        put16(out, at + 28, self.hSyncStart)
+        put16(out, at + 30, self.hSyncEnd)
+        put16(out, at + 32, self.vSyncStart)
+        put16(out, at + 34, self.vSyncEnd)
+        put32(out, at + 36, U32(0))
+        put64(out, at + 40, U64(0))
+    }
+}
+
+namespace ModeLayout {
+    let kernel: Number = 68
+    let record: Number = 48
+    // `DRM_MODE_TYPE_PREFERRED` and `DRM_MODE_FLAG_INTERLACE`.
+    let typePreferred: U32 = U32(8)
+    let flagInterlace: U32 = U32(16)
+}
+
+// `Mode.flags`.
+namespace ModeFlags {
+    let preferred: U32 = U32(1)
+    let interlaced: U32 = U32(2)
+}
+
+function readModeInfo(block: RawPtr, at: Number) -> ModeInfo {
+    return ModeInfo {
+        clock: heapLoad<U32>(block, at),
+        hDisplay: heapLoad<U16>(block, at + 4),
+        hSyncStart: heapLoad<U16>(block, at + 6),
+        hSyncEnd: heapLoad<U16>(block, at + 8),
+        hTotal: heapLoad<U16>(block, at + 10),
+        hSkew: heapLoad<U16>(block, at + 12),
+        vDisplay: heapLoad<U16>(block, at + 14),
+        vSyncStart: heapLoad<U16>(block, at + 16),
+        vSyncEnd: heapLoad<U16>(block, at + 18),
+        vTotal: heapLoad<U16>(block, at + 20),
+        vScan: heapLoad<U16>(block, at + 22),
+        refresh: heapLoad<U32>(block, at + 24),
+        flags: heapLoad<U32>(block, at + 28),
+        modeType: heapLoad<U32>(block, at + 32),
+        name: stringFromCBytes(heapOffset(block, at + 36), 32),
+    }
+}
+
+// `ConnectorInfo.type`.
+enum ConnectorKind: U32 {
+    Unknown = 0
+    Internal = 1
+    Hdmi = 2
+    DisplayPort = 3
+    Virtual = 4
+    UsbC = 5
+}
+
+// `ConnectorInfo.state`.
+enum ConnectorState: U32 {
+    Disconnected = 0
+    Connected = 1
+    Unknown = 2
+}
+
+// `struct drm_mode_get_connector`, filled: the kernel's record with its
+// modes and encoders.
+struct Connector {
+    var id: U32
+    // `DRM_MODE_CONNECTOR_*`.
+    var kernelKind: U32
+    // `DRM_MODE_CONNECTED` 1, `DISCONNECTED` 2, `UNKNOWNCONNECTION` 3.
+    var connection: U32
+    var widthMm: U32
+    var heightMm: U32
+    var modes: [ModeInfo]
+    var encoders: [U32]
+
+    function kind(borrow self) -> ConnectorKind {
+        return match self.kernelKind {
+            // LVDS, eDP, DSI.
+            7, 14, 16 -> .Internal
+            11, 12 -> .Hdmi
+            10 -> .DisplayPort
+            15 -> .Virtual
+            20 -> .UsbC
+            else -> .Unknown
+        }
+    }
+
+    function state(borrow self) -> ConnectorState {
+        return match self.connection {
+            1 -> .Connected
+            2 -> .Disconnected
+            else -> .Unknown
+        }
+    }
+}
+
+// The encoder array @0, the mode array @8, their counts @32 and @40, the
+// connector @48; its type @52, connection @60 and size @64 and @68.
+function readConnector(card: borrow Descriptor, id: U32) -> Result<Connector, TesseraError> {
+    let blockBytes = zeroedBlock(count: 80, alignment: 16)
+    let block = blockBytes.pointer()
+    heapStore<U32>(block, 48, id)
+    let probed = try card.control(Drm.modeGetConnector, block)
+    let modeRoom = heapLoad<U32>(block, 32)
+    let encoderRoom = heapLoad<U32>(block, 40)
+    let modesBytes = zeroedBlock(count: (modeRoom + 1) * ModeLayout.kernel, alignment: 16)
+    let modes = modesBytes.pointer()
+    let encodersBytes = zeroedBlock(count: (encoderRoom + 1) * 4, alignment: 16)
+    let encoders = encodersBytes.pointer()
+    zeroBytes(block, 80)
+    heapStore<U64>(block, 0, U64(pointerAddress(encoders)))
+    heapStore<U64>(block, 8, U64(pointerAddress(modes)))
+    heapStore<U32>(block, 32, U32(modeRoom))
+    heapStore<U32>(block, 40, U32(encoderRoom))
+    heapStore<U32>(block, 48, id)
+    let read = try card.control(Drm.modeGetConnector, block)
+    var found: [ModeInfo] = []
+    for index in 0..boundedCount(block, 32, modeRoom) {
+        found.append(readModeInfo(modes, index * ModeLayout.kernel))
+    }
+    return .Ok(
+        Connector {
+            id: id,
+            kernelKind: heapLoad<U32>(block, 52),
+            connection: heapLoad<U32>(block, 60),
+            widthMm: heapLoad<U32>(block, 64),
+            heightMm: heapLoad<U32>(block, 68),
+            modes: found,
+            encoders: readIds(encoders, boundedCount(block, 40, encoderRoom)),
+        }
+    )
+}
+
+// The CRTCs a connector's encoders can drive, as a mask over CRTC indices:
+// `struct drm_mode_get_encoder`, the encoder @0, its possible CRTCs @12.
+function connectorCrtcs(
+    card: borrow Descriptor,
+    connector: borrow Connector
+) -> Result<U32, TesseraError> {
+    var mask = U32(0)
+    let blockBytes = zeroedBlock(count: 20, alignment: 16)
+    let block = blockBytes.pointer()
+    for encoder in connector.encoders {
+        zeroBytes(block, 20)
+        heapStore<U32>(block, 0, encoder)
+        let read = try card.control(Drm.modeGetEncoder, block)
+        mask = mask | heapLoad<U32>(block, 12)
+    }
+    return .Ok(mask)
+}
+
+// Bounded writes: past the end of `out` they only count, so a call can
+// answer `BufferTooSmall` with the size it needed.
+function fits(out: borrow Buffer, at: Number, size: Number) -> Bool {
+    return !isNull(out.address) && Number(at + size) <= out.length
+}
+
+function put16(out: borrow Buffer, at: Number, value: U16) {
+    if fits(out, at, 2) { heapStore<U16>(out.address, at, value) }
+}
+
+function put32(out: borrow Buffer, at: Number, value: U32) {
+    if fits(out, at, 4) { heapStore<U32>(out.address, at, value) }
+}
+
+function put64(out: borrow Buffer, at: Number, value: U64) {
+    if fits(out, at, 8) { heapStore<U64>(out.address, at, value) }
+}
+
+// `PlaneInfo.type`.
+enum PlaneKind: U32 {
+    Primary = 0
+    Cursor = 1
+    Overlay = 2
+}
+
+// From the plane's `type` property: overlay 0, primary 1, cursor 2 in the
+// kernel.
+function planeKind(plane: borrow KmsObject) -> PlaneKind {
+    return match plane.value("type").or(U64(0)) {
+        1 -> .Primary
+        2 -> .Cursor
+        else -> .Overlay
+    }
+}
+
+// `PlaneInfo.capabilities`.
+distinct PlaneCapabilities = U32
+
+namespace PlaneCapabilities {
+    let none: PlaneCapabilities = PlaneCapabilities(0)
+    let scaling: PlaneCapabilities = PlaneCapabilities(1)
+    let rotation: PlaneCapabilities = PlaneCapabilities(2)
+    let alpha: PlaneCapabilities = PlaneCapabilities(4)
+    let damage: PlaneCapabilities = PlaneCapabilities(8)
+    let inFence: PlaneCapabilities = PlaneCapabilities(16)
+}
+
+function planeCapabilities(plane: borrow KmsObject) -> PlaneCapabilities {
+    var capabilities = PlaneCapabilities.none
+    if plane.has("rotation") { capabilities = capabilities | PlaneCapabilities.rotation }
+    if plane.has("alpha") { capabilities = capabilities | PlaneCapabilities.alpha }
+    if plane.has("FB_DAMAGE_CLIPS") { capabilities = capabilities | PlaneCapabilities.damage }
+    if plane.has("IN_FENCE_FD") { capabilities = capabilities | PlaneCapabilities.inFence }
+    return capabilities
+}
+
+// `struct drm_mode_get_plane`: the plane @0, its possible CRTCs @12, the
+// format count @20 and array @24.
+struct PlaneFacts {
+    var crtcMask: U32
+    var formats: [U32]
+}
+
+function planeFacts(card: borrow Descriptor, plane: U32) -> Result<PlaneFacts, TesseraError> {
+    let blockBytes = zeroedBlock(count: 32, alignment: 16)
+    let block = blockBytes.pointer()
+    heapStore<U32>(block, 0, plane)
+    let counted = try card.control(Drm.modeGetPlane, block)
+    let room = heapLoad<U32>(block, 20)
+    let formatsBytes = zeroedBlock(count: (room + 1) * 4, alignment: 16)
+    let formats = formatsBytes.pointer()
+    heapStore<U64>(block, 24, U64(pointerAddress(formats)))
+    heapStore<U32>(block, 20, U32(room))
+    let filled = try card.control(Drm.modeGetPlane, block)
+    return .Ok(
+        PlaneFacts {
+            crtcMask: heapLoad<U32>(block, 12),
+            formats: readIds(formats, boundedCount(block, 20, room))
+        }
+    )
+}
+
+// `struct drm_mode_get_blob`: the blob @0, its length @4, the data @8.
+function propertyBlob(card: borrow Descriptor, blob: U32) -> Result<ByteBlock, TesseraError> {
+    let headerBytes = zeroedBlock(count: 16, alignment: 16)
+    let header = headerBytes.pointer()
+    heapStore<U32>(header, 0, blob)
+    let sized = try card.control(Drm.modeGetPropBlob, header)
+    let length = heapLoad<U32>(header, 4)
+    let data = zeroedBlock(count: length + 8, alignment: 16)
+    heapStore<U64>(header, 8, U64(pointerAddress(data.pointer())))
+    match card.control(Drm.modeGetPropBlob, header) {
+        Ok(read) -> return .Ok(move data)
+        Error(failed) -> return .Error(failed)
+    }
+}
+
+// The formats a plane scans out, as format and modifier pairs: from its
+// `IN_FORMATS` blob when it has one, otherwise its format list, linear.
+//
+// `struct drm_format_modifier_blob`: the format count @8 and offset @12,
+// the modifier count @16 and offset @20; each modifier record (24 bytes) is
+// a mask @0 over 64 formats from the index @8, and the modifier @16.
+function planeFormats(
+    card: borrow Descriptor,
+    plane: borrow KmsObject,
+    facts: borrow PlaneFacts
+) -> Result<[FormatPair], TesseraError> {
+    var pairs: [FormatPair] = []
+    let blob = U32(plane.value("IN_FORMATS").or(U64(0)))
+    if blob != 0 {
+        let dataBlock = try propertyBlob(card, blob)
+        let data = dataBlock.pointer()
+        let formatCount = heapLoad<U32>(data, 8)
+        let formatsAt = heapLoad<U32>(data, 12)
+        let modifierCount = heapLoad<U32>(data, 16)
+        let modifiersAt = heapLoad<U32>(data, 20)
+        for item in 0..modifierCount {
+            let at = modifiersAt + item * 24
+            let mask = heapLoad<U64>(data, at)
+            let first = heapLoad<U32>(data, at + 8)
+            let modifier = Modifier(heapLoad<U64>(data, at + 16))
+            for bit in 0..64 {
+                let format = first + bit
+                if (mask & (U64(1) << U64(bit))) != U64(0) && format < formatCount {
+                    pairs.append(
+                        FormatPair {
+                            format: FourCc(heapLoad<U32>(data, formatsAt + format * 4)),
+                            modifier: modifier
+                        }
+                    )
+                }
+            }
+        }
+    }
+    if pairs.count == 0 {
+        for format in facts.formats {
+            pairs.append(FormatPair { format: FourCc(format), modifier: Modifier(0) })
+        }
+    }
+    return .Ok(pairs)
+}
+
+// The pairs the primary planes of this process's display scan out, for
+// `Gpu.formats`.
+function scanoutPairs() -> Result<[FormatPair], TesseraError> {
+    if deviceLibrary.displays.count == 0 { return .Error(failure(.Unsupported)) }
+    let card = try deviceOf(deviceLibrary.displays[0].object)
+    var pairs: [FormatPair] = []
+    for plane in deviceLibrary.displays[0].planes {
+        let kms = try kmsObject(0, plane, Drm.objectPlane)
+        if planeKind(kms) != .Primary { continue }
+        let facts = try planeFacts(card, plane)
+        let formats = try planeFormats(card, kms, facts)
+        for pair in formats { pairs.append(pair) }
+    }
+    return .Ok(pairs)
+}

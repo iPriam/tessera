@@ -1,0 +1,150 @@
+//! The presentation contract: how a platform's navigation, windows and arrangement are described to the interface built on it.
+import Foundation
+
+/// How the user moves focus and selection around a platform.
+public enum NavigationModel {
+    /// A pointer, such as a mouse or trackpad.
+    Pointer
+    /// The touch screen.
+    Touch
+    /// A directional controller, such as a game pad or a remote.
+    Directional
+}
+
+/// How a platform presents windows.
+public enum WindowModel {
+    /// Windows float freely, each where it was put.
+    Freeform
+    /// Windows of an application are grouped into a stage beside a strip of the other stages, as Stage Manager does.
+    Staged
+    /// Windows fill the output one at a time, in a stack.
+    Stack
+    /// One window fills the output.
+    Fullscreen
+}
+
+/// The compositor mode a platform starts in (roadmap/15-form-factors.md), which decides how the compositor draws windows.
+///
+/// This is distinct from the window model, which is how the platform presents windows within its arrangement.
+public enum Arrangement {
+    /// The freeform compositor mode, where the desktop starts.
+    Freeform
+    /// The stack compositor mode, where a phone or tablet starts.
+    Stack
+    /// One fullscreen surface at a time, where a console or television starts.
+    Exclusive
+    /// Stage Manager, which either adaptive platform may turn on.
+    Stage
+}
+
+/// How a platform starts: its navigation, its windows and whether its system chrome stays on screen.
+public struct PresentationPolicy {
+    /// How the user moves around the platform.
+    var navigation: NavigationModel
+    /// How the platform presents windows.
+    var windows: WindowModel
+    /// Whether the system's bars and controls stay on screen.
+    var persistentSystemChrome: Bool
+}
+
+extend Arrangement {
+    /// The name the arrangement goes by.
+    function name(borrow self) -> String {
+        return match self {
+            Freeform -> "freeform"
+            Stack -> "stack"
+            Exclusive -> "exclusive"
+            Stage -> "stage"
+        }
+    }
+}
+
+extend WindowModel {
+    /// The compositor mode the window model needs. Stage Manager is a mode of
+    /// the compositor's, which draws the strip's pictures of the applications
+    /// aside (roadmap/15-form-factors.md).
+    function arrangement(borrow self) -> Arrangement {
+        return match self {
+            Freeform -> .Freeform
+            Staged -> .Stage
+            Stack -> .Stack
+            Fullscreen -> .Exclusive
+        }
+    }
+
+    /// The name the window model goes by.
+    function name(borrow self) -> String {
+        return match self {
+            Freeform -> "freeform"
+            Staged -> "staged"
+            Stack -> "stack"
+            Fullscreen -> "fullscreen"
+        }
+    }
+}
+
+extend DynamicPlatform {
+    /// The arrangement this platform presents its windows in.
+    function arrangement(borrow self) -> Arrangement {
+        return match self {
+            AdaptiveDesktop -> .Freeform
+            AdaptiveMobile -> .Stack
+            Console -> .Exclusive
+            Media -> .Exclusive
+        }
+    }
+
+    /// The presentation policy this platform follows: its navigation, its windows and how it shows surfaces.
+    function presentationPolicy(borrow self) -> PresentationPolicy {
+        return match self {
+            AdaptiveDesktop -> PresentationPolicy {
+                navigation: .Pointer,
+                windows: .Freeform,
+                persistentSystemChrome: true,
+            }
+            AdaptiveMobile -> PresentationPolicy {
+                navigation: .Touch,
+                windows: .Stack,
+                persistentSystemChrome: true,
+            }
+            Console -> PresentationPolicy {
+                navigation: .Directional,
+                windows: .Fullscreen,
+                persistentSystemChrome: false,
+            }
+            Media -> PresentationPolicy {
+                navigation: .Directional,
+                windows: .Fullscreen,
+                persistentSystemChrome: true,
+            }
+        }
+    }
+
+    /// What makes Adaptive Desktop and Adaptive Mobile adaptive: the policy
+    /// above is only where each starts. A tablet on a keyboard dock runs
+    /// Adaptive Mobile with freeform or staged windows and a pointer; a
+    /// convertible folded flat runs Adaptive Desktop with touch and a stack.
+    /// Console and Media do not adapt: a television and a console are driven
+    /// from the couch, fullscreen, with a directional controller, and nothing
+    /// else is offered there.
+    function adapts(borrow self) -> Bool {
+        return match self {
+            AdaptiveDesktop -> true
+            AdaptiveMobile -> true
+            Console -> false
+            Media -> false
+        }
+    }
+
+    /// The window models this platform allows: all of them when it adapts, otherwise only its own.
+    function allowedWindowModels(borrow self) -> [WindowModel] {
+        if adapts() { return [.Freeform, .Staged, .Stack, .Fullscreen] }
+        return [.Fullscreen]
+    }
+
+    /// The navigation models this platform allows: all of them when it adapts, otherwise only its own.
+    function allowedNavigationModels(borrow self) -> [NavigationModel] {
+        if adapts() { return [.Pointer, .Touch, .Directional] }
+        return [.Directional]
+    }
+}

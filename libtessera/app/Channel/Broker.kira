@@ -1,0 +1,148 @@
+import Foundation
+import Heap
+
+// The broker's side of §25.4, for `bootstrap` alone (`tessera.broker`).
+//
+// The broker listens where every service checks in and every System channel
+// connects, and takes each connection as a Channel. What arrives on one is
+// either a Channel message, which a System channel sends, or a message on
+// the check-in wire (`Service.kira`), which a service sends; the library
+// tells them apart, so the broker never sees how either is framed. It
+// answers a System channel with `Channel.write`, and a service with
+// `brokerSend`, which carries at most one Channel the way the check-in wire
+// does.
+
+// `BrokerMessage.kind`: how what arrived is framed.
+@Derive(Copy)
+public enum BrokerMessageKind: U32 {
+    CheckInWire = 0
+    ChannelMessage = 1
+}
+
+public struct BrokerConnection {
+    var channel: Handle
+    // The process at the other end; its program is
+    // `servicePeerProgram(channel)`.
+    var process: UNumber
+}
+
+public struct BrokerMessage {
+    var bytes: UNumber
+    var kind: BrokerMessageKind
+}
+
+function brokerEntitled() -> Bool { return entitlementHeld("tessera.broker") }
+
+// Starts listening where services and System channels reach the broker.
+// `AlreadyExists` while another broker listens.
+public function brokerListen() -> Result<Handle, TesseraError> {
+    if !brokerEntitled() { return .Error(failure(.NotEntitled)) }
+    let backing = try kernelBrokerListen()
+    let object = objectCreate(.Channel(.BrokerListener), backing)
+    return handleForNew(object, Rights.processDefault)
+}
+
+// The next connection waiting on `listener`, or `ShouldWait`. The listener
+// asserts `READABLE` while one waits.
+public function brokerAccept(listener: Handle) -> Result<BrokerConnection, TesseraError> {
+    let object = try resolveObject(listener, .Channel, Rights.read)
+    let role = try channelOf(object)
+    match role {
+        BrokerListener -> {}
+        Plain, Connection, ServiceListener -> return .Error(failure(.WrongType))
+    }
+    let listener = try backingOf(object)
+    let backing = try kernelBrokerAccept(listener)
+    let process = match kernelPeerProcess(backing) {
+        Ok(value) -> value
+        Error(failed) -> {
+            kernelRelease(backing)
+            return .Error(failed)
+        }
+    }
+    // The program is read now, while the client is surely still there; one
+    // that cannot be read is asked of the kernel again when wanted.
+    var role = ChannelRole.Plain
+    match kernelPeerProgram(backing) {
+        Ok(program) -> role = .Connection(program)
+        Error(failed) -> absorb failed
+    }
+    let channel = try serviceChannelObject(backing, move role)
+    return match handleForNew(channel, Rights.processDefault) {
+        Ok(handle) -> .Ok(BrokerConnection { channel: handle, process: process })
+        Error(failed) -> .Error(failed)
+    }
+}
+
+// The next message on a connection the broker accepted, into `bytes`: a
+// Channel message's header and body, or a check-in message whole. Handles
+// that came with it are closed. `ShouldWait` when nothing waits,
+// `PeerClosed` once the other end has gone, `BufferTooSmall` (and the
+// message lost) when it does not fit.
+public function brokerReceive(
+    connection: Handle,
+    bytes: borrow Buffer
+) -> Result<BrokerMessage, TesseraError> {
+    if !brokerEntitled() { return .Error(failure(.NotEntitled)) }
+    let object = try resolveObject(connection, .Channel, Rights.read)
+    let backing = try backingOf(object)
+    let message = try channelReceive(backing)
+    for index in 0..message.attached.count { kernelRelease(message.attached[index]) }
+    var kind = BrokerMessageKind.CheckInWire
+    var from = U64(0)
+    var length = message.length
+    // A Channel message starts with its handle count, and a check-in
+    // message with its op, which is never 0.
+    if message.length >= Transfer.prefixBytes + Wire.headerBytes && heapLoad<U32>(
+        message.block,
+        0
+    ) == U32(0) {
+        kind = .ChannelMessage
+        from = messagePayloadOffset(message)
+        length = messagePayloadLength(message)
+    }
+    if length > bytes.length {
+        deallocate(message.block)
+        return .Error(failureDetail(.BufferTooSmall, length))
+    }
+    copyBytes(bytes.address, heapOffset(message.block, from), length)
+    deallocate(message.block)
+    return .Ok(BrokerMessage { bytes: length, kind: kind })
+}
+
+// Sends `bytes` on the check-in wire of `connection`, carrying `channel`
+// when one is given. The channel leaves this process whether the send
+// succeeds or not. A full queue is `ShouldWait` and a service that has
+// gone is `PeerClosed`.
+public function brokerSend(
+    connection: Handle,
+    bytes: borrow Buffer,
+    channel: Handle?
+) -> Result<Void, TesseraError> {
+    if !brokerEntitled() { return .Error(failure(.NotEntitled)) }
+    let object = try resolveObject(connection, .Channel, Rights.write)
+    var attached: [Number] = []
+    match channel {
+        Some(carriedHandle) -> {
+            let carried = try resolveObject(carriedHandle, .Channel, Rights.transfer)
+            let carriedBacking = try backingOf(carried)
+            attached.append(carriedBacking)
+        }
+        None -> {}
+    }
+    let backing = try backingOf(object)
+    let sent = kernelPacketSend(
+        backing,
+        bytes.address,
+        bytes.length,
+        nullPointer(),
+        U64(0),
+        attached,
+        false
+    )
+    match channel {
+        Some(carriedHandle) -> handleDrop(carriedHandle)
+        None -> {}
+    }
+    return sent
+}

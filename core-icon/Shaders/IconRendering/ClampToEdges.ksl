@@ -1,0 +1,65 @@
+// clampToEdges: a texture sampled with its point clamped into `frame`
+// (x, y, width, height), mapped through the image's transform, and clamped
+// again to the texture's valid rectangle. The image argument is RenderBox's:
+// the texture and five float2s, the transform's columns and translation,
+// then the low and high corners.
+import Stitch
+
+type ClampToEdgesArguments {
+    let toUser: Float4
+    let toUserTranslation: Float2
+    let imageColumnX: Float2
+    let imageColumnY: Float2
+    let imageTranslation: Float2
+    let imageLow: Float2
+    let imageHigh: Float2
+    let frame: Float4
+}
+
+type FullscreenIn {
+    @builtin(vertex_index)
+    let vid: UInt
+}
+
+type FullscreenOut {
+    @builtin(position)
+    let clip_position: Float4
+}
+
+type StitchOut {
+    let color: Float4
+}
+
+shader ClampToEdges {
+    group Draw {
+        uniform arguments: ClampToEdgesArguments
+        texture image: Texture2d
+        sampler imageSampler: Sampler
+    }
+
+    vertex {
+        input FullscreenIn
+        output FullscreenOut
+
+        function entry(input: FullscreenIn) -> FullscreenOut {
+            let out: FullscreenOut
+            out.clip_position = Stitch.fullscreen(input.vid)
+            return out
+        }
+    }
+
+    fragment {
+        input FullscreenOut
+        output StitchOut
+
+        function entry(input: FullscreenOut) -> StitchOut {
+            let a = arguments
+            let position = Stitch.userPoint(input.clip_position.xy, a.toUser, a.toUserTranslation)
+            let p = clamp(position, a.frame.xy, a.frame.xy + a.frame.zw)
+            let uv = clamp(a.imageColumnX * p.x + a.imageColumnY * p.y + a.imageTranslation, a.imageLow, a.imageHigh)
+            let result: StitchOut
+            result.color = sample(image, imageSampler, uv)
+            return result
+        }
+    }
+}

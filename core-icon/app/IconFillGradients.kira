@@ -1,0 +1,67 @@
+import Foundation
+import RenderBox
+
+// The gradients a fill resolves to, as IconRendering's
+// `Icon.Fill.resolve(parameters:)` resolves them: an automatic gradient made
+// from its one colour, in Display P3, where `Icon.Color` keeps it.
+
+// `ICRRenderingParameters.Fills.automaticGradient`.
+namespace AutomaticGradientDefaults {
+    // Where the colour's own stop sits from the far end. At 0 the stops
+    // fall at the gradient's ends.
+    let basePosition: Number = 0
+    // How far each component is pushed from the colour's luminance.
+    let saturationBoost: Number = 0.2
+    // How much the other stop is lightened toward white, by the colour's
+    // luminance: at most a quarter, at most half, at most three quarters,
+    // and above; a negative amount darkens it toward black.
+    let dimLightening: Number = 0.04
+    let midDimLightening: Number = 0.08
+    let midBrightLightening: Number = 0.15
+    let brightLightening: Number = -0.05
+}
+
+// Rec. 709's luminance weights, which the lightening is chosen by.
+namespace Luminance709 {
+    let red: Number = 0.2126
+    let green: Number = 0.7152
+    let blue: Number = 0.0722
+}
+
+function lighteningFor(luminance: Number) -> Number {
+    if luminance <= 0.25 { return AutomaticGradientDefaults.dimLightening }
+    if luminance <= 0.5 { return AutomaticGradientDefaults.midDimLightening }
+    if luminance <= 0.75 { return AutomaticGradientDefaults.midBrightLightening }
+    return AutomaticGradientDefaults.brightLightening
+}
+
+// One component of the adjusted stop: pushed from `luminance`, then moved
+// `lightening` of the way toward white, or toward black when negative.
+function adjustedComponent(value: Number, luminance: Number, lightening: Number) -> Number {
+    let boosted = value - AutomaticGradientDefaults.saturationBoost * (luminance - value)
+    let room = lightening < 0 ? boosted : 1 - boosted
+    return max(min(boosted + lightening * room, 1), 0)
+}
+
+// The automatic gradient `color` makes: a lightened stop at the top and
+// the colour at the bottom, or the colour at the top and a darkened stop
+// at the bottom, running down its layer.
+function automaticGradient(color: borrow IconColor) -> IconGradient {
+    let base = inDisplayP3(color)
+    let luminance = Luminance709.red * base.red + Luminance709.green * base.green + Luminance709.blue * base.blue
+    let lightening = lighteningFor(luminance)
+    let adjusted = IconColor {
+        space: .DisplayP3,
+        red: adjustedComponent(base.red, luminance, lightening),
+        green: adjustedComponent(base.green, luminance, lightening),
+        blue: adjustedComponent(base.blue, luminance, lightening),
+        alpha: base.alpha
+    }
+    let lightens = lightening > 0
+    return IconGradient {
+        from: lightens ? copy adjusted : copy base,
+        to: lightens ? copy base : copy adjusted,
+        start: IconPoint { x: 0.5, y: 0 },
+        stop: IconPoint { x: 0.5, y: 1 }
+    }
+}

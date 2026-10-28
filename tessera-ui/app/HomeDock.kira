@@ -1,0 +1,83 @@
+//! The home screen's Dock: what the platform's Dock holds, and the choices the person makes in it.
+import Foundation
+import AppKit
+
+// The Dock of a touch platform, which the platform keeps and the home screen
+// draws under its pages, as an iPad's stands on its home screen: the platform
+// says what it holds over the links, and the home screen says which
+// application was chosen in it (AppKit's Bridge/Dock.kira).
+
+/// An application in the Dock: its name, whether it is open, and whether the
+/// Dock keeps it when it is not.
+public struct PlatformDockEntry {
+    /// The application's name.
+    let application: String
+    /// Whether the application is open.
+    let running: Bool
+    /// Whether the Dock keeps the application when it is not open.
+    let kept: Bool
+}
+
+// --- The home screen's side ---------------------------------------------------
+
+/// What the platform's Dock holds, in its order; none while the platform has
+/// said nothing, as one that draws its own Dock never does.
+public function platformDock(bridge: borrow BridgeHandle) -> [PlatformDockEntry]? {
+    let items = try dockFromPlatform(copy bridge) otherwise return .None
+    var entries: [PlatformDockEntry] = []
+    for item in items {
+        entries.append(
+            PlatformDockEntry {
+                application: copy item.application,
+                running: item.running,
+                kept: item.kept
+            }
+        )
+    }
+    return .Some(entries)
+}
+
+/// Tells the platform the person chose `application` in the Dock: it brings
+/// the application's window forward, or opens it.
+public function chooseInPlatformDock(bridge: borrow BridgeHandle, application: borrow String) {
+    match chooseInDock(copy bridge, application) {
+        Ok -> log info("the Dock's choice went to the platform", application: application)
+        Error(failure) -> log warn(
+            "the Dock's choice could not be handed to the platform",
+            failure: failure
+        )
+    }
+}
+
+// --- The platform's side ---------------------------------------------------------
+
+/// Tells the applications what the Dock holds, when it changed: the home
+/// screen draws it.
+public function publishPlatformDock(
+    bridge: borrow BridgeHandle,
+    entries: borrow [PlatformDockEntry]
+) {
+    var items: [BridgeDockItem] = []
+    for entry in entries {
+        items.append(
+            BridgeDockItem {
+                application: copy entry.application,
+                running: entry.running,
+                kept: entry.kept,
+            }
+        )
+    }
+    match publishDock(copy bridge, items) {
+        Ok -> {}
+        Error(failure) -> log warn(
+            "the Dock could not be handed to the home screen",
+            failure: failure
+        )
+    }
+}
+
+/// The applications the person chose in the home screen's Dock since the last
+/// call, in the order chosen.
+public function takePlatformDockChoices(bridge: borrow BridgeHandle) -> [String] {
+    return takeDockChoices(copy bridge)
+}

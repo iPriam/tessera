@@ -1,0 +1,60 @@
+//! Negates the last number of an expression by editing its text.
+//!
+//! The +/- key negates the number being typed, so the edit works on the text
+//! and leaves the rest of the expression as it was typed.
+
+import Foundation
+
+/// The expression with the sign of its last number changed.
+///
+/// A minus that starts the number is removed. Otherwise a minus is put in
+/// front of it. A minus after an operator or an open bracket is a sign, so
+/// `1+-2` becomes `1+2`. A minus after a number is subtraction, so `5-3`
+/// becomes `5--3`.
+///
+/// If the expression does not end in a number, it is returned unchanged.
+///
+/// # Examples
+///
+/// ```kira
+/// let flipped = negatingLastNumber("1+-2")
+/// ```
+public function negatingLastNumber(expression: borrow String) -> String {
+    let start = lastNumberStart(expression)
+    if start == expression.count {
+        return slice(expression, 0, expression.count)
+    }
+    if start > 0 && slice(expression, start - 1, start) == "-" && isSignPosition(
+        expression,
+        start - 1
+    ) {
+        return slice(expression, 0, start - 1) + slice(expression, start, expression.count)
+    }
+    return slice(expression, 0, start) + "-" + slice(expression, start, expression.count)
+}
+
+/// The index where the trailing run of digits and points begins.
+///
+/// Returns the length of `expression` when it does not end in a number.
+function lastNumberStart(expression: borrow String) -> Number {
+    var start = expression.count
+    while true {
+        if start == 0 { break }
+        let character = slice(expression, start - 1, start)
+        if !Numerals.digits.contains(character) && character != "." { break }
+        start = start - 1
+    }
+    return start
+}
+
+/// Whether the minus at `index` has no number before it, so it reads as a sign.
+///
+/// A minus at the start of the text, or after an operator or an open bracket,
+/// is a sign.
+function isSignPosition(expression: borrow String, index: Number) -> Bool {
+    if index == 0 {
+        return true
+    }
+    let before = slice(expression, index - 1, index)
+    return before == "(" || before == "+" || before == "-" || before == "*" || before == "/"
+}

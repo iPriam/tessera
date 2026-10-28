@@ -1,0 +1,538 @@
+import Foundation
+import Heap
+import LibTessera
+
+// Installing an application from a disk image, and opening one installed.
+//
+// The desktop asks PID 1 to install `/Volumes/<volume>/<Name>.app`, a bundle
+// at the top of a read-only volume, as a Mac user drags an application out
+// of a .dmg into Applications. What PID 1 copies is not the bundle but the
+// whole image the volume was mounted from, to `/Applications/<Name>.app`:
+// an installed application is the image as a file (roadmap/12-apps.md), so
+// the code it runs is still on a mount nothing can write. The copy is
+// written beside the target and renamed over it, so a machine stopped in the
+// middle has the old application or the new one, never half of one.
+//
+// Opening `/Applications/<Name>.app` mounts that file read-only at
+// `/run/Applications/<Name>` and starts the bundle's executable there.
+//
+// Installing also records the image's SHA-256 in PID 1's own state, and
+// every launch reads the file again and compares: the file is on a volume
+// that can be written, so bytes that no longer match what was installed are
+// refused, the one case where something changed behind the owner's back
+// (roadmap/12-apps.md). Signatures, which say who made the bytes, are not
+// checked yet.
+
+namespace Installed {
+    let imagesDirectory: String = "/" + SystemDirectory.runtime + "/" + SystemDirectory.applications
+    // Where the digest of each installed image is kept, `<Name>.sha256`.
+    let digestsDirectory: String = "/" + SystemDirectory.systemData + "/applications"
+}
+
+// The application a request names: `Notes` for `/Applications/Notes.app`,
+// a bundle in a volume, or the executable inside one.
+function requestedName(path: borrow String) -> String {
+    let last = nameOf(path)
+    if last.endsWith(".app") && last.count > 4 { return last.substring(0, last.count - 4) }
+    return last
+}
+
+// Writes `said` on `reply` as an answer, when there is anything to say,
+// and lets go of the channel.
+function answerRequest(reply: Handle, said: borrow String) {
+    if reply == Handle.invalid { return }
+    let text = said.utf8()
+    if text.count > 0 {
+        let total = ServiceMessage.headerBytes + text.count
+        let bodyBytes = zeroedBlock(count: total, alignment: 16)
+        let body = bodyBytes.pointer()
+        heapStore<U32>(body, 0, ServiceOpcode.Answer.rawValue())
+        heapStore<U32>(body, 4, UN32(total))
+        heapStore<U32>(body, 8, UN32(1))
+        heapStore<U32>(body, 12, UN32(text.count))
+        for index in 0..text.count {
+            heapStore<U8>(body, ServiceMessage.headerBytes + index, text[index])
+        }
+        let none: [Handle] = []
+        match channelWrite(reply, Buffer { address: body, length: total }, none) {
+            Ok -> {}
+            Error(failed) -> log warn("could not answer the desktop", error: errorName(failed))
+        }
+    }
+    release(reply)
+}
+
+function installedDigestName(name: borrow String) -> String { return name + ".sha256" }
+
+// The SHA-256 of `bytes`, in lowercase hexadecimal.
+function digestOf(bytes: borrow [UN8]) -> String {
+    let block = zeroedBlock(count: bytes.count + 1, alignment: 16)
+    for index in 0..bytes.count { heapStore<U8>(block.pointer(), index, bytes[index]) }
+    return digestSha256(Buffer { address: block.pointer(), length: bytes.count })
+}
+
+// Records the digest of the image installed as `name`; whether it was.
+function recordDigest(
+    calls: Handle,
+    name: borrow String,
+    image: borrow [UN8]
+) -> Result<Void, TesseraError> {
+    try ensureDirectories(
+        calls,
+        [directoryOf(Installed.digestsDirectory), Installed.digestsDirectory]
+    )
+    return atomicWriteFile(
+        calls,
+        Installed.digestsDirectory,
+        installedDigestName(name),
+        digestOf(image).utf8()
+    )
+}
+
+// Whether the image installed as `name` still has the bytes it was
+// installed with. One installed before digests were kept has none to be
+// checked against: it opens, and the log says it was not checked.
+function installedImageIntact(
+    calls: Handle,
+    name: borrow String,
+    path: borrow String
+) -> Result<Void, InstalledImageFailure> {
+    let record = Installed.digestsDirectory + "/" + installedDigestName(name)
+    let digestPresent = match pathPresent(calls, record) {
+        Ok(value) -> value
+        Error(failed) -> return .Error(.CouldNotRead(failed))
+    }
+    if !digestPresent {
+        log warn("an installed application has no digest to be checked against", application: name)
+        return .Ok
+    }
+    let recordBytes = match readWholeFile(calls, record) {
+        Ok(value) -> value
+        Error(failed) -> return .Error(.CouldNotRead(failed))
+    }
+    let recordBlock = zeroedBlock(count: recordBytes.count + 1, alignment: 16)
+    for index in 0..recordBytes.count {
+        heapStore<U8>(recordBlock.pointer(), index, recordBytes[index])
+    }
+    let recorded = textOf(recordBlock.pointer(), recordBytes.count).trim()
+    let image = match readWholeFile(calls, path) {
+        Ok(value) -> value
+        Error(failed) -> return .Error(.CouldNotRead(failed))
+    }
+    let found = digestOf(image)
+    if recorded != found {
+        log fault(
+            "refused to open an application whose image changed since it was installed",
+            application: name,
+            recorded,
+            found
+        )
+        return .Error(.NotIntact)
+    }
+    return .Ok
+}
+
+// The longest image PID 1 copies: an application, not a disk.
+let installLimitBytes: Number = 268435456
+
+// What the mount table says is mounted at `target`, or none when nothing is.
+function mountedSourceAt(target: borrow String) -> Result<String?, TesseraError> {
+    let table = try volumeMounts()
+    var source: String? = .None
+    for line in table.split("\n") {
+        let fields = line.split(" ")
+        if fields.count >= 2 && fields[1] == target { source = .Some(copy fields[0]) }
+    }
+    return .Ok(source)
+}
+
+enum DiskReadFailure {
+    Read(TesseraError)
+    TooLarge
+}
+
+// Every byte of the disk at `path`, read to its end; a disk has no size to
+// ask for first.
+function readDisk(calls: Handle, path: borrow String) -> Result<[UN8], DiskReadFailure> {
+    var contents: [UN8] = []
+    let file = match openForReading(calls, path) {
+        Ok(value) -> value
+        Error(failed) -> return .Error(.Read(failed))
+    }
+    let chunkBytes = zeroedBlock(count: fileReadChunkSize, alignment: 16)
+    let chunk = chunkBytes.pointer()
+    var consumed: Number = 0
+    while true {
+        let buffers = [Buffer { address: chunk, length: fileReadChunkSize }]
+        match answer(calls, fileReadAt(file, consumed, buffers, calls, PortKey.call)) {
+            Error(failed) -> {
+                release(file)
+                return .Error(.Read(failed))
+            }
+            Ok(read) -> {
+                let got = Number(read.result0)
+                if got == 0 { break }
+                if contents.count + got > installLimitBytes {
+                    release(file)
+                    return .Error(.TooLarge)
+                }
+                for index in 0..got { contents.append(heapLoad<U8>(chunk, index)) }
+                consumed += got
+            }
+        }
+    }
+    release(file)
+    return .Ok(contents)
+}
+
+// Whether `bytes` begin as a SquashFS image does, with `hsqs`.
+function isSquashfsImage(bytes: borrow [UN8]) -> Bool {
+    return bytes.count >= 96 && bytes[0] == UN8(0x68) && bytes[1] == UN8(0x73) && bytes[2] == UN8(
+        0x71
+    ) && bytes[3] == UN8(0x73)
+}
+
+// The volume and bundle name of `/Volumes/<volume>/<Name>.app`, or empty
+// names when `path` is not a bundle at the top of a volume.
+struct ContainedBundle {
+    var volume: String
+    var name: String
+}
+
+function containedBundle(path: borrow String) -> ContainedBundle {
+    let none = ContainedBundle { volume: "", name: "" }
+    if path.contains("..") || path.contains("//") || !path.startsWith(
+        "/" + SystemDirectory.volumes + "/"
+    ) || !path.endsWith(".app") { return none }
+    let inside = path.substring(9, path.count)
+    let slash = try inside.indexOf("/") otherwise return none
+    if slash == 0 { return none }
+    let bundle = inside.substring(slash + 1, inside.count)
+    if bundle.contains("/") || bundle.count <= 4 { return none }
+    return ContainedBundle {
+        volume: "/" + SystemDirectory.volumes + "/" + inside.substring(0, slash),
+        name: bundle.substring(0, bundle.count - 4)
+    }
+}
+
+// Whether the application whose executable is `path`, on a disk image in
+// /Volumes, may be opened from there: the image's signature is checked as
+// for an install. Anything not on /Volumes is not a disk image's to check.
+function containedImagePermitted(
+    calls: Handle,
+    path: borrow String,
+    consent: borrow mut Consent
+) -> Result<ImagePermission, TesseraError> {
+    let marker = ".app/Contents/MacOS/"
+    if !path.startsWith("/" + SystemDirectory.volumes + "/") { return .Ok(.Allowed) }
+    let at = try path.indexOf(marker) otherwise return .Ok(.Allowed)
+    if at == 0 { return .Ok(.Allowed) }
+    let bundle = containedBundle(path.substring(0, at + 4))
+    if bundle.name.count == 0 { return .Ok(.Refused) }
+    let source = try mountedSourceAt(bundle.volume)
+    let disk = match source {
+        Some(value) -> value
+        None -> {
+            log warn("the volume an application is on is not a disk", volume: bundle.volume)
+            return .Ok(.Refused)
+        }
+    }
+    if !disk.startsWith("/dev/") {
+        log warn(
+            "the volume an application is on is not a disk",
+            volume: bundle.volume,
+            source: disk
+        )
+        return .Ok(.Refused)
+    }
+    let image = match readDisk(calls, disk) {
+        Ok(value) -> value
+        Error(failure) -> match failure {
+            Read(failed) -> return .Error(failed)
+            TooLarge -> {
+                log warn("a disk image is too large to be an application", disk)
+                return .Ok(.Refused)
+            }
+        }
+    }
+    if !isSquashfsImage(image) {
+        log warn("refused to open from a disk that is not a disk image", disk)
+        return .Ok(.Refused)
+    }
+    return imagePermitted(calls, bundle.name, image, true, consent)
+}
+
+enum InstallOutcome {
+    Installed
+    Refused
+}
+
+// Installs the bundle at `path` by copying the image it is on into
+// /Applications.
+function installApplication(
+    calls: Handle,
+    path: borrow String,
+    consent: borrow mut Consent
+) -> Result<InstallOutcome, TesseraError> {
+    let bundle = containedBundle(path)
+    if bundle.name.count == 0 {
+        log warn("refused to install something that is not a bundle on a volume", path)
+        return .Ok(.Refused)
+    }
+    let volumeIsReadOnly = try readOnlyVolumeAt(bundle.volume)
+    if !volumeIsReadOnly {
+        log warn("refused to install from a volume that can be written", volume: bundle.volume)
+        return .Ok(.Refused)
+    }
+    let executable = try isApplicationExecutable(path + "/Contents/MacOS/" + bundle.name)
+    let binaryPresent = try pathPresent(calls, path + "/Contents/MacOS/" + bundle.name)
+    if !executable || !binaryPresent {
+        log warn("refused to install a bundle with no executable", path)
+        return .Ok(.Refused)
+    }
+    let source = try mountedSourceAt(bundle.volume)
+    let disk = match source {
+        Some(value) -> value
+        None -> {
+            log warn("the volume an application is on is not a disk", volume: bundle.volume)
+            return .Ok(.Refused)
+        }
+    }
+    if !disk.startsWith("/dev/") {
+        log warn(
+            "the volume an application is on is not a disk",
+            volume: bundle.volume,
+            source: disk
+        )
+        return .Ok(.Refused)
+    }
+    let image = match readDisk(calls, disk) {
+        Ok(value) -> value
+        Error(failure) -> match failure {
+            Read(failed) -> return .Error(failed)
+            TooLarge -> {
+                log warn("a disk image is too large to be an application", disk)
+                return .Ok(.Refused)
+            }
+        }
+    }
+    if !isSquashfsImage(image) {
+        log warn("refused to install from a disk that is not a disk image", disk)
+        return .Ok(.Refused)
+    }
+    let permission = try imagePermitted(calls, bundle.name, image, false, consent)
+    match permission {
+        Allowed -> {}
+        Refused -> return .Ok(.Refused)
+    }
+    try atomicWriteFile(calls, "/" + SystemDirectory.applications, bundle.name + ".app", image)
+    match recordDigest(calls, bundle.name, image) {
+        Ok -> {}
+        Error(failed) -> log warn(
+            "an application was installed without a digest to check it against",
+            application: bundle.name,
+            error: errorName(failed)
+        )
+    }
+    log info("installed an application", application: bundle.name, from: disk, bytes: image.count)
+    return .Ok(.Installed)
+}
+
+// Whether something is at `path`.
+function pathPresent(calls: Handle, path: borrow String) -> Result<Bool, TesseraError> {
+    match lookup(calls, path, Rights.inspect) {
+        Ok(node) -> {
+            release(node)
+            return .Ok(true)
+        }
+        Error(failed) -> {
+            if failed.code == .NotFound { return .Ok(false) }
+            return .Error(failed)
+        }
+    }
+}
+
+// The name of an installed image `/Applications/<Name>.app`, or none when
+// `path` is not one.
+function installedImageName(path: borrow String) -> String? {
+    if path.contains("..") || !path.startsWith(
+        "/" + SystemDirectory.applications + "/"
+    ) || !path.endsWith(".app") { return .None }
+    let bundle = path.substring(14, path.count)
+    if bundle.contains("/") || bundle.count <= 4 { return .None }
+    return .Some(bundle.substring(0, bundle.count - 4))
+}
+
+// Why an installed application cannot be opened from its image. A mount
+// failure is logged where it happens, with the error.
+enum InstalledImageFailure {
+    NotNamed
+    NotIntact
+    NoDirectory
+    MountFailed
+    CouldNotRead(TesseraError)
+}
+
+// The executable to start for the installed image `/Applications/<Name>.app`,
+// mounted read-only first unless it is mounted already; or why it cannot be.
+function openInstalledImage(
+    calls: Handle,
+    path: borrow String,
+    consent: borrow mut Consent
+) -> Result<String, InstalledImageFailure> {
+    let name = match installedImageName(path) {
+        Some(value) -> value
+        None -> return .Error(.NotNamed)
+    }
+    match installedImageIntact(calls, name, path) {
+        Ok -> {}
+        Error(reason) -> {
+            consent.refusal = name + " is damaged and can't be opened: its image changed since it was installed."
+            return .Error(reason)
+        }
+    }
+    let target = Installed.imagesDirectory + "/" + name
+    let mounted = match readOnlyVolumeAt(target) {
+        Ok(value) -> value
+        Error(failed) -> {
+            log warn(
+                "could not tell whether an installed application is mounted",
+                application: name,
+                error: errorName(failed)
+            )
+            return .Error(.MountFailed)
+        }
+    }
+    if !mounted {
+        match ensureDirectories(calls, [Installed.imagesDirectory, target]) {
+            Ok -> {}
+            Error(failed) -> {
+                log warn(
+                    "could not create an installed image mount directory",
+                    error: errorName(failed)
+                )
+                return .Error(.NoDirectory)
+            }
+        }
+        match volumeMountImage(
+            path,
+            target,
+            .Squashfs,
+            VolumeOptions.readOnly | VolumeOptions.noDevices | VolumeOptions.noSetIdentity
+        ) {
+            Ok -> {}
+            Error(failed) -> {
+                log warn(
+                    "could not mount an installed application",
+                    application: name,
+                    error: errorName(failed)
+                )
+                return .Error(.MountFailed)
+            }
+        }
+        log info("mounted an installed application", application: name, at: target)
+    }
+    return .Ok(target + "/" + name + ".app/Contents/MacOS/" + name)
+}
+
+// Removes `name` from `directory`.
+function removeFrom(
+    calls: Handle,
+    directory: borrow String,
+    name: borrow String
+) -> Result<Void, TesseraError> {
+    let node = try lookup(calls, directory, directoryRights())
+    let removed = removeName(calls, node, name)
+    release(node)
+    return removed
+}
+
+enum UninstallOutcome {
+    Removed
+    Refused
+}
+
+// Uninstalls the installed image `path`, `/Applications/<Name>.app`: its
+// mount goes, then the file. Its data stays, because deleting what somebody
+// made is theirs to ask for, not a side effect of removing the program
+// (roadmap/12-apps.md). An application that is open is not uninstalled.
+function uninstallApplication(
+    calls: Handle,
+    path: borrow String,
+    fleet: borrow mut Fleet
+) -> Result<UninstallOutcome, TesseraError> {
+    let name = match installedImageName(path) {
+        Some(value) -> value
+        None -> {
+            log warn("refused to uninstall something that is not an installed application", path)
+            return .Ok(.Refused)
+        }
+    }
+    let isInstalled = try pathPresent(calls, path)
+    if !isInstalled {
+        log warn("refused to uninstall something that is not an installed application", path)
+        return .Ok(.Refused)
+    }
+    let target = Installed.imagesDirectory + "/" + name
+    for at in 0..fleet.services.count {
+        if fleet.services[at].path.startsWith(target + "/") && running(fleet, at) {
+            log warn("an open application is not uninstalled; quit it first", application: name)
+            fleet.consent.refusal = "Quit " + name + " before uninstalling it."
+            return .Ok(.Refused)
+        }
+    }
+    let mounted = try readOnlyVolumeAt(target)
+    if mounted {
+        try volumeUnmount(target, VolumeUnmountOptions.none)
+    }
+    match pathPresent(calls, target) {
+        Ok(present) -> if present {
+            match removeFrom(calls, Installed.imagesDirectory, name) {
+                Ok -> {}
+                Error(failed) -> log warn(
+                    "an unmounted image directory remains",
+                    application: name,
+                    error: errorName(failed)
+                )
+            }
+        }
+        Error(failed) -> log warn(
+            "could not check for an unmounted image directory",
+            application: name,
+            error: errorName(failed)
+        )
+    }
+    match removeFrom(calls, "/" + SystemDirectory.applications, name + ".app") {
+        Ok -> {}
+        Error(failed) -> {
+            log warn(
+                "could not remove an installed application",
+                application: name,
+                error: errorName(failed)
+            )
+            return .Error(failed)
+        }
+    }
+    match pathPresent(calls, Installed.digestsDirectory + "/" + installedDigestName(name)) {
+        Ok(present) -> if present {
+            match removeFrom(calls, Installed.digestsDirectory, installedDigestName(name)) {
+                Ok -> {}
+                Error(failed) -> log warn(
+                    "the removed application's digest remains",
+                    application: name,
+                    error: errorName(failed)
+                )
+            }
+        }
+        Error(failed) -> log warn(
+            "could not check for the removed application's digest",
+            application: name,
+            error: errorName(failed)
+        )
+    }
+    // A removal is as durable as a write only once the volume is flushed: a
+    // machine stopped before then would have the application back.
+    try machineFlush()
+    log info("uninstalled an application", application: name)
+    return .Ok(.Removed)
+}

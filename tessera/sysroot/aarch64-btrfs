@@ -1,0 +1,13 @@
+# The btrfs userland the installer runs, mkfs.btrfs and the libraries it
+# links beyond the C library, from the same snapshot sysroot/aarch64 pins. libudev
+# loads libcap, so mkfs.btrfs fails at load time without it. Each line is a
+# package's SHA-256 and its path under the archive.
+https://snapshot.debian.org/archive/debian/20261016T000000Z
+aaf42d86c34a6a8885bc9cf8078ef50b9d64c043b238f64a52c59c244f286f95 pool/main/b/btrfs-progs/btrfs-progs_6.14-1_arm64.deb
+d7d122b4c7a0a8ae6135a1687c9c4ce80a88f9e498c01998f634dd32caab9016 pool/main/u/util-linux/libblkid1_2.41.5-0+deb13u1_arm64.deb
+448ad6b190184dbff24508ef2eda88bd737a5ffc0f9750eb779fcf9885292bea pool/main/u/util-linux/libuuid1_2.41.5-0+deb13u1_arm64.deb
+ee0f990bef6693c8249d7a3de4b17f65d549beae84b6d1413421618ac6427914 pool/main/l/lzo2/liblzo2-2_2.10-3+b1_arm64.deb
+924540bd59fdbfa77a0604360efdaca54411a43daf11c7e002a3c64791b67448 pool/main/libz/libzstd/libzstd1_1.5.7+dfsg-1_arm64.deb
+209aa5cf671e97b9eb0410844fa6df4cae2e75b0c72e7802ab6c8ece13e6ddef pool/main/z/zlib/zlib1g_1.3.dfsg+really1.3.1-1+b1_arm64.deb
+459b1c9c17cc3c586e90d13d2a991715d498c6eed6c046cabf321021167bc380 pool/main/s/systemd/libudev1_257.13-1~deb13u1_arm64.deb
+863aa5b9cdf6f80010b48982d4639126b09a89eeef2c0c5c7be226297c811581 pool/main/libc/libcap2/libcap2_2.75-10+deb13u1+b3_arm64.deb

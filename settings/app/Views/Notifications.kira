@@ -1,0 +1,60 @@
+import Foundation
+import KiraUI
+import LibTessera
+import PlatformUI
+
+// Notifications (roadmap/23-product-experience.md §4): whether each
+// application's notifications show a banner. A notification without one
+// still goes into the history the lock screen lists.
+
+construct NotificationsPane() extends Widget {
+    body {
+        let quiet = quietSetting()
+        var rows: [Any Widget] = []
+        for application in installedApplications() {
+            let name = copy application.name
+            let kept = copy quiet
+            rows.append(
+                Toggle(
+                    title = copy name,
+                    isOn = !quiet.contains(name),
+                    onChange = { on in
+                        changeSetting(NotificationSetting.quiet, .Some(namesWith(kept, name, !on)))
+                        return
+                    }
+                )
+            )
+        }
+        Form(
+            children: [
+                Section(
+                    children: rows,
+                    header: Text("Banners"),
+                    footer: Text(
+                        "An application without banners still keeps its notifications on the lock screen."
+                    )
+                )
+            ]
+        )
+        .navigationTitle("Notifications")
+    }
+}
+
+// The applications Settings keeps out of banners now.
+function quietSetting() -> [String] {
+    var names: [String] = []
+    for name in storedSetting(NotificationSetting.quiet, "").split(NotificationSetting.separator) {
+        if name.count > 0 { names.append(copy name) }
+    }
+    return names
+}
+
+// `names` with `name` in it or out of it, as Settings keeps such a list.
+function namesWith(names: borrow [String], name: borrow String, present: Bool) -> String {
+    var kept: [String] = []
+    for each in names {
+        if each != name { kept.append(copy each) }
+    }
+    if present { kept.append(copy name) }
+    return joined(kept, NotificationSetting.separator)
+}

@@ -1,0 +1,47 @@
+import Foundation
+import Build
+
+// LLVM's debugger on a dev machine: `lldb-server`, the stub stock `lldb`
+// on the host attaches through (init serves it on the machine's LLDB port,
+// MachineLayout.lldbPort), and `lldb` itself with the `liblldb` it runs on,
+// stripped, under `usr`. They are LLVM's own, cross-built on the build host
+// against the target's C library and landed in `Host.lldb`'s tree.
+
+namespace LldbLayout {
+    let programs: [String] = ["usr/bin/lldb-server", "usr/bin/lldb"]
+    // Where `liblldb.so.<version>` is, by the name lldb's NEEDED entry gives.
+    let libraries: String = "usr/lib"
+}
+
+// LLDB's tree for `context`'s architecture.
+function platformLldb(
+    graph: borrow mut Graph,
+    context: borrow BuildContext
+) -> Result<Artifact, String> {
+    let root = match context.host.lldb(context.architecture) {
+        Ok(found) -> found
+        Error(problem) -> return .Error(
+            "\(problem): cross-build LLVM's lldb-server and lldb for \(context.architecture.multiarch()) on the build host and land their usr tree there"
+        )
+    }
+    let architecture = context.architecture.name()
+    var binaries = copy LldbLayout.programs
+    let libraries = match listDirectory(joinedPath(root, LldbLayout.libraries)) {
+        Ok(listing) -> listing.entries
+        Error(failure) -> return .Error("no \(LldbLayout.libraries) in \(root): \(failure)")
+    }
+    for library in libraries {
+        if library.startsWith("liblldb.so.") {
+            binaries.append("\(LldbLayout.libraries)/\(library)")
+        }
+    }
+    var parts: [TreePart] = []
+    for binary in binaries {
+        let stripped = graph.strip(
+            "\(architecture)/lldb/\(binary)",
+            graph.source(joinedPath(root, binary))
+        )
+        parts.append(.Place(TreePlace { path: copy binary, artifact: stripped.binary }))
+    }
+    return .Ok(graph.tree("\(architecture)/lldb", parts))
+}

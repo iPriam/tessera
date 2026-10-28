@@ -1,0 +1,335 @@
+import Foundation
+import Heap
+
+// Ed25519 signature verification (RFC 8032), after TweetNaCl's.
+//
+// A field element modulo 2^255 - 19 is sixteen signed limbs of sixteen bits,
+// held in Ints so that products and their sums fit without care. Only
+// verifying is here: it handles nothing secret, so it need not run in
+// constant time, and it swaps points with a branch.
+
+struct EdwardsPoint {
+    var x: [Number]
+    var y: [Number]
+    var z: [Number]
+    var t: [Number]
+}
+
+namespace Field {
+    let zero: [Number] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    let one: [Number] = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+
+    // Carries each limb into the next, the top one wrapping round times 38.
+    function carry(o: borrow mut [Number]) {
+        for i in 0..16 {
+            o[i] = o[i] + 65536
+            let c = o[i] >> 16
+            if i < 15 {
+                o[i + 1] = o[i + 1] + c - 1
+            } else {
+                o[0] = o[0] + 38 * (c - 1)
+            }
+            o[i] = o[i] - c * 65536
+        }
+    }
+
+    function add(a: borrow [Number], b: borrow [Number]) -> [Number] {
+        var o = Field.zero
+        for i in 0..16 { o[i] = a[i] + b[i] }
+        return o
+    }
+
+    function sub(a: borrow [Number], b: borrow [Number]) -> [Number] {
+        var o = Field.zero
+        for i in 0..16 { o[i] = a[i] - b[i] }
+        return o
+    }
+
+    function mul(a: borrow [Number], b: borrow [Number]) -> [Number] {
+        var t: [Number] = []
+        for i in 0..31 { t.append(0) }
+        for i in 0..16 {
+            for j in 0..16 { t[i + j] = t[i + j] + a[i] * b[j] }
+        }
+        for i in 0..15 { t[i] = t[i] + 38 * t[i + 16] }
+        var o = Field.zero
+        for i in 0..16 { o[i] = t[i] }
+        Field.carry(o)
+        Field.carry(o)
+        return o
+    }
+
+    function square(a: borrow [Number]) -> [Number] { return Field.mul(a, a) }
+
+    // a^(p - 2), which is 1/a.
+    function invert(a: borrow [Number]) -> [Number] {
+        var c = copy a
+        for step in 0..254 {
+            let bit = 253 - step
+            c = Field.square(c)
+            if bit != 2 && bit != 4 { c = Field.mul(c, a) }
+        }
+        return c
+    }
+
+    // a^((p - 5) / 8), on the way to a square root.
+    function pow2523(a: borrow [Number]) -> [Number] {
+        var c = copy a
+        for step in 0..251 {
+            let bit = 250 - step
+            c = Field.square(c)
+            if bit != 1 { c = Field.mul(c, a) }
+        }
+        return c
+    }
+
+    // The 32 little-endian bytes of `n`, fully reduced.
+    function pack(n: borrow [Number]) -> [Number] {
+        var t = copy n
+        Field.carry(t)
+        Field.carry(t)
+        Field.carry(t)
+        for pass in 0..2 {
+            var m = Field.zero
+            m[0] = t[0] - 0xffed
+            for i in 1..15 {
+                m[i] = t[i] - 0xffff - ((m[i - 1] >> 16) & 1)
+                m[i - 1] = m[i - 1] & 0xffff
+            }
+            m[15] = t[15] - 0x7fff - ((m[14] >> 16) & 1)
+            let borrowed = (m[15] >> 16) & 1
+            m[14] = m[14] & 0xffff
+            // t - p did not go below zero: keep it.
+            if borrowed == 0 { t = m }
+        }
+        var o: [Number] = []
+        for i in 0..16 {
+            o.append(t[i] & 0xff)
+            o.append(t[i] >> 8)
+        }
+        return o
+    }
+
+    function differs(a: borrow [Number], b: borrow [Number]) -> Bool {
+        let packedA = Field.pack(a)
+        let packedB = Field.pack(b)
+        for i in 0..32 {
+            if packedA[i] != packedB[i] { return true }
+        }
+        return false
+    }
+
+    // The low bit of `a` reduced: its sign, as Ed25519 calls it.
+    function parity(a: borrow [Number]) -> Number { return Field.pack(a)[0] & 1 }
+
+    function unpack(bytes: borrow [Number]) -> [Number] {
+        var o = Field.zero
+        for i in 0..16 { o[i] = bytes[2 * i] + bytes[2 * i + 1] * 256 }
+        o[15] = o[15] & 0x7fff
+        return o
+    }
+}
+
+// d, 2d, the base point's coordinates and a square root of -1.
+namespace Curve {
+    let d: [Number] = [0x78a3, 0x1359, 0x4dca, 0x75eb, 0xd8ab, 0x4141, 0x0a4d, 0x0070, 0xe898, 0x7779, 0x4079, 0x8cc7, 0xfe73, 0x2b6f, 0x6cee, 0x5203]
+    let doubleD: [Number] = [0xf159, 0x26b2, 0x9b94, 0xebd6, 0xb156, 0x8283, 0x149a, 0x00e0, 0xd130, 0xeef3, 0x80f2, 0x198e, 0xfce7, 0x56df, 0xd9dc, 0x2406]
+    let baseX: [Number] = [0xd51a, 0x8f25, 0x2d60, 0xc956, 0xa7b2, 0x9525, 0xc760, 0x692c, 0xdc5c, 0xfdd6, 0xe231, 0xc0a4, 0x53fe, 0xcd6e, 0x36d3, 0x2169]
+    let baseY: [Number] = [0x6658, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666]
+    let rootOfMinusOne: [Number] = [0xa0b0, 0x4a0e, 0x1b27, 0xc4ee, 0xe478, 0xad2f, 0x1806, 0x2f43, 0xd7a7, 0x3dfb, 0x0099, 0x2b4d, 0xdf0b, 0x4fc1, 0x2480, 0x2b83]
+
+    // The group order L, little-endian bytes.
+    let groupOrder: [Number] = [0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9, 0xde, 0x14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10]
+
+    function basePoint() -> EdwardsPoint {
+        return EdwardsPoint {
+            x: Curve.baseX,
+            y: Curve.baseY,
+            z: Field.one,
+            t: Field.mul(Curve.baseX, Curve.baseY)
+        }
+    }
+}
+
+extend EdwardsPoint {
+    // self + q in extended coordinates.
+    function adding(q: borrow EdwardsPoint) -> EdwardsPoint {
+        let a = Field.mul(Field.sub(y, x), Field.sub(q.y, q.x))
+        let b = Field.mul(Field.add(x, y), Field.add(q.x, q.y))
+        let c = Field.mul(Field.mul(t, q.t), Curve.doubleD)
+        let zz = Field.mul(z, q.z)
+        let d = Field.add(zz, zz)
+        let e = Field.sub(b, a)
+        let f = Field.sub(d, c)
+        let g = Field.add(d, c)
+        let h = Field.add(b, a)
+        return EdwardsPoint {
+            x: Field.mul(e, f),
+            y: Field.mul(h, g),
+            z: Field.mul(g, f),
+            t: Field.mul(e, h)
+        }
+    }
+
+    // s·self, with `s` 32 little-endian bytes.
+    function multiplied(s: borrow [Number]) -> EdwardsPoint {
+        var p = EdwardsPoint { x: Field.zero, y: Field.one, z: Field.one, t: Field.zero }
+        var r = EdwardsPoint { x: copy x, y: copy y, z: copy z, t: copy t }
+        for step in 0..256 {
+            let bit = 255 - step
+            let set = (s[trunc(bit / 8)] >> (bit % 8)) & 1
+            if set == 1 {
+                p = p.adding(r)
+                r = r.adding(r)
+            } else {
+                r = r.adding(p)
+                p = p.adding(p)
+            }
+        }
+        return p
+    }
+
+    // The 32-byte encoding of this point.
+    function packed() -> [Number] {
+        let inverse = Field.invert(z)
+        let affineX = Field.mul(x, inverse)
+        let affineY = Field.mul(y, inverse)
+        var r = Field.pack(affineY)
+        r[31] = r[31] ^ (Field.parity(affineX) << 7)
+        return r
+    }
+}
+
+struct DecodedPoint {
+    var ok: Bool
+    var point: EdwardsPoint
+}
+
+// The point whose encoding is `bytes`, negated; not ok when `bytes` encodes
+// no point.
+function unpackNegatedPoint(bytes: borrow [Number]) -> DecodedPoint {
+    let y = Field.unpack(bytes)
+    let one = Field.one
+    let ySquared = Field.square(y)
+    let num = Field.sub(ySquared, one)
+    let den = Field.add(one, Field.mul(ySquared, Curve.d))
+    let den2 = Field.square(den)
+    let den4 = Field.square(den2)
+    let den6 = Field.mul(den4, den2)
+    var t = Field.mul(Field.mul(den6, num), den)
+    t = Field.pow2523(t)
+    t = Field.mul(Field.mul(t, num), den)
+    t = Field.mul(t, den)
+    var x = Field.mul(t, den)
+    if Field.differs(Field.mul(Field.square(x), den), num) {
+        x = Field.mul(x, Curve.rootOfMinusOne)
+    }
+    let failed = DecodedPoint {
+        ok: false,
+        point: EdwardsPoint { x: Field.zero, y: Field.zero, z: Field.zero, t: Field.zero },
+    }
+    if Field.differs(Field.mul(Field.square(x), den), num) { return failed }
+    if Field.parity(x) == (bytes[31] >> 7) { x = Field.sub(Field.zero, x) }
+    let product = Field.mul(x, y)
+    return DecodedPoint { ok: true, point: EdwardsPoint { x: x, y: y, z: one, t: product } }
+}
+
+// The 64-byte little-endian number `wide` modulo the group order: 32 bytes.
+function reduceScalar(wide: borrow [Number]) -> [Number] {
+    let order = Curve.groupOrder
+    var x = copy wide
+    for step in 0..32 {
+        let i = 63 - step
+        var carry = 0
+        for j in (i - 32).. (i - 12) {
+            x[j] = x[j] + carry - 16 * x[i] * order[j - (i - 32)]
+            carry = (x[j] + 128) >> 8
+            x[j] = x[j] - carry * 256
+        }
+        x[i - 12] = x[i - 12] + carry
+        x[i] = 0
+    }
+    var carry = 0
+    for k in 0..32 {
+        x[k] = x[k] + carry - (x[31] >> 4) * order[k]
+        carry = x[k] >> 8
+        x[k] = x[k] & 255
+    }
+    for k in 0..32 { x[k] = x[k] - carry * order[k] }
+    var r: [Number] = []
+    for k in 0..32 {
+        if k < 31 { x[k + 1] = x[k + 1] + (x[k] >> 8) }
+        r.append(x[k] & 255)
+    }
+    return r
+}
+
+// Whether the 32-byte little-endian `s` is below the group order, as a
+// signature's second half must be.
+function belowGroupOrder(s: borrow [Number]) -> Bool {
+    let order = Curve.groupOrder
+    for step in 0..32 {
+        let at = 31 - step
+        if s[at] < order[at] { return true }
+        if s[at] > order[at] { return false }
+    }
+    return false
+}
+
+// Whether `signature`, 64 bytes, is `publicKey`'s, 32 bytes, over the
+// `count` bytes at `message`.
+function ed25519Verify(
+    message: RawPtr,
+    count: Number,
+    publicKey: borrow [U8],
+    signature: borrow [U8]
+) -> Bool {
+    if publicKey.count != 32 || signature.count != 64 { return false }
+    var key: [Number] = []
+    for i in 0..32 { key.append(Number(publicKey[i])) }
+    var r: [Number] = []
+    var s: [Number] = []
+    for i in 0..32 {
+        r.append(Number(signature[i]))
+        s.append(Number(signature[32 + i]))
+    }
+    if !belowGroupOrder(s) { return false }
+    let decoded = unpackNegatedPoint(key)
+    if !decoded.ok { return false }
+    // h = SHA-512(R || A || M), over one block holding all three.
+    let total = 64 + count
+    let joinedBytes = zeroedBlock(count: total + 1, alignment: 16)
+    let joined = joinedBytes.pointer()
+    for i in 0..32 {
+        heapStore<U8>(joined, i, signature[i])
+        heapStore<U8>(joined, 32 + i, publicKey[i])
+    }
+    copyBytes(heapOffset(joined, 64), message, count)
+    let digest = sha512(joined, total)
+    var wide: [Number] = []
+    for i in 0..64 { wide.append(Number(digest[i])) }
+    let h = reduceScalar(wide)
+    // s·B - h·A must be R.
+    let check = decoded.point.multiplied(h).adding(Curve.basePoint().multiplied(s))
+    let packed = check.packed()
+    for i in 0..32 {
+        if packed[i] != r[i] { return false }
+    }
+    return true
+}
+
+// Whether `signature`, 64 bytes, was made over `message` by the key whose
+// public half is `publicKey`, 32 bytes: an Ed25519 signature, as RFC 8032
+// defines it and `openssl pkeyutl -sign -rawin` makes it. Anyone may ask.
+public function signatureVerifyEd25519(
+    message: borrow Buffer,
+    publicKey: borrow Buffer,
+    signature: borrow Buffer
+) -> Bool {
+    if publicKey.length != U64(32) || signature.length != U64(64) { return false }
+    var key: [U8] = []
+    for i in 0..32 { key.append(heapLoad<U8>(publicKey.address, i)) }
+    var signed: [U8] = []
+    for i in 0..64 { signed.append(heapLoad<U8>(signature.address, i)) }
+    return ed25519Verify(message.address, message.length, key, signed)
+}

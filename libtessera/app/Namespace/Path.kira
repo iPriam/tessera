@@ -1,0 +1,127 @@
+import Foundation
+import Heap
+
+// Paths (§13.2) and what the kernel says about a node (§13.3).
+//
+// Until the Namespace service exists a Node is a kernel node backing and the
+// library enforces the rights a handle carries. The backend resolves every
+// path beneath the node it is relative to, never through a link.
+
+@Derive(Copy)
+public enum NodeKind: U32 {
+    File = 0
+    Directory = 1
+    Link = 2
+    // The virtual directory of a picker's results.
+    Selection = 3
+    Special = 4
+}
+
+// A path's rule violation as `InvalidPath`, `detail` the byte offset, or
+// `Ok`. The empty path names the node itself.
+function pathCheck(path: borrow String) -> Result<Void, TesseraError> {
+    if path.count > 4096 { return .Error(failureDetail(.InvalidPath, U64(4096))) }
+    var start = 0
+    for index in 0.. (path.count + 1) {
+        let end = index == path.count
+        var byte = 47
+        if !end { byte = path.charAt(index) }
+        if !end && byte < 32 { return .Error(failureDetail(.InvalidPath, U64(index))) }
+        if byte == 47 && path.count > 0 {
+            let length = index - start
+            if length == 0 { return .Error(failureDetail(.InvalidPath, U64(index))) }
+            if length > 255 { return .Error(failureDetail(.InvalidPath, U64(start))) }
+            let component = path.substring(start, index)
+            if component == "." || component == ".." {
+                return .Error(failureDetail(.InvalidPath, U64(start)))
+            }
+            start = index + 1
+        }
+    }
+    return .Ok
+}
+
+// A single component: a valid path with no `/`.
+function nameCheck(name: borrow String) -> Result<Void, TesseraError> {
+    if name.count == 0 { return .Error(failure(.InvalidPath)) }
+    try pathCheck(name)
+    match name.indexOf("/") {
+        Some(slash) -> return .Error(failureDetail(.InvalidPath, U64(slash)))
+        None -> return .Ok
+    }
+}
+
+function pathComponents(path: borrow String) -> Number {
+    if path.count == 0 { return 0 }
+    return path.split("/").count
+}
+
+// Whether `backing` names the same node as one of the containers or roots
+// the process was started with: those refuse deletion.
+function nodeIsProtected(backing: Number) -> Result<Bool, TesseraError> {
+    let mine = try kernelNodeStat(backing)
+    let roots: [StartupTag] = [StartupTag.containerData, StartupTag.containerCache, StartupTag.containerTemp, StartupTag.bundle, StartupTag.systemRoot]
+    for index in 0..roots.count {
+        let given = match startupHandle(roots[index]) {
+            Some(value) -> value
+            None -> continue
+        }
+        match handleSlotOf(given) {
+            Some(slot) -> {
+                let slotBacking = try backingOf(objectOfSlot(slot))
+                let root = try kernelNodeStat(slotBacking)
+                if root.identity == mine.identity && root.volume == mine.volume {
+                    return .Ok(true)
+                }
+            }
+            None -> {}
+        }
+    }
+    return .Ok(false)
+}
+
+// `NodeInfo`'s `flags` and `attributes` bits.
+namespace NodeInfo {
+    let protectedRoot: U32 = U32(1)
+    let containerRoot: U32 = U32(2)
+    let hidden: U32 = U32(1)
+    let immutable: U32 = U32(2)
+    let executable: U32 = U32(4)
+    let encryptedAtRest: U32 = U32(8)
+}
+
+// `NodeInfo`, 128 bytes, for the node with the rights its handle carries.
+function nodeInfoFill(
+    backing: Number,
+    rights: Rights,
+    block: RawPtr
+) -> Result<Void, TesseraError> {
+    let stat = try kernelNodeStat(backing)
+    heapStore<U32>(block, 0, code(stat.kind))
+    var flags = U32(0)
+    let guarded = try nodeIsProtected(backing)
+    if guarded { flags = NodeInfo.protectedRoot | NodeInfo.containerRoot }
+    heapStore<U32>(block, 4, flags)
+    heapStore<U64>(block, 8, stat.size)
+    heapStore<U64>(block, 16, stat.identity)
+    heapStore<U64>(block, 24, stat.volume)
+    heapStore<U64>(block, 32, stat.created)
+    heapStore<U64>(block, 40, stat.modified)
+    heapStore<U64>(block, 48, stat.accessed)
+    heapStore<U64>(block, 56, stat.changed)
+    heapStore<U64>(block, 64, rights.raw)
+    var attributes = U32(0)
+    if stat.immutable { attributes = attributes | NodeInfo.immutable }
+    if stat.executable { attributes = attributes | NodeInfo.executable }
+    if stat.encrypted { attributes = attributes | NodeInfo.encryptedAtRest }
+    heapStore<U32>(block, 100, attributes)
+    heapStore<U32>(block, 104, stat.blockSize)
+    heapStore<U64>(block, 112, stat.allocated)
+    return .Ok
+}
+
+function nodeInfoWrite(object: Number, block: RawPtr) -> Result<U64, TesseraError> {
+    let backing = try backingOf(object)
+    try nodeInfoFill(backing, Rights.none, block)
+    return .Ok(128)
+}

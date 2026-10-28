@@ -1,0 +1,413 @@
+import Foundation
+import Heap
+import LibTessera
+import DeviceKit
+
+// Devices, from the DeviceKit registry.
+//
+// A device id is `(class + 1) << 48` over a class-local number (LibTessera
+// `app/Device/Device.kira`): the IIO device and sensor kind
+// (`n << 8 | kind`), the ALSA card and device (`card << 8 | device`), or the
+// `videoN` / `eventN` number, each read from the entry's node. The first
+// device of a class is its default.
+//
+// A `List` answer is one 184-byte record per device: id @0, class @8, sub
+// kind @12, flags @16, capability length @20, name @24, vendor @88 (64 bytes
+// each, NUL-padded), capabilities @152 (32 bytes).
+
+struct Device {
+    var id: Number
+    var entry: EntryId
+    var deviceClass: DeviceClass
+    // A sensor's kind; other classes have none.
+    var kind: SensorKind?
+    var name: String
+    var flags: DeviceFlags
+}
+
+namespace DeviceId {
+    // `1 << 48`: the class sits above the class-local number.
+    let classUnit: Number = 281474976710656
+    // `1 << 8`: the card or IIO device sits above the device or kind.
+    let localUnit: Number = 256
+}
+
+namespace ListRecord {
+    let bytes: Number = 184
+    let nameAt: Number = 24
+    let textBytes: Number = 64
+    let capabilitiesAt: Number = 152
+    let capabilitiesBytes: Number = 32
+}
+
+namespace RegistryRecord {
+    let specBytes: Number = 16
+    // A match answer: a header, then one `EntryInfoRecord` per entry.
+    let listBytes: Number = 32768
+    let headerBytes: Number = 8
+    let entryBytes: Number = 48
+    // A property's key follows its `PropertyHeader`.
+    let propertyBytes: Number = 512
+    let keyAt: Number = 16
+    let channelBytes: Number = 16
+    let channelRoom: Number = 64
+}
+
+namespace NodePrefix {
+    let pcm: String = "pcmC"
+    let pcmDevice: String = "D"
+    let iio: String = "iio:device"
+    let video: String = "video"
+    let event: String = "event"
+}
+
+namespace AudioDirection {
+    let output: String = "output"
+    let input: String = "input"
+}
+
+function deviceId(deviceClass: borrow DeviceClass, local: Number) -> Number {
+    return (Number(deviceClass.rawValue()) + 1) * DeviceId.classUnit + local
+}
+
+function familyOf(deviceClass: borrow DeviceClass) -> Family {
+    return match deviceClass {
+        Sensor -> Family.Sensor
+        Camera -> Family.Camera
+        Haptic -> Family.Haptic
+        AudioInput -> Family.Audio
+        AudioOutput -> Family.Audio
+    }
+}
+
+function isAudio(deviceClass: borrow DeviceClass) -> Bool {
+    return deviceClass == .AudioInput || deviceClass == .AudioOutput
+}
+
+// The decimal number `text` holds from `start` to `end`.
+function numberIn(text: borrow String, start: Number, end: Number) -> Number? {
+    if end <= start { return .None }
+    return text.substring(start, end).toNumber()
+}
+
+// A text property of an entry; None when the entry does not have that text.
+function textProperty(entry: EntryId, key: borrow String) -> Result<String?, TesseraError> {
+    let block = zeroedBlock(count: RegistryRecord.propertyBytes, alignment: 16)
+    let size = match registryProperty(
+        entry,
+        key,
+        Buffer { address: block.pointer(), length: RegistryRecord.propertyBytes }
+    ) {
+        Ok(value) -> value
+        // A property the entry lacks is absent, not a failure.
+        Error(failed) -> return absentProperty(failed)
+    }
+    let header: PropertyHeader = heapLoad(block.pointer())
+    if header.kind != PropertyType.String.rawValue() { return .Ok(.None) }
+    let at = ceil((RegistryRecord.keyAt + header.keyLength) / 8) * 8
+    if at + header.valueLength > size { return .Ok(.None) }
+    return .Ok(.Some(stringFromCBytes(heapOffset(block.pointer(), at), header.valueLength)))
+}
+
+// The entries of a registry class.
+function entriesOf(entryClass: borrow EntryClass) -> Result<[EntryId], TesseraError> {
+    let spec = classSpec(entryClass)
+    let list = zeroedBlock(count: RegistryRecord.listBytes, alignment: 16)
+    let specBuffer = Buffer { address: spec.pointer(), length: RegistryRecord.specBytes }
+    let count = match registryMatch(
+        specBuffer,
+        Buffer { address: list.pointer(), length: RegistryRecord.listBytes }
+    ) {
+        Ok(value) -> value
+        Error(failed) -> return .Error(failed)
+    }
+    var found: [EntryId] = []
+    for index in 0..count {
+        let at = RegistryRecord.headerBytes + index * RegistryRecord.entryBytes
+        let record: EntryInfoRecord = heapLoad(list.pointer(), at)
+        found.append(EntryId(record.id))
+    }
+    return .Ok(found)
+}
+
+// The node's name after its directory; None when the entry has no node.
+function absentProperty(reason: borrow TesseraError) -> Result<String?, TesseraError> {
+    if reason.code == .NotFound { return .Ok(.None) }
+    return .Error(reason)
+}
+
+function absentNode(reason: borrow TesseraError) -> Result<String?, TesseraError> {
+    if reason.code == .Unsupported { return .Ok(.None) }
+    return .Error(reason)
+}
+
+function nodeName(entry: EntryId) -> Result<String?, TesseraError> {
+    let node = match registryNode(entry) {
+        Ok(value) -> value
+        Error(failed) -> return absentNode(failed)
+    }
+    return match node.lastIndexOf("/") {
+        Some(slash) -> .Ok(.Some(node.substring(slash + 1, node.count)))
+        None -> .Ok(.Some(node))
+    }
+}
+
+// Opens an entry through devicekitd, waiting for the answer on a port of
+// its own so no other completion is taken in its place.
+function openDevice(
+    service: borrow Service,
+    entry: EntryId,
+    family: borrow Family
+) -> Result<Ref, TesseraError> {
+    try deviceOpen(entry, family, OpenOptions.none, service.openPort, UNumber(1))
+    let completions = try portWait(service.openPort, 1, Number(Deadline.infinite))
+    if completions.count == 0 { return .Error(failure(.Internal)) }
+    let opened = completions[0]
+    if opened.error.code != .Ok { return .Error(opened.error) }
+    return .Ok(Ref(opened.result0))
+}
+
+// `pcmC<card>D<device>p` for playback, `...c` for capture.
+function audioDevices(deviceClass: borrow DeviceClass) -> Result<[Device], TesseraError> {
+    var found: [Device] = []
+    let direction = deviceClass == .AudioOutput ? AudioDirection.output : AudioDirection.input
+    let entries = try entriesOf(.AudioEndpoint)
+    for entry in entries {
+        let node = try nodeName(entry)
+        let name = match node {
+            Some(value) -> value
+            None -> continue
+        }
+        let entryDirection = try textProperty(entry, "direction")
+        if !name.startsWith(NodePrefix.pcm) || entryDirection != .Some(direction) { continue }
+        let split = match name.indexOf(NodePrefix.pcmDevice) {
+            Some(value) -> value
+            None -> continue
+        }
+        let card = numberIn(name, NodePrefix.pcm.count, split)
+        let device = numberIn(name, split + 1, name.count - 1)
+        let label = try textProperty(entry, "name")
+        match card {
+            Some(cardNumber) -> match device {
+                Some(deviceNumber) -> found.append(
+                    Device {
+                        id: deviceId(deviceClass, cardNumber * DeviceId.localUnit + deviceNumber),
+                        entry: entry,
+                        deviceClass: deviceClass,
+                        kind: .None,
+                        name: label.or("") + " \(deviceNumber)",
+                        flags: DeviceFlags.none,
+                    }
+                )
+                None -> {}
+            }
+            None -> {}
+        }
+    }
+    return .Ok(found)
+}
+
+let sensorKinds: [SensorKind] = [SensorKind.Accelerometer, SensorKind.Gyroscope, SensorKind.Magnetometer, SensorKind.Barometer, SensorKind.AmbientLight, SensorKind.Proximity, SensorKind.Gravity, SensorKind.LinearAcceleration, SensorKind.RotationVector, SensorKind.StepCounter, SensorKind.StepDetector, SensorKind.Temperature, SensorKind.Humidity, SensorKind.HeartRate, SensorKind.Hinge, SensorKind.Orientation, SensorKind.Significant,]
+
+// The kinds of channel a sensor has, each once.
+function kindsOf(service: borrow Service, entry: EntryId) -> Result<[SensorKind], TesseraError> {
+    let sensor = try openDevice(service, entry, .Sensor)
+    let room = RegistryRecord.channelRoom * RegistryRecord.channelBytes
+    let records = zeroedBlock(count: room, alignment: 16)
+    let read = sensorChannels(sensor, Buffer { address: records.pointer(), length: room })
+    closeRef(sensor)
+    let count = try read
+    var kinds: [SensorKind] = []
+            for channel in 0..count {
+                let record: SensorChannelRecord = heapLoad(
+                    records.pointer(),
+                    channel * RegistryRecord.channelBytes
+                )
+                let raw = record.kind
+                match caseWithCode(sensorKinds, raw) {
+                    Some(kind) -> if !arrayContains(kinds, kind) { kinds.append(kind) }
+                    None -> log warn(
+                        "a sensor has a channel of a kind LibTessera does not have",
+                        kind: raw
+                    )
+                }
+            }
+    return .Ok(kinds)
+}
+
+// One device per kind of channel an IIO device has. A sensor that cannot be
+// opened or read is not listed, and the reason is logged where that is decided.
+function sensorDevices(service: borrow Service) -> Result<[Device], TesseraError> {
+    var found: [Device] = []
+    let entries = try entriesOf(.Sensor)
+    for entry in entries {
+        let node = try nodeName(entry)
+        let name = match node {
+            Some(value) -> value
+            None -> continue
+        }
+        if !name.startsWith(NodePrefix.iio) { continue }
+        let number = match numberIn(name, NodePrefix.iio.count, name.count) {
+            Some(value) -> value
+            None -> continue
+        }
+        let kinds = try kindsOf(service, entry)
+        let label = try textProperty(entry, "name")
+        for kind in kinds {
+            found.append(
+                Device {
+                    id: deviceId(.Sensor, number * DeviceId.localUnit + Number(kind.rawValue())),
+                    entry: entry,
+                    deviceClass: .Sensor,
+                    kind: .Some(kind),
+                    name: label.or(""),
+                    flags: DeviceFlags.none,
+                }
+            )
+        }
+    }
+    return .Ok(found)
+}
+
+// Devices whose node is `<prefix><number>`.
+function numberedDevices(
+    deviceClass: borrow DeviceClass,
+    entryClass: borrow EntryClass,
+    prefix: borrow String
+) -> Result<[Device], TesseraError> {
+    var found: [Device] = []
+    let entries = try entriesOf(entryClass)
+    for entry in entries {
+        let node = try nodeName(entry)
+        let name = match node {
+            Some(value) -> value
+            None -> continue
+        }
+        if !name.startsWith(prefix) { continue }
+        let label = try textProperty(entry, "name")
+        match numberIn(name, prefix.count, name.count) {
+            Some(number) -> found.append(
+                Device {
+                    id: deviceId(deviceClass, number),
+                    entry: entry,
+                    deviceClass: deviceClass,
+                    kind: .None,
+                    name: label.or(""),
+                    flags: DeviceFlags.none,
+                }
+            )
+            None -> {}
+        }
+    }
+    return .Ok(found)
+}
+
+// Every device of the class, the first marked default.
+function devicesOf(
+    service: borrow Service,
+    deviceClass: borrow DeviceClass
+) -> Result<[Device], TesseraError> {
+    var found: [Device] = []
+    match deviceClass {
+        Sensor -> found = try sensorDevices(service)
+        AudioInput -> found = try audioDevices(deviceClass)
+        AudioOutput -> found = try audioDevices(deviceClass)
+        Camera -> found = try numberedDevices(deviceClass, .Camera, NodePrefix.video)
+        Haptic -> found = try numberedDevices(deviceClass, .HapticDevice, NodePrefix.event)
+    }
+    if found.count > 0 { found[0].flags = found[0].flags | DeviceFlags.systemDefault }
+    return .Ok(found)
+}
+
+// The device `id` names, or the class default for 0; None when there is none.
+function findDevice(
+    service: borrow Service,
+    deviceClass: borrow DeviceClass,
+    id: Number
+) -> Result<Device?, TesseraError> {
+    let devices = try devicesOf(service, deviceClass)
+    for device in devices {
+        if id == 0 || device.id == id { return .Ok(.Some(device)) }
+    }
+    return .Ok(.None)
+}
+
+// An audio device's ranges, when its PCM is free to open: DeviceKit's
+// 32-byte record, which is LibTessera's `AudioCapabilities` layout. The
+// answer is the bytes written.
+function writeCapabilities(
+    service: borrow Service,
+    device: borrow Device,
+    record: RawPtr
+) -> Result<Number, TesseraError> {
+    if !isAudio(device.deviceClass) { return .Ok(0) }
+    let audio = try openDevice(service, device.entry, .Audio)
+    let capabilities = Buffer {
+        address: heapOffset(record, ListRecord.capabilitiesAt),
+        length: ListRecord.capabilitiesBytes
+    }
+    let read = audioFormats(audio, capabilities)
+    closeRef(audio)
+    let count = try read
+    return .Ok(count > 0 ? ListRecord.capabilitiesBytes : 0)
+}
+
+function list(service: borrow mut Service, client: Number, deviceClass: borrow DeviceClass) {
+    let asker = service.clients[client]
+    if !classEntitled(asker, deviceClass) {
+        answer(asker.channel, .List, .NotEntitled)
+        return
+    }
+    match listedDevices(service, client, deviceClass) {
+        Ok -> {}
+        Error(failed) -> answer(asker.channel, .List, failed.code)
+    }
+}
+
+function listedDevices(service: borrow mut Service, client: Number, deviceClass: borrow DeviceClass) -> Result<Void, TesseraError> {
+    let found = try devicesOf(service, deviceClass)
+    return listFound(service, client, deviceClass, found)
+}
+
+function listFound(service: borrow mut Service, client: Number, deviceClass: borrow DeviceClass, found: borrow [Device]) -> Result<Void, TesseraError> {
+    let asker = service.clients[client]
+    var devices: [Device] = []
+    for device in found {
+        if entitled(asker, entitlementFor(device.deviceClass, device.kind)) {
+            devices.append(device)
+        }
+    }
+    let size = Number(devices.count) * ListRecord.bytes
+    let block = zeroedBlock(count: size, alignment: 16)
+    for (index, device) in devices.enumerated() {
+        let record = heapOffset(block.pointer(), index * ListRecord.bytes)
+        let kind = match device.kind {
+            Some(sensor) -> sensor.rawValue()
+            None -> UN32(0)
+        }
+        let capabilities = try writeCapabilities(service, device, record)
+        heapStore(
+            record,
+            DeviceInfoHead {
+                id: UNumber(device.id),
+                deviceClass: deviceClass.rawValue(),
+                kind: kind,
+                flags: device.flags.raw,
+                capabilityCount: UN32(capabilities),
+            }
+        )
+        storeText(record, ListRecord.nameAt, device.name, ListRecord.textBytes)
+    }
+    let none: [Handle] = []
+    send(
+        asker.channel,
+        .List,
+        .Ok,
+        UNumber(devices.count),
+        UNumber(0),
+        UNumber(0),
+        Buffer { address: block.pointer(), length: size },
+        none
+    )
+    return .Ok
+}

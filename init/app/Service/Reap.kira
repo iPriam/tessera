@@ -1,0 +1,85 @@
+import Foundation
+import Heap
+import LibTessera
+
+// How a process that has ended ended.
+
+namespace ProcessInfo {
+    let bytes: Number = 96
+    let version: Number = 1
+}
+
+// How a process ended, as `ProcessInfo` says.
+@Derive(Copy)
+enum Termination: UN32 {
+    Exited = 0
+    Killed = 1
+    Crashed = 2
+    JobKilled = 3
+    OutOfMemory = 4
+}
+
+let terminations: [Termination] = [Termination.Exited, Termination.Killed, Termination.Crashed, Termination.JobKilled, Termination.OutOfMemory]
+
+// Says how the service behind `process` ended, closes the handle (which
+// collects the process), and answers whether it exited by itself with
+// status 0. A service kept running logs its exits apart from the others, so
+// one restarting over and over does not use up the repeats the log shows of
+// every other service's exit.
+function reap(
+    process: Handle,
+    name: borrow String,
+    keptRunning: Bool
+) -> Result<Bool, TesseraError> {
+    let clean = logEnding(process, name, keptRunning)
+    release(process)
+    return clean
+}
+
+// Logs how the service behind `process` ended; whether it exited by itself
+// with status 0.
+function logEnding(
+    process: Handle,
+    name: borrow String,
+    keptRunning: Bool
+) -> Result<Bool, TesseraError> {
+    let info = zeroedBlock(count: ProcessInfo.bytes, alignment: 16)
+    try objectInfo(
+        process,
+        .Process,
+        ProcessInfo.version,
+        Buffer { address: info.pointer(), length: ProcessInfo.bytes }
+    )
+    let record: ProcessInfoRecord = heapLoad(info.pointer())
+    let code = Number(record.exitCode)
+    let termination = match caseWithCode(terminations, record.terminationReason) {
+        Some(value) -> value
+        None -> {
+            log warn(
+                "a service ended in a way this init does not know",
+                service: name,
+                status: code
+            )
+            return .Ok(false)
+        }
+    }
+    match termination {
+        Exited -> {
+            if keptRunning {
+                log info("a service kept running exited", service: name, status: code)
+            } else {
+                log info("a service exited", service: name, status: code)
+            }
+            return .Ok(code == 0)
+        }
+        Killed -> log warn("a service was killed", service: name)
+        Crashed -> log warn(
+            "a service was ended by a fault or a signal",
+            service: name,
+            signal: code
+        )
+        JobKilled -> log warn("a service's job was killed", service: name)
+        OutOfMemory -> log warn("a service ran out of memory", service: name)
+    }
+    return .Ok(false)
+}

@@ -1,0 +1,7 @@
+//! The tablet driver package: finds a tablet on USB and publishes it to the device registry.
+/// The Tessera tablet driver package: a USB tablet's driver.
+construct TesseraTabletDriver extends Package {
+    let version: String = "0.1.0"
+    let kind: PackageKind = .App
+    let moduleRoot: String = "TesseraTabletDriver"
+}

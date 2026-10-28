@@ -1,0 +1,139 @@
+import Foundation
+import RenderBox
+
+// The box an SVG document's shapes cover once placed by a transform: every
+// shape's outline taken through its elements' transforms and the placement,
+// then measured, as a group's layers are measured to size the images they
+// are drawn in: a display list's bounding rect, which takes a filled
+// shape's outline and a stroke's own bounds, caps and joins included, and
+// leaves out what draws nothing.
+
+// What a walk has covered so far.
+struct Extent {
+    var covered: Bool = false
+    var box: Rect = Rect {}
+}
+
+extend Extent {
+    function include(borrow mut self, rect: borrow Rect) {
+        if !covered {
+            box = copy rect
+            covered = true
+            return
+        }
+        let left = min(box.x, rect.x)
+        let top = min(box.y, rect.y)
+        let right = max(box.x + box.width, rect.x + rect.width)
+        let bottom = max(box.y + box.height, rect.y + rect.height)
+        box = Rect { x: left, y: top, width: right - left, height: bottom - top }
+    }
+}
+
+function svgExtent(
+    document: borrow SvgElement,
+    placement: borrow AffineTransform
+) -> Result<Rect?, SvgFailure> {
+    let box = try svgViewBox(document)
+    let canvas = Rect { width: IconGeometry.canvas, height: IconGeometry.canvas }
+    let fitted = viewBoxFit(box, canvas).concatenating(placement)
+    var extent = Extent {}
+    var painter = SvgPainter { list: DisplayList() }
+    painter.collectNamed(document)
+    let style = SvgStyle()
+    for child in document.children { painter.measure(child, fitted, style, extent) }
+    return .Ok(extent.covered ? .Some(copy extent.box) : .None)
+}
+
+// The transform `drawSvg` maps a viewBox into `frame` with.
+function viewBoxFit(box: borrow Rect, frame: borrow Rect) -> AffineTransform {
+    let scale = min(frame.width / box.width, frame.height / box.height)
+    return AffineTransform {}.translatedBy(
+        frame.x + (frame.width - box.width * scale) / 2,
+        frame.y + (frame.height - box.height * scale) / 2
+    ).scaledBy(scale, scale).translatedBy(-box.x, -box.y)
+}
+
+extend SvgPainter {
+    function measure(
+        element: borrow SvgElement,
+        outer: borrow AffineTransform,
+        inherited: borrow SvgStyle,
+        extent: borrow mut Extent
+    ) {
+        if definesOnly(element.name) { return }
+        let opacity = try opacityAttribute(element, "opacity") otherwise 1
+        if opacity <= 0 { return }
+        let style = styleOf(element, inherited)
+        let local = match element.attribute("transform") {
+            Some(written) -> svgTransform(written).concatenating(outer)
+            None -> copy outer
+        }
+        if element.name == "use" {
+            measureUse(element, local, style, extent)
+            return
+        }
+        match shapePath(element) {
+            Some(path) -> measureShape(path, local, style, extent)
+            // A container draws only what is inside it.
+            None -> {}
+        }
+        for child in element.children { measure(child, local, style, extent) }
+    }
+
+    // What `drawShape` draws of `path`: its fill's outline, and its
+    // stroke's bounds taken through `local`.
+    function measureShape(
+        path: borrow Path,
+        local: borrow AffineTransform,
+        style: borrow SvgStyle,
+        extent: borrow mut Extent
+    ) {
+        if paintNamed(style.fill) != .None {
+            extent.include(pathBounds(path.transformed(local)))
+        }
+        if style.strokeWidth <= 0 || paintNamed(style.stroke) == .None { return }
+        let stroked = StrokedPath {
+            path: copy path,
+            transform: AffineTransform {},
+            style: StrokeStyle {
+                lineWidth: style.strokeWidth,
+                lineCap: style.lineCap,
+                lineJoin: style.lineJoin,
+                miterLimit: style.miterLimit
+            }
+        }
+        let bounds = match strokeBounds(stroked) {
+            Some(value) -> value
+            // An empty stroke contributes no extent.
+            None -> return
+        }
+        extent.include(local.applying(bounds))
+    }
+
+    function measureUse(
+        element: borrow SvgElement,
+        local: borrow AffineTransform,
+        style: borrow SvgStyle,
+        extent: borrow mut Extent
+    ) {
+        let reference = match element.attribute("href") {
+            Some(value) -> value
+            None -> match element.attribute("xlink:href") {
+                Some(value) -> value
+                // A use without a reference contributes no extent.
+                None -> return
+            }
+        }
+        let target = match referenced(reference) {
+            Some(value) -> value
+            // An unresolved reference has no geometry to measure.
+            None -> return
+        }
+        let moved = local.translatedBy(lengthAttribute(element, "x"), lengthAttribute(element, "y"))
+        if target.name == "symbol" {
+            for child in target.children { measure(child, moved, style, extent) }
+            return
+        }
+        measure(target, moved, style, extent)
+    }
+}

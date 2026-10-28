@@ -1,0 +1,133 @@
+import Foundation
+import Heap
+import LibTessera
+
+// What the server says about the machine as it starts.
+
+// The kernel LibTessera's backend runs on, as its backend topic names it
+// (roadmap/16 §20.3).
+@Derive(Copy)
+enum Backend: UN32 {
+    Linux = 0
+    Xnu = 1
+    Native = 2
+}
+
+let backends: [Backend] = [Backend.Linux, Backend.Xnu, Backend.Native]
+
+// The processor, as the machine topic names it.
+@Derive(Copy)
+enum Architecture: UN32 {
+    Arm64 = 0
+    Intel64 = 1
+    RiscV64 = 2
+}
+
+let architectures: [Architecture] = [Architecture.Arm64, Architecture.Intel64, Architecture.RiscV64]
+
+namespace InfoBlock {
+    let bytes: Number = 64
+    let version: Number = 1
+}
+
+// The first word `topic` answers.
+function infoWord(topic: InfoTopic) -> Result<UN32, TesseraError> {
+    let block = zeroedBlock(count: Number(InfoBlock.bytes), alignment: 16)
+    try systemInfo(
+        move topic,
+        InfoBlock.version,
+        Buffer { address: block.pointer(), length: InfoBlock.bytes }
+    )
+    return .Ok(blockLoad<U32>(block, 0))
+}
+
+// Reports the kernel the machine is running and the processor it runs on.
+// This is the first of the SystemServices models: a fact about the machine,
+// read from the OS rather than compiled in.
+function reportKernel() {
+    match readKernel() {
+        Ok -> {}
+        Error(reason) -> log warn("the kernel information could not be read", error: errorName(reason))
+    }
+}
+
+function readKernel() -> Result<Void, TesseraError> {
+    let backendWord = try infoWord(.Backend)
+    let machineWord = try infoWord(.Machine)
+    let backend = caseWithCode(backends, backendWord)
+    let machine = caseWithCode(architectures, machineWord)
+    match backend {
+        Some(kernel) -> match machine {
+            Some(processor) -> log info("read the kernel", kernel: kernel, machine: processor)
+            None -> log info("read the kernel", kernel: kernel)
+        }
+        None -> log warn("the backend is not one this knows")
+    }
+    return .Ok
+}
+
+namespace Time {
+    let second: Number = 1000000000
+}
+
+function monotonic() -> Result<Number, TesseraError> { return timeRead(.Monotonic) }
+
+// Reports the monotonic clock, in whole seconds since the machine started.
+function reportClock() {
+    match monotonic() {
+        Ok(now) -> log info("read the monotonic clock", seconds: floor(now / Time.second))
+        Error(failed) -> log warn("the monotonic clock is unavailable", error: errorName(failed))
+    }
+}
+
+namespace TimerProbe {
+    let ahead: Number = 10000000000
+    let key: Number = 1
+}
+
+// Arms a Timer ten seconds out on a port of its own and says how long it has
+// left. This is the object an event loop waits on time with; here it only
+// proves the timer calls work, so it is cancelled and closed at once.
+function reportTimer() {
+    match probeTimer() {
+        Ok(remaining) -> log info("armed a timer", remaining: floor(remaining / Time.second))
+        Error(reason) -> log warn("the timer probe failed", error: errorName(reason))
+    }
+}
+
+function probeTimer() -> Result<Number, TesseraError> {
+    let timer = try timerCreate(.Monotonic)
+    let armed = armTimer(timer)
+    closeHandle(timer)
+    return armed
+}
+
+// Arms and cancels `timer`; how long it had left.
+function armTimer(timer: Handle) -> Result<Number, TesseraError> {
+    let port = try portCreate(.None)
+    let armed = setAndCancel(timer, port)
+    closeHandle(port)
+    return armed
+}
+
+function setAndCancel(timer: Handle, port: Handle) -> Result<Number, TesseraError> {
+    let deadline = try monotonic() + TimerProbe.ahead
+    try timerSet(timer, deadline, 0, TimerOptions.none, port, TimerProbe.key)
+    let later = try monotonic()
+    try timerCancel(timer)
+    return .Ok(deadline - later)
+}
+
+// Creates a Memory object, which is what a shared buffer is passed over when
+// a client fills memory and hands the compositor the handle to map the same
+// pages; here it only proves the call works. One page, whose size is the
+// kernel's: a size that is not whole pages is refused. Closed at once.
+function reportMemory() {
+    match memoryCreate(memoryPageSize(), MemoryOptions.none) {
+        Ok(memory) -> {
+            log info("opened an anonymous memory file")
+            closeHandle(memory)
+        }
+        Error(failed) -> log warn("anonymous memory is unavailable", error: errorName(failed))
+    }
+}

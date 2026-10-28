@@ -1,0 +1,115 @@
+import Foundation
+
+// The values a stream (§16.3) is described and answered with.
+
+@Derive(Copy)
+public struct StreamFormat {
+    var sampleRate: UNumber
+    var channels: UNumber
+    var sampleFormat: AudioSampleFormat
+    var framesPerBuffer: UNumber
+    var channelMask: UNumber
+    var pixelFormat: UNumber
+    var width: UNumber
+    var height: UNumber
+    var framesPerSecondQ16: UNumber
+    var colorSpace: UNumber
+    var hdrMode: UNumber
+    var rateHz: UNumber
+    var maxReportLatency: UNumber
+    var sensorFormat: SensorSampleFormat
+    var patternFormat: HapticPatternFormat
+}
+
+@Derive(Copy)
+public struct StreamDescriptor {
+    var streamClass: DeviceClass
+    var deviceId: UNumber
+    var bufferCount: UNumber
+    var bufferSize: UNumber
+    var flags: StreamFlags
+    var format: StreamFormat
+}
+
+@Derive(Copy)
+public struct StreamPacket {
+    var timestamp: UNumber
+    var length: UNumber
+    var flags: PacketFlags
+    var sequence: UNumber
+}
+
+struct StreamState {
+    var live: Bool
+    var object: Number
+    var descriptor: StreamDescriptor
+    var state: StreamStatus
+}
+
+struct StreamSlot {
+    var live: Bool
+    var stream: Number
+    var index: Number
+    var memory: Number
+    var size: U64
+    var queued: Bool
+}
+
+// `StreamDescriptor.flags`.
+@Derive(Copy)
+public distinct StreamFlags = UNumber
+
+public namespace StreamFlags {
+    let none: StreamFlags = StreamFlags(0)
+    let lowLatency: StreamFlags = StreamFlags(1)
+    // The sensor may wake the CPU.
+    let wakeup: StreamFlags = StreamFlags(2)
+    let exclusive: StreamFlags = StreamFlags(4)
+    let all: StreamFlags = StreamFlags(7)
+}
+
+// `StreamInfo.state`.
+@Derive(Copy)
+public enum StreamStatus: U32 {
+    Configured = 0
+    Running = 1
+    Stopped = 2
+    Failed = 3
+}
+
+// `StreamPacket.flags`.
+@Derive(Copy)
+public distinct PacketFlags = UNumber
+
+public namespace PacketFlags {
+    let none: PacketFlags = PacketFlags(0)
+    let discontinuity: PacketFlags = PacketFlags(1)
+    let endOfStream: PacketFlags = PacketFlags(2)
+    // A compressed camera keyframe.
+    let keyframe: PacketFlags = PacketFlags(4)
+    let silence: PacketFlags = PacketFlags(8)
+}
+
+// An audio stream's samples.
+@Derive(Copy)
+public enum AudioSampleFormat: U32 {
+    I16 = 0
+    I24 = 1
+    I32 = 2
+    F32 = 3
+}
+
+// A sensor stream's samples.
+@Derive(Copy)
+public enum SensorSampleFormat: U32 {
+    Vector3F32 = 0
+    ScalarF32 = 1
+    QuaternionF32 = 2
+    U64Count = 3
+}
+
+// A haptic stream's patterns.
+@Derive(Copy)
+public enum HapticPatternFormat: U32 {
+    AmplitudeF32AtHz = 0
+}

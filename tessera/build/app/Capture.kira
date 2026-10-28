@@ -1,0 +1,304 @@
+import Foundation
+import Build
+
+// An application or a platform captured on the host, without booting
+// Tessera:
+//
+//     kira build capture <component>|all
+//
+// The component runs from the system's root, against the frameworks it
+// holds. With no display to connect to, TesseraUI draws
+// its frames into a texture of its own and writes the one asked for
+// (tessera-ui/app/Capture.kira), through the variables Ember's harness
+// reads. A component is a Linux program, so the step runs on a Linux host
+// of the architecture it builds.
+
+struct CaptureOptions {
+    // Where the picture goes: a .png is converted from the PPM written, and
+    // for `all` it is a directory holding <component>.png.
+    let out: String
+    // How many frames are drawn, one each 60 Hz refresh, and the one
+    // written, the last when 0.
+    let frames: Number
+    let at: Number
+    // The interface drawn: Adaptive Mobile's for adaptive-mobile and the
+    // desktop's for the rest when empty.
+    let mode: String
+    let scale: Number
+}
+
+function captureOptions(graph: borrow mut Graph) -> CaptureOptions {
+    let frames = graph.option(
+        textChoice("capture-frames", "how many frames a capture draws; 60 when not given")
+    )
+    let at = graph.option(
+        textChoice("capture-at", "the frame a capture writes; the last when not given")
+    )
+    let scale = graph.option(textChoice("capture-scale", "the scale a capture draws at"))
+    return CaptureOptions {
+        out: graph.option(textChoice("capture-out", "where a capture writes its picture")),
+        frames: numberOr(frames, 60),
+        at: numberOr(at, 0),
+        mode: graph.option(
+            Choice {
+                name: "capture-mode",
+                summary: "the interface a capture draws",
+                values: ["", "desktop", "mobile"],
+                fallback: ""
+            }
+        ),
+        scale: numberOr(scale, 0)
+    }
+}
+
+function numberOr(text: borrow String, fallback: Number) -> Number {
+    return match text.toNumber() {
+        Some(value) -> value
+        None -> fallback
+    }
+}
+
+// The components a capture can name.
+struct CaptureRoots {
+    let names: [String]
+    let kinds: [ComponentKind]
+}
+
+// The `capture` step: the system's root, so each framework is there to
+// load.
+function describeCapture(
+    graph: borrow mut Graph,
+    release: borrow DescribedRelease,
+    host: borrow Host,
+    architecture: Architecture
+) {
+    let options = captureOptions(graph)
+    var names: [String] = []
+    var kinds: [ComponentKind] = []
+    for described in release.components {
+        names.append(copy described.component.name)
+        kinds.append(described.component.kind)
+    }
+    let captured = CaptureRoots { names: names, kinds: kinds }
+    let machine = copy host
+    graph.step(
+        Step {
+            name: "capture",
+            summary: "an application or a platform drawn on a Linux host, without booting; `<component>|all`",
+            produces: [copy release.systemRoot],
+            run: .Some({ run in return capture(machine, architecture, options, captured, run) })
+        }
+    )
+}
+
+// Whether `name`, of `kind`, draws through TesseraUI's hosting. Display
+// Check runs a session loop of its own.
+function capturable(name: borrow String, kind: ComponentKind) -> Bool {
+    if name == "adaptive-desktop" || name == "adaptive-mobile" { return true }
+    return kind == .Application && name != "display-check"
+}
+
+function capture(
+    host: borrow Host,
+    architecture: Architecture,
+    options: borrow CaptureOptions,
+    captured: borrow CaptureRoots,
+    run: borrow StepRun
+) -> Number {
+    if host.darwin || host.architecture != architecture {
+        log fault(
+            "a capture runs the component's Linux build, so it runs on a Linux host of its architecture",
+            architecture: architecture.name()
+        )
+        return 1
+    }
+    if run.arguments.count != 1 {
+        log fault("usage: kira build capture <component>|all")
+        return 2
+    }
+    let target = run.arguments[0]
+    let directory = "\(host.machineDirectory(architecture))/host-run"
+    let libraries = match stageRunDirectory(directory, run.paths[0]) {
+        Ok(paths) -> paths
+        Error(problem) -> {
+            log fault("the run directory cannot be made", problem)
+            return 1
+        }
+    }
+    let captures = options.out.count > 0 ? copy options.out : "\(host.machineDirectory(architecture))/captures"
+    var found = false
+    for (index, name) in captured.names.enumerated() {
+        if !capturable(name, captured.kinds[index]) { continue }
+        if target != "all" && target != name { continue }
+        found = true
+        let out = target == "all" || options.out.count == 0 ? "\(captures)/\(name).png" : copy options.out
+        let executable = componentExecutable(name, run.paths[0])
+        match captureOne(host, name, executable, out, directory, libraries, options) {
+            Ok -> log info("captured", component: name, picture: out)
+            Error(problem) -> {
+                log fault("the capture failed", component: name, problem: problem)
+                return 1
+            }
+        }
+    }
+    if !found {
+        log fault("that is not a component a capture draws", component: target)
+        return 2
+    }
+    return 0
+}
+
+// The executable of `name` in its install root at `root`.
+function componentExecutable(name: borrow String, root: borrow String) -> String {
+    if name == "adaptive-desktop" || name == "adaptive-mobile" { return "\(root)/bin/\(name)" }
+    let bundle = applicationBundle(name)
+    return "\(root)/\(bundle).app/Contents/MacOS/\(lastNameOf(bundle))"
+}
+
+// Makes `directory`, where Foundation finds each framework's resources as a
+// build's bundle (`bundledReadPath`), and answers every framework's
+// directory, for the loader.
+function stageRunDirectory(
+    directory: borrow String,
+    root: borrow String
+) -> Result<[String], String> {
+    let bundles = "\(directory)/.kira-build"
+    match makePathTree(bundles) {
+        Ok -> {}
+        Error(failure) -> return .Error("\(bundles) cannot be made: \(traceText(failure))")
+    }
+    var libraries: [String] = []
+    for kind in ["Frameworks", "PrivateFrameworks"] {
+        let parent = "\(root)/System/Library/\(kind)"
+        if !isDirectory(parent) { continue }
+        let names = match listDirectory(parent) {
+            Ok(listing) -> listing.entries
+            Error(failure) -> return .Error("\(parent) cannot be listed: \(traceText(failure))")
+        }
+        for entry in names {
+            if !entry.endsWith(".framework") { continue }
+            let framework = "\(parent)/\(entry)"
+            let bundle = "\(bundles)/\(entry.substring(0, entry.count - 10)).klbundle"
+            let link = "\(bundle)/resources"
+            match makePathTree(bundle) {
+                Ok -> {}
+                Error(failure) -> return .Error("\(bundle) cannot be made: \(traceText(failure))")
+            }
+            if pathExists(link) || linkExists(link) {
+                match removePath(link) {
+                    Ok -> {}
+                    Error(failure) -> return .Error(
+                        "\(link) cannot be replaced: \(traceText(failure))"
+                    )
+                }
+            }
+            match makeSymbolicLink(framework, link) {
+                Ok -> {}
+                Error(failure) -> return .Error("\(link) cannot be made: \(traceText(failure))")
+            }
+            libraries.append(framework)
+        }
+    }
+    if libraries.count == 0 { return .Error("no frameworks in the system root") }
+    return .Ok(libraries)
+}
+
+// Whether a link is at `path`, whatever it names. An entry that cannot be
+// looked at is taken to be there, so removing it says why it cannot be.
+function linkExists(path: borrow String) -> Bool {
+    return match linkStatus(path) {
+        Ok(status) -> true
+        Error(failure) -> match failure {
+            Missing -> false
+            NotFile, NotDirectory, ReadFailed, InvalidText, WriteFailed, CreateFailed, RenameFailed,
+                RemoveFailed, InvalidRange -> true
+        }
+    }
+}
+
+// Runs `executable` in `directory` until it has drawn its frames, and
+// leaves the frame asked for at `out`.
+function captureOne(
+    host: borrow Host,
+    name: borrow String,
+    executable: borrow String,
+    out: borrow String,
+    directory: borrow String,
+    libraries: borrow [String],
+    options: borrow CaptureOptions
+) -> Result<Void, String> {
+    if !fileExists(executable) { return .Error("\(executable) is not built") }
+    var mode = copy options.mode
+    if mode.count == 0 { mode = name == "adaptive-mobile" ? "mobile" : "desktop" }
+    let png = out.endsWith(".png")
+    let picture = png ? "\(directory)/\(name).ppm" : copy out
+    let logPath = "\(directory)/\(name).log"
+    if fileExists(picture) {
+        match removePath(picture) {
+            Ok -> {}
+            Error(failure) -> return .Error("\(picture) cannot be removed: \(traceText(failure))")
+        }
+    }
+    match makePathTree(parentOf(out)) {
+        Ok -> {}
+        Error(failure) -> return .Error("\(parentOf(out)) cannot be made: \(traceText(failure))")
+    }
+    let command = ProcessCommand {
+        program: copy executable,
+        environment: [
+            EnvironmentEntry { name: "LD_LIBRARY_PATH", value: joined(libraries, ":") },
+            EnvironmentEntry { name: "KIRA_UI_MODE", value: mode },
+            EnvironmentEntry { name: "KIRA_GRAPHICS_CAPTURE_FRAME", value: copy picture },
+            EnvironmentEntry { name: "KIRA_GRAPHICS_CAPTURE_AT", value: String(options.at) },
+            EnvironmentEntry {
+                name: "KIRA_GRAPHICS_QUIT_AFTER_FRAMES",
+                value: String(options.frames)
+            },
+            EnvironmentEntry { name: "KIRA_GRAPHICS_SCALE", value: String(options.scale) }
+        ],
+        directory: copy directory,
+        input: .Null,
+        output: .File(copy logPath),
+        errors: .File(copy logPath)
+    }
+    let status = match runProgram(command) {
+        Ok(ended) -> ended
+        Error(problem) -> return .Error(problem)
+    }
+    let written = readBootLog(logPath)
+    if status != 0 {
+        return .Error("\(name) exited with \(status); its log is \(logPath):\n\(written.tail(30))")
+    }
+    if !fileExists(picture) {
+        return .Error("\(name) wrote no picture; its log is \(logPath):\n\(written.tail(30))")
+    }
+    if !png { return .Ok }
+    let convert = ProcessCommand {
+        program: host.find("magick"),
+        arguments: [copy picture, copy out],
+        input: .Null
+    }
+    return match runProgram(convert) {
+        Ok(ended) -> ended == 0 ? .Ok : .Error("\(picture) could not be converted to \(out)")
+        Error(problem) -> .Error(problem)
+    }
+}
+
+// Starts `command` and waits for it, answering its exit status.
+function runProgram(command: borrow ProcessCommand) -> Result<Number, String> {
+    let child = match command.start() {
+        Ok(started) -> started
+        Error(failure) -> return .Error("\(command.program) did not start: \(traceText(failure))")
+    }
+    let ended = child.wait()
+    match child.release() {
+        Ok -> {}
+        Error(failure) -> absorb failure
+    }
+    return match ended {
+        Ok(exit) -> .Ok(exitStatus(exit))
+        Error(failure) -> .Error(
+            "\(command.program) could not be waited for: \(traceText(failure))"
+        )
+    }
+}

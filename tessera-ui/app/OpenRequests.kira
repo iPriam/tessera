@@ -1,0 +1,72 @@
+// Opening an application at a place (roadmap/36-app-lifecycle.md): one
+// program asks another to show a folder or a document by leaving the place
+// in Settings under `open.<application>`, then opening the application, as
+// Settings opens at a pane. The application takes the request when its
+// window is first built and whenever Settings change, and forgets it, so it
+// is followed once. Only the system's own programs may write a setting, so
+// only they can ask; a confined application's grants are later work.
+
+import Foundation
+import LibTessera
+
+namespace OpenRequest {
+    let prefix: String = "open."
+}
+
+// Opens `application` showing `place`, a path it knows how to show.
+public function openApplicationAt(application: borrow Application, place: borrow String) {
+    let channel = match settingsConnect() {
+        Ok(found) -> found
+        Error(failed) -> {
+            log warn(
+                "the Settings service cannot be reached to open a place",
+                error: errorName(failed)
+            )
+            openApplication(application)
+            return
+        }
+    }
+    match settingsWrite(channel, OpenRequest.prefix + application.name, place) {
+        Ok -> {}
+        Error(failed) -> log warn(
+            "a place to open could not be left",
+            application: copy application.name,
+            error: errorName(failed)
+        )
+    }
+    match handleClose(channel) {
+        Ok -> {}
+        // The request is written or refused already.
+        Error(failed) -> absorb failed
+    }
+    openApplication(application)
+}
+
+// The place this application, `name`, was asked to show, which is then
+// forgotten; none when none was asked.
+public function takeOpenRequest(name: borrow String) -> String? {
+    let key = OpenRequest.prefix + name
+    let place = settingValue(key, "")
+    if place.count == 0 { return .None }
+    match settingsConnect() {
+        Ok(channel) -> {
+            match settingsRemove(channel, key) {
+                Ok -> {}
+                Error(failed) -> log warn(
+                    "a request to open a place could not be forgotten",
+                    error: errorName(failed)
+                )
+            }
+            match handleClose(channel) {
+                Ok -> {}
+                // The request is forgotten or not already.
+                Error(failed) -> absorb failed
+            }
+        }
+        Error(failed) -> log warn(
+            "the Settings service cannot be reached",
+            error: errorName(failed)
+        )
+    }
+    return .Some(place)
+}

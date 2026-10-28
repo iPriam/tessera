@@ -1,0 +1,340 @@
+import Foundation
+import Heap
+
+// Reading a dying process's core, which the kernel writes to a crash
+// reporter's standard input when `core_pattern` names it with a `|`. A pipe
+// reads only forward, so the core is read in its own order: the ELF header,
+// the program headers and the notes, which hold the threads' registers.
+// The threads' stacks are read from the process's memory then, while the
+// dump waits on the pipe, and standard input is closed, which ends the dump. Reading on to the stacks in the core went through every mapping
+// below them first, a reserved heap's untouched pages written out as zeros,
+// and held the dying process -- its screen frozen, never started again --
+// for as long as that took.
+
+// A program header's `p_type`.
+@Open enum ElfSegment: U32 {
+    // `PT_LOAD`
+    Load = 1
+    // `PT_NOTE`
+    Note = 4
+}
+
+// A core note's `n_type`.
+@Open enum CoreNote: U32 {
+    // `NT_PRSTATUS`: a thread's registers.
+    Status = 1
+    // `NT_PRPSINFO`: the process.
+    Process = 3
+    // `NT_SIGINFO`: the signal that ended it.
+    Signal = 1397311305
+}
+
+namespace CoreLayout {
+    let headerBytes: U64 = U64(64)
+    let programHeaderBytes: U64 = U64(56)
+    let typeCore: U32 = U32(4)
+    // `elf_prstatus`: the registers start after the times.
+    let statusRegisters: Number = 112
+    let statusPid: Number = 32
+    // How much of a stack is kept below and above the stack pointer.
+    let stackBelow: U64 = U64(512)
+    let stackAbove: U64 = U64(1048576)
+    // The most of the notes read: a process with thousands of threads.
+    let notesLimit: U64 = U64(16777216)
+    // The most program headers read; a core with more names its count in a
+    // section header the stream has not reached.
+    let extendedCount: U32 = U32(0xFFFF)
+    let chunk: U64 = U64(1048576)
+}
+
+// Standard input, read forward.
+struct CoreStream {
+    var at: U64 = U64(0)
+    var ended: Bool = false
+    let scratch: ByteBlock
+}
+
+// A stretch of a thread's stack, as the core holds it.
+struct CoreStack {
+    let address: U64
+    let bytes: ByteBlock
+    let count: U64
+}
+
+struct CoreSegment {
+    let kind: ElfSegment
+    let offset: U64
+    let address: U64
+    let size: U64
+}
+
+// Reads `count` bytes into `target`, or as many as come before the end.
+function coreRead(stream: borrow mut CoreStream, target: RawPtr, count: U64) -> U64 {
+    var total = U64(0)
+    while total < count && !stream.ended {
+        let got = read(0, heapOffset(target, total), count - total)
+        if answerFailed(got) || got == 0 {
+            stream.ended = true
+            break
+        }
+        total = total + U64(got)
+    }
+    stream.at = stream.at + total
+    return total
+}
+
+// Reads past everything before `offset`; whether the stream reached it.
+function coreSkipTo(stream: borrow mut CoreStream, offset: U64) -> Bool {
+    while stream.at < offset && !stream.ended {
+        let left = offset - stream.at
+        coreRead(
+            stream,
+            stream.scratch.pointer(),
+            left < CoreLayout.chunk ? left : CoreLayout.chunk
+        )
+    }
+    return stream.at == offset
+}
+
+// `count` bytes at `offset`, or none when the stream ends before them or has
+// passed them.
+function coreBytesAt(stream: borrow mut CoreStream, offset: U64, count: U64) -> ByteBlock? {
+    if !coreSkipTo(stream, offset) { return .None }
+    let block = zeroedBlock(count: Number(count) + 1, alignment: 16)
+    if coreRead(stream, block.pointer(), count) != count { return .None }
+    return .Some(move block)
+}
+
+// What the core says: the threads, the signal and the process, and the
+// stacks it holds.
+function readCore(capture: borrow mut CrashCapture, directory: borrow String) -> [CoreStack] {
+    var stream = CoreStream { scratch: zeroedBlock(count: Number(CoreLayout.chunk), alignment: 16) }
+    let segments = readCoreStream(capture, stream)
+    // The dump waits on the pipe meanwhile, the process's memory whole; closed,
+    // the dump ends and the process exits, its memory gone.
+    let stacks = readStacks(capture, directory, segments)
+    closeBacking(0)
+    return stacks
+}
+
+// The core's loaded segments, once its notes are read into `capture`.
+function readCoreStream(
+    capture: borrow mut CrashCapture,
+    stream: borrow mut CoreStream
+) -> [CoreSegment] {
+    let header = match coreBytesAt(stream, U64(0), CoreLayout.headerBytes) {
+        Some(value) -> move value
+        None -> {
+            capture.problems.append("no core came on standard input")
+            return []
+        }
+    }
+    let base = header.pointer()
+    if heapLoad<U32>(base, 0) != U32(0x464C457F) || heapLoad<U8>(base, 4) != U8(2) || U32(
+        heapLoad<U16>(base, 16)
+    ) != CoreLayout.typeCore {
+        capture.problems.append("standard input is not a 64-bit ELF core")
+        return []
+    }
+    let machine = U32(heapLoad<U16>(base, 18))
+    match machine {
+        183 -> capture.architecture = .Arm64
+        62 -> capture.architecture = .X64
+        else -> {
+            capture.problems.append("the core is of machine \(machine)")
+            return []
+        }
+    }
+    let count = U32(heapLoad<U16>(base, 56))
+    if count == CoreLayout.extendedCount {
+        capture.problems.append("the core has too many segments to read")
+        return []
+    }
+    let headers = match coreBytesAt(
+        stream,
+        heapLoad<U64>(base, 32),
+        U64(count) * CoreLayout.programHeaderBytes
+    ) {
+        Some(value) -> move value
+        None -> {
+            capture.problems.append("the core ended in its program headers")
+            return []
+        }
+    }
+    var segments: [CoreSegment] = []
+    for index in 0..Number(count) {
+        let entry = heapOffset(headers.pointer(), U64(index) * CoreLayout.programHeaderBytes)
+        segments.append(
+            CoreSegment {
+                kind: fromCode<ElfSegment>(heapLoad<U32>(entry, 0)),
+                offset: heapLoad<U64>(entry, 8),
+                address: heapLoad<U64>(entry, 16),
+                size: heapLoad<U64>(entry, 32)
+            }
+        )
+    }
+    for segment in segments {
+        if segment.kind != .Note { continue }
+        let size = segment.size < CoreLayout.notesLimit ? segment.size : CoreLayout.notesLimit
+        match coreBytesAt(stream, segment.offset, size) {
+            Some(notes) -> readNotes(capture, notes.pointer(), size)
+            None -> capture.problems.append("the core ended in its notes")
+        }
+    }
+    return segments
+}
+
+// Each note: its name's and description's lengths, its type, then both,
+// each padded to four bytes.
+function readNotes(capture: borrow mut CrashCapture, notes: RawPtr, size: U64) {
+    var at = U64(0)
+    while at + U64(12) <= size {
+        let nameBytes = U64(heapLoad<U32>(notes, at))
+        let descriptionBytes = U64(heapLoad<U32>(notes, at + U64(4)))
+        let kind = heapLoad<U32>(notes, at + U64(8))
+        let description = at + U64(12) + ((nameBytes + U64(3)) & ~U64(3))
+        if description + descriptionBytes > size { return }
+        readNote(
+            capture,
+            fromCode<CoreNote>(kind),
+            heapOffset(notes, description),
+            descriptionBytes
+        )
+        at = description + ((descriptionBytes + U64(3)) & ~U64(3))
+    }
+}
+
+function readNote(capture: borrow mut CrashCapture, kind: CoreNote, body: RawPtr, size: U64) {
+    match kind {
+        Status -> readStatusNote(capture, body, size)
+        Process -> {
+            // `elf_prpsinfo`: the user at 16, the parent at 28, the name at 40.
+            if size < U64(136) { return }
+            capture.userId = Number(heapLoad<U32>(body, 16))
+            capture.pid = Number(heapLoad<U32>(body, 24))
+            capture.parentPid = Number(heapLoad<U32>(body, 28))
+            capture.name = stringFromCBytes(heapOffset(body, 40), 16)
+        }
+        Signal -> readSignalNote(capture, body, size)
+        // The other notes, files and auxiliary vector among them, the
+        // report reads from /proc instead.
+        else -> {}
+    }
+}
+
+function readStatusNote(capture: borrow mut CrashCapture, body: RawPtr, size: U64) {
+    let words = generalRegisterWords(capture.architecture)
+    if size < U64(CoreLayout.statusRegisters + words * 8) { return }
+    var registers: [U64] = []
+    for index in 0..words {
+        registers.append(heapLoad<U64>(body, CoreLayout.statusRegisters + index * 8))
+    }
+    capture.threads.append(
+        CrashedThread {
+            id: Number(heapLoad<U32>(body, CoreLayout.statusPid)),
+            registers: registers
+        }
+    )
+    if capture.signal == 0 { capture.signal = Number(heapLoad<U16>(body, 12)) }
+}
+
+function readSignalNote(capture: borrow mut CrashCapture, body: RawPtr, size: U64) {
+    if size < U64(24) { return }
+    capture.signal = Number(heapLoad<U32>(body, 0))
+    capture.signalCode = Number(heapLoad<I32>(body, 8))
+    // A fault's address, or a sender's pid and user and the value it
+    // sent, share the union. A code above 0 is the kernel's, for a fault.
+    if signalIsFault(capture.signal) && capture.signalCode > 0 {
+        capture.faultAddress = heapLoad<U64>(body, 16)
+        return
+    }
+    capture.senderPid = Number(heapLoad<I32>(body, 16))
+    // A Kira trap sends itself SIGTRAP with the trap's number.
+    if capture.signal == Signal.trap && capture.signalCode == -1 && size >= U64(28) {
+        capture.trapCode = Number(heapLoad<I32>(body, 24))
+    }
+}
+
+// The general registers' count: x0 to x30, sp, pc and pstate on arm64;
+// Linux's `user_regs_struct` on x86-64; pc and x1 to x31 on RISC-V.
+function generalRegisterWords(architecture: Architecture) -> Number {
+    return match architecture {
+        Arm64 -> 34
+        X64 -> 27
+        RiscV64 -> 32
+    }
+}
+
+// SIGILL, SIGTRAP, SIGBUS, SIGFPE and SIGSEGV carry the address they were
+// taken at.
+function signalIsFault(signal: Number) -> Bool {
+    return match signal {
+        4 -> true
+        5 -> true
+        7 -> true
+        8 -> true
+        11 -> true
+        else -> false
+    }
+}
+
+// Each thread's stack around its stack pointer, within the loaded segment
+// holding it, read from the process's memory.
+function readStacks(
+    capture: borrow mut CrashCapture,
+    directory: borrow String,
+    segments: borrow [CoreSegment]
+) -> [CoreStack] {
+    let memory = openat(
+        AtDirectory.current,
+        cStringFrom(directory + "/mem"),
+        LinuxOpen.readOnly | LinuxOpen.closeOnExec,
+        0
+    )
+    if answerFailed(memory) {
+        capture.problems.append("\(directory)/mem could not be opened")
+        return []
+    }
+    var stacks: [CoreStack] = []
+    for thread in capture.threads {
+        let pointer = threadStackPointer(capture.architecture, thread.registers)
+        for segment in segments {
+            if segment.kind != .Load || segment.size == U64(0) { continue }
+            if pointer < segment.address || pointer >= segment.address + segment.size { continue }
+            let low = pointer - segment.address > CoreLayout.stackBelow ? pointer - CoreLayout.stackBelow : segment.address
+            let rest = segment.address + segment.size - low
+            let size = rest < CoreLayout.stackAbove ? rest : CoreLayout.stackAbove
+            let bytes = zeroedBlock(count: Number(size) + 1, alignment: 16)
+            let got = pread(memory, bytes.pointer(), size, low)
+            if answerFailed(got) || got <= 0 {
+                capture.problems.append("a thread's stack could not be read")
+                continue
+            }
+            stacks.append(CoreStack { address: low, bytes: move bytes, count: U64(got) })
+        }
+    }
+    closeBacking(memory)
+    return stacks
+}
+
+function threadStackPointer(architecture: Architecture, registers: borrow [U64]) -> U64 {
+    return architecture == .Arm64 ? registers[31] : registers[19]
+}
+
+function threadFramePointer(architecture: Architecture, registers: borrow [U64]) -> U64 {
+    return architecture == .Arm64 ? registers[29] : registers[4]
+}
+
+function threadProgramCounter(architecture: Architecture, registers: borrow [U64]) -> U64 {
+    return architecture == .Arm64 ? registers[32] : registers[16]
+}
+
+// The word at `address` in one of `stacks`.
+function stackWord(stacks: borrow [CoreStack], address: U64) -> U64? {
+    for stack in stacks {
+        if address >= stack.address && address + U64(8) <= stack.address + stack.count {
+            return .Some(heapLoad<U64>(stack.bytes.pointer(), address - stack.address))
+        }
+    }
+    return .None
+}

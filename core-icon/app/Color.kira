@@ -1,0 +1,139 @@
+import Foundation
+
+// A colour as a `.tessicon` document keeps it: its space, its components and
+// alpha. The document keeps the space it was chosen in, so it reads back as
+// it was chosen; drawing takes it in sRGB.
+
+public enum IconColorSpace {
+    Srgb
+    ExtendedSrgb
+    DisplayP3
+    Gray
+    ExtendedGray
+}
+
+public struct IconColor {
+    var space: IconColorSpace = .Srgb
+    // Red, green and blue; a gray space's level is all three.
+    var red: Number = 0
+    var green: Number = 0
+    var blue: Number = 0
+    var alpha: Number = 1
+}
+
+// The colour a drawing is made in: sRGB, premultiplied by nothing.
+public struct SrgbColor {
+    var red: Number = 0
+    var green: Number = 0
+    var blue: Number = 0
+    var alpha: Number = 1
+}
+
+extend IconColor {
+    // The colour in sRGB, as it is drawn.
+    function srgb() -> SrgbColor {
+        return match space {
+            Srgb, ExtendedSrgb, Gray, ExtendedGray -> SrgbColor {
+                red: red,
+                green: green,
+                blue: blue,
+                alpha: alpha
+            }
+            DisplayP3 -> displayP3InSrgb(self)
+        }
+    }
+}
+
+// An sRGB colour as a document writes it.
+public function srgbIconColor(color: borrow SrgbColor) -> IconColor {
+    return IconColor {
+        space: .Srgb,
+        red: color.red,
+        green: color.green,
+        blue: color.blue,
+        alpha: color.alpha
+    }
+}
+
+// Display P3 and sRGB share their transfer curve and white; only the
+// primaries differ, by this matrix between their linear values.
+namespace DisplayP3Matrix {
+    let rr: Number = 1.2249401
+    let rg: Number = -0.2249404
+    let rb: Number = 0
+    let gr: Number = -0.0420569
+    let gg: Number = 1.0420571
+    let gb: Number = 0
+    let br: Number = -0.0196376
+    let bg: Number = -0.0786361
+    let bb: Number = 1.0982735
+}
+
+// The other way, from sRGB's linear values to Display P3's.
+namespace SrgbToDisplayP3Matrix {
+    let rr: Number = 0.8224621
+    let rg: Number = 0.177538
+    let rb: Number = 0
+    let gr: Number = 0.0331941
+    let gg: Number = 0.9668058
+    let gb: Number = 0
+    let br: Number = 0.0170827
+    let bg: Number = 0.0723974
+    let bb: Number = 0.9105199
+}
+
+// The sRGB transfer curve's pieces (IEC 61966-2-1).
+namespace SrgbCurve {
+    let linearBelow: Number = 0.04045
+    let linearSlope: Number = 12.92
+    let offset: Number = 0.055
+    let scale: Number = 1.055
+    let exponent: Number = 2.4
+    let encodedBelow: Number = 0.0031308
+}
+
+function linearFromEncoded(value: Number) -> Number {
+    if abs(value) <= SrgbCurve.linearBelow { return value / SrgbCurve.linearSlope }
+    let sign = value < 0 ? -1 : 1
+    return sign * pow((abs(value) + SrgbCurve.offset) / SrgbCurve.scale, SrgbCurve.exponent)
+}
+
+function encodedFromLinear(value: Number) -> Number {
+    if abs(value) <= SrgbCurve.encodedBelow { return value * SrgbCurve.linearSlope }
+    let sign = value < 0 ? -1 : 1
+    return sign * (SrgbCurve.scale * pow(abs(value), 1 / SrgbCurve.exponent) - SrgbCurve.offset)
+}
+
+function displayP3InSrgb(color: borrow IconColor) -> SrgbColor {
+    let r = linearFromEncoded(color.red)
+    let g = linearFromEncoded(color.green)
+    let b = linearFromEncoded(color.blue)
+    let m = DisplayP3Matrix.rr * r + DisplayP3Matrix.rg * g + DisplayP3Matrix.rb * b
+    let n = DisplayP3Matrix.gr * r + DisplayP3Matrix.gg * g + DisplayP3Matrix.gb * b
+    let o = DisplayP3Matrix.br * r + DisplayP3Matrix.bg * g + DisplayP3Matrix.bb * b
+    return SrgbColor {
+        red: clamp(encodedFromLinear(m), 0, 1),
+        green: clamp(encodedFromLinear(n), 0, 1),
+        blue: clamp(encodedFromLinear(o), 0, 1),
+        alpha: color.alpha
+    }
+}
+
+// The colour in Display P3, unclamped, as IconRendering's `Icon.Color`
+// keeps every colour; a gray's level is the same in either space.
+function inDisplayP3(color: borrow IconColor) -> IconColor {
+    if color.space == .DisplayP3 { return copy color }
+    let r = linearFromEncoded(color.red)
+    let g = linearFromEncoded(color.green)
+    let b = linearFromEncoded(color.blue)
+    let m = SrgbToDisplayP3Matrix.rr * r + SrgbToDisplayP3Matrix.rg * g + SrgbToDisplayP3Matrix.rb * b
+    let n = SrgbToDisplayP3Matrix.gr * r + SrgbToDisplayP3Matrix.gg * g + SrgbToDisplayP3Matrix.gb * b
+    let o = SrgbToDisplayP3Matrix.br * r + SrgbToDisplayP3Matrix.bg * g + SrgbToDisplayP3Matrix.bb * b
+    return IconColor {
+        space: .DisplayP3,
+        red: encodedFromLinear(m),
+        green: encodedFromLinear(n),
+        blue: encodedFromLinear(o),
+        alpha: color.alpha
+    }
+}

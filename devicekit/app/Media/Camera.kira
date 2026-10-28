@@ -1,0 +1,398 @@
+import Foundation
+import Heap
+import LibTessera
+
+// Camera (17 §14.2) over V4L2 with `V4L2_MEMORY_USERPTR`: each slot is memory
+// the caller attached, which the driver writes frames into in place.
+//
+// `struct v4l2_buffer` (88 bytes): `index` 0, `type` 4, `bytesused` 8,
+// `flags` 12, `timestamp` 24 (`timeval`), `sequence` 56, `memory` 60,
+// `m.userptr` 64, `length` 72.
+
+namespace Video {
+    let enumFormat: U64 = U64(0xC0405602)
+    let setFormat: U64 = U64(0xC0D05605)
+    let requestBuffers: U64 = U64(0xC0145608)
+    let queueBuffer: U64 = U64(0xC058560F)
+    let dequeueBuffer: U64 = U64(0xC0585611)
+    let streamOn: U64 = U64(0x40045612)
+    let streamOff: U64 = U64(0x40045613)
+    let setParameters: U64 = U64(0xC0CC5616)
+    let getControl: U64 = U64(0xC008561B)
+    let setControl: U64 = U64(0xC008561C)
+    let queryControl: U64 = U64(0xC0445624)
+    // `V4L2_BUF_TYPE_VIDEO_CAPTURE`, `V4L2_MEMORY_USERPTR`.
+    let capture: U32 = U32(1)
+    let userPointer: U32 = U32(2)
+    let bufferBytes: Number = 88
+    // `V4L2_BUF_FLAG_KEYFRAME`, `V4L2_BUF_FLAG_ERROR`.
+    let keyframe: U32 = U32(0x8)
+    let error: U32 = U32(0x40)
+    // `V4L2_FLASH_LED_MODE_TORCH`.
+    let torchOn: U32 = U32(2)
+    // The fraction `v4l2_captureparm.timeperframe` is written over.
+    let framesPerSecondOne: U32 = U32(65536)
+}
+
+namespace CameraDefault {
+    let width: U32 = U32(640)
+    let height: U32 = U32(480)
+    // YUYV.
+    let format: FourCc = FourCc(0x56595559)
+    let slotLimit: Number = 32
+}
+
+namespace CameraRecord {
+    let formatBytes: Number = 32
+    let controlBytes: Number = 32
+}
+
+// Memory a caller attached for one slot.
+struct CameraSlot {
+    var slot: Number
+    var memory: Buffer
+}
+
+// What a Camera connection keeps besides its object.
+struct CameraConnection {
+    var object: Number
+    // The slots `configure` asked the driver for.
+    var slotCount: Number
+    var streaming: Bool
+    var slots: [CameraSlot]
+}
+
+function cameraOf(object: Number) -> Number {
+    for (index, camera) in deviceLibrary.cameras.enumerated() {
+        if camera.object == object { return index }
+    }
+    deviceLibrary.cameras.append(
+        CameraConnection { object: object, slotCount: 0, streaming: false, slots: [] }
+    )
+    return deviceLibrary.cameras.count - 1
+}
+
+function resolveCamera(camera: Ref, rights: RefRights) -> Result<Number, TesseraError> {
+    let object = try resolveConnection(camera, .Camera, rights)
+    return .Ok(cameraOf(object))
+}
+
+function cameraDevice(index: Number) -> Result<Descriptor, TesseraError> {
+    return deviceOf(deviceLibrary.cameras[index].object)
+}
+
+// The V4L2 control behind each setting: `EXPOSURE_ABSOLUTE`, `GAIN`,
+// `FOCUS_ABSOLUTE`, `WHITE_BALANCE_TEMPERATURE`, `ZOOM_ABSOLUTE`,
+// `FLASH_LED_MODE` and `POWER_LINE_FREQUENCY`.
+function videoControl(setting: borrow CameraSetting) -> U32 {
+    return match setting {
+        Exposure -> U32(0x009A0902)
+        Gain -> U32(0x00980913)
+        Focus -> U32(0x009A090A)
+        WhiteBalance -> U32(0x0098091A)
+        Zoom -> U32(0x009A090D)
+        Torch -> U32(0x009C0901)
+        PowerLineFrequency -> U32(0x00980918)
+    }
+}
+
+let cameraSettings: [CameraSetting] = [.Exposure, .Gain, .Focus, .WhiteBalance, .Zoom, .Torch, .PowerLineFrequency]
+
+// A control the driver does not have is `Unsupported`.
+function controlAnswer(answer: borrow Result<Number, TesseraError>) -> Result<Void, TesseraError> {
+    return match answer {
+        Ok(value) -> .Ok
+        Error(failed) -> {
+            match errnoOf(failed) {
+                Invalid -> return .Error(failure(.Unsupported))
+                else -> return .Error(failed)
+            }
+        }
+    }
+}
+
+// One 32-byte `CameraFormat` per pixel format the device captures, with no
+// size: the driver fits any size `configure` asks for.
+public function cameraFormats(camera: Ref, out: borrow Buffer) -> Result<Number, TesseraError> {
+    let index = try resolveCamera(camera, RefRights.read)
+    let device = try cameraDevice(index)
+    let blockBytes = zeroedBlock(count: 64, alignment: 16)
+    let block = blockBytes.pointer()
+    var count: Number = 0
+    while true {
+        zeroBytes(block, 64)
+        heapStore<U32>(block, 0, U32(count))
+        heapStore<U32>(block, 4, Video.capture)
+        // The list ends with `EINVAL`.
+        match device.control(Video.enumFormat, block) {
+            Ok(value) -> {}
+            Error(failed) -> {
+                match errnoOf(failed) {
+                    Invalid -> break
+                    else -> return .Error(failed)
+                }
+            }
+        }
+        let at = count * CameraRecord.formatBytes
+        try requireRoom(out, at + CameraRecord.formatBytes)
+        zeroBytes(heapOffset(out.address, at), CameraRecord.formatBytes)
+        heapStore<U32>(out.address, at, heapLoad<U32>(block, 44))
+        heapStore<U32>(out.address, at + 20, heapLoad<U32>(block, 8))
+        count++
+    }
+    return .Ok(count)
+}
+
+// `VIDIOC_S_PARM` for an asked frame rate. A driver without one keeps its
+// own, which `configure` still answers.
+function setFrameRate(device: borrow Descriptor, framesPerSecondQ16: U32) {
+    let parametersBytes = zeroedBlock(count: 204, alignment: 16)
+    let parameters = parametersBytes.pointer()
+    heapStore<U32>(parameters, 0, Video.capture)
+    heapStore<U32>(parameters, 12, Video.framesPerSecondOne)
+    heapStore<U32>(parameters, 16, framesPerSecondQ16)
+    match device.control(Video.setParameters, parameters) {
+        Ok(value) -> {}
+        Error(failed) -> log info("the camera keeps its own frame rate", error: errorName(failed))
+    }
+}
+
+// `VIDIOC_S_FMT` with the asked size and fourcc (0 keeps 640x480 YUYV), the
+// frame rate when one is asked, then `slots` user-pointer buffers.
+public function cameraConfigure(
+    camera: Ref,
+    format: CameraFormat,
+    slots: Number
+) -> Result<CameraFormat, TesseraError> {
+    let index = try resolveCamera(camera, RefRights.write)
+    if deviceLibrary.cameras[index].streaming { return .Error(failure(.BadState)) }
+    if slots <= 0 || slots > CameraDefault.slotLimit { return .Error(failure(.InvalidArgument)) }
+    let device = try cameraDevice(index)
+    let blockBytes = zeroedBlock(count: 208, alignment: 16)
+    let block = blockBytes.pointer()
+    heapStore<U32>(block, 0, Video.capture)
+    heapStore<U32>(block, 8, format.width == 0 ? CameraDefault.width : format.width)
+    heapStore<U32>(block, 12, format.height == 0 ? CameraDefault.height : format.height)
+    heapStore<U32>(block, 16, format.format.raw == 0 ? CameraDefault.format.raw : format.format.raw)
+    let set = try device.control(Video.setFormat, block)
+    var chosen = format
+    chosen.width = heapLoad<U32>(block, 8)
+    chosen.height = heapLoad<U32>(block, 12)
+    chosen.format = FourCc(heapLoad<U32>(block, 16))
+    // The bytes one frame needs travel back in `flags`.
+    chosen.flags = heapLoad<U32>(block, 28)
+    if format.format.raw != 0 && chosen.format != format.format {
+        return .Error(failure(.FormatUnsupported))
+    }
+    if format.framesPerSecondQ16 != 0 { setFrameRate(device, format.framesPerSecondQ16) }
+    let requestBytes = zeroedBlock(count: 20, alignment: 16)
+    let request = requestBytes.pointer()
+    heapStore<U32>(request, 0, U32(slots))
+    heapStore<U32>(request, 4, Video.capture)
+    heapStore<U32>(request, 8, Video.userPointer)
+    match device.control(Video.requestBuffers, request) {
+        Ok(value) -> {}
+        Error(failed) -> {
+            match errnoOf(failed) {
+                Invalid -> return .Error(failure(.FormatUnsupported))
+                else -> return .Error(failed)
+            }
+        }
+    }
+    deviceLibrary.cameras[index].slots = []
+    deviceLibrary.cameras[index].slotCount = slots
+    return .Ok(chosen)
+}
+
+function slotOf(index: Number, slot: Number) -> Number? {
+    for (at, attached) in deviceLibrary.cameras[index].slots.enumerated() {
+        if attached.slot == slot { return .Some(at) }
+    }
+    return .None
+}
+
+// The memory a slot's frames land in. It must stay mapped until the slot is
+// attached again, the camera is configured again, or the connection closes.
+public function cameraAttach(
+    camera: Ref,
+    slot: Number,
+    memory: borrow Buffer
+) -> Result<Void, TesseraError> {
+    let index = try resolveCamera(camera, RefRights.write)
+    if slot < 0 || slot >= deviceLibrary.cameras[index].slotCount { return .Error(failure(.OutOfRange)) }
+    if isNull(memory.address) || memory.length == 0 { return .Error(failure(.InvalidArgument)) }
+    match slotOf(index, slot) {
+        Some(at) -> deviceLibrary.cameras[index].slots[at].memory = memory
+        None -> deviceLibrary.cameras[index].slots.append(CameraSlot { slot: slot, memory: memory })
+    }
+    return .Ok
+}
+
+public function cameraQueue(camera: Ref, slot: Number) -> Result<Void, TesseraError> {
+    let index = try resolveCamera(camera, RefRights.write)
+    let attached = match slotOf(index, slot) {
+        Some(at) -> deviceLibrary.cameras[index].slots[at].memory
+        None -> return .Error(failure(.BadState))
+    }
+    let device = try cameraDevice(index)
+    let blockBytes = zeroedBlock(count: Video.bufferBytes, alignment: 16)
+    let block = blockBytes.pointer()
+    heapStore<U32>(block, 0, U32(slot))
+    heapStore<U32>(block, 4, Video.capture)
+    heapStore<U32>(block, 60, Video.userPointer)
+    heapStore<RawPtr>(block, 64, attached.address)
+    heapStore<U32>(block, 72, U32(attached.length))
+    let queued = try device.control(Video.queueBuffer, block)
+    return .Ok
+}
+
+function frameFlags(bufferFlags: U32) -> CameraFrameFlags {
+    var flags = CameraFrameFlags.none
+    if (bufferFlags & Video.keyframe) != 0 { flags = flags | CameraFrameFlags.keyframe }
+    if (bufferFlags & Video.error) != 0 { flags = flags | CameraFrameFlags.error }
+    return flags
+}
+
+// A filled slot, or `ShouldWait` until one is. The driver's monotonic
+// timestamp is kept as it is.
+public function cameraDequeue(camera: Ref) -> Result<CameraFrame, TesseraError> {
+    let index = try resolveCamera(camera, RefRights.read)
+    let object = deviceLibrary.cameras[index].object
+    let device = try deviceOf(object)
+    let blockBytes = zeroedBlock(count: Video.bufferBytes, alignment: 16)
+    let block = blockBytes.pointer()
+    heapStore<U32>(block, 4, Video.capture)
+    heapStore<U32>(block, 60, Video.userPointer)
+    match device.control(Video.dequeueBuffer, block) {
+        Ok(value) -> {}
+        Error(failed) -> {
+            match errnoOf(failed) {
+                Again -> return .Error(failure(.ShouldWait))
+                NoDevice -> deviceLibrary.objects[object].state = .Lost
+                // Any other failure leaves the camera as it was; the caller
+                // hears of it.
+                else -> {}
+            }
+            return .Error(failed)
+        }
+    }
+    return .Ok(
+        CameraFrame {
+            slot: heapLoad<U32>(block, 0),
+            bytes: heapLoad<U32>(block, 8),
+            sequence: U64(heapLoad<U32>(block, 56)),
+            timestamp: U64(loadTime(block, 24, Time.nanosecondsPerMicrosecond)),
+            flags: frameFlags(heapLoad<U32>(block, 12)),
+        }
+    )
+}
+
+function setStreaming(index: Number, on: Bool) -> Result<Void, TesseraError> {
+    let device = try cameraDevice(index)
+    let blockBytes = zeroedBlock(count: 8, alignment: 16)
+    let block = blockBytes.pointer()
+    heapStore<U32>(block, 0, Video.capture)
+    let switched = try device.control(on ? Video.streamOn : Video.streamOff, block)
+    deviceLibrary.cameras[index].streaming = on
+    return .Ok
+}
+
+public function cameraStart(camera: Ref) -> Result<Void, TesseraError> {
+    let index = try resolveCamera(camera, RefRights.write)
+    return setStreaming(index, true)
+}
+
+// `STREAMOFF` takes every queued slot back from the driver.
+public function cameraStop(camera: Ref) -> Result<Void, TesseraError> {
+    let index = try resolveCamera(camera, RefRights.write)
+    return setStreaming(index, false)
+}
+
+function readControl(
+    device: borrow Descriptor,
+    setting: borrow CameraSetting
+) -> Result<Number, TesseraError> {
+    let blockBytes = zeroedBlock(count: 8, alignment: 16)
+    let block = blockBytes.pointer()
+    heapStore<U32>(block, 0, videoControl(setting))
+    try controlAnswer(device.control(Video.getControl, block))
+    let current = heapLoad<U32>(block, 4)
+    if setting == .Torch { return .Ok(current == Video.torchOn ? 1 : 0) }
+    return .Ok(Number(signedOf32(current)))
+}
+
+// Sets the control and answers the value the driver kept; with
+// `CameraValue.read` only reads it. Torch is on for any nonzero value.
+public function cameraControl(
+    camera: Ref,
+    setting: CameraSetting,
+    value: Number
+) -> Result<Number, TesseraError> {
+    let index = try resolveCamera(camera, RefRights.write)
+    let device = try cameraDevice(index)
+    if value != CameraValue.read {
+        let blockBytes = zeroedBlock(count: 8, alignment: 16)
+        let block = blockBytes.pointer()
+        heapStore<U32>(block, 0, videoControl(setting))
+        let setting32 = setting == .Torch ? (value != 0 ? Video.torchOn : U32(0)) : word32Of(value)
+        heapStore<U32>(block, 4, setting32)
+        try controlAnswer(device.control(Video.setControl, block))
+    }
+    return readControl(device, setting)
+}
+
+// One 32-byte record per control the device has: the setting `u32` @0, then
+// the minimum @8, maximum @16 and current value @24 as `i64`.
+public function cameraControls(camera: Ref, out: borrow Buffer) -> Result<Number, TesseraError> {
+    let index = try resolveCamera(camera, RefRights.read)
+    let device = try cameraDevice(index)
+    let blockBytes = zeroedBlock(count: 68, alignment: 16)
+    let block = blockBytes.pointer()
+    var count: Number = 0
+    for setting in cameraSettings {
+        zeroBytes(block, 68)
+        heapStore<U32>(block, 0, videoControl(setting))
+        // A control the driver lacks is skipped.
+        match device.control(Video.queryControl, block) {
+            Ok(value) -> {}
+            Error(failed) -> {
+                match errnoOf(failed) {
+                    Invalid -> continue
+                    else -> return .Error(failed)
+                }
+            }
+        }
+        let at = count * CameraRecord.controlBytes
+        try requireRoom(out, at + CameraRecord.controlBytes)
+        let minimum = signedOf32(heapLoad<U32>(block, 40))
+        let maximum = signedOf32(heapLoad<U32>(block, 44))
+        let current = try readControl(device, setting)
+        zeroBytes(heapOffset(out.address, at), CameraRecord.controlBytes)
+        heapStore<U32>(out.address, at, code(setting))
+        heapStore<U64>(out.address, at + 8, twosComplement(minimum))
+        heapStore<U64>(out.address, at + 16, twosComplement(maximum))
+        heapStore<U64>(out.address, at + 24, twosComplement(current))
+        count++
+    }
+    return .Ok(count)
+}
+
+function cameraRelease(object: Number) {
+    var kept: [CameraConnection] = []
+    for (index, camera) in deviceLibrary.cameras.enumerated() {
+        if camera.object != object {
+            kept.append(camera)
+            continue
+        }
+        if camera.streaming {
+            match setStreaming(index, false) {
+                Ok -> {}
+                Error(failed) -> log debug(
+                    "a camera did not stop streaming as it closed",
+                    error: errorName(failed)
+                )
+            }
+        }
+    }
+    deviceLibrary.cameras = kept
+}

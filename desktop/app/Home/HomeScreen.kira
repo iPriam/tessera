@@ -1,0 +1,639 @@
+import Foundation
+import HomeLayout
+import LibTessera
+import KiraUI
+import TesseraUI
+import PlatformUI
+
+// Home on Adaptive Mobile, as on an iPad: its pages side by side, which a
+// swipe turns, with App Library after the last, and the dots over the Dock.
+// A press held still on Home edits it: the icons wobble, each application
+// can be taken off Home, and an icon dragged moves, onto another to make a
+// folder or into one, and to the screen's side to turn the page it is
+// carried to. Done keeps the edit; Cancel puts Home back as it was.
+//
+// One drag on the whole screen follows every press, so a swipe that begins
+// on an icon still turns the page; a press that stays and lets go is the
+// icon's, which opens it.
+
+construct HomeScreen(applications: [Application], notice: String?) extends Widget {
+    // The screen shown, among the shown pages' screens and App Library after
+    // them, and how far a swipe has carried it.
+    @State var page: Number = 0
+    @State var swipe: Number = 0
+    @State var swiping: Bool = false
+    @State var editing: Bool = false
+    // The press under way: when it began and where, and whether it moved.
+    @State var pressAt: Number = 0
+    @State var pressX: Number = 0
+    @State var pressY: Number = 0
+    @State var pressMoved: Bool = false
+    // Whether Home was already edited when the press began: the press held
+    // to start the edit ends nothing when it lets go.
+    @State var pressEdits: Bool = false
+    // The item carried while Home is edited, where the finger has it, and
+    // since when it has been at the screen's side.
+    @State var carrying: Bool = false
+    @State var carryPage: Number = 0
+    @State var carryIndex: Number = 0
+    @State var carryX: Number = 0
+    @State var carryY: Number = 0
+    @State var edgeSince: Number = 0
+    // The folder open, by its page and place, its name as being typed, the
+    // pages overview, and App Library's search.
+    @State var folderPage: Number = 0
+    @State var folderOpen: Bool = false
+    @State var folderIndex: Number = 0
+    @State var folderName: String = ""
+    @State var overview: Bool = false
+    @State var query: String = ""
+    // The App Library category open over the page, or nothing.
+    @State var libraryFolder: String = ""
+    // The widget gallery, and the item whose removal is being asked about,
+    // by its page and place.
+    @State var gallery: Bool = false
+    @State var editMenu: Bool = false
+    @State var askPage: Number = 0
+    @State var askOpen: Bool = false
+    @State var askIndex: Number = 0
+    // Whether the keyboard is in use, which rings the item it is on: its
+    // place on the screen shown, and in the open folder.
+    @State var keyed: Bool = false
+    @State var focusIndex: Number = 0
+    @State var folderFocus: Number = 0
+    // Whether system search is open over Home.
+    @State var searching: Bool = false
+
+    body {
+        let metrics = launcherMetrics()
+        let space = homeSpace(metrics)
+        let arrangement = arrangedHome(applications, space)
+        let screens = arrangement.screenPages(space)
+        let count = screens.count + 1
+        let current = min(page, count - 1)
+        let width = viewportWidth()
+        self.holdToEdit(arrangement, screens, current, metrics)
+        setHomeEditing(editing)
+        setHomeIcons(homeIconsShown(arrangement, screens, current, metrics))
+        let look = HomeTileLook {
+            editing: editing,
+            carried: carrying ? .Some(HomeSlot { page : carryPage, index: carryIndex }): .None,
+            focused: keyed && current < screens.count ? .Some(
+                HomeSlot {
+                    page : screens[current].page,
+                    index: screens[current].first + focusIndex
+                }
+            ): .None,
+            kept: storedNotificationHistory()
+        }
+        let actions = HomeTileActions {
+            openFolder: { slot in
+                folderPage = slot.page
+                folderOpen = true
+                folderIndex = slot.index
+                folderName = folderNamed(loadArrangement(), slot)
+            },
+            remove: { slot in
+                askPage = slot.page
+                askOpen = true
+                askIndex = slot.index
+            }
+        }
+        let widgetActions = self.widgetActions(applications, space)
+        var strip: [Any Widget] = []
+        for (index, screen) in screens.enumerated() {
+            let at = screen.page
+            let shownPage = arrangement.screenPage(screen)
+            let widgets = copy shownPage.widgets
+            strip.append(
+                VStack(spacing = .None, alignment = .Center) {
+                    FixedGap(width = 0, height = metrics.top)
+                    if widgets.count > 0 {
+                        homeWidgetBand(at, widgets, arrangement.pages.count, editing, widgetActions)
+                        FixedGap(width = 0, height = HomeWidgetBand.gap)
+                    }
+                    homePageGrid(
+                        screen,
+                        shownPage.items,
+                        applications,
+                        homePageMetrics(metrics, shownPage),
+                        look,
+                        actions
+                    )
+                    Spacer()
+                    homePageDots(screens.count, index, editing, { in overview = true })
+                    FixedGap(width = 0, height = HomePaging.aboveDock)
+                    homeDock(editing)
+                }.width(resolvedLength(width)).fillHeight()
+            )
+        }
+        strip.append(
+            homeLibrary(
+                applications,
+                arrangement,
+                metrics,
+                $query,
+                copy libraryFolder,
+                { name, onto in
+                    var changed = loadArrangement()
+                    changed.addToHome(name, onto, space)
+                    commitHome(changed)
+                },
+                { name in libraryFolder = name }
+            ).width(resolvedLength(width))
+        )
+        ZStack(alignment = .TopLeading) {
+            HStack(spacing = .None, alignment = .Top, children = strip)
+            .offset(x = resolvedLength(-current * width + swipe), y = resolvedLength(0))
+            .animation(swiping ? .Immediate : .Smooth)
+            VStack(spacing = .None, alignment = .Center) {
+                Spacer()
+                hint(notice)
+            }
+            .fillWidth()
+            .fillHeight()
+            .edgePadding(EdgeSet.bottom, resolvedLength(dockBand()))
+            if editing && current < screens.count { self.editBar() }
+            if carrying { self.carried(arrangement, applications, metrics) }
+            if folderOpen {
+                self.openFolder(arrangement, applications, metrics, space, screens, current)
+            }
+            if overview { self.pagesOverview(arrangement) }
+            if gallery { self.widgetGallery(arrangement, screens, current, space) }
+            if searching {
+                SearchPanel(installed = copy applications, dismiss = { in searching = false })
+            }
+            if libraryFolder.count > 0 {
+                libraryFolderScreen(copy libraryFolder, applications, { in libraryFolder = "" })
+                .transition(opacityTransition(), animation: .Smooth)
+            }
+        }
+        .fillWidth()
+        .fillHeight()
+        // While Home is edited its own bar takes the top, as an iPad's does.
+        .statusBarHidden(editing)
+        .alert(
+            title = removalTitle(self.asked(arrangement)),
+            isPresented = askOpen,
+            message = removalMessage(self.asked(arrangement)),
+            actions = removalActions(
+                self.asked(arrangement),
+                HomeSlot { page: askPage, index: askIndex },
+                applications,
+                { in askOpen = false }
+            )
+        )
+        .gesture(
+            DragGesture(minimumDistance: 0).onChanged {
+                value in self.pressed(move value, arrangement, screens, current, count, metrics)
+            }.onEnded {
+                value in self.released(move value, screens, current, count, metrics, space)
+            }
+        )
+        .onKeyPress(KeyEquivalent.leftArrow, action = { in self.keyStep(-1, false) })
+        .onKeyPress(KeyEquivalent.rightArrow, action = { in self.keyStep(1, false) })
+        .onKeyPress(KeyEquivalent.upArrow, action = { in self.keyStep(-metrics.columns, false) })
+        .onKeyPress(KeyEquivalent.downArrow, action = { in self.keyStep(metrics.columns, false) })
+        .onKeyPress(
+            KeyEquivalent.leftArrow,
+            modifiers = [.Shift],
+            action = { in self.keyStep(-1, true) }
+        )
+        .onKeyPress(
+            KeyEquivalent.rightArrow,
+            modifiers = [.Shift],
+            action = { in self.keyStep(1, true) }
+        )
+        .onKeyPress(
+            KeyEquivalent.upArrow,
+            modifiers = [.Shift],
+            action = { in self.keyStep(-metrics.columns, true) }
+        )
+        .onKeyPress(
+            KeyEquivalent.downArrow,
+            modifiers = [.Shift],
+            action = { in self.keyStep(metrics.columns, true) }
+        )
+        .onKeyPress(KeyEquivalent.returnKey, action = { in self.keyOpen() })
+        .onKeyPress(KeyEquivalent.escape, action = { in self.keyEscape() })
+        .onKeyPress(KeyEquivalent.delete, action = { in self.keyRemove() })
+        .onKeyPress("E", modifiers = [.Command], action = { in self.keyEdit() })
+        .onKeyPress("G", modifiers = [.Command], action = { in self.keyGroup() })
+        .onKeyPress(" ", modifiers = [.Command], action = { in searching = !editing })
+    }
+
+    // A press held still long enough edits Home, carrying the item under it.
+    function holdToEdit(
+        arrangement: borrow HomeArrangement,
+        screens: borrow [HomeScreenPage],
+        current: Number,
+        metrics: borrow LauncherMetrics
+    ) {
+        if editing || pressAt == 0 || pressMoved || current >= screens.count { return }
+        // Nothing under a folder, the pages, the gallery or a question is
+        // picked up.
+        if folderOpen || overview || gallery || askOpen { return }
+        if unixMillis() - pressAt < HomePaging.longPress { return }
+        editing = true
+        beginHomeEdit()
+        let screen = screens[current]
+        let paged = homePageMetrics(metrics, arrangement.screenPage(screen))
+        let index = homeIndexAt(pressX, pressY, paged)
+        if homeOnIcon(pressX, pressY, index, paged, false) && index < screen.count {
+            carrying = true
+            carryPage = screen.page
+            carryIndex = screen.first + index
+            carryX = pressX
+            carryY = pressY
+        }
+    }
+
+    function pressed(
+        value: DragGestureValue,
+        arrangement: borrow HomeArrangement,
+        screens: borrow [HomeScreenPage],
+        current: Number,
+        count: Number,
+        metrics: borrow LauncherMetrics
+    ) {
+        // A press that starts somewhere else is a new one, even when the last
+        // one's end never came, as when the edit it started took the screen.
+        let fresh = pressAt == 0 || value.startLocation.x != pressX || value.startLocation.y != pressY
+        if fresh {
+            pressAt = unixMillis()
+            pressX = value.startLocation.x
+            pressY = value.startLocation.y
+            pressMoved = false
+            pressEdits = editing
+            keyed = false
+            if !editing { redrawAfter(HomePaging.longPress / 1000) }
+            // While Home is edited a press on an item picks it up at once.
+            if editing && !folderOpen && !overview && !gallery && !askOpen && current < screens.count {
+                self.pickUp(arrangement, screens[current], metrics)
+            }
+        }
+        let far = abs(value.translation.width) > HomePaging.still || abs(
+            value.translation.height
+        ) > HomePaging.still
+        if far { pressMoved = true }
+        if carrying {
+            carryX = value.location.x
+            carryY = value.location.y
+            self.carryToSide(value.location.x, count)
+            return
+        }
+        // A pull down on a page, as on an iPad, opens system search.
+        if pressMoved && !editing && !folderOpen && current < count - 1 && value.translation.height > HomePaging.searchPull && value.translation.height > abs(
+            value.translation.width
+        ) {
+            searching = true
+            return
+        }
+        if pressMoved && !folderOpen && !overview && !gallery && !askOpen && abs(
+            value.translation.width
+        ) > abs(value.translation.height) {
+            swiping = true
+            let width = viewportWidth()
+            // Past the first page or the last the strip gives a third as much.
+            let past = current == 0 && value.translation.width > 0 || current == count - 1 && value.translation.width < 0
+            swipe = past ? value.translation.width / 3 : max(
+                min(value.translation.width, width),
+                -width
+            )
+        }
+    }
+
+    // While Home is edited a press on an item of `screen` picks it up.
+    function pickUp(
+        arrangement: borrow HomeArrangement,
+        screen: borrow HomeScreenPage,
+        metrics: borrow LauncherMetrics
+    ) {
+        let paged = homePageMetrics(metrics, arrangement.screenPage(screen))
+        let index = homeIndexAt(pressX, pressY, paged)
+        if homeOnIcon(pressX, pressY, index, paged, true) && index < screen.count {
+            carrying = true
+            carryPage = screen.page
+            carryIndex = screen.first + index
+        }
+    }
+
+    // An item held at the screen's side turns the page after a moment.
+    function carryToSide(x: Number, count: Number) {
+        let width = viewportWidth()
+        let side = x < HomePaging.edge ? -1 : (x > width - HomePaging.edge ? 1 : 0)
+        if side == 0 {
+            edgeSince = 0
+            return
+        }
+        let now = unixMillis()
+        if edgeSince == 0 {
+            edgeSince = now
+            redrawAfter(HomePaging.edgeWait / 1000)
+            return
+        }
+        if now - edgeSince < HomePaging.edgeWait { return }
+        // App Library takes no icons, so an item goes no further than the
+        // last page.
+        page = max(min(page + side, count - 2), 0)
+        edgeSince = now
+        redrawAfter(HomePaging.edgeWait / 1000)
+    }
+
+    function released(
+        value: DragGestureValue,
+        screens: borrow [HomeScreenPage],
+        current: Number,
+        count: Number,
+        metrics: borrow LauncherMetrics,
+        space: borrow HomeSpace
+    ) {
+        pressAt = 0
+        edgeSince = 0
+        if carrying {
+            carrying = false
+            // A tap on an icon is no move: only a press carried away moves it.
+            if !pressMoved || current >= screens.count { return }
+            if onDockBand(value.location.y, viewportHeight()) {
+                carriedToDock(HomeSlot { page: carryPage, index: carryIndex }, value.location.x)
+                return
+            }
+            let target = screens[current]
+            var changed = loadArrangement()
+            let paged = homePageMetrics(metrics, changed.screenPage(target))
+            let index = max(homeIndexAt(value.location.x, value.location.y, paged), 0)
+            let from = HomeSlot { page: carryPage, index: carryIndex }
+            let to = HomeSlot { page: target.page, index: target.first + index }
+            let onto = changed.itemAt(to).isSome() && from != to && homeOverIcon(
+                value.location.x,
+                value.location.y,
+                index,
+                paged
+            )
+            if onto {
+                changed.dropItem(from, to, space)
+            } else {
+                changed.moveItem(from, to, space)
+            }
+            commitHome(changed)
+            return
+        }
+        if !swiping {
+            self.tappedWhileEditing(screens, current, metrics)
+            return
+        }
+        swiping = false
+        let width = viewportWidth()
+        let flung = value.predictedEndTranslation.width
+        if flung < -width / 2 && current < count - 1 { page = current + 1 }
+        if flung > width / 2 && current > 0 { page = current - 1 }
+        swipe = 0
+    }
+
+    // A tap while Home is edited that no control took, off the items and
+    // their badges, ends the edit as Done does, as on an iPad; with Edit's
+    // menu out it only puts the menu away. The edit bar and the widgets keep
+    // their own taps.
+    function tappedWhileEditing(
+        screens: borrow [HomeScreenPage],
+        current: Number,
+        metrics: borrow LauncherMetrics
+    ) {
+        if !editing || !pressEdits || pressMoved || current >= screens.count { return }
+        if folderOpen || overview || gallery || askOpen { return }
+        let page = loadArrangement().screenPage(screens[current])
+        let paged = homePageMetrics(metrics, page)
+        let above = page.widgets.count > 0 ? paged.top - HomePaging.edge : HomeEditBar.reach
+        if pressY < above { return }
+        // The Dock answers its own taps, its badges' too.
+        if pressY >= viewportHeight() - dockBand() { return }
+        if editMenu {
+            editMenu = false
+            return
+        }
+        if homeOnItem(pressX, pressY, homeIndexAt(pressX, pressY, paged), page.items.count, paged) {
+            return
+        }
+        self.endEdit(true)
+    }
+
+    // The bar along the top while Home is edited, where the status bar was:
+    // Edit, whose small menu adds a widget or shows the pages, and Done,
+    // each a small pill in its corner as an iPad's are.
+    function editBar() -> Any Widget {
+        return VStack(spacing = .Length(HomeEditBar.gap), alignment = .Leading) {
+            HStack(spacing = .None, alignment = .Center) {
+                homeEditPill("Edit", { in editMenu = !editMenu })
+                Spacer()
+                homeEditPill("Done", { in self.endEdit(true) })
+            }
+            .fillWidth()
+            if editMenu {
+                VStack(spacing = .None, alignment = .Leading) {
+                    homeEditChoice(
+                        "Add Widget",
+                        .PlusSquareOnSquare,
+                        { in
+                            editMenu = false
+                            gallery = true
+                        }
+                    )
+                    homeEditChoice(
+                        "Edit Pages",
+                        .SquareGrid2x2,
+                        { in
+                            editMenu = false
+                            overview = true
+                        }
+                    )
+                }
+                .padding(resolvedLength(6))
+                .glassEffect(shape: .Squircle(HomeEditBar.menuCorner))
+            }
+        }
+        .fillWidth()
+        .edgePadding(EdgeSet.horizontal, resolvedLength(HomeEditBar.inset))
+        .edgePadding(EdgeSet.top, resolvedLength(HomeEditBar.top))
+    }
+
+    function endEdit(keep: Bool) {
+        endHomeEdit(keep)
+        editing = false
+        // Done acts as its press lets go, a build before the drag's end is
+        // reported: forgotten here, that press is not taken for one held to
+        // edit Home again.
+        pressAt = 0
+        carrying = false
+        overview = false
+        gallery = false
+        editMenu = false
+        askOpen = false
+        folderOpen = false
+        redrawAfter(0)
+    }
+
+    // The item carried, under the finger, a little larger than on the page.
+    function carried(
+        arrangement: borrow HomeArrangement,
+        applications: borrow [Application],
+        metrics: borrow LauncherMetrics
+    ) -> Any Widget {
+        let item = try arrangement.itemAt(
+            HomeSlot { page: carryPage, index: carryIndex }
+        ) otherwise return EmptyView()
+        return ApplicationIcon(name = item.name(), side = metrics.icon)
+        .scaleEffect(1.1)
+        .offset(
+            x = resolvedLength(carryX - metrics.icon / 2),
+            y = resolvedLength(carryY - metrics.icon / 2)
+        )
+    }
+
+    // The folder open over the page.
+    function openFolder(
+        arrangement: borrow HomeArrangement,
+        applications: borrow [Application],
+        metrics: borrow LauncherMetrics,
+        space: borrow HomeSpace,
+        screens: borrow [HomeScreenPage],
+        current: Number
+    ) -> Any Widget {
+        if !folderOpen { return EmptyView() }
+        let page = folderPage
+        let slot = HomeSlot { page: page, index: folderIndex }
+        let item = try arrangement.itemAt(slot) otherwise return EmptyView()
+        let folder = match item {
+            Folder(value) -> value
+            App -> return EmptyView()
+        }
+        let onto = screens.count > 0 ? screens[min(current, screens.count - 1)].page : 0
+        let renamed = copy slot
+        let shifted = copy slot
+        let apps = copy folder.apps
+        let actions = HomeFolderActions {
+            close: { in
+                if editing {
+                    var changed = loadArrangement()
+                    changed.renameFolder(renamed, folderName)
+                    commitHome(changed)
+                }
+                folderOpen = false
+            },
+            rename: { name in
+                var changed = loadArrangement()
+                changed.renameFolder(renamed, name)
+                commitHome(changed)
+            },
+            shift: { app, by in
+                var at: Number = 0
+                for index in 0..apps.count {
+                    if apps[index] == app { at = index }
+                }
+                var changed = loadArrangement()
+                changed.reorderFolder(shifted, app, at + by)
+                commitHome(changed)
+            },
+            moveOut: { app in
+                var changed = loadArrangement()
+                changed.moveOut(app, onto, space)
+                if changed.itemAt(HomeSlot { page: page, index: folderIndex }).isNone() {
+                    folderOpen = false
+                }
+                commitHome(changed)
+            }
+        }
+        let focused: Number? = keyed ? .Some(folderFocus) : .None
+        return homeFolderPanel(
+            folder,
+            applications,
+            metrics,
+            editing,
+            $folderName,
+            actions,
+            move focused
+        )
+    }
+
+    // What a widget asks of Home.
+    function widgetActions(
+        applications: borrow [Application],
+        space: borrow HomeSpace
+    ) -> HomeWidgetActions {
+        let installed = copy applications
+        return HomeWidgetActions {
+            open: { kind in
+                let owner = kind == HomeWidgetKind.battery ? "Settings" : copy kind
+                match applicationNamed(installed, owner) {
+                    Some(application) -> openApplication(application)
+                    None -> log warn("a widget's application is not installed", widget: copy kind)
+                }
+            },
+            resize: { at, index in
+                var changed = loadArrangement()
+                changed.resizeWidget(at, index, space)
+                commitHome(changed)
+            },
+            shift: { at, index, side in
+                var changed = loadArrangement()
+                changed.shiftWidget(at, index, side, space)
+                commitHome(changed)
+            },
+            remove: { at, index in
+                var changed = loadArrangement()
+                changed.removeWidget(at, index)
+                commitHome(changed)
+            }
+        }
+    }
+
+    // The widget gallery over the page, adding to the page shown.
+    function widgetGallery(
+        arrangement: borrow HomeArrangement,
+        screens: borrow [HomeScreenPage],
+        current: Number,
+        space: borrow HomeSpace
+    ) -> Any Widget {
+        let onto = screens.count > 0 ? screens[min(current, screens.count - 1)].page : 0
+        let widgets = onto < arrangement.pages.count ? copy arrangement.pages[onto].widgets : []
+        return VStack(spacing = .None, alignment = .Center) {
+            Spacer()
+            homeWidgetGallery(
+                widgets,
+                { widget in
+                    var changed = loadArrangement()
+                    changed.addWidget(onto, move widget, space)
+                    commitHome(changed)
+                    gallery = false
+                },
+                { in gallery = false }
+            )
+            Spacer()
+        }
+        .fillWidth()
+        .fillHeight()
+    }
+
+    // The item whose removal is being asked about, when a question is open.
+    function asked(arrangement: borrow HomeArrangement) -> HomeItem? {
+        if !askOpen { return .None }
+        return arrangement.itemAt(HomeSlot { page: askPage, index: askIndex })
+    }
+
+    // The pages side by side, to hide, show and move.
+    function pagesOverview(arrangement: borrow HomeArrangement) -> Any Widget {
+        let actions = HomePagesActions {
+            toggle: { at in
+                var changed = loadArrangement()
+                changed.toggleHidden(at)
+                commitHome(changed)
+            },
+            shift: { at, by in
+                var changed = loadArrangement()
+                changed.movePage(at, at + by)
+                commitHome(changed)
+            },
+            done: { in overview = false }
+        }
+        return homePagesOverview(arrangement, actions)
+    }
+}

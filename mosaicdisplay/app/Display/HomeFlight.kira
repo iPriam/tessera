@@ -1,0 +1,700 @@
+import Foundation
+import LibTessera
+import TesseraDisplayClient
+
+// A window going home on a touch screen, as an iPad's does
+// (roadmap/15-form-factors.md). Swiped up from the band along the bottom edge
+// it becomes a card under the finger: smaller the higher it is lifted, the
+// point of it under the finger staying under it, its corners rounding. Let go
+// moving up, or lifted far enough, it flies into its application's icon in
+// the Dock on a spring that carries the finger's speed, so a flick up, to one
+// side or the other, curves into the same icon. Otherwise it springs back to
+// fill the screen. Coming back from home it grows out of the icon the same
+// way.
+//
+// The card is the window's own picture, cut to a rounded rectangle that
+// becomes the icon's, and the icon fades in over it as the card nears it
+// (`drawIconOverCard`). The platform
+// says where each icon is (`DisplayStageBadge.home`), is asked to go home as
+// the card is let go, and is told the window flies (`Fly`), so it keeps its
+// Dock up until the card has `Landed`. An application opened from the home
+// screen grows out of the icon the home screen says it was opened from
+// (`DisplayLaunchOrigin`) instead, and goes home back into it. The icon's
+// place in the platform's or the home screen's picture is left out while the
+// card flies (`vacatedSlot`), so the card leaves or lands in an empty place
+// and the icon is back the frame the card goes. While a card moves only the
+// home screen and the platform are drawn under it, as an iPad shows its home
+// screen behind every application.
+
+enum HomePhase {
+    // Under the finger.
+    Tracking
+    // Into the icon, back to fill the screen, or out of the icon.
+    Leaving
+    Returning
+    Opening
+}
+
+// Where the card is, by its center and size, in points; or how fast each of
+// those moves, in points a second.
+struct HomeCard {
+    var x: Number = 0
+    var y: Number = 0
+    var width: Number = 0
+    var height: Number = 0
+}
+
+struct HomeSample {
+    var time: Number
+    var x: Number
+    var y: Number
+}
+
+struct HomeFlight {
+    var index: Number
+    var phase: HomePhase
+    var badge: DisplayStageBadge
+    var card: HomeCard
+    var velocity: HomeCard = HomeCard {}
+    // Where and when the finger went down, and where it has been lately.
+    var startX: Number = 0
+    var startY: Number = 0
+    var started: Number = 0
+    var samples: [HomeSample] = []
+    var ticked: Number = 0
+    // How many frames the platform had committed when the card came to rest,
+    // and when that was: a landed card stays over the platform until it has
+    // drawn the icon, or the Dock gone, again.
+    var platformSeen: Number = 0
+    var homeScreenSeen: Number = 0
+    var landed: Number = 0
+    // Whether it grows out of, or flies into, the home screen's icon rather
+    // than the Dock's.
+    var homeScreen: Bool = false
+}
+
+namespace HomeMotion {
+    // How small the card gets as it is lifted: by `reach` of its size at
+    // most, `pull` setting how soon, as 1 - reach * (1 - e^(-pull * lift /
+    // height)).
+    let reach: Number = 0.75
+    let pull: Number = 1.6
+    // The card's corner at its smallest, and how fast it rounds as it
+    // shrinks.
+    let corner: Number = 34
+    let rounding: Number = 140
+    // Letting go lifted past this share of the output's height goes home,
+    // and so does letting go moving up faster than `fling` points a second
+    // at any height, unless it is moving down faster than `sink`.
+    let lift: Number = 0.16
+    let fling: Number = 350
+    let sink: Number = 150
+    // A press that moves less than `tap` points and comes up within `tapTime`
+    // milliseconds is a tap on the home indicator, which goes home too.
+    let tap: Number = 8
+    let tapTime: Number = 300
+    // The finger's speed is read over its last `window` milliseconds.
+    let window: Number = 90
+    // The spring every flight rides: how long it takes to respond, in
+    // seconds, and how much of its swing it damps.
+    let response: Number = 0.44
+    let damping: Number = 0.84
+    let step: Number = 0.004
+    // The most of the clock one tick moves a card by: a late frame moves it
+    // as far as the time that passed, so a slow display drops frames rather
+    // than slowing the flight down.
+    let longestTick: Number = 0.5
+    // A card within `settled` points of where it goes, slower than `still`
+    // points a second, is there.
+    let settled: Number = 0.5
+    let still: Number = 6
+    // The card's corner becomes the icon's once the card is narrower than
+    // this share of the output.
+    let iconShare: Number = 0.3
+    let frame: Number = 16000000
+    // How long after the home screen opens an application from an icon the
+    // application's first picture still grows out of it, in milliseconds.
+    let opened: Number = 15000
+    // The longest a landed card waits for the platform to draw, in
+    // milliseconds.
+    let platformWait: Number = 600
+}
+
+// The icon the platform drew for the surface at `index`, with where it stands.
+function homeBadge(server: borrow Server, index: Number) -> DisplayStageBadge? {
+    let surface = server.clients[index].surface
+    for client in server.clients {
+        if !client.alive || client.role != .Platform { continue }
+        for badge in client.badges {
+            if badge.surface == surface && badge.home.width > 0 && badge.home.height > 0 {
+                return .Some(badge)
+            }
+        }
+    }
+    return .None
+}
+
+// The icon a window going home flies into, and whether it is the home
+// screen's: the one it was opened from there, as an iPad's flies back to the
+// icon it came out of, or else its icon on the home screen's page when the
+// platform has it there, or else its icon in the Dock.
+struct HomeIcon {
+    let badge: DisplayStageBadge
+    let homeScreen: Bool
+}
+
+function homeIconOf(server: borrow Server, index: Number) -> HomeIcon? {
+    match server.clients[index].homeIcon {
+        Some(badge) -> return .Some(HomeIcon { badge: badge, homeScreen: true })
+        None -> {}
+    }
+    let badge = try homeBadge(server, index) otherwise return .None
+    return .Some(HomeIcon { badge: badge, homeScreen: badge.homeScreen })
+}
+
+// Whether a window may fly: an application filling the screen in the stack.
+function homeMovable(server: borrow Server, index: Number) -> Bool {
+    let client = server.clients[index]
+    return server.mode == .Stack && client.alive && client.role == .Application
+        && client.content.isSome()
+}
+
+// Whether a window may fly home: one that may fly, with an icon to fly into.
+function homeFlies(server: borrow Server, index: Number) -> Bool {
+    return homeMovable(server, index) && homeIconOf(server, index).isSome()
+}
+
+function wholeCard(frame: borrow Geometry) -> HomeCard {
+    return HomeCard {
+        x: frame.x + frame.width / 2,
+        y: frame.y + frame.height / 2,
+        width: frame.width,
+        height: frame.height,
+    }
+}
+
+function iconCard(badge: borrow DisplayStageBadge) -> HomeCard {
+    return HomeCard {
+        x: badge.home.x + badge.home.width / 2,
+        y: badge.home.y + badge.home.height / 2,
+        width: badge.home.width,
+        height: badge.home.height,
+    }
+}
+
+// A press in the band along the bottom edge while an application fills the
+// screen takes the window under the finger; nothing else hears the press.
+// The finger is timed by its records, `time` in milliseconds, so a busy
+// display reads its speed as it was.
+function beginHomeFlight(server: borrow mut Server, time: UNumber) -> Bool {
+    if server.homeFlight.isSome() || server.inputHeld || server.dock <= 0 { return false }
+    if server.pointerY < server.display.scanout.pointHeight() - server.dock { return false }
+    let index = try server.focus otherwise return false
+    if server.clients[index].hidden || !homeMovable(server, index) { return false }
+    let icon = try homeIconOf(server, index) otherwise return false
+    let now = Number(time)
+    server.homeFlight = .Some(
+        HomeFlight {
+            index: index,
+            phase: .Tracking,
+            badge: icon.badge,
+            card: wholeCard(server.clients[index].frame),
+            startX: server.pointerX,
+            startY: server.pointerY,
+            started: now,
+            samples: [HomeSample { time: now, x: server.pointerX, y: server.pointerY }],
+            homeScreen: icon.homeScreen,
+        }
+    )
+    log info("a window is being swiped home", surface: server.clients[index].surface.raw)
+    tellHomeScreenFlight(server)
+    let surface = server.clients[index].surface
+    tellPlatforms(
+        server,
+        .WindowRequested(DisplayWindowRequest { surface: surface, action: .Peek })
+    )
+    return true
+}
+
+// The card follows the finger, drawn once the records ready are all read.
+// False when no card is under it.
+function followHome(server: borrow mut Server, time: UNumber) -> Bool {
+    var flight = match server.homeFlight {
+        Some(value) -> value
+        None -> return false
+    }
+    if flight.phase != .Tracking { return false }
+    let now = Number(time)
+    flight.samples.append(HomeSample { time: now, x: server.pointerX, y: server.pointerY })
+    var kept: [HomeSample] = []
+    for sample in flight.samples {
+        if now - sample.time <= HomeMotion.window * 2 { kept.append(sample) }
+    }
+    flight.samples = move kept
+    flight.card = trackedCard(server, flight)
+    server.homeFlight = .Some(move flight)
+    server.cursorOwed = true
+    return true
+}
+
+// The card under the finger: the window scaled by how far it is lifted,
+// about the point the finger went down on.
+function trackedCard(server: borrow Server, flight: borrow HomeFlight) -> HomeCard {
+    let whole = server.clients[flight.index].frame
+    let height = server.display.scanout.pointHeight()
+    let lift = max(flight.startY - server.pointerY, 0)
+    let scale = 1 - HomeMotion.reach * (1 - exp(-HomeMotion.pull * lift / max(height, 1)))
+    let centerX = whole.x + whole.width / 2
+    let centerY = whole.y + whole.height / 2
+    return HomeCard {
+        x: server.pointerX + (centerX - flight.startX) * scale,
+        y: server.pointerY + (centerY - flight.startY) * scale,
+        width: whole.width * scale,
+        height: whole.height * scale,
+    }
+}
+
+// The finger came up, at `time`: the card goes home or back, carried on at
+// the finger's speed.
+function endHomeFlight(server: borrow mut Server, time: UNumber) -> Result<Void, TesseraError> {
+    var flight = match server.homeFlight {
+        Some(value) -> value
+        None -> return .Ok
+    }
+    if flight.phase != .Tracking { return .Ok }
+    let now = Number(time)
+    var first = flight.samples[0]
+    for sample in flight.samples {
+        if now - sample.time <= HomeMotion.window {
+            first = sample
+            break
+        }
+    }
+    let last = flight.samples[flight.samples.count - 1]
+    let span = max(last.time - first.time, 1) / 1000
+    let speedX = last.time > first.time ? (last.x - first.x) / span : 0
+    let speedY = last.time > first.time ? (last.y - first.y) / span : 0
+    let lifted = flight.startY - server.pointerY
+    let moved = abs(server.pointerX - flight.startX) + abs(lifted)
+    let tapped = moved < HomeMotion.tap && now - flight.started < HomeMotion.tapTime
+    let height = server.display.scanout.pointHeight()
+    let home = tapped || speedY < -HomeMotion.fling
+        || lifted > height * HomeMotion.lift && speedY < HomeMotion.sink
+    flight.velocity = HomeCard { x: speedX, y: speedY, width: 0, height: 0 }
+    flight.phase = home ? .Leaving : .Returning
+    let ticked = try nowMillis()
+    flight.ticked = Number(ticked)
+    let surface = server.clients[flight.index].surface
+    server.homeFlight = .Some(move flight)
+    log info("a swiped window was let go", surface: surface.raw, home: home, speedY: speedY)
+    let action: DisplayWindowAction = home ? .Home : .Unpeek
+    tellPlatforms(
+        server,
+        .WindowRequested(DisplayWindowRequest { surface: surface, action: action })
+    )
+    if home { tellFlight(server, surface, .Fly) }
+    armHome(server)
+    redraw(server, "a swiped window let go")
+    return .Ok
+}
+
+// The platform hid the window in front, or showed one again, by a key, a tap
+// or its own choice: in the stack it flies into its icon, or out of it.
+function flyHome(server: borrow mut Server, index: Number, hidden: Bool) -> Result<Void, TesseraError> {
+    if hidden && server.focus != .Some(index) { return .Ok }
+    match server.homeFlight {
+        Some(flight) -> if flight.index == index { return .Ok }
+        None -> {}
+    }
+    // A window coming back grows out of the home screen's icon it was opened
+    // from a moment ago, or else its icon in the Dock, which it then goes
+    // back into; one with no icon to grow out of opens at once, and the
+    // platform, keeping its Dock up for a flight, hears it landed.
+    let surface = server.clients[index].surface
+    if !hidden { server.clients[index].homeIcon = try takeLaunchBadge(server, surface) }
+    if !homeFlies(server, index) {
+        if !hidden { tellFlight(server, surface, .Landed) }
+        return .Ok
+    }
+    let icon = match homeIconOf(server, index) {
+        Some(value) -> value
+        None -> return .Ok
+    }
+    let ticked = try nowMillis()
+    server.homeFlight = .Some(
+        HomeFlight {
+            index: index,
+            phase: hidden ? .Leaving : .Opening,
+            badge: copy icon.badge,
+            card: hidden ? wholeCard(server.clients[index].frame) : iconCard(icon.badge),
+            ticked: Number(ticked),
+            homeScreen: icon.homeScreen,
+        }
+    )
+    tellFlight(server, surface, .Fly)
+    armHome(server)
+    return .Ok
+}
+
+// Tells the platform the window on `surface` flies, or has landed.
+function tellFlight(server: borrow Server, surface: DisplaySurfaceId, action: DisplayWindowAction) {
+    tellPlatforms(
+        server,
+        .WindowRequested(DisplayWindowRequest { surface: surface, action: action })
+    )
+}
+
+// The icon as the platform has it now: its atlas is laid out again as
+// windows are put away, so a flight reads it afresh each frame, and keeps the
+// last it read should the platform drop it.
+function flightBadge(server: borrow Server, flight: borrow HomeFlight) -> DisplayStageBadge {
+    if flight.homeScreen { return copy flight.badge }
+    return match homeBadge(server, flight.index) {
+        Some(badge) -> badge
+        None -> copy flight.badge
+    }
+}
+
+// The home screen's icon an application is being opened from, on the
+// output, and when the home screen said so.
+struct LaunchOrigin {
+    var time: Number
+    var icon: StageFrame
+    var corner: Number
+}
+
+// The home screen says which icon it is opening an application from.
+function setLaunchOrigin(
+    server: borrow mut Server,
+    index: Number,
+    asked: borrow DisplayLaunchOrigin
+) -> Result<Void, TesseraError> {
+    let client = server.clients[index]
+    if asked.surface != client.surface || client.role != .Desktop {
+        log warn("a launch origin came from other than the home screen", surface: asked.surface.raw)
+        return .Ok
+    }
+    let now = try nowMillis()
+    server.launchOrigin = .Some(
+        LaunchOrigin {
+            time: Number(now),
+            icon: StageFrame {
+                x: client.frame.x + asked.icon.x,
+                y: client.frame.y + asked.icon.y,
+                width: asked.icon.width,
+                height: asked.icon.height,
+            },
+            corner: asked.corner,
+        }
+    )
+    return .Ok
+}
+
+// An application's first picture in the stack: it grows out of the home
+// screen's icon it was opened from a moment ago, or else its icon in the Dock.
+function flyOpen(server: borrow mut Server, index: Number) -> Result<Void, TesseraError> {
+    if server.homeFlight.isSome() {
+        tellFlight(server, server.clients[index].surface, .Landed)
+        return .Ok
+    }
+    return flyHome(server, index, false)
+}
+
+// The home screen's icon an application on `surface` was opened from a moment
+// ago, taken; none when it was opened otherwise.
+function takeLaunchBadge(
+    server: borrow mut Server,
+    surface: DisplaySurfaceId
+) -> Result<DisplayStageBadge?, TesseraError> {
+    let origin = match server.launchOrigin {
+        Some(value) -> value
+        None -> return .Ok(.None)
+    }
+    server.launchOrigin = .None
+    let now = try nowMillis()
+    if Number(now) - origin.time > HomeMotion.opened { return .Ok(.None) }
+    return .Ok(.Some(
+        DisplayStageBadge {
+            surface: surface,
+            slot: 0,
+            home: origin.icon,
+            homeCorner: origin.corner,
+            homeScreen: true
+        }
+    ))
+}
+
+// Where the card is going.
+function homeTarget(server: borrow Server, flight: borrow HomeFlight) -> HomeCard {
+    return match flight.phase {
+        Leaving -> iconCard(flightBadge(server, flight))
+        Tracking, Returning, Opening -> wholeCard(server.clients[flight.index].frame)
+    }
+}
+
+// One frame of a flight: the spring moves the card on by the time since the
+// last, and the flight ends once the card is where it goes.
+function homeTick(server: borrow mut Server, fired: borrow Completion) -> Result<Void, TesseraError> {
+    if fired.error.code != .Ok { return .Ok }
+    var flight = match server.homeFlight {
+        Some(value) -> value
+        None -> return .Ok
+    }
+    if flight.phase == .Tracking { return .Ok }
+    if !server.clients[flight.index].alive {
+        server.homeFlight = .None
+        tellFlight(server, server.clients[flight.index].surface, .Landed)
+        redraw(server, "a flying window went")
+        return .Ok
+    }
+    let now = Number(try nowMillis())
+    let elapsed = clamp((now - flight.ticked) / 1000, 0, HomeMotion.longestTick)
+    flight.ticked = now
+    flight.badge = flightBadge(server, flight)
+    let target = homeTarget(server, flight)
+    let stiffness = (2 * 3.14159265 / HomeMotion.response) * (2 * 3.14159265 / HomeMotion.response)
+    let friction = 2 * HomeMotion.damping * sqrt(stiffness)
+    var left = elapsed
+    while left > 0 {
+        let step = min(left, HomeMotion.step)
+        flight.velocity.x += (
+            -stiffness * (flight.card.x - target.x) - friction * flight.velocity.x
+        ) * step
+        flight.velocity.y += (
+            -stiffness * (flight.card.y - target.y) - friction * flight.velocity.y
+        ) * step
+        flight.velocity.width += (
+            -stiffness * (flight.card.width - target.width) - friction * flight.velocity.width
+        ) * step
+        flight.velocity.height += (
+            -stiffness * (flight.card.height - target.height) - friction * flight.velocity.height
+        ) * step
+        flight.card.x += flight.velocity.x * step
+        flight.card.y += flight.velocity.y * step
+        flight.card.width = max(flight.card.width + flight.velocity.width * step, 1)
+        flight.card.height = max(flight.card.height + flight.velocity.height * step, 1)
+        left -= step
+    }
+    let there = abs(flight.card.x - target.x) < HomeMotion.settled && abs(
+        flight.card.y - target.y
+    ) < HomeMotion.settled
+        && abs(flight.card.width - target.width) < HomeMotion.settled
+        && abs(flight.card.height - target.height) < HomeMotion.settled
+    let resting = abs(flight.velocity.x) + abs(flight.velocity.y) + abs(flight.velocity.width)
+        + abs(flight.velocity.height) < HomeMotion.still
+    if there && resting {
+        // Landed: the platform draws the icon, or takes the Dock away, again,
+        // and the card stays over it until that frame is drawn.
+        if flight.landed == 0 {
+            flight.landed = now
+            flight.platformSeen = server.platformFrames
+            flight.homeScreenSeen = server.homeScreenFrames
+            tellFlight(server, server.clients[flight.index].surface, .Landed)
+        }
+        // Landed in its icon in the Dock: the icon is in the platform's
+        // picture already, under the place left for the card, so the card
+        // goes and the icon shows in the same frame.
+        if flight.phase == .Leaving && !flight.homeScreen {
+            server.homeFlight = .None
+            redraw(server, "a window landed in its icon")
+            return .Ok
+        }
+        // Landed in the home screen's icon, which the home screen left out
+        // while the card flew: the card stays until it has drawn it again; and
+        // out of an icon, until the platform has drawn the screen without it.
+        let behind = flight.phase == .Leaving
+        ? server.homeScreenFrames == flight.homeScreenSeen
+        : server.platformFrames == flight.platformSeen
+        if behind && now - flight.landed < HomeMotion.platformWait {
+            server.homeFlight = .Some(move flight)
+            tellHomeScreenFlight(server)
+            armHome(server)
+            return .Ok
+        }
+        log info(
+            "a window's flight home settled",
+            surface: server.clients[flight.index].surface.raw,
+            home: flight.phase == .Leaving
+        )
+        server.homeFlight = .None
+        redraw(server, "a window's flight settled")
+            return .Ok
+    }
+    server.homeFlight = .Some(move flight)
+    armHome(server)
+    redraw(server, "a window's flight")
+    return .Ok
+}
+
+// The platform or the home screen committed a frame: a card resting until
+// that one had drawn lets go.
+function noteFlightOwnerFrame(server: borrow mut Server, role: borrow DisplayRole) {
+    match role {
+        Platform -> server.platformFrames += 1
+        Desktop -> server.homeScreenFrames += 1
+        None, Application, Presence -> return
+    }
+    let flight = try server.homeFlight otherwise return
+    if flight.landed <= 0 { return }
+    let waitsOn: DisplayRole = flight.phase == .Leaving ? .Desktop : .Platform
+    if role != waitsOn { return }
+    log info("a window's flight home settled once the screen behind it drew")
+    server.homeFlight = .None
+    redraw(server, "a window's flight settled")
+}
+
+// The home screen's icon a window flies out of or into now, which the home
+// screen leaves out of its picture so its wallpaper shows there, as an
+// iPad's does; none once the card has landed, so it draws the icon again.
+function flyingHomeScreenIcon(server: borrow Server) -> Geometry? {
+    let flight = try server.homeFlight otherwise return .None
+    // Left out from the moment the window comes off it, under the finger
+    // too, until the window is back in it.
+    if !flight.homeScreen || flight.landed > 0 { return .None }
+    let home = flight.badge.home
+    return .Some(Geometry { x: home.x, y: home.y, width: home.width, height: home.height })
+}
+
+// Tells the home screen when the icon it is to leave out changes: the icon,
+// on its own surface, or that the window landed.
+function tellHomeScreenFlight(server: borrow mut Server) {
+    let flying = flyingHomeScreenIcon(server)
+    if flying == server.homeScreenIcon { return }
+    server.homeScreenIcon = copy flying
+    let index = try clientIn(server, .Desktop) otherwise return
+    let client = server.clients[index]
+    let message: DisplayMessage = match flying {
+        Some(icon) -> .SetLaunchOrigin(
+            DisplayLaunchOrigin {
+                surface: client.surface,
+                icon: StageFrame {
+                    x: icon.x - client.frame.x,
+                    y: icon.y - client.frame.y,
+                    width: icon.width,
+                    height: icon.height,
+                },
+                corner: 0,
+            }
+        )
+        None -> .WindowRequested(DisplayWindowRequest { surface: client.surface, action: .Landed })
+    }
+    match flying {
+        Some(icon) -> log info(
+            "told the home screen of the icon a window flies by",
+            surface: client.surface.raw,
+            x: icon.x - client.frame.x,
+            y: icon.y - client.frame.y
+        )
+        None -> log info("told the home screen the window flying by its icon landed")
+    }
+    tell(client.channel, message)
+}
+
+// Only a card in flight schedules frames; one under the finger moves with it.
+function armHome(server: borrow mut Server) {
+    if server.homeTimer.isNone() {
+        match timerCreate(.Monotonic) {
+            Ok(timer) -> server.homeTimer = .Some(timer)
+            Error(reason) -> stopHomeWithoutTimer(server, reason)
+        }
+    }
+    let timer = try server.homeTimer otherwise return
+    let armed = match monotonic() {
+        Ok(now) -> timerSet(
+            timer,
+            UNumber(now + HomeMotion.frame),
+            0,
+            TimerOptions.none,
+            server.port,
+            PortKey.home
+        )
+        Error(failed) -> .Error(failed)
+    }
+    match armed {
+        Ok -> {}
+        Error(reason) -> stopHomeWithoutTimer(server, reason)
+    }
+}
+
+function stopHomeWithoutTimer(server: borrow mut Server, reason: borrow TesseraError) {
+    log warn("a window's flight home could not schedule a frame", error: errorName(reason))
+    server.homeFlight = .None
+}
+
+// How far the card has become the icon's shape: none while it is wider than
+// `HomeMotion.iconShare` of the output, all of it at the icon's size.
+function homeNearness(server: borrow Server, flight: borrow HomeFlight) -> Number {
+    let from = server.display.scanout.pointWidth() * HomeMotion.iconShare
+    let to = flight.badge.home.width
+    if from <= to { return 1 }
+    let t = clamp((from - flight.card.width) / (from - to), 0, 1)
+    return t * t * (3 - 2 * t)
+}
+
+// The card's corner: rounder as it shrinks, then the icon's.
+function homeCorner(server: borrow Server, flight: borrow HomeFlight) -> Number {
+    let whole = server.clients[flight.index].frame
+    let shrunk = 1 - flight.card.width / max(whole.width, 1)
+    let card = min(HomeMotion.corner, shrunk * HomeMotion.rounding)
+    return card + (flight.badge.homeCorner - card) * homeNearness(server, flight)
+}
+
+// Whether the client at `index` is drawn as the card rather than in its
+// place: a card hides every application under it too, as the home screen is
+// what an iPad shows behind one.
+function underHomeFlight(server: borrow Server, index: Number) -> Bool {
+    if server.homeFlight.isNone() { return false }
+    return server.clients[index].role == .Application
+}
+
+// The card, over everything else: the window's own picture filling it at its
+// own shape, cut to the card's rounded rectangle, down to the icon's place.
+function drawHomeFlight(composer: borrow Composer, server: borrow Server) {
+    let flight = try server.homeFlight otherwise return
+    let client = server.clients[flight.index]
+    let content = try client.content otherwise return
+    let texture = try content.texture otherwise return
+    let card = Geometry {
+        x: flight.card.x - flight.card.width / 2,
+        y: flight.card.y - flight.card.height / 2,
+        width: flight.card.width,
+        height: flight.card.height,
+    }
+    let density = server.display.scanout.scale
+    let whole = client.frame
+    let scale = max(card.width / max(whole.width, 1), card.height / max(whole.height, 1))
+    let drawnWidth = content.width / density * scale
+    let drawnHeight = content.height / density * scale
+    let picture = Geometry {
+        x: flight.card.x - drawnWidth / 2,
+        y: flight.card.y - drawnHeight / 2,
+        width: drawnWidth,
+        height: drawnHeight,
+    }
+    drawSurface(
+        composer,
+        texture,
+        picture,
+        .Some(copy card),
+        1,
+        content.extentX(),
+        content.extentY(),
+        homeCorner(server, flight),
+        1
+    )
+    drawIconOverCard(composer, server, flight, card, homeCorner(server, flight))
+    drawCardIndicator(composer, card, scale, flight.phase)
+}
+
+// The icon's place the card flies out of or into, which the picture of the
+// client `role` names is drawn around: the Dock's in the platform's, and the
+// home screen's in the desktop's. None while no card is in flight to or from
+// an icon of that client.
+function vacatedSlot(server: borrow Server, role: borrow DisplayRole) -> Geometry? {
+    let flight = try server.homeFlight otherwise return .None
+    // The home screen leaves its icon out itself (`tellHomeScreenFlight`):
+    // nothing is under its picture to show through a place cut out of it.
+    if flight.homeScreen || role != .Platform { return .None }
+    let home = flightBadge(server, flight).home
+    return .Some(Geometry { x: home.x, y: home.y, width: home.width, height: home.height })
+}

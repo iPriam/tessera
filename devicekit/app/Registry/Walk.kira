@@ -1,0 +1,510 @@
+import Foundation
+import LibTessera
+
+// The walk of `/sys` the registry is built from (17 §7.1, §25).
+
+// The canonical sysfs path a class link names.
+function canonicalPath(link: borrow String) -> Result<String, TesseraError> {
+    let target = try linkTarget(link)
+    return match target {
+        Some(value) -> .Ok(resolvePath(link.substring(0, link.lastIndexOf("/").or(0)), value))
+        None -> .Ok(link)
+    }
+}
+
+// The last component of a link's target: a driver's or subsystem's name.
+function linkName(link: borrow String) -> Result<String?, TesseraError> {
+    let target = try linkTarget(link)
+    return match target {
+        Some(value) -> .Ok(.Some(lastComponent(value)))
+        None -> .Ok(.None)
+    }
+}
+
+// The physical device behind a class device: its bus, driver and ids.
+function busProperties(path: borrow String) -> Result<[Property], TesseraError> {
+    var found: [Property] = []
+    // A class device's `device` link names the physical device; one without
+    // the link is its own.
+    var device = path
+    let target = try linkTarget(path + "/device")
+    match target {
+        Some(target) -> device = resolvePath(path, target)
+        None -> {}
+    }
+    let subsystem = try linkName(device + "/subsystem")
+    let bus = subsystem.or("")
+    if bus.count > 0 { found.append(textProperty("busType", bus)) }
+    let driver = try linkName(device + "/driver")
+    match driver {
+        Some(driver) -> found.append(textProperty("driver", driver))
+        None -> {}
+    }
+    match attribute(device + "/vendor") {
+        Some(vendor) -> appendHex(found, "vendorId", vendor)
+        None -> {}
+    }
+    // A PCI device's id; on other buses `device` is a link to the parent,
+    // with nothing to read.
+    if bus == "pci" {
+        match attribute(device + "/device") {
+            Some(product) -> appendHex(found, "productId", product)
+            None -> {}
+        }
+    }
+    found.append(textProperty("location", "\(bus)-\(lastComponent(device))"))
+    found.append(flagProperty("removable", attribute(device + "/removable") == .Some("removable")))
+    found.append(textProperty("seat", "seat0"))
+    return .Ok(found)
+}
+
+function appendHex(properties: borrow mut [Property], key: borrow String, text: borrow String) {
+    match parseHex(text) {
+        Ok(value) -> properties.append(numberProperty(key, U64(value)))
+        Error(failed) -> log debug("a sysfs id is not hexadecimal", key, text)
+    }
+}
+
+// What a walk finds at one sysfs path.
+struct Found {
+    var path: String
+    var entryClass: EntryClass
+    var family: Family
+    var node: String?
+    var name: String
+    var subsystem: String
+}
+
+function makeEntry(found: borrow Found) -> Result<Entry, TesseraError> {
+    var properties = try busProperties(found.path)
+    properties.append(textProperty("name", found.name))
+    properties.append(textProperty("subsystem", found.subsystem))
+    var flags = EntryFlags.none
+    if found.path.contains("/virtual/") { flags = flags | EntryFlags.virtual }
+    for property in properties {
+        if property.key == "removable" && property.word() == .Some(U64(1)) {
+            flags = flags | EntryFlags.removable
+        }
+    }
+    return .Ok(Entry {
+        id: entryIdOf(found.path),
+        entryClass: found.entryClass,
+        family: found.family,
+        parent: .None,
+        flags: flags,
+        path: found.path,
+        node: found.node,
+        name: found.name,
+        properties: properties,
+    })
+}
+
+// What an input device can do, as `InputKind` bits, from its capability
+// masks.
+function inputKinds(eventPath: borrow String) -> U64 {
+    let caps = eventPath + "/device/capabilities/"
+    let events = hexAttribute(caps + "ev").or(0)
+    // The key bitmap is hex words, most significant first, one per `long`;
+    // KEY_Q (16) and KEY_A (30) are in the last.
+    let words = attribute(caps + "key").or("").split(" ")
+    var lowest: Number = 0
+    if words.count > 0 {
+        match parseHex(words[words.count - 1]) {
+            Ok(value) -> lowest = value
+            Error(failed) -> log debug("the key bitmap is not hexadecimal", words[words.count - 1])
+        }
+    }
+    let letters: Number = (1 << 16) | (1 << 30)
+    var kinds: Number = 0
+    // EV_KEY with the letter row is a keyboard; EV_REL a pointer; EV_ABS a
+    // touch surface; EV_SW switches.
+    if (events & 2) != 0 && (lowest & letters) == letters { kinds = kinds | 1 }
+    if (events & 4) != 0 { kinds = kinds | 2 }
+    if (events & 8) != 0 { kinds = kinds | 4 }
+    if (events & 32) != 0 { kinds = kinds | 32 }
+    return U64(kinds)
+}
+
+function scanDrm(entries: borrow mut [Entry]) -> Result<Void, TesseraError> {
+    let root = "/sys/class/drm"
+    for name in listedEntries(root) {
+        if !name.startsWith("card") { continue }
+        let path = try canonicalPath("\(root)/\(name)")
+        match name.indexOf("-") {
+            None -> {
+                // The adapter is the device the card hangs off; the card
+                // itself is its display controller.
+                let adapter = try canonicalPath("\(root)/\(name)/device")
+                var render: String? = .None
+                for sibling in listedEntries(path + "/..") {
+                    if sibling.startsWith("renderD") { render = .Some("/dev/dri/\(sibling)") }
+                }
+                let driverName = try linkName(adapter + "/driver")
+                let driver = driverName.or("")
+                var gpu = try makeEntry(
+                    Found {
+                        path: adapter,
+                        entryClass: .GpuAdapter,
+                        family: .Gpu,
+                        node: render,
+                        name: driver,
+                        subsystem: "drm"
+                    }
+                )
+                gpu.properties.append(textProperty("vendor.tessera.primary", "/dev/dri/\(name)"))
+                entries.append(gpu)
+                entries.append(
+                    try makeEntry(
+                        Found {
+                            path: path,
+                            entryClass: .DisplayController,
+                            family: .Display,
+                            node: .Some("/dev/dri/\(name)"),
+                            name: name,
+                            subsystem: "drm"
+                        }
+                    )
+                )
+            }
+            Some(dash) -> {
+                let kind = name.substring(dash + 1, name.count)
+                var connector = try makeEntry(
+                    Found {
+                        path: path,
+                        entryClass: .Connector,
+                        family: .None,
+                        node: .None,
+                        name: kind,
+                        subsystem: "drm"
+                    }
+                )
+                connector.properties.append(textProperty("connectorType", kind))
+                connector.properties.append(
+                    textProperty("status", attribute(path + "/status").or(""))
+                )
+                entries.append(connector)
+            }
+        }
+    }
+    return .Ok
+}
+
+// Where a class directory's entries are and what they are.
+struct ClassScan {
+    var root: String
+    var prefix: String
+    var entryClass: EntryClass
+    var family: Family
+    var nodePrefix: String?
+}
+
+function scanClass(entries: borrow mut [Entry], scan: borrow ClassScan) -> Result<Void, TesseraError> {
+    for name in listedEntries(scan.root) {
+        if !name.startsWith(scan.prefix) { continue }
+        let path = try canonicalPath("\(scan.root)/\(name)")
+        let label = attribute(path + "/name").or(attribute(path + "/device/name").or(name))
+        let node: String? = match scan.nodePrefix {
+            Some(prefix) -> .Some(prefix + name)
+            None -> .None
+        }
+        entries.append(
+            try makeEntry(
+                Found {
+                    path: path,
+                    entryClass: scan.entryClass,
+                    family: scan.family,
+                    node: node,
+                    name: label,
+                    subsystem: lastComponent(scan.root)
+                }
+            )
+        )
+    }
+    return .Ok
+}
+
+function scanInput(entries: borrow mut [Entry]) -> Result<Void, TesseraError> {
+    let root = "/sys/class/input"
+    for name in listedEntries(root) {
+        if !name.startsWith("event") { continue }
+        let path = try canonicalPath("\(root)/\(name)")
+        let label = attribute(path + "/device/name").or(name)
+        let node = "/dev/input/\(name)"
+        var entry = try makeEntry(
+            Found {
+                path: path,
+                entryClass: .InputDevice,
+                family: .Input,
+                node: .Some(node),
+                name: label,
+                subsystem: "input"
+            }
+        )
+        entry.properties.append(numberProperty("inputKinds", inputKinds(path)))
+        entries.append(entry)
+        // A device with force feedback (EV_FF) is a haptic device as well.
+        let events = hexAttribute(path + "/device/capabilities/ev").or(0)
+        if (events & (1 << 0x15)) != 0 {
+            entries.append(
+                try makeEntry(
+                    Found {
+                        path: path + "/ff",
+                        entryClass: .HapticDevice,
+                        family: .Haptic,
+                        node: .Some(node),
+                        name: label,
+                        subsystem: "input"
+                    }
+                )
+            )
+        }
+    }
+    return .Ok
+}
+
+function scanSound(entries: borrow mut [Entry]) -> Result<Void, TesseraError> {
+    let root = "/sys/class/sound"
+    for name in listedEntries(root) {
+        let path = try canonicalPath("\(root)/\(name)")
+        if name.startsWith("card") {
+            entries.append(
+                try makeEntry(
+                    Found {
+                        path: path,
+                        entryClass: .AudioCard,
+                        family: .None,
+                        node: .None,
+                        name: attribute(path + "/id").or(name),
+                        subsystem: "sound"
+                    }
+                )
+            )
+        }
+        if !name.startsWith("pcmC") { continue }
+        match name.indexOf("D") {
+            Some(device) -> {
+                let card = name.substring(4, device)
+                let label = attribute("\(root)/card\(card)/id").or(name)
+                var entry = try makeEntry(
+                    Found {
+                        path: path,
+                        entryClass: .AudioEndpoint,
+                        family: .Audio,
+                        node: .Some("/dev/snd/\(name)"),
+                        name: label,
+                        subsystem: "sound"
+                    }
+                )
+                entry.properties.append(
+                    textProperty("direction", name.endsWith("p") ? "output" : "input")
+                )
+                entries.append(entry)
+            }
+            // A PCM node is always `pcmC<card>D<device><p|c>`.
+            None -> {}
+        }
+    }
+    return .Ok
+}
+
+function scanUsb(entries: borrow mut [Entry]) -> Result<Void, TesseraError> {
+    let root = "/sys/bus/usb/devices"
+    for name in listedEntries(root) {
+        let path = try canonicalPath("\(root)/\(name)")
+        match usbNode(path) {
+            Some(node) -> {
+                var entry = try makeEntry(
+                    Found {
+                        path: path,
+                        entryClass: .UsbDevice,
+                        family: .Usb,
+                        node: .Some(node),
+                        name: attribute(path + "/product").or(name),
+                        subsystem: "usb"
+                    }
+                )
+                appendHex(entry.properties, "vendorId", attribute(path + "/idVendor").or(""))
+                appendHex(entry.properties, "productId", attribute(path + "/idProduct").or(""))
+                entries.append(entry)
+            }
+            None -> {
+                if name.contains(":") { entries.append(try usbInterface(path, name)) }
+            }
+        }
+    }
+    return .Ok
+}
+
+// A USB interface: its class, subclass and protocol, and its device's vendor
+// and product, which an interface carries as IOKit's interface nubs do, so a
+// driver manifest can match the kind of interface a device has (§18.2).
+function usbInterface(path: borrow String, name: borrow String) -> Result<Entry, TesseraError> {
+    var entry = try makeEntry(
+        Found {
+            path: path,
+            entryClass: .UsbInterface,
+            family: .None,
+            node: .None,
+            name: name,
+            subsystem: "usb"
+        }
+    )
+    let device = path.substring(0, path.lastIndexOf("/").or(0))
+    appendHex(entry.properties, "vendorId", attribute(device + "/idVendor").or(""))
+    appendHex(entry.properties, "productId", attribute(device + "/idProduct").or(""))
+    appendHex(entry.properties, "interfaceClass", attribute(path + "/bInterfaceClass").or(""))
+    appendHex(entry.properties, "interfaceSubClass", attribute(path + "/bInterfaceSubClass").or(""))
+    appendHex(entry.properties, "interfaceProtocol", attribute(path + "/bInterfaceProtocol").or(""))
+    return .Ok(entry)
+}
+
+// `/dev/bus/usb/BBB/DDD` for a USB device; an interface has no node.
+function usbNode(path: borrow String) -> String? {
+    let bus = numberAttribute(path + "/busnum").or(-1)
+    let device = numberAttribute(path + "/devnum").or(-1)
+    if bus < 0 || device < 0 { return .None }
+    return .Some("/dev/bus/usb/\(paddedThree(bus))/\(paddedThree(device))")
+}
+
+function paddedThree(value: Number) -> String {
+    var text = "\(value)"
+    while text.count < 3 { text = "0" + text }
+    return text
+}
+
+function scanBlock(entries: borrow mut [Entry]) -> Result<Void, TesseraError> {
+    let root = "/sys/class/block"
+    for name in listedEntries(root) {
+        let path = try canonicalPath("\(root)/\(name)")
+        let partition = try pathPresent(path + "/partition")
+        let entryClass: EntryClass = partition ? .Partition : .BlockDevice
+        var entry = try makeEntry(
+            Found {
+                path: path,
+                entryClass: entryClass,
+                family: .Block,
+                node: .Some("/dev/\(name)"),
+                name: name,
+                subsystem: "block"
+            }
+        )
+        // `size` counts 512-byte sectors whatever the logical block is.
+        entry.properties.append(
+            numberProperty("size", U64(numberAttribute(path + "/size").or(0) * 512))
+        )
+        entries.append(entry)
+    }
+    return .Ok
+}
+
+// Every entry sysfs shows, in no order, without parents.
+function walkSysfs() -> Result<[Entry], TesseraError> {
+    var entries: [Entry] = []
+    try scanDrm(entries)
+    try scanInput(entries)
+    try scanSound(entries)
+    try scanClass(
+        entries,
+        ClassScan {
+            root: "/sys/class/video4linux",
+            prefix: "video",
+            entryClass: .Camera,
+            family: .Camera,
+            nodePrefix: .Some("/dev/")
+        }
+    )
+    try scanClass(
+        entries,
+        ClassScan {
+            root: "/sys/bus/iio/devices",
+            prefix: "iio:device",
+            entryClass: .Sensor,
+            family: .Sensor,
+            nodePrefix: .Some("/dev/")
+        }
+    )
+    try scanClass(
+        entries,
+        ClassScan {
+            root: "/sys/class/power_supply",
+            prefix: "",
+            entryClass: .PowerSource,
+            family: .PowerSource,
+            nodePrefix: .None
+        }
+    )
+    try scanClass(
+        entries,
+        ClassScan {
+            root: "/sys/class/thermal",
+            prefix: "thermal_zone",
+            entryClass: .ThermalZone,
+            family: .Thermal,
+            nodePrefix: .None
+        }
+    )
+    try scanClass(
+        entries,
+        ClassScan {
+            root: "/sys/class/backlight",
+            prefix: "",
+            entryClass: .Backlight,
+            family: .Backlight,
+            nodePrefix: .None
+        }
+    )
+    try scanBlock(entries)
+    try scanClass(
+        entries,
+        ClassScan {
+            root: "/sys/class/hidraw",
+            prefix: "hidraw",
+            entryClass: .HidDevice,
+            family: .Hid,
+            nodePrefix: .Some("/dev/")
+        }
+    )
+    try scanUsb(entries)
+    try scanClass(
+        entries,
+        ClassScan {
+            root: "/sys/class/rtc",
+            prefix: "rtc",
+            entryClass: .Rtc,
+            family: .Rtc,
+            nodePrefix: .Some("/dev/")
+        }
+    )
+    return .Ok(entries)
+}
+
+// `entries` in tree order, which is path order, each with its parent: the
+// longest entry path that is a prefix of its own.
+function treeOrder(entries: borrow [Entry]) -> [Entry] {
+    var sorted = entries.sorted({ left, right in return orderStrings(left.path, right.path) < 0 })
+    for index in 0..sorted.count {
+        var parentLength = 0
+        for other in sorted {
+            if other.path.count > parentLength && sorted[index].path.startsWith(other.path + "/") {
+                parentLength = other.path.count
+                sorted[index].parent = .Some(other.id)
+            }
+        }
+    }
+    return sorted
+}
+
+function findEntry(entries: borrow [Entry], id: EntryId) -> Number? {
+    for (index, entry) in entries.enumerated() {
+        if entry.id == id { return .Some(index) }
+    }
+    return .None
+}
+
+function childCount(entries: borrow [Entry], id: EntryId) -> Number {
+    var count = 0
+    for entry in entries {
+        if entry.parent == .Some(id) { count++ }
+    }
+    return count
+}

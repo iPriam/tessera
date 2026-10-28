@@ -1,0 +1,69 @@
+import Foundation
+import LibTessera
+import PlatformKit
+import PlatformUI
+import TesseraDisplayClient
+import KiraUI
+import AppKit
+
+// The Dock on Adaptive Desktop (roadmap/11-adaptive-desktop.md, "The Dock").
+// PlatformKit keeps what is in it: what is installed, Inlay first as Finder is on
+// a Mac, then what is open that is not kept. Which application a window is
+// comes from PID 1, which named it on the link it made between them.
+
+namespace DockOrder {
+    // The application the Dock starts with, as a Mac's starts with Finder.
+    let first: String = "Inlay"
+}
+
+// Keeps every installed application in the Dock, Inlay first.
+function keepInstalled(desktop: borrow mut Desktop) {
+    desktop.installed = keepInstalledInDock(desktop.state, [DockOrder.first])
+}
+
+// The person chose `name` in the Dock. Open, its window furthest in front
+// comes to the front, back from the Dock if every one was minimized there;
+// not open, PID 1 is asked to open it.
+function dockChose(desktop: borrow mut Desktop, name: borrow String) {
+    if desktop.lock.locked { return }
+    match desktop.state.applicationNamed(name) {
+        Some(application) -> match desktop.state.topmostSurfaceOf(application) {
+            Some(surface) -> {
+                let shown = DisplaySurfaceId(surface.raw)
+                desktop.front = .Some(shown)
+                match focus(desktop, shown, "bring an application forward from the Dock") {
+                    Ok(sent) -> if sent {
+                        log info("the Dock brought an application forward", application: name)
+                    }
+                    Error(failed) -> requestFailed("bring an application forward from the Dock", failed)
+                }
+            }
+            None -> match desktop.state.minimizedSurfaceOf(application) {
+                Some(surface) -> restore(desktop, DisplaySurfaceId(surface.raw))
+                None -> log warn("an open application has no window", application: name)
+            }
+        }
+        None -> match openInstalled(desktop.installed, name) {
+            Ok -> {}
+            Error(failure) -> match failure {
+                NotInstalled(missing) -> log warn(
+                    "an application that is not installed was chosen",
+                    application: missing
+                )
+            }
+        }
+    }
+}
+
+// Keeps the band along the bottom of the output for the Dock: the compositor
+// lays every window out above it, and the pointer over it is the platform's.
+function keepDockBand(desktop: borrow mut Desktop, channel: Handle) {
+    let band = dockBand()
+    match sent(sendSetDock(channel, UNumber(band))) {
+        Ok(sent) -> if sent {
+            desktop.dock = band
+            log info("the Dock takes the bottom of the output", height: band)
+        }
+        Error(failed) -> requestFailed("keep the Dock's band", failed)
+    }
+}

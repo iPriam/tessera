@@ -1,0 +1,136 @@
+import Foundation
+import RenderBox
+
+// An SVG document's elements, as a tree: each tag's name, its attributes and
+// the elements inside it. Text, comments, the XML declaration and doctype
+// are skipped; an icon's layer draws, it does not say anything.
+
+public struct SvgAttribute {
+    let name: String
+    let value: String
+}
+
+public struct SvgElement {
+    var name: String = ""
+    var attributes: [SvgAttribute] = []
+    var children: [SvgElement] = []
+}
+
+public enum SvgFailure {
+    // The text holds no `<svg>` element.
+    NoDocument
+    // A tag is not closed, at this byte.
+    UnclosedTag(Number)
+    // The `viewBox` or size states no area.
+    EmptyCanvas
+    // The display list refused a restore or a layer's end.
+    Drawing(DisplayListFailure)
+}
+
+namespace SvgMark {
+    let open: Number = 60
+    let close: Number = 62
+    let slash: Number = 47
+    let bang: Number = 33
+    let question: Number = 63
+    let equals: Number = 61
+    let quote: Number = 34
+    let apostrophe: Number = 39
+    let space: Number = 32
+    let tab: Number = 9
+    let newline: Number = 10
+    let carriage: Number = 13
+}
+
+function svgSpace(code: Number) -> Bool {
+    return code == SvgMark.space || code == SvgMark.tab || code == SvgMark.newline || code == SvgMark.carriage
+}
+
+extend SvgElement {
+    // The property `name`: what the `style` it carries sets, which CSS ranks
+    // over a presentation attribute, else its own attribute.
+    function attribute(borrow self, name: borrow String) -> String? {
+        for attribute in attributes {
+            if attribute.name != "style" { continue }
+            match styleProperty(attribute.value, name) {
+                Some(value) -> return .Some(value)
+                None -> {}
+            }
+        }
+        for attribute in attributes {
+            if attribute.name == name { return .Some(copy attribute.value) }
+        }
+        return .None
+    }
+}
+
+// The property `name` of a `style` attribute, `fill: #fff; opacity: 0.5`.
+function styleProperty(style: borrow String, name: borrow String) -> String? {
+    for declaration in style.split(";") {
+        let parts = declaration.split(":")
+        if parts.count == 2 && parts[0].trim() == name { return .Some(parts[1].trim()) }
+    }
+    return .None
+}
+
+// A reader over the text, one byte at a time.
+struct SvgReader {
+    let text: String
+    var at: Number = 0
+}
+
+extend SvgReader {
+    function current(borrow self) -> Number {
+        return at < text.count ? text.charAt(at) : 0
+    }
+
+    function ended(borrow self) -> Bool {
+        return at >= text.count
+    }
+
+    function skipSpace(borrow mut self) {
+        for _ in at..text.count {
+            if !svgSpace(current()) { return }
+            at += 1
+        }
+    }
+
+    // Moves past `marker`; false when the text ends first.
+    function skipPast(borrow mut self, marker: borrow String) -> Bool {
+        let found = text.indexOf(marker, at)
+        match found {
+            Some(index) -> {
+                at = index + marker.count
+                return true
+            }
+            None -> {
+                at = text.count
+                return false
+            }
+        }
+    }
+
+    // A name: everything up to space, `=`, `/` or `>`.
+    function name(borrow mut self) -> String {
+        let start = at
+        for _ in at..text.count {
+            let c = current()
+            if svgSpace(c) || c == SvgMark.equals || c == SvgMark.slash || c == SvgMark.close {
+                break
+            }
+            at += 1
+        }
+        return text.substring(start, at)
+    }
+
+    // A quoted attribute value.
+    function quoted(borrow mut self) -> Result<String, SvgFailure> {
+        let mark = current()
+        if mark != SvgMark.quote && mark != SvgMark.apostrophe { return .Ok(name()) }
+        let start = at + 1
+        let quote = mark == SvgMark.quote ? "\"" : "'"
+        let end = try text.indexOf(quote, start) otherwise return .Error(.UnclosedTag(at))
+        at = end + 1
+        return .Ok(text.substring(start, end))
+    }
+}

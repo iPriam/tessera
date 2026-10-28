@@ -1,0 +1,47 @@
+import Foundation
+import PlatformKit
+import PlatformUI
+import TesseraDisplayClient
+import KiraUI
+import TesseraUI
+
+// Stage Manager on Adaptive Desktop (roadmap/15-form-factors.md): F6 turns it
+// on and off. On, the compositor puts the application in front on the stage
+// and draws every other one small in the strip down the leading edge, and the
+// platform supplies each window's badge artwork to the compositor. A click
+// on a picture brings that application to the stage, as a click on a window
+// brings it forward. Off, every window goes back where it
+// was left.
+
+// Turns Stage Manager on, or off when it is on.
+function toggleStage(desktop: borrow mut Desktop) {
+    let channel = match desktop.channel {
+        Some(value) -> value
+        None -> return
+    }
+    let mode: CompositorMode = desktop.mode == .Stage ? .Freeform : .Stage
+    match sent(sendSetMode(channel, copy mode, false)) {
+        Ok(sent) -> if !sent { return }
+        Error(failed) -> {
+            requestFailed("turn Stage Manager on or off", failed)
+            return
+        }
+    }
+    desktop.mode = mode
+    redrawAfter(0)
+    log info("Stage Manager changed", on: mode == .Stage)
+}
+
+// Artwork for waiting and active windows, ready before focus changes.
+function stageBadgesOf(desktop: borrow Desktop) -> [DynamicPlatformBadge] {
+    var badges: [DynamicPlatformBadge] = []
+    for item in stageBadgeItems(desktop.state) {
+        badges.append(
+            DynamicPlatformBadge {
+                surface: DisplaySurfaceId(item.surface.raw),
+                icon: ApplicationIcon(name = copy item.name, side = StageBadgeAtlas.icon)
+            }
+        )
+    }
+    return badges
+}

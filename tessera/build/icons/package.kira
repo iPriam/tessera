@@ -1,0 +1,10 @@
+// The build's icon renders, a package of their own so that what decides
+// whether an icon is drawn again is this package and CoreIcon alone: an edit
+// anywhere else in the build leaves every picture as it is.
+construct TesseraIcons extends Package {
+    let version: String = "0.1.0"
+    let kind: PackageKind = .Library
+    let dependencies: [Dependency] = [
+        Dependency { name: "CoreIcon", path: "../../../core-icon" }
+    ]
+}

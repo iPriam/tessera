@@ -1,0 +1,164 @@
+//! The wire the trash service speaks: the request and answer layouts, and how they are received and sent.
+import Foundation
+import Heap
+import LibTessera
+import TrashStore
+
+// The wire, as LibTessera `app/Trash/Trash.kira` speaks it: a 32-byte header,
+// `op` @0, `code` @4 (an `ErrorCode` value), `a` @8, `b` @16, `c` @24, then the
+// operation's bytes. An answer carries the request's `op`.
+
+/// The wire's sizes: the header's length and how many handles a request may carry.
+namespace TrashWire {
+    let headerBytes: Number = 32
+    // The longest path a request carries, in bytes of UTF-8.
+    let maximumPathBytes: Number = 4096
+    // A request carries no handles; a few are taken to close them.
+    let handleCapacity: Number = 4
+    // The most a listing answers with, which a channel message carries.
+    let maximumListBytes: Number = 65536
+}
+
+/// The operations a client may ask of the trash service.
+@Derive(Copy)
+@Derive(CaseIterable)
+enum Operation: UN32 {
+    Move = 1
+    PutBack = 2
+    List = 3
+    Empty = 4
+}
+
+/// A request decoded from a message.
+enum Request {
+    Move(String)
+    PutBack(String)
+    List
+    Empty
+}
+
+/// A request refused as it was sent: the operation, and why.
+struct Refused {
+    var operation: UN32
+    var reason: ErrorCode
+}
+
+/// The next request on `channel`; handles a client sends are closed, since no request carries any.
+function receive(channel: Handle) -> Result<Request, Refused> {
+    let size = TrashWire.headerBytes + TrashWire.maximumPathBytes
+    let block = zeroedBlock(count: size, alignment: 16)
+    let bytes = Buffer { address: block.pointer(), length: size }
+    let received = match channelRead(channel, bytes, TrashWire.handleCapacity) {
+        Ok(value) -> value
+        Error(failed) -> return .Error(
+            Refused { operation: code(Operation.Move), reason: .InvalidArgument }
+        )
+    }
+    closeHandles(received.handles)
+    if received.bytes < TrashWire.headerBytes {
+        return .Error(Refused { operation: code(Operation.Move), reason: .InvalidArgument })
+    }
+    let raw = blockLoad<U32>(block, 0)
+    let operation = try caseWithCode(allCases_Operation(), raw) otherwise return .Error(
+        Refused { operation: raw, reason: .Unsupported }
+    )
+    let payload = heapOffset(block.pointer(), TrashWire.headerBytes)
+    let payloadLength = received.bytes - TrashWire.headerBytes
+    if payloadLength > TrashWire.maximumPathBytes {
+        return .Error(Refused { operation: code(operation), reason: .InvalidArgument })
+    }
+    let text = stringFromCBytes(payload, payloadLength)
+    return match operation {
+        Move -> .Ok(.Move(text))
+        PutBack -> .Ok(.PutBack(text))
+        List -> .Ok(.List)
+        Empty -> .Ok(.Empty)
+    }
+}
+
+/// Sends one answer under the raw `operation`: the outcome, then `payload`.
+function send(
+    channel: Handle,
+    operation: UN32,
+    outcome: borrow ErrorCode,
+    payload: borrow String
+) -> Result<Void, TesseraError> {
+    let size = TrashWire.headerBytes + payload.count
+    let block = zeroedBlock(count: size, alignment: 16)
+    blockStore<U32>(block, 0, operation)
+    blockStore<U32>(block, 4, outcome.rawValue())
+    if payload.count > 0 {
+        copyBytes(
+            heapOffset(block.pointer(), TrashWire.headerBytes),
+            payload.data,
+            U64(payload.count)
+        )
+    }
+    let none: [Handle] = []
+    return channelWrite(channel, Buffer { address: block.pointer(), length: size }, none)
+}
+
+/// An answer with no payload; a client that cannot be sent to has gone.
+function answer(channel: Handle, operation: UN32, outcome: borrow ErrorCode) {
+    let none = ""
+    match send(channel, operation, outcome, none) {
+        // The answer is sent, so there is nothing more to do.
+        Ok -> {}
+        Error(failed) -> log warn("a client could not be answered", error: errorName(failed))
+    }
+}
+
+/// Answers the request on `channel`: the move's id, or the reason it was refused.
+function answerRequest(channel: Handle) {
+    match receive(channel) {
+        Ok(request) -> match request {
+            Move(path) -> match moveToTrash(path) {
+                Ok(id) -> match send(channel, code(Operation.Move), .Ok, id) {
+                    Ok -> {}
+                    Error(failed) -> log warn(
+                        "the answer could not be sent",
+                        error: errorName(failed)
+                    )
+                }
+                Error(reason) -> answer(channel, code(Operation.Move), reason)
+            }
+            PutBack(id) -> match putBack(id) {
+                Ok -> answer(channel, code(Operation.PutBack), .Ok)
+                Error(reason) -> answer(channel, code(Operation.PutBack), reason)
+            }
+            List -> answerList(channel)
+            Empty -> match emptyTrash() {
+                Ok -> answer(channel, code(Operation.Empty), .Ok)
+                Error(reason) -> answer(channel, code(Operation.Empty), reason)
+            }
+        }
+        Error(refused) -> answer(channel, refused.operation, refused.reason)
+    }
+}
+
+/// Answers a listing: for each item its id on a line, then the path it came from on the next, empty when it has no record.
+function answerList(channel: Handle) {
+    let entries = match trashEntries() {
+        Ok(value) -> value
+        Error(reason) -> {
+            answer(channel, code(Operation.List), reason)
+            return
+        }
+    }
+    var lines: [String] = []
+    var size: Number = 0
+    for entry in entries {
+        let original = match entry.original {
+            Some(path) -> path
+            None -> ""
+        }
+        let pair = entry.id + "\n" + original + "\n"
+        if size + pair.count > TrashWire.maximumListBytes { break }
+        size += pair.count
+        lines.append(pair)
+    }
+    match send(channel, code(Operation.List), .Ok, joined(lines, "")) {
+        Ok -> {}
+        Error(failed) -> log warn("the listing could not be sent", error: errorName(failed))
+    }
+}

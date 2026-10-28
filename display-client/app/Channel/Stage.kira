@@ -1,0 +1,162 @@
+import Foundation
+
+// Stage Manager's layout (roadmap/15-form-factors.md, "What is one thing and
+// what is four"). Below the bar and above the dock, a strip down the leading
+// edge holds the applications not in front, each as a small picture of its
+// window, the most recent at the top; the rest of the output is the stage,
+// where the window in front is centred. MosaicDisplay draws the pictures and
+// takes presses on them through these numbers, and a platform draws the
+// strip's icons over them through the same numbers, so the two agree to the
+// pixel.
+
+// A rectangle on the output, in pixels.
+@Derive(Copy)
+public struct StageFrame {
+    var x: Number
+    var y: Number
+    var width: Number
+    var height: Number
+}
+
+public namespace StageLayout {
+    // The most applications the strip shows; older ones wait off it, as on
+    // a Mac.
+    let shown: Number = 6
+    // The strip's width as a share of the output's, and the least it is.
+    let stripShare: Number = 0.14
+    let stripLeast: Number = 120
+    // The space round the strip's pictures and between the stage and the
+    // output's edges.
+    let gap: Number = 16
+    // How much of the stage a window entering it takes.
+    let windowWidthShare: Number = 0.86
+    let windowHeightShare: Number = 0.9
+    // A slot is never taller than this share of its width.
+    let slotAspect: Number = 0.8
+    let iconSide: Number = 32
+    let iconOverhang: Number = 8
+    let duration: Number = 280
+}
+
+// The strip down the leading edge of an output `width` by `height`, below the
+// `top` band and above the `bottom` band.
+public function stageStrip(
+    width: Number,
+    height: Number,
+    top: Number,
+    bottom: Number
+) -> StageFrame {
+    let stripWidth = max(StageLayout.stripLeast, trunc(width * StageLayout.stripShare))
+    return StageFrame { x: 0, y: top, width: stripWidth, height: max(height - top - bottom, 0) }
+}
+
+// The stage: the output beside the strip, below the bar and above the dock.
+public function stageRoom(
+    width: Number,
+    height: Number,
+    top: Number,
+    bottom: Number
+) -> StageFrame {
+    let strip = stageStrip(width, height, top, bottom)
+    return StageFrame {
+        x: strip.width,
+        y: top + StageLayout.gap,
+        width: max(width - strip.width - StageLayout.gap, 0),
+        height: max(height - top - bottom - 2 * StageLayout.gap, 0),
+    }
+}
+
+// Where a window entering the stage goes: centred on it.
+public function stageWindow(
+    width: Number,
+    height: Number,
+    top: Number,
+    bottom: Number
+) -> StageFrame {
+    let room = stageRoom(width, height, top, bottom)
+    let windowWidth = trunc(room.width * StageLayout.windowWidthShare)
+    let windowHeight = trunc(room.height * StageLayout.windowHeightShare)
+    return StageFrame {
+        x: room.x + trunc((room.width - windowWidth) / 2),
+        y: room.y + trunc((room.height - windowHeight) / 2),
+        width: windowWidth,
+        height: windowHeight,
+    }
+}
+
+// The box of the strip's `place`th application, 0 at the top. The boxes are
+// spread down the strip, centred on it as a whole.
+public function stageSlot(
+    width: Number,
+    height: Number,
+    top: Number,
+    bottom: Number,
+    place: Number,
+    count: Number = StageLayout.shown
+) -> StageFrame {
+    let strip = stageStrip(width, height, top, bottom)
+    let slotWidth = strip.width - 2 * StageLayout.gap
+    let slots = max(min(count, StageLayout.shown), 1)
+    let room = max(strip.height - StageLayout.gap, 0)
+    let slotHeight = min(
+        trunc(slotWidth * StageLayout.slotAspect),
+        max(trunc(room / slots) - StageLayout.gap, 0)
+    )
+    let used = slots * (slotHeight + StageLayout.gap) - StageLayout.gap
+    let first = strip.y + trunc((strip.height - used) / 2)
+    return StageFrame {
+        x: StageLayout.gap,
+        y: first + place * (slotHeight + StageLayout.gap),
+        width: slotWidth,
+        height: max(slotHeight, 0),
+    }
+}
+
+// A picture `pictureWidth` by `pictureHeight` scaled to fit `slot` and
+// centred in it.
+public function stageThumbnail(
+    slot: borrow StageFrame,
+    pictureWidth: Number,
+    pictureHeight: Number
+) -> StageFrame {
+    if pictureWidth <= 0 || pictureHeight <= 0 { return copy slot }
+    let scale = min(slot.width / pictureWidth, slot.height / pictureHeight)
+    let fittedWidth = trunc(pictureWidth * scale)
+    let fittedHeight = trunc(pictureHeight * scale)
+    return StageFrame {
+        x: slot.x,
+        y: slot.y + trunc((slot.height - fittedHeight) / 2),
+        width: fittedWidth,
+        height: fittedHeight,
+    }
+}
+
+// The badge belongs to the window's lower leading corner, including for a
+// portrait window whose preview leaves most of its slot empty.
+public function stageBadge(picture: borrow StageFrame) -> StageFrame {
+    let side = min(StageLayout.iconSide, max(picture.height * 0.4, 16))
+    return StageFrame {
+        x: max(picture.x - StageLayout.iconOverhang, 0),
+        y: picture.y + picture.height - side + StageLayout.iconOverhang,
+        width: side,
+        height: side,
+    }
+}
+
+// A window keeps its dimensions on the stage. Only a window larger than the
+// available room shrinks, with its aspect preserved.
+public function stageWindowFrame(
+    room: borrow StageFrame,
+    width: Number,
+    height: Number
+) -> StageFrame {
+    let scale = min(1, min(room.width / max(width, 1), room.height / max(height, 1)))
+    let fittedWidth = max(trunc(width * scale), 1)
+    let fittedHeight = max(trunc(height * scale), 1)
+    return StageFrame {
+        x: room.x + trunc((room.width - fittedWidth) / 2),
+        y: room.y + trunc((room.height - fittedHeight) / 2),
+        width: fittedWidth,
+        height: fittedHeight,
+    }
+}

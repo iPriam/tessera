@@ -1,0 +1,128 @@
+import Foundation
+import Heap
+import LibTessera
+import DeviceKit
+
+// The wire, the Devices service's (LibTessera `app/Device/Wire.kira`): a
+// 32-byte header, `op` @0, `code` @4 (an `ErrorCode` value), `a` @8, `b`
+// @16, `c` @24, then the operation's bytes. An answer carries the request's
+// `op` (roadmap/16-libtessera.md §25.4). `List`'s answer has the number of
+// records in `a`; `Mount`, `Unmount` and `Eject` name a volume by its
+// registry entry in `a`, and `Mount` answers its mount point after the
+// header; `Watch` keeps the channel (`Watchers.kira`).
+
+@Derive(Copy)
+@Derive(CaseIterable)
+enum Operation: UN32 {
+    List = 1
+    Mount = 2
+    Unmount = 3
+    Eject = 4
+    Watch = 5
+}
+
+namespace VolumeWire {
+    let headerBytes: Number = 32
+    let messageBytes: Number = 256
+    // A client's message carries no handles; a few are taken to close them.
+    let handleCapacity: Number = 4
+    // A volume's `List` record.
+    let recordBytes: Number = 160
+}
+
+enum Request {
+    List
+    Mount(EntryId)
+    Unmount(EntryId)
+    Eject(EntryId)
+    Watch
+}
+
+// Why nothing could be taken off a channel as a request.
+enum ReceiveFailure {
+    // The channel had nothing (`ShouldWait`) or failed.
+    Channel(TesseraError)
+    // An operation a client does not send; it is answered `Unsupported`.
+    UnknownOperation(UN32)
+}
+
+// The next request on `channel`. Handles a client sends are closed: no
+// request carries any.
+function receive(channel: Handle) -> Result<Request, ReceiveFailure> {
+    let block = zeroedBlock(count: VolumeWire.messageBytes, alignment: 16)
+    let bytes = Buffer { address: block.pointer(), length: VolumeWire.messageBytes }
+    let received = match channelRead(channel, bytes, VolumeWire.handleCapacity) {
+        Ok(value) -> value
+        Error(failed) -> return .Error(.Channel(failed))
+    }
+    closeHandles(received.handles)
+    if received.bytes < VolumeWire.headerBytes {
+        return .Error(.Channel(failure(.InvalidArgument)))
+    }
+    let raw = blockLoad<U32>(block, 0)
+    let operation = try caseWithCode(allCases_Operation(), raw) otherwise return .Error(
+        .UnknownOperation(raw)
+    )
+    let entry = EntryId(blockLoad<U64>(block, 8))
+    return .Ok(
+        match operation {
+            List -> .List
+            Mount -> .Mount(entry)
+            Unmount -> .Unmount(entry)
+            Eject -> .Eject(entry)
+            Watch -> .Watch
+        }
+    )
+}
+
+// Sends one message under the raw `operation`: the header, then `payload`.
+function send(
+    channel: Handle,
+    operation: UN32,
+    outcome: borrow ErrorCode,
+    argument: Number,
+    payload: borrow Buffer
+) -> Result<Void, TesseraError> {
+    let length = VolumeWire.headerBytes + payload.length
+    let block = zeroedBlock(count: length, alignment: 16)
+    blockStore<U32>(block, 0, operation)
+    blockStore<U32>(block, 4, outcome.rawValue())
+    blockStore<U64>(block, 8, UNumber(argument))
+    if payload.length > 0 {
+        copyBytes(
+            heapOffset(block.pointer(), VolumeWire.headerBytes),
+            payload.address,
+            payload.length
+        )
+    }
+    let none: [Handle] = []
+    return channelWrite(channel, Buffer { address: block.pointer(), length: length }, none)
+}
+
+function noPayload() -> Buffer { return Buffer { address: nullPointer(), length: 0 } }
+
+// An answer: the header, then `payload`. A client that cannot be sent to has
+// gone, and the channel is closed after it either way.
+function answerWith(
+    channel: Handle,
+    operation: UN32,
+    outcome: borrow ErrorCode,
+    argument: Number,
+    payload: borrow Buffer
+) {
+    match send(channel, operation, outcome, argument, payload) {
+        Ok -> {}
+        Error(failed) -> log warn("a client could not be answered", error: errorName(failed))
+    }
+}
+
+// A header-only answer.
+function answer(channel: Handle, operation: UN32, outcome: borrow ErrorCode) {
+    answerWith(channel, operation, outcome, 0, noPayload())
+}
+
+// `text`'s bytes into a fixed, NUL-padded field of `field` bytes at `offset`.
+function storeText(base: RawPtr, offset: Number, text: borrow String, field: Number) {
+    let count = min(Number(text.count), field - 1)
+    copyBytes(heapOffset(base, offset), text.data, count)
+}

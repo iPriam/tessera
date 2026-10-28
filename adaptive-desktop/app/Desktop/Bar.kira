@@ -1,0 +1,59 @@
+import Foundation
+import KiraUI
+import TesseraDisplayClient
+
+// The system bar's menus and the keyboard (roadmap/11-adaptive-desktop.md, "The
+// system bar"). While a menu is out the platform holds the keyboard and the
+// pointer, as a Mac's menu bar does: the arrows move through it, and the
+// pointer reaches it wherever the menu hangs below the bar's band. Focus stays
+// on the window in front, which keeps its colour.
+
+// Puts the keyboard on the system bar: the platform holds the input, and the
+// first menu of the application in front comes down.
+function focusBar(desktop: borrow mut Desktop) {
+    if desktop.lock.locked || frontMenus(desktop).count == 0 { return }
+    match holdInput(desktop, "put the keyboard on the bar") {
+        Ok(sent) -> if !sent { return }
+        Error(failed) -> {
+            requestFailed("put the keyboard on the bar", failed)
+            return
+        }
+    }
+    systemBarKey(frontMenus(desktop), desktop.bar, .Next)
+    log info("the keyboard is on the bar")
+}
+
+// The bar's menu or the switcher went away: the platform lets the input go,
+// and what has focus has the keyboard again.
+function giveBackKeyboard(desktop: borrow mut Desktop) {
+    let channel = match desktop.channel {
+        Some(value) -> value
+        None -> return
+    }
+    match sent(sendHoldInput(channel, false)) {
+        Ok(sent) -> if sent { log info("the keyboard left the bar") }
+        Error(failed) -> requestFailed("let the input go", failed)
+    }
+}
+
+// A menu put out on the bar by the pointer holds the input for the platform,
+// as one put out by F2 does, and lets it go when the menu goes away, chosen
+// or dismissed.
+function followBarMenu(desktop: borrow mut Desktop) {
+    let out = menuBarState().open
+    if out < 0 {
+        if desktop.bar.menu.isSome() {
+            desktop.bar = SystemBarSelection {}
+            giveBackKeyboard(desktop)
+        }
+        return
+    }
+    if desktop.bar.menu == .Some(out) { return }
+    let held = desktop.bar.menu.isSome()
+    desktop.bar.menu = .Some(out)
+    desktop.bar.row = .None
+    if !held { match holdInput(desktop, "hold the keyboard for the bar's menu") {
+        Ok(sent) -> if sent { log info("a menu is out on the bar", menu: out) }
+        Error(failed) -> requestFailed("hold the keyboard for the bar's menu", failed)
+    } }
+}

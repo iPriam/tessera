@@ -1,0 +1,26 @@
+import Foundation
+
+// The time the platform shows once the clock was set (roadmap/16-libtessera.md
+// §12 `timeChanged`), as the menu bar clock follows
+// NSSystemClockDidChangeNotification.
+
+namespace Realtime {
+    // `unixMillis()` counts milliseconds; the realtime clock nanoseconds.
+    let nanosecondsPerMillisecond: Number = 1000000
+}
+
+// Realtime, in nanoseconds since 1970, as `2030-01-01 00:00 UTC`.
+function utcText(realtime: Number) -> String {
+    let seconds = floor(realtime / CivilTime.nanosecondsPerSecond)
+    let rest = seconds % CivilTime.secondsPerDay
+    let date = civilDate(floor(seconds / CivilTime.secondsPerDay))
+    let hour = floor(rest / CivilTime.secondsPerHour)
+    let minute = floor(rest % CivilTime.secondsPerHour / CivilTime.secondsPerMinute)
+    return "\(date.year)-\(zeroPadded(date.month, 2))-\(zeroPadded(date.day, 2)) \(zeroPadded(hour, 2)):\(zeroPadded(minute, 2)) UTC"
+}
+
+// `RealtimeDetails`: Realtime less Monotonic @0, so the time now is that
+// plus Monotonic.
+function clockSet(offset: Number) {
+    log info("the clock was set", now: utcText(offset + now()))
+}

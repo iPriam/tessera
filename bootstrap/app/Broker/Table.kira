@@ -1,0 +1,146 @@
+import Foundation
+import LibTessera
+
+// The services this machine offers, who may offer them and who may reach
+// them.
+//
+// A service is offered by one program, named by the executable its process
+// runs, and nothing else may check in under its name: a process that is not
+// `/bin/power` cannot stand in for the Power service, as launchd lets only
+// the job whose plist names a Mach service register it. The table is here,
+// in one place, rather than in a manifest each service carries: Tessera has
+// a handful of services, all built together, and the list is short enough
+// to read in full.
+//
+// A client needs the service's entitlement, if it names one. The image
+// carries no signed entitlements yet, so a client is known by its program
+// as the services themselves know it (16 §25.4): a program under `/bin` is
+// part of the system and holds every entitlement, and any other holds the
+// defaults (16 §11.6).
+//
+// A service posts only the System events the table names for it, so a
+// service that is not the Devices service cannot tell applications that a
+// device came or went, as only the daemon that owns a notification posts
+// it on macOS.
+
+// A service's check-in connection and the key its waits complete with.
+@Derive(Copy)
+struct CheckIn {
+    let channel: Handle
+    let key: Number
+}
+
+struct OfferedService {
+    let name: String
+    let program: String
+    let entitlement: String?
+    let events: [String]
+    // Its check-in connection, once it has checked in.
+    var checkIn: CheckIn? = .None
+
+    // Whether the service may post the event `ordinal`.
+    function mayPost(borrow self, ordinal: Number) -> Bool {
+        for event in events {
+            if wireOrdinal(event) == ordinal { return true }
+        }
+        return false
+    }
+
+    function isCheckedInUnder(borrow self, key: Number) -> Bool {
+        match checkIn {
+            Some(connection) -> return connection.key == key
+            None -> return false
+        }
+    }
+}
+
+// The directory every program the system offers lives in, with its slash.
+namespace SystemPrograms {
+    let directory: String = "/" + SystemDirectory.programs + "/"
+}
+
+function serviceTable() -> [OfferedService] {
+    return [
+        // LibTessera's Devices calls: audio, camera, sensors and haptics.
+        OfferedService {
+            name: "tessera.devices",
+            program: SystemPrograms.directory + "devices",
+            entitlement: .None,
+            events: ["System/deviceChanged"]
+        },
+        // LibTessera's Power calls: the power page, wake locks, scheduled wakes.
+        OfferedService {
+            name: "tessera.power",
+            program: SystemPrograms.directory + "power",
+            entitlement: .None,
+            events: ["System/timeChanged"]
+        },
+        // The disks and what they hold, which the system's own tools read.
+        OfferedService {
+            name: "tessera.volume",
+            program: SystemPrograms.directory + "volume",
+            entitlement: .Some("tessera.volume"),
+            events: ["System/volumeChanged"]
+        },
+        // The pasteboard: the one text item copy and paste share. Anyone may
+        // write it; a read needs an interaction token (roadmap/23 §5.1).
+        OfferedService {
+            name: "tessera.pasteboard",
+            program: SystemPrograms.directory + "pasteboard",
+            entitlement: .None,
+            events: []
+        },
+        // The Trash: it moves a person's items into the Trash on the data
+        // volume. Only programs the system runs hold the entitlement
+        // (roadmap/19).
+        OfferedService {
+            name: "tessera.trash",
+            program: SystemPrograms.directory + "trash",
+            entitlement: .Some("tessera.trash"),
+            events: []
+        },
+        // The Presence service: it verifies an interaction token before anything
+        // acts on the person's behalf (roadmap/16 §14.1).
+        OfferedService {
+            name: "tessera.presence",
+            program: SystemPrograms.directory + "presence",
+            entitlement: .None,
+            events: []
+        },
+        // The machine's settings: anyone reads them, and the service itself
+        // lets only the system write them.
+        OfferedService {
+            name: "tessera.settings",
+            program: SystemPrograms.directory + "settingsd",
+            entitlement: .None,
+            events: ["System/settingsChanged"]
+        },
+        // The recovery media's Install service: partitioning, erasing and
+        // installing, which no running system offers.
+        OfferedService {
+            name: "tessera.install",
+            program: SystemPrograms.directory + "installer",
+            entitlement: .Some("tessera.install"),
+            events: []
+        },
+    ]
+}
+
+// The entitlements every program holds (16 §11.6).
+function defaultEntitlements() -> [String] {
+    return ["tessera.audio.playback", "tessera.haptics", "tessera.trace"]
+}
+
+// Whether `program` holds `entitlement`; a program the broker could not
+// name holds only the defaults.
+function holds(program: borrow String?, entitlement: borrow String?) -> Bool {
+    let needed = try entitlement otherwise return true
+    match program {
+        Some(path) -> {
+            if path.startsWith(SystemPrograms.directory) { return true }
+        }
+        // An unnamed program is not part of the system.
+        None -> {}
+    }
+    return defaultEntitlements().contains(needed)
+}

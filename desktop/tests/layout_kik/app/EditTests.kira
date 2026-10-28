@@ -1,0 +1,100 @@
+import Foundation
+import HomeLayout
+
+@Test
+function movingOntoAFullPagePassesItsLastItemOn() {
+    var home = arranged(["A", "B", "C", "D", "E"])
+    home.moveItem(HomeSlot { page: 1, index: 0 }, HomeSlot { page: 0, index: 0 }, smallSpace)
+    let first = namesOn(home, 0) == ["E", "A", "B", "C"]
+    expect!(first)
+    let second = namesOn(home, 1) == ["D"]
+    expect!(second)
+}
+
+@Test
+function droppingAnAppOnAnotherMakesAFolder() {
+    var home = arranged(["A", "B", "C"])
+    home.dropItem(HomeSlot { page: 0, index: 0 }, HomeSlot { page: 0, index: 1 }, smallSpace)
+    let page = namesOn(home, 0) == [HomeFolderName.made, "C"]
+    expect!(page)
+    let made = folderAt(home, 0, 0) == ["B", "A"]
+    expect!(made)
+    home.dropItem(HomeSlot { page: 0, index: 1 }, HomeSlot { page: 0, index: 0 }, smallSpace)
+    let grown = folderAt(home, 0, 0) == ["B", "A", "C"]
+    expect!(grown)
+}
+
+@Test
+function aFolderIsRenamedReorderedAndEmptied() {
+    var home = arranged(["A", "B"])
+    home.dropItem(HomeSlot { page: 0, index: 0 }, HomeSlot { page: 0, index: 1 }, smallSpace)
+    let slot = HomeSlot { page: 0, index: 0 }
+    home.renameFolder(slot, "Work")
+    expect!(namesOn(home, 0)[0] == "Work")
+    home.renameFolder(slot, "")
+    expect!(namesOn(home, 0)[0] == HomeFolderName.made)
+    home.reorderFolder(slot, "A", 0)
+    let order = folderAt(home, 0, 0) == ["A", "B"]
+    expect!(order)
+    home.moveOut("A", 0, smallSpace)
+    let out = namesOn(home, 0) == [HomeFolderName.made, "A"]
+    expect!(out)
+    home.leave("B")
+    let gone = namesOn(home, 0) == ["A"]
+    expect!(gone)
+}
+
+@Test
+function takingOffHomeAndBackMakesNoDuplicate() {
+    var home = arranged(["A", "B"])
+    home.removeFromHome("A")
+    expect!(home.slotOf("A").isNone())
+    expect!(home.removed.contains("A"))
+    home.addToHome("A", 0, smallSpace)
+    home.addToHome("A", 0, smallSpace)
+    let page = namesOn(home, 0) == ["B", "A"]
+    expect!(page)
+    expect!(!home.removed.contains("A"))
+}
+
+@Test
+function pagesMoveAndHideButOneStaysShown() {
+    var home = arranged(["A", "B", "C", "D", "E"])
+    home.movePage(1, 0)
+    let first = namesOn(home, 0) == ["E"]
+    expect!(first)
+    home.toggleHidden(0)
+    let shown = home.shownPages() == [1]
+    expect!(shown)
+    home.toggleHidden(1)
+    expect!(home.shownPages().count == 1)
+}
+
+@Test
+function anEditSettlesWithoutEmptyPagesAndKeepsItsReset() {
+    var home = arranged(["A"])
+    home.reset = "42"
+    home.pages.append(HomePage {})
+    let settled = home.settled()
+    expect!(settled.pages.count == 1)
+    expect!(settled.reset == "42")
+}
+
+@Test
+function widgetsTakeRowsAndFit() {
+    var home = arranged(["A", "B", "C", "D"])
+    home.addWidget(0, HomeWidget { kind: "Clock" }, smallSpace)
+    expect!(home.pages[0].widgets.count == 1)
+    // Two rows of two go to the band, so every icon moves on.
+    expect!(home.room(0, smallSpace) == 0)
+    expect!(namesOn(home, 0).count == 0)
+    expect!(namesOn(home, 1).count == 4)
+    home.addWidget(0, HomeWidget { kind: "Battery" }, smallSpace)
+    expect!(home.pages[0].widgets.count == 1)
+    home.resizeWidget(0, 0, smallSpace)
+    let small = match home.pages[0].widgets[0].size {
+        Small -> true
+        Medium -> false
+    }
+    expect!(small)
+}

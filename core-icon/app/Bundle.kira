@@ -1,0 +1,126 @@
+import Foundation
+import Kten
+
+// A `.tessicon` on disk: a folder holding the document, `icon.kten`, and the
+// artwork its layers draw, in `Assets/`, each an SVG or a PNG.
+
+public namespace IconBundleLayout {
+    let extension: String = ".tessicon"
+    let document: String = "icon.kten"
+    let assets: String = "Assets"
+}
+
+public enum IconFileFailure {
+    // The folder or a file in it could not be read or written, at this path.
+    Unreadable(String)
+    Unwritable(String)
+    NotKten(KtenParseFailure)
+    Malformed(IconReadFailure)
+    // An asset a layer draws is not in `Assets/`, or is not SVG or PNG.
+    MissingAsset(String)
+    UnknownAsset(String)
+}
+
+// What a layer's artwork is.
+public enum IconArtwork {
+    // An SVG document's text.
+    Vector(String)
+    // A PNG's pixels.
+    Bitmap(Image)
+}
+
+public struct IconAsset {
+    let name: String
+    let artwork: IconArtwork
+}
+
+public struct IconBundle {
+    var document: IconDocument = IconDocument {}
+    var assets: [IconAsset] = []
+}
+
+extend IconBundle {
+    // The artwork named `name`.
+    function asset(borrow self, name: borrow String) -> IconArtwork? {
+        for asset in assets {
+            if asset.name == name { return .Some(copy asset.artwork) }
+        }
+        return .None
+    }
+}
+
+function assetIn(folder: borrow String, name: borrow String) -> Result<IconAsset, IconFileFailure> {
+    let path = "\(folder)/\(IconBundleLayout.assets)/\(name)"
+    if name.endsWith(".svg") {
+        return match readFile(path) {
+            Ok(contents) -> .Ok(IconAsset { name: copy name, artwork: .Vector(contents.text) })
+            Error(failure) -> {
+                // The layer names the asset; which read failed says less.
+                absorb failure
+                return .Error(.MissingAsset(copy name))
+            }
+        }
+    }
+    if name.endsWith(".png") {
+        return match decodeImageFile(path) {
+            Ok(image) -> .Ok(IconAsset { name: copy name, artwork: .Bitmap(image) })
+            Error(failure) -> {
+                // The layer names the asset; which read failed says less.
+                absorb failure
+                return .Error(.MissingAsset(copy name))
+            }
+        }
+    }
+    return .Error(.UnknownAsset(copy name))
+}
+
+// The `.tessicon` at `folder`, with every asset its layers draw.
+public function readIconBundle(folder: borrow String) -> Result<IconBundle, IconFileFailure> {
+    let documentPath = "\(folder)/\(IconBundleLayout.document)"
+    let text = match readFile(documentPath) {
+        Ok(contents) -> contents.text
+        Error(failure) -> {
+            // The path says where; the failure adds nothing a caller acts on.
+            absorb failure
+            return .Error(.Unreadable(documentPath))
+        }
+    }
+    let document = try parsedIconDocument(text)
+    var assets: [IconAsset] = []
+    var named: [String] = []
+    for group in document.groups {
+        for layer in group.layers {
+            if layer.image.count == 0 || named.contains(layer.image) { continue }
+            named.append(copy layer.image)
+            assets.append(try assetIn(folder, layer.image))
+        }
+    }
+    return .Ok(IconBundle { document: document, assets: assets })
+}
+
+// Writes `document` as the `.tessicon` at `folder`, whose assets are already
+// in place.
+public function writeIconDocument(
+    folder: borrow String,
+    document: borrow IconDocument
+) -> Result<Void, IconFileFailure> {
+    if !isDirectory(folder) {
+        match makeDirectory(folder) {
+            Ok -> {}
+            Error(failure) -> {
+                // The path says where; the failure adds nothing a caller acts on.
+                absorb failure
+                return .Error(.Unwritable(copy folder))
+            }
+        }
+    }
+    let path = "\(folder)/\(IconBundleLayout.document)"
+    return match writeFile(path, iconDocumentText(document)) {
+        Ok -> .Ok
+        Error(failure) -> {
+            // The path says where; the failure adds nothing a caller acts on.
+            absorb failure
+            return .Error(.Unwritable(path))
+        }
+    }
+}

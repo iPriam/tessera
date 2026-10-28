@@ -1,0 +1,42 @@
+import Foundation
+import KCoreAnimation
+
+// What the window and the engine share. The window is built again whenever
+// something changes, so what has to outlive a build lives here.
+public class BrowserModel {
+    // What the address field holds: what the person typed, or the page's own
+    // address while the page is the one that changed it.
+    var field: String = ""
+    // The last address the engine reported, so the field follows the page only
+    // when the page moved.
+    var followed: String = ""
+    // Where the pointer went down in the page, and how far a drag has gone.
+    var pressX: Number = 0
+    var pressY: Number = 0
+    var pointerDown: Bool = false
+    // The page the window opens on.
+    var home: String = "https://www.wikipedia.org/"
+}
+
+namespace BrowserMetrics {
+    // The height of the bar above the page, in logical pixels.
+    let chrome: Number = 52
+    // The page a new window opens on.
+    let home: String = "https://www.wikipedia.org/"
+    let scrollStep: Number = 40
+}
+
+// What was typed as the address, as a page's address: an address with a
+// scheme stays as it is, a bare host gets https, and anything else with a
+// space in it is searched for.
+function addressFromText(text: borrow String) -> String {
+    let typed = text.trim()
+    if typed.count == 0 { return copy BrowserMetrics.home }
+    if typed.contains("://") || typed.startsWith("about:") || typed.startsWith("file:") {
+        return typed
+    }
+    if typed.contains(" ") || !typed.contains(".") {
+        return "https://duckduckgo.com/?q=" + joined(typed.split(" "), "+")
+    }
+    return "https://" + typed
+}

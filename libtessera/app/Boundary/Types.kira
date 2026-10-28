@@ -1,0 +1,119 @@
+import Foundation
+
+// The values that cross LibTessera's boundary.
+//
+// Every one of them is fixed-width. RIDL lays the structures out; the widths
+// and meanings are the specification's (`roadmap/16-libtessera.md`, §2 and §3).
+
+// A process-local, unforgeable name for an object. Zero is never a handle.
+//
+// The low 32 bits are the slot in this process's handle table plus one, the
+// high 32 bits the slot's generation, so a closed handle is never confused with
+// the one that later takes its slot.
+@Derive(Copy)
+public distinct Handle = UNumber
+
+// What a handle allows. Bits 0–15 are generic, 16–31 type-specific (§3.3).
+@Derive(Copy)
+public distinct Rights = UNumber
+
+// Observable state of an object. Bits 0–15 per type, 24–31 user (§3.4).
+@Derive(Copy)
+public distinct Signals = UNumber
+
+// Bytes the caller owns: an address in this process and a length.
+@Derive(Copy)
+public struct Buffer {
+    var address: RawPtr
+    var length: UNumber
+}
+
+@Derive(Copy)
+@Derive(CaseIterable)
+public enum ObjectType: U32 {
+    None = 0
+    Port = 1
+    Event = 2
+    EventPair = 3
+    Timer = 4
+    Channel = 5
+    Memory = 6
+    Thread = 7
+    Process = 8
+    Job = 9
+    Node = 10
+    File = 11
+    Watch = 12
+    Endpoint = 13
+    Stream = 14
+    WakeLock = 15
+    Presence = 16
+}
+
+@Derive(Copy)
+public enum CompletionKind: U32 {
+    User = 0
+    Signal = 1
+    Timer = 2
+    Io = 3
+    Namespace = 4
+    Launch = 5
+    Grant = 6
+    Net = 7
+    Stream = 8
+    Power = 9
+    Service = 10
+    Device = 11
+}
+
+// One asynchronous result (§5.2). A returned handle is in `result0` and is
+// already in the handle table when the packet is observed.
+@Derive(Copy)
+public struct Completion {
+    var key: UNumber
+    var error: TesseraError
+    var kind: CompletionKind
+    var flags: CompletionFlags
+    var result0: UNumber
+    var result1: UNumber
+    var aux: UNumber
+    var timestamp: UNumber
+}
+
+@Derive(Copy)
+public struct HandleInfo {
+    var objectType: ObjectType
+    var rights: Rights
+    var objectId: UNumber
+}
+
+// Two linked ends: a channel, an event pair.
+@Derive(Copy)
+public struct HandlePair {
+    var first: Handle
+    var second: Handle
+}
+
+// `Channel.peek`: bytes and handles of the next message.
+@Derive(Copy)
+public struct MessageSize {
+    var bytes: UNumber
+    var handles: UNumber
+}
+
+// `Channel.read`: the byte count of the message and the handles it carried.
+public struct ReceivedMessage {
+    var bytes: UNumber
+    var handles: [Handle]
+}
+
+public namespace Deadline {
+    // The deadline that never passes.
+    let infinite: UNumber = 0xFFFFFFFFFFFFFFFF
+    // The deadline already passed: wait polls.
+    let poll: UNumber = 0
+}
+
+public namespace Handle {
+    let invalid: Handle = Handle(0)
+}

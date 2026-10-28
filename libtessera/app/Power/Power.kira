@@ -1,0 +1,387 @@
+import Foundation
+import Heap
+
+// Power and thermal (§18), from the Power service (17 §25). The service
+// listens as `power` and speaks the Devices service's wire (see
+// `Device/Wire.kira`):
+//
+//   1 `Page`: the answer carries a Memory handle to the service's page, a
+//     `PowerInfo` the service refreshes in place, laid out as §18.1 says
+//     (see `PowerPage`), followed @64 by a sequence that is odd while a
+//     refresh is being written.
+//   2 `WakeLock`: `a` the kind, `b` the timeout, the reason as bytes. The
+//     connection is the lock: the service holds a wake source while it is
+//     open and closes it when the timeout passes.
+//   3 `ScheduleWake`: `a` the boot-clock deadline. The service arms the
+//     real-time clock's alarm, so the system wakes from suspend for it; the
+//     completion itself comes from this process's own timer.
+//
+// The page is mapped once and read on every `Power.read`. A WakeLock
+// keeps its expiry (monotonic) in its state and asserts `PEER_CLOSED` once it
+// has passed or the service has let go.
+
+@Derive(Copy)
+@Derive(CaseIterable)
+public enum BatteryState: U32 {
+    Unknown = 0
+    Discharging = 1
+    Charging = 2
+    Full = 3
+    NotCharging = 4
+}
+
+@Derive(Copy)
+@Derive(CaseIterable)
+public enum ExternalPower: U32 {
+    None = 0
+    Usb = 1
+    Wireless = 2
+    Dock = 3
+    Mains = 4
+}
+
+@Derive(Copy)
+@Derive(CaseIterable)
+public enum ThermalLevel: U32 {
+    Nominal = 0
+    Fair = 1
+    Serious = 2
+    Critical = 3
+}
+
+@Derive(Copy)
+public struct PowerInfo {
+    // 0 to 100; `PowerInfo.noBattery` when there is none.
+    var batteryPercent: UNumber
+    var batteryState: BatteryState
+    var externalPower: ExternalPower
+    var thermalLevel: ThermalLevel
+    var lowPowerMode: Bool
+    var timeToEmpty: UNumber
+    var timeToFull: UNumber
+    var powerDrawMilliwatts: UNumber
+    var cpuThrottlePercent: UNumber
+    var gpuThrottlePercent: UNumber
+    var updated: UNumber
+}
+
+public namespace PowerInfo {
+    // `batteryPercent` on a machine without a battery.
+    let noBattery: UNumber = 0xFFFFFFFF
+}
+
+@Derive(Copy)
+public enum WakeLockKind: U32 {
+    // Keep running while backgrounded.
+    Cpu = 0
+    // Keep the screen on; the front-most GUI only.
+    Display = 1
+    // Implied by an active audio output stream.
+    Audio = 2
+    // Keep the radios up for a transfer.
+    Network = 3
+}
+
+// The power page: §18.1's `PowerInfo`, then the refresh sequence.
+namespace PowerPage {
+    let batteryPercentAt: Number = 0
+    let batteryStateAt: Number = 4
+    let externalPowerAt: Number = 8
+    let thermalLevelAt: Number = 12
+    let lowPowerModeAt: Number = 16
+    let timeToEmptyAt: Number = 24
+    let timeToFullAt: Number = 32
+    let powerDrawAt: Number = 40
+    let cpuThrottleAt: Number = 44
+    let gpuThrottleAt: Number = 48
+    let updatedAt: Number = 56
+    let sequenceAt: Number = 64
+    let bytes: Number = 4096
+    // Reads a refresh may overlap before `Power.read` gives up.
+    let tries: Number = 8
+}
+
+// What the Power service is asked, as its wire numbers it.
+@Derive(Copy)
+enum PowerOperation: U32 {
+    Page = 1
+    WakeLock = 2
+    ScheduleWake = 3
+}
+
+// The service's answer to one request on a connection of its own, with its
+// error in the Power subsystem.
+function powerRequest(
+    connection: Number,
+    operation: PowerOperation,
+    a: U64,
+    b: U64,
+    payload: RawPtr,
+    length: U64
+) -> Result<DeviceMessage, TesseraError> {
+    let operationCode = code(operation)
+    let sent = deviceSend(connection, operationCode, a, b, U64(0), payload, length)
+    if !succeeded(sent) { return .Error(failureIn(.DeviceLost, .Power)) }
+    let answer = match deviceAwait(connection, .None, operationCode) {
+        Ok(value) -> value
+        Error(failed) -> {
+            var error = failed
+            error.subsystem = .Power
+            return .Error(error)
+        }
+    }
+    if answer.code != U32(0) {
+        let code = answer.code
+        deviceMessageRelease(answer)
+        return .Error(failureIn(errorCodeFrom(code), .Power))
+    }
+    return .Ok(answer)
+}
+
+// Maps the service's page, once.
+function powerPageMap() -> Result<Void, TesseraError> {
+    if !isNull(library.powerPage) { return .Ok }
+    let connection = match serviceConnectFd("tessera.power") {
+        Ok(value) -> value
+        Error(failed) -> {
+            return .Error(failureIn(.DeviceLost, .Power))
+        }
+    }
+    let answer = powerRequest(connection, .Page, U64(0), U64(0), nullPointer(), U64(0))
+    kernelRelease(connection)
+    let reply = try answer
+    var mapped: Result<Void, TesseraError> = .Error(failureIn(.Internal, .Power))
+    if reply.handles.count == 1 {
+        match handleSlotOf(reply.handles[0]) {
+            Some(slot) -> {
+                let slotBacking = try backingOf(objectOfSlot(slot))
+                match kernelMapReadOnly(slotBacking, U64(PowerPage.bytes)) {
+                    Ok(page) -> {
+                        library.powerPage = page
+                        mapped = .Ok
+                    }
+                    Error(failed) -> mapped = .Error(failed)
+                }
+            }
+            None -> {}
+        }
+    }
+    deviceMessageRelease(reply)
+    return mapped
+}
+
+public function powerRead() -> Result<PowerInfo, TesseraError> {
+    try powerPageMap()
+    let page = library.powerPage
+    for _ in 0..PowerPage.tries {
+        let before = heapLoad<U64>(page, PowerPage.sequenceAt)
+        // A state the power service names that this library does not know
+        // reads as unknown; a source or level it does not know is the
+        // service's fault.
+        let batteryState = match caseWithCode(
+            allCases_BatteryState(),
+            heapLoad<U32>(page, PowerPage.batteryStateAt)
+        ) {
+            Some(value) -> value
+            None -> BatteryState.Unknown
+        }
+        let externalPower = match caseWithCode(
+            allCases_ExternalPower(),
+            heapLoad<U32>(page, PowerPage.externalPowerAt)
+        ) {
+            Some(value) -> value
+            None -> return .Error(failureIn(.Internal, .Power))
+        }
+        let thermalLevel = match caseWithCode(
+            allCases_ThermalLevel(),
+            heapLoad<U32>(page, PowerPage.thermalLevelAt)
+        ) {
+            Some(value) -> value
+            None -> return .Error(failureIn(.Internal, .Power))
+        }
+        let info = PowerInfo {
+            batteryPercent: heapLoad<U32>(page, PowerPage.batteryPercentAt),
+            batteryState: batteryState,
+            externalPower: externalPower,
+            thermalLevel: thermalLevel,
+            lowPowerMode: heapLoad<U8>(page, PowerPage.lowPowerModeAt) != U8(0),
+            timeToEmpty: heapLoad<U64>(page, PowerPage.timeToEmptyAt),
+            timeToFull: heapLoad<U64>(page, PowerPage.timeToFullAt),
+            powerDrawMilliwatts: heapLoad<U32>(page, PowerPage.powerDrawAt),
+            cpuThrottlePercent: heapLoad<U32>(page, PowerPage.cpuThrottleAt),
+            gpuThrottlePercent: heapLoad<U32>(page, PowerPage.gpuThrottleAt),
+            updated: heapLoad<U64>(page, PowerPage.updatedAt),
+        }
+        if (before & U64(1)) == U64(0) && heapLoad<U64>(page, PowerPage.sequenceAt) == before {
+            return .Ok(info)
+        }
+    }
+    return .Error(failureIn(.ShouldWait, .Power))
+}
+
+public function wakeLockAcquire(
+    kind: WakeLockKind,
+    reason: borrow String,
+    timeout: UNumber,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    if reason.count > 256 { return .Error(failure(.InvalidArgument)) }
+    let target = try portTarget(port)
+    if kind != .Audio && !entitlementHeld("tessera.power.wakelock") {
+        portComplete(
+            target,
+            key,
+            .Error(failureIn(.NotEntitled, .Power)),
+            .Power,
+            U64(0),
+            U64(0),
+            U64(0)
+        )
+        return .Ok
+    }
+    if kind == .Display {
+        portComplete(
+            target,
+            key,
+            .Error(failureIn(.Unsupported, .Display)),
+            .Power,
+            U64(0),
+            U64(0),
+            U64(0)
+        )
+        return .Ok
+    }
+    var limit = timeout
+    if limit == U64(0) || (kind == .Cpu && limit > U64(3600) * U64(1000000000)) {
+        limit = U64(600) * U64(1000000000)
+    }
+    let connection = match serviceConnectFd("tessera.power") {
+        Ok(value) -> value
+        Error(failed) -> {
+            portComplete(
+                target,
+                key,
+                .Error(failureIn(.DeviceLost, .Power)),
+                .Power,
+                U64(0),
+                U64(0),
+                U64(0)
+            )
+            return .Ok
+        }
+    }
+    match powerRequest(
+        connection,
+        .WakeLock,
+        U64(code(kind)),
+        limit,
+        reason.data,
+        U64(reason.count)
+    ) {
+        Ok(reply) -> deviceMessageRelease(reply)
+        Error(failed) -> {
+            kernelRelease(connection)
+            portComplete(target, key, .Error(failed), .Power, U64(0), U64(0), U64(0))
+            return .Ok
+        }
+    }
+    let lock = WakeLockObject { deadline: monotonicNow() + limit, kind: kind, reason: reason }
+    let object = objectCreate(.WakeLock(move lock), connection)
+    let handle = match handleMint(object, Rights.wait | Rights.inspect) {
+        Ok(value) -> value
+        Error(failed) -> {
+            objectDestroy(object)
+            portComplete(target, key, .Error(failed), .Power, U64(0), U64(0), U64(0))
+            return .Ok
+        }
+    }
+    portComplete(target, key, .Ok, .Power, handle.raw, U64(0), U64(0))
+    return .Ok
+}
+
+// Closing the connection releases the service's wake source.
+function wakeLockTeardown(object: Number) {
+    objectRelease(object)
+}
+
+function wakeLockSignals(object: Number, lock: borrow WakeLockObject) -> U32 {
+    if monotonicNow() >= lock.deadline { return Signals.peerClosed.raw }
+    return match library.objects[object].backing {
+        Some(backing) -> socketSignals(backing) & Signals.peerClosed.raw
+        None -> Signals.peerClosed.raw
+    }
+}
+
+// A timer on the alarm clock (the boot-time clock where the alarm clock is
+// not allowed) owned by the pending operation; the completion is the
+// wake. The Power service is asked to arm the real-time clock for the same
+// moment; a system without one still wakes the process on time while it
+// runs. The timer lives as long as the process does.
+public function powerScheduleWake(
+    deadline: UNumber,
+    tolerance: UNumber,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    let target = try portTarget(port)
+    if !entitlementHeld("tessera.power.wake") { return .Error(failureIn(.NotEntitled, .Power)) }
+    // The alarm clock takes a capability this process may lack; the
+    // boot-time clock still wakes it on time while it runs.
+    let alarm = kernelTimerCreate(.BoottimeAlarm)
+    let clock = match alarm {
+        Ok -> ClockSource.BoottimeAlarm
+        Error(refused) -> ClockSource.Boottime
+    }
+    let timer = match alarm {
+        Ok(value) -> value
+        Error(refused) -> match kernelTimerCreate(.Boottime) {
+            Ok(value) -> value
+            Error(failed) -> return .Error(failed)
+        }
+    }
+    let armed = kernelTimerProgram(timer, deadline, U64(0))
+    if !succeeded(armed) {
+        kernelRelease(timer)
+        return armed
+    }
+    // The power service keeps the machine from sleeping through the
+    // deadline. Without it, or when it refuses, the timer still fires while
+    // the machine runs, which is all a process that cannot reach it gets.
+    match serviceConnectFd("tessera.power") {
+        Ok(connection) -> {
+            match powerRequest(
+                connection,
+                .ScheduleWake,
+                deadline,
+                tolerance,
+                nullPointer(),
+                U64(0)
+            ) {
+                Ok(reply) -> deviceMessageRelease(reply)
+                // Refused: the timer still fires while the machine runs.
+                Error(failed) -> absorb failed
+            }
+            kernelRelease(connection)
+        }
+        // No power service: the timer still fires while the machine runs.
+        Error(failed) -> absorb failed
+    }
+    let object = objectCreate(.Timer(timerQuiet(clock)), timer)
+    let index = pendingAdd(.Wake, .Object(object), target, key)
+    wakeStep(index)
+    return .Ok
+}
+
+function wakeStep(index: Number) {
+    let object = library.pending[index].object
+    let backing = match backingOf(object) {
+        Ok(value) -> value
+        Error(failed) -> {
+            pendingFinish(index, .Error(failed), U64(0), U64(0), U64(0))
+            return
+        }
+    }
+    if (kernelReady(backing, Ready.readable) & Ready.readable) == 0 { return }
+    pendingFinish(index, .Ok, clockValue(.Boottime), U64(0), U64(0))
+}

@@ -1,0 +1,595 @@
+import Foundation
+import Heap
+import LibTessera
+
+// `Display.commit` (17 §12.3): CRTC and plane records become one atomic
+// commit. Every applied commit asks the kernel for an out-fence per CRTC
+// (`OUT_FENCE_PTR`); the first one is imported into the display's timeline at
+// the commit's serial, so the timeline reaches N exactly when commit N is on
+// screen, and a `FlipEvent` completion is a readiness wait on that same
+// out-fence. The page-flip events the kernel also queues are drained by the
+// next call that needs them (`lastFlip`, the next commit).
+
+namespace CommitRecord {
+    let crtc: Number = 32
+    let plane: Number = 72
+    // `CrtcState.flags`.
+    let active: U32 = U32(1)
+    let variableRefresh: U32 = U32(2)
+    // `CrtcState.mode`: leave the mode as it is.
+    let keepMode: U32 = U32(0xFFFFFFFF)
+    // An `OUT_FENCE_PTR` slot the kernel has not filled.
+    let noFence: U32 = U32(0xFFFFFFFF)
+    // How long a blocking commit waits for the flip before it.
+    let flipWait: Number = 1000000000
+}
+
+// The property writes of one atomic commit, and the first record that named
+// a property its object does not have.
+struct AtomicRequest {
+    var objects: [U32]
+    var properties: [U32]
+    var values: [U64]
+    var failedAt: Number?
+
+    function add(borrow mut self, object: U32, property: U32?, value: U64, record: Number) {
+        match property {
+            Some(id) -> {
+                self.objects.append(object)
+                self.properties.append(id)
+                self.values.append(value)
+            }
+            None -> {
+                if self.failedAt.isNone() { self.failedAt = .Some(record) }
+            }
+        }
+    }
+}
+
+// What the commit has to give back once the kernel answers, and what it
+// learnt on the way.
+struct CommitScratch {
+    var blobs: [U32]
+    var inFences: [Descriptor]
+    // The CRTC records that asked for an out-fence.
+    var outRecords: [Number]
+    var shown: [ScanPlane]
+    var mask: U32
+    var allActive: Bool
+
+    function done(borrow self, card: borrow Descriptor) {
+        for blob in self.blobs { destroyBlob(card, blob) }
+        for fence in self.inFences { fence.close() }
+    }
+}
+
+// A signed 32-bit field as a property value, which the kernel reads as s64.
+function signedValue(value: U32) -> U64 {
+    if (value & U32(0x80000000)) != 0 { return U64(value) | U64(0xFFFFFFFF00000000) }
+    return U64(value)
+}
+
+function crtcIndex(display: Number, crtc: U32) -> Number? {
+    for (index, id) in deviceLibrary.displays[display].crtcs.enumerated() {
+        if id == crtc { return .Some(index) }
+    }
+    return .None
+}
+
+// A mode blob for a connector's `mode`-th mode: `struct
+// drm_mode_create_blob`, the data @0, its length @8, the blob @12.
+function modeBlob(card: borrow Descriptor, connector: U32, mode: U32) -> Result<U32, TesseraError> {
+    let found = try readConnector(card, connector)
+    if mode >= found.modes.count { return .Error(failure(.ModeRejected)) }
+    let modeBytes = zeroedBlock(count: ModeLayout.kernel, alignment: 16)
+    found.modes[mode].write(modeBytes.pointer(), 0)
+    let blockBytes = zeroedBlock(count: 16, alignment: 16)
+    let block = blockBytes.pointer()
+    heapStore<U64>(block, 0, U64(pointerAddress(modeBytes.pointer())))
+    heapStore<U32>(block, 8, U32(ModeLayout.kernel))
+    let created = try card.control(Drm.modeCreateBlob, block)
+    return .Ok(heapLoad<U32>(block, 12))
+}
+
+function destroyBlob(card: borrow Descriptor, blob: U32) {
+    match card.controlWord(Drm.modeDestroyBlob, blob) {
+        Ok(destroyed) -> {}
+        Error(failed) -> log warn("a mode blob was not destroyed", error: errorName(failed))
+    }
+}
+
+// The commit's failure from the kernel's answer.
+function commitFailure(failed: borrow TesseraError) -> TesseraError {
+    return match errnoOf(failed) {
+        Invalid -> failure(.ModeRejected)
+        OutOfRange -> failure(.ModeRejected)
+        Busy -> failure(.FlipPending)
+        AccessDenied -> failure(.NotMaster)
+        NotPermitted -> failure(.NotMaster)
+        NoSpace -> failure(.OutOfMemory)
+        NoMemory -> failure(.OutOfMemory)
+        else -> failed
+    }
+}
+
+// A record's failure, with the record's index as `detail`.
+function atRecord(failed: borrow TesseraError, record: Number) -> TesseraError {
+    return failure(failed.code, Number(record))
+}
+
+// One `CrtcState` record.
+function addCrtc(
+    display: Number,
+    card: borrow Descriptor,
+    crtcs: borrow Buffer,
+    record: Number,
+    test: Bool,
+    slots: RawPtr,
+    atomic: borrow mut AtomicRequest,
+    scratch: borrow mut CommitScratch
+) -> Result<Void, TesseraError> {
+    let at = record * CommitRecord.crtc
+    let crtc = heapLoad<U32>(crtcs.address, at)
+    let flags = heapLoad<U32>(crtcs.address, at + 4)
+    let connector = heapLoad<U32>(crtcs.address, at + 8)
+    let mode = heapLoad<U32>(crtcs.address, at + 12)
+    let index = try crtcIndex(display, crtc) otherwise return .Error(
+        failure(.ModeRejected, Number(record))
+    )
+    // Gamma and colour matrices are not applied.
+    if heapLoad<U64>(crtcs.address, at + 16) != U64(0) || heapLoad<U64>(
+        crtcs.address,
+        at + 24
+    ) != U64(0) {
+        return .Error(failure(.Unsupported))
+    }
+    scratch.mask = scratch.mask | (U32(1) << U32(index))
+    let active = (flags & CommitRecord.active) != 0
+    if !active { scratch.allActive = false }
+    let kms = try kmsObject(display, crtc, Drm.objectCrtc)
+    atomic.add(crtc, kms.propertyId("ACTIVE"), active ? U64(1) : U64(0), record)
+    if active && mode != CommitRecord.keepMode {
+        if connector == 0 { return .Error(failure(.ModeRejected, Number(record))) }
+        let blob = match modeBlob(card, connector, mode) {
+            Ok(value) -> value
+            Error(failed) -> return .Error(atRecord(failed, record))
+        }
+        scratch.blobs.append(blob)
+        atomic.add(crtc, kms.propertyId("MODE_ID"), U64(blob), record)
+    }
+    if !active { atomic.add(crtc, kms.propertyId("MODE_ID"), U64(0), record) }
+    if connector != 0 {
+        let connectorKms = try kmsObject(display, connector, Drm.objectConnector)
+        atomic.add(
+            connector,
+            connectorKms.propertyId("CRTC_ID"),
+            active ? U64(crtc) : U64(0),
+            record
+        )
+    }
+    match kms.propertyId("VRR_ENABLED") {
+        Some(id) -> atomic.add(
+            crtc,
+            .Some(id),
+            (flags & CommitRecord.variableRefresh) != 0 ? U64(1) : U64(0),
+            record
+        )
+        None -> {}
+    }
+    if !test && active {
+        atomic.add(
+            crtc,
+            kms.propertyId("OUT_FENCE_PTR"),
+            U64(pointerAddress(heapOffset(slots, record * 8))),
+            record
+        )
+        scratch.outRecords.append(record)
+    }
+    return .Ok
+}
+
+// A plane record's in-fence as a sync file the display engine waits on.
+function inFence(planes: borrow Buffer, at: Number) -> Result<Descriptor?, TesseraError> {
+    let raw = heapLoad<U64>(planes.address, at + 56)
+    if raw == U64(0) { return .Ok(.None) }
+    let fence = try resolve(Ref(raw), .Fence, RefRights.wait)
+    let sync = try syncDevice()
+    let handle = try fenceOf(fence)
+    return match syncobjToDescriptor(
+        sync,
+        handle,
+        Drm.syncobjExportSyncFile,
+        heapLoad<U64>(planes.address, at + 64)
+    ) {
+        Ok(file) -> .Ok(.Some(file))
+        // Nothing submitted yet reaches that point.
+        Error(failed) -> .Error(failure(.ShouldWait))
+    }
+}
+
+// The plane properties a `PlaneState` record sets from its own fields.
+function addPlaneGeometry(
+    atomic: borrow mut AtomicRequest,
+    plane: U32,
+    kms: borrow KmsObject,
+    planes: borrow Buffer,
+    at: Number,
+    row: Number
+) {
+    atomic.add(plane, kms.propertyId("SRC_X"), U64(heapLoad<U32>(planes.address, at + 16)), row)
+    atomic.add(plane, kms.propertyId("SRC_Y"), U64(heapLoad<U32>(planes.address, at + 20)), row)
+    atomic.add(plane, kms.propertyId("SRC_W"), U64(heapLoad<U32>(planes.address, at + 24)), row)
+    atomic.add(plane, kms.propertyId("SRC_H"), U64(heapLoad<U32>(planes.address, at + 28)), row)
+    atomic.add(plane, kms.propertyId("CRTC_W"), U64(heapLoad<U32>(planes.address, at + 40)), row)
+    atomic.add(plane, kms.propertyId("CRTC_H"), U64(heapLoad<U32>(planes.address, at + 44)), row)
+    atomic.add(
+        plane,
+        kms.propertyId("CRTC_X"),
+        signedValue(heapLoad<U32>(planes.address, at + 32)),
+        row
+    )
+    atomic.add(
+        plane,
+        kms.propertyId("CRTC_Y"),
+        signedValue(heapLoad<U32>(planes.address, at + 36)),
+        row
+    )
+    let zpos = heapLoad<U16>(planes.address, at + 48)
+    match kms.propertyId("zpos") {
+        Some(id) -> {
+            if zpos != 0 { atomic.add(plane, .Some(id), U64(zpos), row) }
+        }
+        None -> {}
+    }
+    match kms.propertyId("alpha") {
+        Some(id) -> atomic.add(plane, .Some(id), U64(heapLoad<U16>(planes.address, at + 50)), row)
+        None -> {}
+    }
+    // 0 is the default, no rotation: `DRM_MODE_ROTATE_0`.
+    let rotation = heapLoad<U32>(planes.address, at + 52)
+    match kms.propertyId("rotation") {
+        Some(id) -> atomic.add(plane, .Some(id), rotation == 0 ? U64(1) : U64(rotation), row)
+        None -> {}
+    }
+}
+
+// One `PlaneState` record; `row` counts the CRTC records before it.
+function addPlane(
+    display: Number,
+    planes: borrow Buffer,
+    record: Number,
+    row: Number,
+    atomic: borrow mut AtomicRequest,
+    scratch: borrow mut CommitScratch
+) -> Result<Void, TesseraError> {
+    let at = record * CommitRecord.plane
+    let plane = heapLoad<U32>(planes.address, at)
+    let crtc = heapLoad<U32>(planes.address, at + 4)
+    let kms = try kmsObject(display, plane, Drm.objectPlane)
+    if crtc == 0 {
+        atomic.add(plane, kms.propertyId("FB_ID"), U64(0), row)
+        atomic.add(plane, kms.propertyId("CRTC_ID"), U64(0), row)
+        scratch.shown.append(ScanPlane { plane: plane, surface: .None })
+        return .Ok
+    }
+    let index = try crtcIndex(display, crtc) otherwise return .Error(
+        failure(.ModeRejected, Number(row))
+    )
+    scratch.mask = scratch.mask | (U32(1) << U32(index))
+    let framebufferObject = match resolve(
+        Ref(heapLoad<U64>(planes.address, at + 8)),
+        .Framebuffer,
+        RefRights.read
+    ) {
+        Ok(value) -> value
+        Error(failed) -> return .Error(atRecord(failed, row))
+    }
+    let framebuffer = deviceLibrary.framebuffers[try framebufferOf(framebufferObject)]
+    if framebuffer.display != deviceLibrary.displays[display].object {
+        return .Error(failure(.ScanoutRejected, Number(row)))
+    }
+    scratch.shown.append(ScanPlane { plane: plane, surface: .Some(framebuffer.surface) })
+    atomic.add(plane, kms.propertyId("FB_ID"), U64(framebuffer.id), row)
+    atomic.add(plane, kms.propertyId("CRTC_ID"), U64(crtc), row)
+    addPlaneGeometry(atomic, plane, kms, planes, at, row)
+    let fence = match inFence(planes, at) {
+        Ok(value) -> value
+        Error(failed) -> return .Error(atRecord(failed, row))
+    }
+    match fence {
+        Some(file) -> {
+            scratch.inFences.append(file)
+            atomic.add(plane, kms.propertyId("IN_FENCE_FD"), U64(file.number), row)
+        }
+        None -> {}
+    }
+    return .Ok
+}
+
+// Every record as property writes.
+function buildCommit(
+    display: Number,
+    card: borrow Descriptor,
+    crtcs: borrow Buffer,
+    planes: borrow Buffer,
+    test: Bool,
+    slots: RawPtr,
+    scratch: borrow mut CommitScratch
+) -> Result<AtomicRequest, TesseraError> {
+    var atomic = AtomicRequest { objects: [], properties: [], values: [], failedAt: .None }
+    let crtcCount = trunc(floor(crtcs.length / CommitRecord.crtc))
+    for record in 0..crtcCount {
+        try addCrtc(display, card, crtcs, record, test, slots, atomic, scratch)
+    }
+    for record in 0..trunc(floor(planes.length / CommitRecord.plane)) {
+        try addPlane(display, planes, record, crtcCount + record, atomic, scratch)
+    }
+    return match atomic.failedAt {
+        Some(record) -> .Error(failure(.ModeRejected, Number(record)))
+        None -> .Ok(atomic)
+    }
+}
+
+// One flip in flight per CRTC: a non-blocking commit over a CRTC whose last
+// commit has not reached the screen is refused, a blocking one waits.
+function awaitPending(display: Number, mask: U32, nonBlock: Bool) -> Result<Void, TesseraError> {
+    try drainFlips(display)
+    let pending = try deviceLibrary.displays[display].pending otherwise return .Ok
+    if (pending.mask & mask) == 0 { return .Ok }
+    let shown = try pending.fence.ready(PollEvents.input, 0)
+    if shown != PollEvents.none { return .Ok }
+    if nonBlock { return .Error(failure(.FlipPending)) }
+    let waited = try pending.fence.ready(PollEvents.input, CommitRecord.flipWait)
+    if waited == PollEvents.none { return .Error(failure(.FlipPending)) }
+    return .Ok
+}
+
+public function displayCommit(
+    display: Ref,
+    crtcs: borrow Buffer,
+    planes: borrow Buffer,
+    extra: borrow Buffer,
+    options: CommitOptions,
+    port: Handle,
+    key: UNumber
+) -> Result<UNumber, TesseraError> {
+    let index = try resolveDisplay(display, RefRights.master)
+    if deviceLibrary.displays[index].released { return .Error(failure(.NotMaster)) }
+    if !CommitOptions.all.has(options) { return .Error(failure(.InvalidArgument)) }
+    if crtcs.length % CommitRecord.crtc != 0 {
+        return .Error(failure(.InvalidArgument, crtcs.length))
+    }
+    if planes.length % CommitRecord.plane != 0 {
+        return .Error(failure(.InvalidArgument, planes.length))
+    }
+    let test = options.has(CommitOptions.testOnly)
+    let card = try deviceOf(deviceLibrary.displays[index].object)
+    let crtcCount = trunc(floor(crtcs.length / CommitRecord.crtc))
+    let slotsBytes = zeroedBlock(count: (crtcCount + 1) * 8, alignment: 16)
+    let slots = slotsBytes.pointer()
+    for at in 0..crtcCount { heapStore<U64>(slots, at * 8, U64(0xFFFFFFFFFFFFFFFF)) }
+    var scratch = CommitScratch {
+        blobs: [],
+        inFences: [],
+        outRecords: [],
+        shown: [],
+        mask: U32(0),
+        allActive: true
+    }
+    let outcome = applyCommit(index, card, crtcs, planes, options, slots, scratch)
+    scratch.done(card)
+    let serial = try outcome
+    if test { return .Ok(U64(0)) }
+    committed(index, scratch.shown)
+    let reply = Reply { port: port, key: key }
+    flipFollow(
+        index,
+        serial,
+        scratch.mask,
+        firstOutFence(slots, scratch.outRecords),
+        options.has(CommitOptions.flipEvent),
+        reply
+    )
+    return .Ok(serial)
+}
+
+// Builds, waits for the flip before it when it has to, and commits; the
+// serial the commit took.
+function applyCommit(
+    display: Number,
+    card: borrow Descriptor,
+    crtcs: borrow Buffer,
+    planes: borrow Buffer,
+    options: CommitOptions,
+    slots: RawPtr,
+    scratch: borrow mut CommitScratch
+) -> Result<U64, TesseraError> {
+    let test = options.has(CommitOptions.testOnly)
+    let atomic = try buildCommit(display, card, crtcs, planes, test, slots, scratch)
+    if !test { try awaitPending(display, scratch.mask, options.has(CommitOptions.nonBlock)) }
+    var flags = U32(0)
+    if test { flags = flags | Drm.atomicTestOnly }
+    if options.has(CommitOptions.nonBlock) { flags = flags | Drm.atomicNonBlock }
+    if options.has(CommitOptions.allowModeset) { flags = flags | Drm.atomicAllowModeset }
+    if !test && scratch.allActive && scratch.mask != 0 { flags = flags | Drm.atomicFlipEvent }
+    let serial = deviceLibrary.displays[display].serial + U64(1)
+    match atomicCommit(card, atomic, flags, serial) {
+        Ok -> {}
+        Error(failed) -> return .Error(commitFailure(failed))
+    }
+    if !test { deviceLibrary.displays[display].serial = serial }
+    return .Ok(serial)
+}
+
+// The out-fence of the first CRTC the kernel gave one; the others close.
+function firstOutFence(slots: RawPtr, records: borrow [Number]) -> Descriptor? {
+    var first: Descriptor? = .None
+    for record in records {
+        let slot = heapLoad<U32>(slots, record * 8)
+        if slot == CommitRecord.noFence { continue }
+        let fence = Descriptor { number: Number(slot) }
+        if first.isNone() { first = .Some(fence) } else { fence.close() }
+    }
+    return first
+}
+
+// `struct drm_mode_atomic`: flags @0, the object count @4, then the object,
+// count, property and value arrays @8–@32, and the serial @48 that comes back
+// in the flip event. The properties are grouped by object as the kernel
+// wants them.
+function atomicCommit(
+    card: borrow Descriptor,
+    atomic: borrow AtomicRequest,
+    flags: U32,
+    serial: U64
+) -> Result<Void, TesseraError> {
+    var objects: [U32] = []
+    for object in atomic.objects {
+        if !arrayContains(objects, object) { objects.append(object) }
+    }
+    let total = atomic.properties.count
+    let objectBytes = zeroedBlock(count: (objects.count + 1) * 4, alignment: 16)
+    let objectBlock = objectBytes.pointer()
+    let countBytes = zeroedBlock(count: (objects.count + 1) * 4, alignment: 16)
+    let countBlock = countBytes.pointer()
+    let propertyBytes = zeroedBlock(count: (total + 1) * 4, alignment: 16)
+    let propertyBlock = propertyBytes.pointer()
+    let valueBytes = zeroedBlock(count: (total + 1) * 8, alignment: 16)
+    let valueBlock = valueBytes.pointer()
+    var written = 0
+    for (item, object) in objects.enumerated() {
+        var count = 0
+        for at in 0..total {
+            if atomic.objects[at] != object { continue }
+            heapStore<U32>(propertyBlock, written * 4, atomic.properties[at])
+            heapStore<U64>(valueBlock, written * 8, atomic.values[at])
+            written++
+            count++
+        }
+        heapStore<U32>(objectBlock, item * 4, object)
+        heapStore<U32>(countBlock, item * 4, U32(count))
+    }
+    let blockBytes = zeroedBlock(count: 56, alignment: 16)
+    let block = blockBytes.pointer()
+    heapStore<U32>(block, 0, flags)
+    heapStore<U32>(block, 4, U32(objects.count))
+    heapStore<U64>(block, 8, U64(pointerAddress(objectBlock)))
+    heapStore<U64>(block, 16, U64(pointerAddress(countBlock)))
+    heapStore<U64>(block, 24, U64(pointerAddress(propertyBlock)))
+    heapStore<U64>(block, 32, U64(pointerAddress(valueBlock)))
+    heapStore<U64>(block, 48, serial)
+    let committed = try card.control(Drm.modeAtomic, block)
+    return .Ok
+}
+
+// Which surface each plane now shows, for `Surface.inUse`.
+function committed(display: Number, shown: borrow [ScanPlane]) {
+    for scan in shown {
+        var slot: Number? = .None
+        for (index, known) in deviceLibrary.displays[display].scanned.enumerated() {
+            if known.plane == scan.plane { slot = .Some(index) }
+        }
+        match slot {
+            Some(index) -> {
+                match deviceLibrary.displays[display].scanned[index].surface {
+                    Some(previous) -> setOnScreen(previous, false)
+                    None -> {}
+                }
+                deviceLibrary.displays[display].scanned[index] = scan
+            }
+            None -> deviceLibrary.displays[display].scanned.append(scan)
+        }
+        match scan.surface {
+            Some(surface) -> setOnScreen(surface, true)
+            None -> {}
+        }
+    }
+}
+
+// After an applied commit: the timeline learns when it is on screen, the old
+// out-fences are closed, and a `FlipEvent` is armed. The commit has been
+// applied whatever happens here, so a failure is said rather than returned.
+function flipFollow(
+    display: Number,
+    serial: U64,
+    mask: U32,
+    outFence: Descriptor?,
+    wantEvent: Bool,
+    reply: borrow Reply
+) {
+    let fence = match outFence {
+        Some(value) -> value
+        None -> {
+            // No out-fence: the commit is on screen as it returns.
+            match deviceLibrary.displays[display].timeline {
+                Some(timeline) -> match signalFence(timeline, serial) {
+                    Ok -> {}
+                    Error(failed) -> log warn(
+                        "a display timeline did not advance",
+                        error: errorName(failed)
+                    )
+                }
+                None -> {}
+            }
+            if wantEvent {
+                match reply.post(.Ok(Answer { result0: serial, result1: U64(mask) }), .Flip) {
+                    Ok -> {}
+                    Error(failed) -> log warn(
+                        "a flip completion was not posted",
+                        error: errorName(failed)
+                    )
+                }
+            }
+            return
+        }
+    }
+    match deviceLibrary.displays[display].timeline {
+        Some(timeline) -> match importOutFence(timeline, fence, serial) {
+            Ok -> {}
+            Error(failed) -> log warn(
+                "a commit's out-fence did not reach the display timeline",
+                error: errorName(failed)
+            )
+        }
+        None -> {}
+    }
+    // Keep the newest two out-fences open; an older one has long signalled
+    // and whatever port waited on it has finished with it.
+    let fences = deviceLibrary.displays[display].outFences
+    var kept: [Descriptor] = []
+    for (index, old) in fences.enumerated() {
+        if index + 1 < fences.count { old.close() } else { kept.append(old) }
+    }
+    kept.append(fence)
+    deviceLibrary.displays[display].outFences = kept
+    deviceLibrary.displays[display].pending = .Some(PendingFlip { fence: fence, mask: mask })
+    if wantEvent {
+        let completion = packet(
+            reply.key,
+            successOutcome,
+            Answer { result0: serial, result1: U64(mask) },
+            .Flip
+        )
+        match reply.attach(
+            fence,
+            SourceEvents.readable,
+            completion,
+            SourceOptions { mode: .Once, fillEvents: false }
+        ) {
+            Ok -> {}
+            Error(failed) -> log warn("a flip completion was not armed", error: errorName(failed))
+        }
+    }
+}
+
+// The out-fence's sync file as the timeline's point `serial`.
+function importOutFence(
+    timeline: Number,
+    fence: borrow Descriptor,
+    serial: U64
+) -> Result<Void, TesseraError> {
+    let sync = try syncDevice()
+    let handle = try fenceOf(timeline)
+    let imported = try syncobjFromDescriptor(sync, fence, handle, Drm.syncobjImportSyncFile, serial)
+    return .Ok
+}

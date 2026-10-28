@@ -1,0 +1,110 @@
+import Foundation
+import LibTessera
+import KiraUI
+import FileOperations
+
+// The Trash in Inlay (roadmap/19-files-and-documents.md, "Decisions"): what
+// was moved there, each with where it came from and Put Back, and Empty
+// Trash, which asks first. The Trash service keeps it; Inlay only asks.
+
+construct TrashPane() extends Widget {
+    @State var emptying: Bool = false
+    @State var problem: String = ""
+
+    body {
+        let items = match trashItems() {
+            Ok(found) -> found
+            Error(failed) -> {
+                log warn("the Trash could not be listed", error: errorName(failed))
+                []
+            }
+        }
+        var rows: [Any Widget] = []
+        for item in items { rows.append(self.row(item)) }
+        if rows.count == 0 { rows.append(Text("The Trash is empty").foregroundColor(.Secondary)) }
+        let full = items.count > 0
+        Form(children: [Section(children: rows, header: Text("Trash"))])
+        .navigationTitle("Trash")
+        .toolbar {
+            ToolbarItem(placement = .PrimaryAction) {
+                Button(role = .Destructive, action = { in emptying = true }) {
+                    Label(title = "Empty Trash", systemImage = .Trash)
+                }
+                .disabled(!full)
+            }
+        }
+        .alert(
+            title = "Are you sure you want to permanently erase the items in the Trash?",
+            isPresented = emptying,
+            message = "You can’t undo this action.",
+            actions = self.emptyActions()
+        )
+        .alert(
+            title = problem,
+            isPresented = problem.count > 0,
+            message = "",
+            actions = [Button(action = { in problem = "" }) { Text("OK") }]
+        )
+    }
+
+    // One item: its name, where it came from, and Put Back when that is known.
+    function row(item: borrow TrashedItem) -> Any Widget {
+        let id = copy item.id
+        return match item.original {
+            Some(path) -> LabeledContent(label = lastPathPart(path)) {
+                Text(shownPath(parentPath(path))).foregroundColor(.Secondary)
+                Button(action = { in self.putBack(id, path) }) { Text("Put Back") }
+            }
+            None -> LabeledContent(label = "Item \(item.id)") {
+                Text("Its original location is not known").foregroundColor(.Secondary)
+            }
+        }
+    }
+
+    function putBack(id: borrow String, path: borrow String) {
+        match trashPutBack(id) {
+            Ok -> log info("put an item back", path: copy path)
+            Error(failed) -> problem = putBackProblem(failed, path)
+        }
+    }
+
+    function emptyActions() -> [Any Widget] {
+        return [
+            Button(
+                role = .Destructive,
+                action = { in
+                    emptying = false
+                    match trashEmpty() {
+                        Ok -> {}
+                        Error(
+                            failed
+                        ) -> problem = "The Trash couldn’t be emptied (\(errorName(failed)))."
+                    }
+                }
+            ) {
+                Text("Empty Trash")
+            },
+            Button(action = { in emptying = false }) { Text("Cancel").fontWeight(.SemiBold) }
+        ]
+    }
+}
+
+// Why an item did not go back: something is where it was, its folder is
+// gone, or the service said otherwise.
+function putBackProblem(failed: borrow TesseraError, path: borrow String) -> String {
+    return match failed.code {
+        AlreadyExists -> "An item named “\(lastPathPart(path))” already exists in “\(shownPath(parentPath(path)))”. Move or rename it, then put this one back."
+        NotFound -> "The folder “\(shownPath(parentPath(path)))” is no longer there."
+        else -> "“\(lastPathPart(path))” couldn’t be put back (\(errorName(failed)))."
+    }
+}
+
+// Where the data volume's folders are seen from: `/data/Documents/x` is
+// `/Documents/x`, as PID 1 binds it.
+function shownPath(path: borrow String) -> String {
+    let documents = "/" + SystemDirectory.data + "/" + SystemDirectory.documents
+    if path == documents || path.startsWith(documents + "/") {
+        return path.substring(SystemDirectory.data.count + 1, path.count)
+    }
+    return copy path
+}

@@ -1,0 +1,110 @@
+//! The trash service's connections: serving each request as it arrives, one connection at a time.
+import Foundation
+import LibTessera
+
+// The listener and the connections. The listener's readiness is waited on
+// with `Object.waitAsync` on a port of this program's; each connection is
+// served alone, on a port of its own, so one slow client holds only the
+// requests behind it.
+
+/// The keys the service's waits are made under.
+namespace PortKey {
+    // The listener's wait.
+    let listener: Number = 1
+    // The termination watch: its completion means the system asks us to stop.
+    let termination: Number = 2
+    // A connection's wait for its request.
+    let channel: Number = 1
+    // The most completions taken in one wait.
+    let batch: Number = 8
+}
+
+/// How long the service waits on a connection: the time for one request.
+namespace Timing {
+    // How long a connection may take to send its request before the service
+    // gives up on it, so one client that connects and stays silent cannot hold
+    // up the requests behind it.
+    let requestNanoseconds: UNumber = UNumber(5000000000)
+}
+
+/// Serves connections as they arrive, forever.
+function serve(listener: Handle) -> Result<Void, TesseraError> {
+    let port = try portCreate(.None)
+    try objectWaitAsync(listener, Signals.readable, .Repeat, port, PortKey.listener)
+    try processWatchTermination(port, PortKey.termination)
+    while true {
+        let completions = match portWait(port, PortKey.batch, Deadline.infinite) {
+            Ok(value) -> value
+            Error(failed) -> if failed.code == .Timeout { continue } else { return .Error(failed) }
+        }
+        for completion in completions {
+            if Number(completion.key) == PortKey.termination {
+                log info("asked to stop")
+                return .Ok
+            }
+            if Number(completion.key) == PortKey.listener { try accept(listener) }
+        }
+    }
+}
+
+/// Takes every connection waiting on the listener, serving each in turn.
+function accept(listener: Handle) -> Result<Void, TesseraError> {
+    while true {
+        let channel = match serviceAccept(listener) {
+            Ok(value) -> value
+            Error(failed) -> return failed.code == .ShouldWait ? .Ok : .Error(failed)
+        }
+        serveConnection(channel)
+    }
+    return .Ok
+}
+
+/// Waits until `channel` has a request or has gone, on a port of its own, for at most `Timing.requestNanoseconds`.
+function awaitRequest(channel: Handle) -> Result<Void, TesseraError> {
+    let port = try portCreate(.None)
+    var result: Result<Void, TesseraError> = .Ok
+    let deadline = monotonicDeadline(Timing.requestNanoseconds)
+    match objectWaitAsync(
+        channel,
+        Signals.readable | Signals.peerClosed,
+        .Once,
+        port,
+        PortKey.channel
+    ) {
+        Ok -> match portWait(port, 1, deadline) {
+            Ok -> {}
+            Error(failed) -> result = .Error(failed)
+        }
+        Error(failed) -> result = .Error(failed)
+    }
+    closeHandle(port)
+    return result
+}
+
+/// Answers one request on `channel`, then closes it.
+function serveConnection(channel: Handle) {
+    match awaitRequest(channel) {
+        Ok -> answerRequest(channel)
+        Error(failed) -> log warn("a request could not be awaited", error: errorName(failed))
+    }
+    closeHandle(channel)
+}
+
+/// Closes a handle, logging a warning when it cannot.
+function closeHandle(handle: Handle) {
+    match handleClose(handle) {
+        // The handle is gone, so there is nothing left to do.
+        Ok -> {}
+        Error(failed) -> log warn("a handle could not be closed", error: errorName(failed))
+    }
+}
+
+/// Closes every handle in `handles`, logging a warning when they cannot.
+function closeHandles(handles: borrow [Handle]) {
+    if handles.count == 0 { return }
+    match handleCloseMany(handles) {
+        // The handles are gone, so there is nothing left to do.
+        Ok -> {}
+        Error(failed) -> log warn("handles could not be closed", error: errorName(failed))
+    }
+}

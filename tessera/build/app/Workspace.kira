@@ -1,0 +1,251 @@
+import Foundation
+import Build
+import Kten
+
+struct WorkspaceRepository {
+    let name: String
+    let location: String
+}
+
+function workspaceRepositories(root: borrow String) -> Result<[WorkspaceRepository], String> {
+    var repositories: [WorkspaceRepository] = []
+    // kiradb is the storage engine Harmony builds on (`../../kiradb` from its packages).
+    var names = [
+        "tessera", "klf-kira", "argument-parser", "krenderbox", "kcore-surface", "system", "kiradb"
+    ]
+    for component in tesseraComponents() {
+        if !names.contains(component.name) { names.append(copy component.name) }
+    }
+    let sorted = names.sorted({ left, right in return orderStrings(left, right) < 0 })
+    for name in sorted {
+        let location = "../" + name
+        if !pathExists(joinedPath(root, location) + "/.git") {
+            return .Error("required Tessera/Kira repository is missing: \(name)")
+        }
+        repositories.append(WorkspaceRepository { name: copy name, location: location })
+    }
+    return .Ok(repositories)
+}
+
+function workspaceNameValid(name: borrow String) -> Bool {
+    if name.count == 0 || name == "." || name == ".." { return false }
+    for index in 0..name.count {
+        let part = name.substring(index, index + 1)
+        if !"abcdefghijklmnopqrstuvwxyz0123456789-_".contains(part) { return false }
+    }
+    return name == "development" || name == "staging" || name.startsWith("worktree-")
+}
+
+function describeWorkspace(graph: borrow mut Graph, base: borrow String) {
+    let root = copy graph.root
+    let pinned = copy base
+    graph.step(Step {
+        name: "workspace", summary: "create <staging|worktree-name> from the development workspace",
+        run: .Some({ run in
+            if run.arguments.count != 2 || run.arguments[0] != "create" {
+                log fault("usage: kira build [-base snapshot] workspace create <name>")
+                return 2
+            }
+            match createWorkspace(root, run.arguments[1], pinned) {
+                Ok(directory) -> {
+                    log info("created workspace", directory)
+                    return 0
+                }
+                Error(problem) -> {
+                    log fault("workspace creation failed; completed checkouts are preserved", problem)
+                    return 1
+                }
+            }
+        })
+    })
+}
+
+function createWorkspace(root: borrow String, name: borrow String, base: borrow String) -> Result<String, String> {
+    if !workspaceNameValid(name) { return .Error("invalid workspace name: \(name)") }
+    let top = parentOf(root)
+    if !fileExists(top + "/workspace.kten") {
+        return .Error("create release train workspaces from a flat workspace checkout")
+    }
+    let branch = try workspaceBranch(root)
+    if branch != "development" {
+        return .Error("create workspaces from the development workspace")
+    }
+    let parent = parentOf(top)
+    let destination = parent + "/" + name
+    if name == "development" {
+        return .Error("development is the integration workspace; create it once from the base repositories")
+    }
+    if pathExists(destination) { return .Error("destination already exists: \(destination)") }
+    if name == "staging" {
+        return createStagingWorkspace(root, destination)
+    }
+    var revisions: [Kten] = []
+    if base.count > 0 {
+        let snapshot = match loadBuildSnapshot(base) {
+            Ok(found) -> found
+            Error(failure) -> return .Error("cannot load workspace base: \(traceText(failure))")
+        }
+        revisions = try trainMetadataItems(snapshot.metadata, "repositories")
+    }
+    let repositories = try workspaceRepositories(root)
+    // Resolve every revision before registering any Git worktree.
+    var commits: [String] = []
+    for repository in repositories {
+        var revision = "HEAD"
+        if base.count > 0 {
+            var found = false
+            for record in revisions {
+                if trainMetadataText(record, "location") == repository.location {
+                    revision = trainMetadataText(record, "commit")
+                    found = true
+                }
+            }
+            if !found || !workspaceCommitValid(revision) { return .Error("train has no revision for \(repository.location)") }
+        }
+        commits.append(try workspaceRevision(root, repository.location, revision))
+    }
+    match makePathTree(destination) {
+        Ok -> {}
+        Error(failure) -> return .Error("cannot create workspace: \(traceText(failure))")
+    }
+    for (index, repository) in repositories.enumerated() {
+        let checkout = destination + "/" + repository.name
+        try hostCommand("git", [
+            "-C", joinedPath(root, repository.location), "worktree", "add", "--detach",
+            checkout, commits[index]
+        ])
+        // Ember's host icon renderer consumes a provisioned native payload.
+        // It is ignored by Git and shared, rather than copied per workspace.
+        if repository.name == "ember" {
+            let payload = joinedPath(root, repository.location) + "/NativeLibs/Dawn"
+            if isDirectory(payload) {
+                match makeSymbolicLink(payload, checkout + "/NativeLibs/Dawn") {
+                    Ok -> {}
+                    Error(failure) -> return .Error("cannot share provisioned host graphics: \(traceText(failure))")
+                }
+            }
+        }
+    }
+    return recordWorkspace(destination, name.startsWith("worktree-") ? "worktree" : copy name, base)
+}
+
+// Staging is the weekly release workspace: a normal clone of development in
+// every repository. It shares development's objects until the weekly merge,
+// keeps its own `staging` branch, and fetches development through a remote
+// named `development`.
+function createStagingWorkspace(root: borrow String, destination: borrow String) -> Result<String, String> {
+    let repositories = try workspaceRepositories(root)
+    match makePathTree(destination) {
+        Ok -> {}
+        Error(failure) -> return .Error("cannot create workspace: \(traceText(failure))")
+    }
+    for repository in repositories {
+        let source = joinedPath(root, repository.location)
+        let checkout = destination + "/" + repository.name
+        try hostCommand("git", ["clone", "--shared", "--single-branch", source, checkout])
+        try hostCommand("git", ["-C", checkout, "remote", "rename", "origin", "development"])
+        try hostCommand("git", ["-C", checkout, "checkout", "-b", "staging"])
+        try hostCommand("git", ["-C", checkout, "branch", "--set-upstream-to=development/development", "staging"])
+        // Ember's host icon renderer consumes a provisioned native payload.
+        // It is ignored by Git and shared, rather than copied per workspace.
+        if repository.name == "ember" {
+            let payload = source + "/NativeLibs/Dawn"
+            if isDirectory(payload) {
+                match makeSymbolicLink(payload, checkout + "/NativeLibs/Dawn") {
+                    Ok -> {}
+                    Error(failure) -> return .Error("cannot share provisioned host graphics: \(traceText(failure))")
+                }
+            }
+        }
+    }
+    return recordWorkspace(destination, "staging", "")
+}
+
+// Write the workspace's record and the rules its sources follow.
+function recordWorkspace(destination: borrow String, role: borrow String, base: borrow String) -> Result<String, String> {
+    let metadata = ktenObject("TesseraWorkspace", [
+        ktenField("version", .Number(1)), ktenField("role", .Text(copy role)),
+        ktenField("base", .Text(copy base))
+    ])
+    match writeFileBytes(destination + "/workspace.kten", metadata.encoded()) {
+        Ok -> {}
+        Error(failure) -> return .Error("cannot record workspace: \(traceText(failure))")
+    }
+    if base.count > 0 {
+        match writeFile(destination + "/workspace.base", base + "\n") {
+            Ok -> {}
+            Error(failure) -> return .Error("cannot pin workspace base: \(traceText(failure))")
+        }
+    }
+    var rules = "Integration workspace. Do not edit sources here. Merge committed changes from worktree workspaces.\n"
+    if role == "worktree" {
+        rules = "Edit sources in this workspace. Preserve its pinned release train.\n"
+    }
+    if role == "staging" {
+        rules = "Weekly release workspace. Release every Thursday. Merge committed changes from development; do not edit sources here.\n"
+    }
+    match writeFile(destination + "/AGENTS.md", rules) {
+        Ok -> return .Ok(destination)
+        Error(failure) -> return .Error("cannot write workspace instructions: \(traceText(failure))")
+    }
+}
+
+function workspaceBranch(root: borrow String) -> Result<String, String> {
+    let command = ProcessCommand {
+        program: "git", arguments: ["-C", copy root, "rev-parse", "--abbrev-ref", "HEAD"],
+        input: .Null
+    }
+    let empty: [UN8] = []
+    let result = match command.run(empty) {
+        Ok(found) -> found
+        Error(failure) -> return .Error("cannot read the workspace branch: \(traceText(failure))")
+    }
+    if !result.succeeded() { return .Error("cannot read the workspace branch") }
+    return .Ok(match textFromBytes(result.output) {
+        Some(text) -> text.trim()
+        None -> ""
+    })
+}
+
+function workspaceCommitValid(revision: borrow String) -> Bool {
+    if revision.count != 40 { return false }
+    for index in 0..revision.count {
+        if !"0123456789abcdef".contains(revision.substring(index, index + 1)) { return false }
+    }
+    return true
+}
+
+function workspaceRevision(root: borrow String, location: borrow String, revision: borrow String) -> Result<String, String> {
+    let command = ProcessCommand {
+        program: "git", arguments: ["-C", joinedPath(root, location), "rev-parse", "--verify", revision + "^{commit}"],
+        input: .Null
+    }
+    let empty: [UN8] = []
+    let result = match command.run(empty) {
+        Ok(found) -> found
+        Error(failure) -> return .Error("cannot resolve \(location)'s revision: \(traceText(failure))")
+    }
+    if !result.succeeded() { return .Error("revision \(revision) is unavailable in \(location)") }
+    let resolved = match textFromBytes(result.output) {
+        Some(text) -> text.trim()
+        None -> return .Error("invalid revision text from \(location)")
+    }
+    if !workspaceCommitValid(resolved) { return .Error("invalid Git commit from \(location)") }
+    return .Ok(resolved)
+}
+
+// A source workspace must not accidentally create a complete OS build when
+// its train has not been provisioned yet. Integration workspaces own that.
+function checkWorkspaceBuild(graph: borrow mut Graph, base: borrow String) {
+    let top = parentOf(graph.root)
+    if !fileExists(top + "/workspace.kten") || !lastNameOf(top).startsWith("worktree-") { return }
+    if graph.request.graph { return }
+    for step in ["train", "release", "system-volume", "initramfs", "installer-image", "recovery-image"] {
+        if graph.requested(step) {
+            graph.problems.append("\(step) builds a complete train; run it from development or staging")
+        }
+    }
+    if graph.requested("boot") && base.count == 0 {
+        graph.problems.append("a worktree boot needs a pinned train; pass -base <snapshot> or create it from a train")
+    }
+}

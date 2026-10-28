@@ -1,0 +1,229 @@
+import Foundation
+import LibTessera
+import DeviceKit
+import TesseraDisplayClient
+
+// A client's frame exchange (roadmap/08-display-server.md, "Frames"), one
+// message at a time. A client asks for a frame, is granted it, attaches the
+// surface it drew and commits it; each step is taken as its message arrives,
+// from the one wait the server makes over everything. Nothing here waits on a
+// client, so a client that is slow to draw, the platform's bar or a window,
+// holds up no key, no pointer and no other client.
+
+// Where a client is in its exchange.
+enum FrameExchange {
+    // No frame asked for.
+    Idle
+    // A frame was granted; its attach is awaited.
+    Granted(DisplayFrame)
+    // The surface is attached; its commit is awaited.
+    Attached(AttachedFrame)
+}
+
+// A frame committed and waiting for the redraw that shows it: the client, the
+// content it replaced, and the frame it is told is done.
+struct OwedFrame {
+    var index: Number
+    var replaced: Content?
+    var frame: DisplayFrame
+}
+
+// A frame granted and attached: the frame, and the token DeviceKit exported
+// its surface under, and how much of it the client drew.
+struct AttachedFrame {
+    var frame: DisplayFrame
+    var token: Token
+    var width: UNumber = 0
+    var height: UNumber = 0
+    var slot: UNumber = 0
+    // Whether the token is a texture to import, or the slot's own is shown.
+    var fresh: Bool = true
+}
+
+// Whether `message` is a step of a frame exchange.
+function isFrameStep(message: borrow DisplayMessage) -> Bool {
+    return match message {
+        FrameRequest, Attach, Commit -> true
+        Hello, Welcome, Key, FrameDone, FrameReady, FocusIn, FocusOut, Configure, AckConfigure,
+            SetMode, ModeChanged, InputCapability, SurfaceCreated, SurfaceDestroyed, GrantFocus,
+            InstallGrab, GrabFired, SetChannel, ChannelChanged, PresentSystem, Verify,
+            VerifyResult, InjectInput, Notify, Notification, ActivateRequested, SetBar,
+            PointerMotion, PointerButton, PointerAxis, PointerEnter, PointerLeave, SetDock,
+            SurfacePressed, RequestWindow, WindowRequested, GrantMove, GrantResize, HoldInput, SetOverlay, SetIdle, IdleChanged, BarBackdrop, SetGlass, SetLaunchOrigin, SetStageBadge,
+            PlaceSurface, SurfacePlaced, SetHidden, SetMargin, Insets, Output -> false
+    }
+}
+
+// Takes one step of the exchange of the client at `index`. False when the
+// step is out of order or does not hold, or its frame could not be shown;
+// the client's session ends then.
+enum SessionFailure {
+    Closed
+    InvalidMessage
+    ExpectedHello
+    UnexpectedFrameRequest
+    UnexpectedAttach
+    UnexpectedCommit
+    NotFrameStep
+    InvalidFrame
+    MissingSurfaceToken
+    InvalidCommit
+    UnknownTextureSlot(Number)
+    TextureSlotLimit(Number)
+    SurfaceDescription(TesseraError)
+    Send(TesseraError)
+    NotControl
+    ClockFailure(TesseraError)
+    InvalidGeometry
+    ExpectedConfigureAck
+}
+
+function exchangeStep(server: borrow mut Server, index: Number, message: DisplayMessage) -> Result<Void, SessionFailure> {
+    let exchange = server.clients[index].exchange
+    return match message {
+        FrameRequest(frame) -> match exchange {
+            Idle -> grantFrame(server, index, frame)
+            Granted, Attached -> .Error(.UnexpectedFrameRequest)
+        }
+        Attach(attached) -> match exchange {
+            Granted(frame) -> attachFrame(server, index, frame, attached)
+            Idle, Attached -> .Error(.UnexpectedAttach)
+        }
+        Commit(committed) -> match exchange {
+            Attached(attached) -> commitFrame(server, index, attached, committed)
+            Idle, Granted -> .Error(.UnexpectedCommit)
+        }
+        Hello, Welcome, Key, FrameDone, FrameReady, FocusIn, FocusOut, Configure, AckConfigure,
+            SetMode, ModeChanged, InputCapability, SurfaceCreated, SurfaceDestroyed, GrantFocus,
+            InstallGrab, GrabFired, SetChannel, ChannelChanged, PresentSystem, Verify,
+            VerifyResult, InjectInput, Notify, Notification, ActivateRequested, SetBar,
+            PointerMotion, PointerButton, PointerAxis, PointerEnter, PointerLeave, SetDock,
+            SurfacePressed, RequestWindow, WindowRequested, GrantMove, GrantResize, HoldInput, SetOverlay, SetIdle, IdleChanged, BarBackdrop, SetGlass, SetLaunchOrigin, SetStageBadge,
+            PlaceSurface, SurfacePlaced, SetHidden, SetMargin, Insets, Output -> .Error(.NotFrameStep)
+    }
+}
+
+// Grants the frame a client asked for.
+function grantFrame(server: borrow mut Server, index: Number, frame: borrow DisplayFrame) -> Result<Void, SessionFailure> {
+    if frame.surface == DisplaySurfaceId.none || frame.serial == 0 {
+        return .Error(.InvalidFrame)
+    }
+    match sendDisplayMessage(
+        server.clients[index].channel,
+        .FrameReady(DisplayFrame { surface: frame.surface, serial: frame.serial })
+    ) {
+        Ok -> log info("granted a frame", frame: frame.serial)
+        Error(reason) -> return .Error(.Send(reason))
+    }
+    server.clients[index].exchange = .Granted(copy frame)
+    return .Ok
+}
+
+// Takes the surface a client attached to the frame it was granted. `Attach`
+// names the surface by the token DeviceKit exported it under; no handle
+// crosses the channel.
+function attachFrame(
+    server: borrow mut Server,
+    index: Number,
+    frame: borrow DisplayFrame,
+    attached: borrow DisplayAttach
+) -> Result<Void, SessionFailure> {
+    let fresh = hasToken(attached.token)
+    if attached.surface == DisplaySurfaceId.none || !fresh && attached.slot == 0 {
+        return .Error(.MissingSurfaceToken)
+    }
+    server.clients[index].exchange = .Attached(
+        AttachedFrame {
+            frame: copy frame,
+            token: tokenOf(attached.token),
+            width: attached.width,
+            height: attached.height,
+            slot: attached.slot,
+            fresh: fresh
+        }
+    )
+    return .Ok
+}
+
+// Shows the frame a client committed, and tells it once it is on the screen.
+function commitFrame(
+    server: borrow mut Server,
+    index: Number,
+    attached: borrow AttachedFrame,
+    committed: borrow DisplayFrame
+) -> Result<Void, SessionFailure> {
+    let frame = attached.frame
+    if committed.surface != frame.surface || committed.serial != frame.serial {
+        return .Error(.InvalidCommit)
+    }
+    server.clients[index].exchange = .Idle
+    let content = match attachedContent(server, index, attached) {
+        Shown(value) -> value
+        // The client is told the frame is done, and draws the next.
+        Skipped(reason) -> {
+            log warn("a client's surface would not import; its frame is skipped", error: errorName(reason))
+            tell(
+                server.clients[index].channel,
+                .FrameDone(DisplayFrame { surface: committed.surface, serial: committed.serial })
+            )
+            return .Ok
+        }
+        Broken(reason) -> return .Error(reason)
+    }
+    // A client's earlier frame still owed is shown first, so what it
+    // replaced is never let go of before the screen moved past it.
+    for owed in server.framesOwed {
+        if owed.index == index {
+            flushRedraw(server)
+            break
+        }
+    }
+    let replaced = server.clients[index].content
+    server.clients[index].content = .Some(content)
+    applyStaged(server, index)
+    if replaced.isNone() && !server.clients[index].hidden {
+        match flyOpen(server, index) {
+            Ok -> {}
+            Error(reason) -> return .Error(.ClockFailure(reason))
+        }
+    }
+    noteFlightOwnerFrame(server, server.clients[index].role)
+    server.framesOwed.append(
+        OwedFrame {
+            index: index,
+            replaced: replaced,
+            frame: DisplayFrame { surface: committed.surface, serial: committed.serial }
+        }
+    )
+    redraw(server, "a client's frame")
+    return .Ok
+}
+
+// The redraw that showed `owed` was made: what it replaced is kept until the
+// next, and the client is told it is done. When the redraw failed the commit
+// may still have reached the screen, so what it replaced is kept for good
+// rather than release storage the display could be reading.
+function finishFrame(server: borrow mut Server, owed: borrow OwedFrame, shown: Bool) {
+    let index = owed.index
+    // A client that went meanwhile holds nothing on the screen any more.
+    if !server.clients[index].alive {
+        match owed.replaced {
+            Some(content) -> letGo(server.composer, content)
+            None -> {}
+        }
+        return
+    }
+    if !shown {
+        log warn("a client's frame did not reach the screen", surface: owed.frame.surface.raw)
+    } else {
+        keepReplaced(server, index, owed.replaced)
+    }
+    tell(server.clients[index].channel, .FrameDone(copy owed.frame))
+    if shown {
+        log info(
+            "a frame reached the display",
+            surface: owed.frame.surface.raw,
+            frame: owed.frame.serial
+        )
+    }
+}

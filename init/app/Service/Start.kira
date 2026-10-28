@@ -1,0 +1,191 @@
+import Foundation
+import Heap
+import LibTessera
+
+// Starting one service.
+//
+// `Process.launch` gives the service its end of a private channel to PID 1
+// as its ParentChannel, an output channel as its standard output and error,
+// and nothing else. PID 1 keeps the other ends, a Process handle to wait on,
+// and the service's process id for the log. It reads the output channel and
+// writes each line to the console after the service's name, so five services
+// writing at once can be told apart (roadmap/03-processes.md).
+
+struct Started {
+    var process: Handle
+    var channel: Handle
+    var pid: UNumber
+    // PID 1's end of the service's standard output and error, or
+    // `Handle.invalid` when the service writes to the console itself.
+    var output: Handle
+    // The job it and everything it starts run in, or `Handle.invalid` when
+    // it runs in PID 1's.
+    var job: Handle
+}
+
+// A job of the service's own, beneath PID 1's. What the service launches is
+// started in its job too, so ending the job ends the drivers and helpers it
+// started along with it; left running, they would hold what the service's
+// next instance claims -- a restarted devicekitd's smart-card driver found
+// its reader's interface still claimed by the one before.
+function serviceJob(service: borrow Service) -> Handle {
+    let own = try startupHandle(StartupTag.job) otherwise return Handle.invalid
+    let unlimited = JobPolicy {
+        maxProcesses: U32(0),
+        maxThreads: U32(0),
+        maxHandlesPerProcess: U32(0),
+        memoryLimit: U64(0),
+        cpuShare: U32(0),
+        maxQos: .None,
+        flags: JobDeny.none
+    }
+    return match jobCreate(own, move unlimited) {
+        Ok(job) -> job
+        Error(failed) -> {
+            log warn(
+                "a service runs in PID 1's job",
+                service: service.name,
+                error: errorName(failed)
+            )
+            Handle.invalid
+        }
+    }
+}
+
+// A service's standard output and error: the ends to give it, and the end
+// PID 1 reads.
+struct OutputPair {
+    var entries: [StartupEntry]
+    var reader: Handle
+}
+
+// A channel for the service to write its output to. Without one, the service
+// is given the console, as it was before PID 1 relayed output.
+function outputEntries() -> OutputPair {
+    let pair = match channelCreate() {
+        Ok(value) -> value
+        Error(failed) -> {
+            log warn("no output channel for a service", error: errorName(failed))
+            return OutputPair { entries: consoleEntries(), reader: Handle.invalid }
+        }
+    }
+    let errors = match handleDuplicate(pair.second, Rights.same) {
+        Ok(value) -> value
+        Error(failed) -> {
+            log warn("no output channel for a service", error: errorName(failed))
+            release(pair.first)
+            release(pair.second)
+            return OutputPair { entries: consoleEntries(), reader: Handle.invalid }
+        }
+    }
+    return OutputPair {
+        entries: [
+            StartupEntry { tag: StartupTag.stdOut, rights: .None, handle: pair.second },
+            StartupEntry { tag: StartupTag.stdErr, rights: .None, handle: errors },
+        ],
+        reader: pair.first
+    }
+}
+
+// The console, for a child's standard output and error: a copy of PID 1's
+// own, since the launch takes the handles it is given.
+function consoleEntries() -> [StartupEntry] {
+    var entries: [StartupEntry] = []
+    let tags: [StartupTag] = [StartupTag.stdOut, StartupTag.stdErr]
+    for index in 0..tags.count {
+        let own = match startupHandle(tags[index]) {
+            Some(value) -> value
+            None -> continue
+        }
+        match handleDuplicate(own, Rights.same) {
+            Ok(copied) -> entries.append(
+                StartupEntry { tag: tags[index], rights: .None, handle: copied }
+            )
+            Error(failed) -> log warn(
+                "the console could not be copied for a service",
+                error: errorName(failed)
+            )
+        }
+    }
+    return entries
+}
+
+// Starts `service`. A service that is not in the image is not a failure to
+// report five times: the table is compiled into this program and the image
+// is assembled by a script, so the two can disagree, and a program that is
+// not there is one warning.
+function start(calls: Handle, service: borrow Service) -> Result<Started, TesseraError> {
+    let executable = try lookup(calls, service.path, Rights.read | Rights.execute | Rights.inspect)
+    // A service started without arguments is started with its own path as
+    // the first, the name it was started under.
+    var given: [String] = []
+    if service.arguments.count > 0 { given = copy service.arguments } else {
+        given.append(copy service.path)
+    }
+    let arguments: Handle? = match launchInfoCreate(.Helper, given) {
+        Ok(memory) -> .Some(memory)
+        Error(failed) -> {
+            release(executable)
+            return .Error(failed)
+        }
+    }
+    let output = outputEntries()
+    var initialHandles = output.entries
+    var flags = LaunchFlags.none
+    if confinedByDefault(service) {
+        match confinedEntries(calls, service) {
+            Ok(given) -> {
+                for entry in given { initialHandles.append(entry) }
+                flags = LaunchFlags.confined
+            }
+            Error(failed) -> {
+                // Not started rather than started unconfined.
+                for entry in initialHandles { release(entry.handle) }
+                if output.reader != Handle.invalid { release(output.reader) }
+                release(executable)
+                match arguments {
+                    Some(memory) -> release(memory)
+                    None -> {}
+                }
+                return .Error(failed)
+            }
+        }
+    }
+    let job = serviceJob(service)
+    let options = LaunchOptions {
+        name: copy service.name,
+        arguments: arguments,
+        initialHandles: initialHandles,
+        flags: flags,
+        job: job != Handle.invalid ? .Some(job) : .None,
+        stackSize: 0,
+    }
+    let launched = answer(calls, processLaunch(executable, options, calls, PortKey.call))
+    release(executable)
+    match arguments {
+        Some(memory) -> release(memory)
+        None -> {}
+    }
+    match launched {
+        Error(failed) -> {
+            if output.reader != Handle.invalid { release(output.reader) }
+            if job != Handle.invalid { release(job) }
+            return .Error(failed)
+        }
+        Ok(done) -> {
+            log info("started a service", service: service.name, pid: done.aux)
+            if flags == LaunchFlags.confined {
+                log info("confined an application", service: service.name)
+            }
+            return .Ok(
+                Started {
+                    process: Handle(done.result0),
+                    channel: Handle(done.result1),
+                    pid: done.aux,
+                    output: output.reader,
+                    job: job
+                }
+            )
+        }
+    }
+}

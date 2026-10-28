@@ -1,0 +1,163 @@
+//! The watches on the directories an application asked to follow: /Volumes,
+//! so that a disk image plugged in or pulled out redraws an application that
+//! shows volumes, and /Applications, so that one installed or uninstalled
+//! redraws what lists them, each without waiting for a key.
+//!
+//! The Volume service makes a mount point before it mounts the volume on it,
+//! so the watch sees the directory appear while it is still empty. After a
+//! watch fires the session looks again every quarter second for a few
+//! seconds, and the application redraws what it then finds.
+
+import Foundation
+import KiraUI
+import Heap
+import LibTessera
+
+/// How long a directory watch keeps looking after a change, and how often it looks.
+namespace DirectoryLook {
+    // How long the session keeps looking after a directory changes, and how
+    // often.
+    let settleMillis: Number = 5000
+    let everyMillis: Number = 250
+    // Room for the watch's events, which are only read to be discarded.
+    let eventBytes: Number = 4096
+    let lookupKey: Number = 1
+}
+
+/// A watch on one directory beneath the application's root: its handle and the completion key its changes arrive under.
+struct DirectoryWatch {
+    // The directory, beneath the root the application was started with, and
+    // the key its completions carry.
+    let path: String
+    let key: WaitKey
+    // None until opened, or when it could not be.
+    var watch: Handle? = .None
+    var armed: Bool = false
+    // The time, in milliseconds since 1970, until which the session keeps
+    // looking, if it is looking.
+    var lookUntil: Number? = .None
+    // Whether it changed since the application last asked.
+    var unseen: Bool = false
+}
+
+/// `path` beneath the root the application was started with, looked up on a
+/// port of its own.
+function watchedDirectory(path: borrow String) -> Result<Handle, TesseraError> {
+    let root = try startupHandle(StartupTag.systemRoot) otherwise return .Error(
+        displayError(.NotFound)
+    )
+    let port = try portCreate(.None)
+    let found = lookUpDirectory(root, path, port)
+    closeHandle(port)
+    return found
+}
+
+/// Opens the directory at `path` beneath `root` and arms its watch on `port`, returning the handle the watch reads from.
+function lookUpDirectory(
+    root: Handle,
+    path: borrow String,
+    port: Handle
+) -> Result<Handle, TesseraError> {
+    let rights = Rights.enumerate | Rights.inspect | Rights.traverse
+    // A lookup names a path beneath the root, without the leading slash.
+    try nodeLookup(root, copy path, rights, port, DirectoryLook.lookupKey)
+    let completions = try portWait(port, 1, Deadline.infinite)
+    // An infinite wait for one completion answers exactly one.
+    if completions.count == 0 { return .Error(displayError(.Internal)) }
+    let answer = completions[0]
+    if answer.error.code != .Ok { return .Error(answer.error) }
+    return .Ok(Handle(answer.result0))
+}
+
+extend DirectoryWatch {
+    /// Opens the watch. One that cannot be made is said, and the application
+    /// goes on without it.
+    function open(borrow mut self) {
+        let made = match watchedDirectory(path) {
+            Ok(directory) -> nodeWatch(directory, WatchMask.created | WatchMask.deleted)
+            Error(failure) -> .Error(failure)
+        }
+        match made {
+            Ok(opened) -> watch = .Some(opened)
+            Error(failure) -> log warn(
+                "cannot watch a directory",
+                directory: copy path,
+                error: errorName(failure)
+            )
+        }
+    }
+
+    /// Closes the watch's handle if one was opened.
+    function close(borrow mut self) {
+        match watch {
+            Some(opened) -> closeHandle(opened)
+            // Never opened.
+            None -> {}
+        }
+        watch = .None
+        armed = false
+    }
+
+    /// Arms the watch on `port` unless it is armed already or not open.
+    function arm(borrow mut self, port: Handle) -> Result<Void, TesseraError> {
+        if armed { return .Ok }
+        let opened = try watch otherwise return .Ok
+        try objectWaitAsync(opened, Signals.readable, .Once, port, Number(code(key)))
+        armed = true
+        return .Ok
+    }
+
+    /// Reads what the watch saw, which only says to look again, and starts
+    /// looking.
+    function changed(borrow mut self) {
+        armed = false
+        match watch {
+            Some(opened) -> drain(opened)
+            // A completion for a watch closed since it was armed.
+            None -> return
+        }
+        log info("a directory changed; looking again", directory: copy path)
+        lookUntil = .Some(unixMillis() + DirectoryLook.settleMillis)
+        unseen = true
+    }
+
+    /// Whether it changed since this was last asked, while the session is
+    /// still looking again: what the application reads can have changed on
+    /// any of those looks.
+    function takeChange(borrow mut self) -> Bool {
+        let changed = unseen || lookUntil != .None
+        unseen = false
+        return changed
+    }
+
+    /// How long the session may wait before it should look at the directory
+    /// again: `fallback` when it is not looking.
+    function waitLimit(borrow mut self, fallback: Number?) -> Number? {
+        let until = try lookUntil otherwise return fallback
+        if unixMillis() >= until {
+            lookUntil = .None
+            return fallback
+        }
+        return match fallback {
+            Some(limit) -> .Some(min(limit, DirectoryLook.everyMillis))
+            None -> .Some(DirectoryLook.everyMillis)
+        }
+    }
+}
+
+/// Reads the watch's events until there are none left.
+function drain(watch: Handle) {
+    let events = zeroedBlock(count: DirectoryLook.eventBytes, alignment: 16)
+    let buffer = Buffer { address: events.pointer(), length: DirectoryLook.eventBytes }
+    while true {
+        match watchRead(watch, buffer) {
+            Ok -> continue
+            Error(failure) -> {
+                if failure.code != .ShouldWait {
+                    log warn("a directory watch could not be read", error: errorName(failure))
+                }
+                return
+            }
+        }
+    }
+}

@@ -1,0 +1,153 @@
+import Foundation
+import LibTessera
+import KiraUI
+import TesseraUI
+
+// System search as a person sees it (roadmap/26-system-search.md, "The
+// experience"): a field on glass with the results under it, grouped, one of
+// them chosen. Typing narrows them; the down and up arrows choose another;
+// Return opens the chosen one, or copies a calculation's answer; Escape, or a
+// press off the panel, puts search away, which gives the keyboard back to
+// what had it. No result is opened by moving the choice.
+
+namespace SearchPanelLook {
+    let width: Number = 560
+    let top: Number = 72
+    let corner: Number = 26
+    let padding: Number = 14
+    let row: Number = 44
+    let rowCorner: Number = 12
+    let icon: Number = 28
+    let header: Number = 13
+    let title: Number = 17
+    let detail: Number = 13
+    // How many results are shown at most.
+    let shown: Number = 9
+}
+
+let searchChosen: RGBAColor = RGBAColor { r: 1.0, g: 1.0, b: 1.0, a: 0.22 }
+let searchDim: RGBAColor = RGBAColor { r: 0.0, g: 0.0, b: 0.0, a: 0.2 }
+
+/// System search over what is behind it; `dismiss` puts it away.
+public construct SearchPanel(installed: [Application], dismiss: () -> Void) extends Widget {
+    @State var query: String = ""
+    @State var chosen: Number = 0
+    @FocusState var typing: Bool = true
+
+    body {
+        let results = searchResults(query, installed)
+        let shown = min(results.count, SearchPanelLook.shown)
+        let at = min(chosen, max(shown - 1, 0))
+        let closing = copy dismiss
+        ZStack(alignment = .Top) {
+            Rectangle().fill(searchDim).fillWidth().fillHeight().onClick(copy dismiss)
+            VStack(spacing = .Small, alignment = .Leading) {
+                TextField(title = "Search", text = $query)
+                .onSubmit({ in self.open(results, at) })
+                .focused($typing)
+                searchRows(results, shown, at, { index in self.open(results, index) })
+                if query.trim().count > 0 && results.count == 0 {
+                    Text("No Results")
+                    .font(size: resolvedLength(SearchPanelLook.title), weight: .SemiBold)
+                    .foregroundColor(.Secondary)
+                }
+            }
+            .padding(resolvedLength(SearchPanelLook.padding))
+            .maxWidth(resolvedLength(SearchPanelLook.width))
+            .glassEffect(shape: .Squircle(SearchPanelLook.corner))
+            .edgePadding(EdgeSet.top, resolvedLength(SearchPanelLook.top))
+        }
+        .fillWidth()
+        .fillHeight()
+        .onKeyPress(
+            KeyEquivalent.downArrow,
+            action = { in chosen = min(at + 1, max(shown - 1, 0)) }
+        )
+        .onKeyPress(KeyEquivalent.upArrow, action = { in chosen = max(at - 1, 0) })
+        .onKeyPress(KeyEquivalent.escape, action = closing)
+    }
+
+    // Opens the result at `index`, then puts search away; a copy that fails
+    // keeps search open and says so.
+    function open(results: borrow [SearchResult], index: Number) {
+        if index >= results.count { return }
+        match activateSearchResult(results[index], installed) {
+            Ok -> dismiss()
+            Error(failed) -> log warn("a search result could not be used", error: errorName(failed))
+        }
+    }
+}
+
+// The first `shown` of `results`, with a header over each group's first, the
+// one at `chosen` lit; pressing one calls `open` with its place.
+function searchRows(
+    results: borrow [SearchResult],
+    shown: Number,
+    chosen: Number,
+    open: (Number) -> Void
+) -> Any Widget {
+    var rows: [Any Widget] = []
+    for index in 0..shown {
+        let result = results[index]
+        if index == 0 || results[index - 1].group != result.group {
+            rows.append(
+                Text(searchGroupTitle(result.group)).font(
+                    size: resolvedLength(SearchPanelLook.header),
+                    weight: .SemiBold
+                ).foregroundColor(.Secondary)
+            )
+        }
+        let pressed = copy open
+        rows.append(
+            Button(action = { in pressed(index) }) {
+                searchRow(result, index == chosen)
+            }.buttonStyle(.Plain)
+        )
+    }
+    return VStack(spacing = .Length(2), alignment = .Leading, children = rows)
+}
+
+function searchGroupTitle(group: borrow SearchGroup) -> String {
+    return match group {
+        Applications -> "Applications"
+        Documents -> "Documents"
+        Settings -> "Settings"
+        Calculation -> "Calculation"
+    }
+}
+
+// One result: its icon for an application, its title, and where it is from.
+function searchRow(result: borrow SearchResult, lit: Bool) -> Any Widget {
+    let symbolSize = resolvedLength(SearchPanelLook.icon * 0.7)
+    let picture: Any Widget = match result.target {
+        Application(application) -> ApplicationIcon(
+            name = copy application.name,
+            side = SearchPanelLook.icon
+        )
+        Pane -> Icon(symbol = .Gear).font(size: symbolSize)
+        Document -> Icon(symbol = .DocText).font(size: symbolSize)
+        Answer -> Icon(symbol = .Equal).font(size: symbolSize)
+    }
+    let row = HStack(spacing = .Medium, alignment = .Center) {
+        picture
+        VStack(spacing = .None, alignment = .Leading) {
+            Text(copy result.title).font(
+                size: resolvedLength(SearchPanelLook.title),
+                weight: .Medium
+            )
+            Text(copy result.detail)
+            .font(size: resolvedLength(SearchPanelLook.detail))
+            .foregroundColor(.Secondary)
+        }
+        Spacer()
+    }
+    .edgePadding(EdgeSet.horizontal, resolvedLength(10))
+    .height(resolvedLength(SearchPanelLook.row))
+    .fillWidth()
+    if !lit { return row }
+    return row.background(
+        RoundedRectangle(cornerRadius = SearchPanelLook.rowCorner, style = .Continuous).fill(
+            searchChosen
+        )
+    )
+}

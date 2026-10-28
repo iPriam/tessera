@@ -1,0 +1,59 @@
+//! Tests of the notification history: what it keeps, and in what order.
+import Foundation
+import PlatformKit
+
+/// A history with a few notifications from two applications, for the tests to read.
+function sample() -> NotificationHistory {
+    var history = NotificationHistory {}
+    history.record("Notes", "Saved", "Shopping", 1)
+    history.record("Clock", "Alarm", "07:00", 2)
+    history.record("Notes", "Shared", "Plans", 3)
+    return history
+}
+
+/// Each group puts its application's newest notification first, and the newest application's group first.
+@Test
+function groupsPutTheNewestApplicationFirst() {
+    let groups = sample().groups()
+    expect!(groups.count == 2)
+    expect!(groups[0].application == "Notes")
+    expect!(groups[0].entries[0].title == "Shared")
+    expect!(groups[1].application == "Clock")
+}
+
+/// Clearing one notification, or every notification of an application, changes that application's count.
+@Test
+function clearingOneOrAGroupChangesTheBadge() {
+    var history = sample()
+    expect!(history.count("Notes") == 2)
+    history.clear(1)
+    expect!(history.count("Notes") == 1)
+    history.clearApplication("Notes")
+    expect!(history.count("Notes") == 0)
+    expect!(history.count("Clock") == 1)
+}
+
+/// Past the limit the oldest notifications go and the newest are kept.
+@Test
+function theOldestGoPastTheLimit() {
+    var history = NotificationHistory {}
+    for index in 0..HistoryLimit.entries + 3 {
+        history.record("Clock", "Tick", String(index), index)
+    }
+    expect!(history.entries.count == HistoryLimit.entries)
+    expect!(history.entries[0].body == "3")
+}
+
+/// The history reads back as it was written, with tabs and line breaks flattened and malformed text reading as empty.
+@Test
+function theHistoryReadsBackAsWritten() {
+    var history = sample()
+    history.record("Notes", "Tab\there", "Line\nbreak", 4)
+    let text = historyText(history)
+    let read = historyFrom(text)
+    expect!(read.entries.count == 4)
+    expect!(read.nextId == 5)
+    expect!(read.entries[3].title == "Tab here")
+    expect!(historyText(read) == text)
+    expect!(historyFrom("version 0\n1\t1\tA\tB\tC\n").entries.count == 0)
+}

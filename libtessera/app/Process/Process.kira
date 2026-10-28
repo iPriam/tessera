@@ -1,0 +1,157 @@
+import Foundation
+import Heap
+
+// Processes (§11.2, §11.3): a kernel backing that is readable once the
+// process has ended.
+
+// Ends the process at once with `code`.
+public function endProcessNow(code: Number) {
+    kernelProcessExit(code)
+}
+
+public function processCurrent() -> Handle {
+    match library.processHandle {
+        Some(cached) -> if handleSlotOf(cached).isSome() { return cached }
+        None -> {}
+    }
+    let pid = kernelProcessId()
+    let process = match processStarted(pid, U64(0)) {
+        Ok(value) -> value
+        Error(failed) -> {
+            // The invalid handle says the process could not be described.
+            absorb failed
+            return Handle.invalid
+        }
+    }
+    let backing = match kernelProcessOpen(pid) {
+        Ok(value) -> value
+        Error(failed) -> {
+            // Nor when it cannot be opened.
+            absorb failed
+            return Handle.invalid
+        }
+    }
+    let object = objectCreate(.Process(move process), backing)
+    let handle = mintOrInvalid(object, Rights.inspect | Rights.setProperty)
+    library.processHandle = .Some(handle)
+    return handle
+}
+
+// The process `pid`, in the job `job` (0 for none it was launched into).
+function processStarted(pid: U64, job: U64) -> Result<ProcessObject, TesseraError> {
+    let started = try kernelProcessStartTime(pid)
+    return .Ok(ProcessObject { pid: pid, started: started, job: job, killedByUs: false })
+}
+
+function processManaged(process: Handle) -> Result<Number, TesseraError> {
+    return resolveObject(process, .Process, Rights.manage)
+}
+
+public function processKill(process: Handle) -> Result<Void, TesseraError> {
+    let object = try processManaged(process)
+    var process = try processOf(object)
+    let backing = try backingOf(object)
+    try kernelProcessKill(backing)
+    process.killedByUs = true
+    setProcess(object, move process)
+    return .Ok
+}
+
+public function processSuspend(process: Handle) -> Result<Void, TesseraError> {
+    let object = try processManaged(process)
+    let backing = try backingOf(object)
+    return kernelProcessSuspend(backing)
+}
+
+public function processResume(process: Handle) -> Result<Void, TesseraError> {
+    let object = try processManaged(process)
+    let backing = try backingOf(object)
+    return kernelProcessResume(backing)
+}
+
+// Reaps a child that has ended so it does not stay a zombie.
+// A child some other wait already reaped answers `ECHILD`, and then there is
+// nothing left to free.
+function processTeardown(object: Number, process: borrow ProcessObject) {
+    if process.pid == kernelProcessId() { return }
+    match library.objects[object].backing {
+        Some(backing) -> match kernelProcessReap(backing) {
+            Ok -> {}
+            Error(failed) -> absorb failed
+        }
+        None -> {}
+    }
+}
+
+// `ProcessInfo`, 96 bytes. Another process stays waitable after this.
+// `ProcessInfo.state`.
+@Derive(Copy)
+enum ProcessState: U32 {
+    Created = 0
+    Running = 1
+    Suspended = 2
+    Terminated = 3
+}
+
+// `ProcessInfo.terminationReason`.
+@Derive(Copy)
+enum TerminationReason: U32 {
+    Exited = 0
+    Killed = 1
+    Crashed = 2
+    JobKilled = 3
+    OutOfMemory = 4
+}
+
+function processInfoWrite(
+    object: Number,
+    process: borrow ProcessObject,
+    block: RawPtr
+) -> Result<U64, TesseraError> {
+    let pid = process.pid
+    let own = pid == kernelProcessId()
+    let backing = try backingOf(object)
+    let kernel = try kernelProcessState(pid, backing, own)
+    var state = ProcessState.Running
+    var reason = TerminationReason.Exited
+    if kernel.ended {
+        state = .Terminated
+        if kernel.killed {
+            reason = process.killedByUs ? .Killed : .Crashed
+        }
+    } else if kernel.suspended {
+        state = .Suspended
+    }
+    heapStore<U64>(block, 0, pid)
+    heapStore<U64>(block, 8, own ? library.startup.jobId : process.job)
+    heapStore<U64>(block, 16, own ? library.startup.appId : U64(0))
+    heapStore<U32>(block, 24, code(state))
+    if own && library.startup.flags.has(StartupFlags.isMain) { heapStore<U8>(block, 28, U8(1)) }
+    heapStore<U64>(block, 32, kernel.exitCode)
+    match process.started {
+        Some(started) -> heapStore<U64>(block, 40, started)
+        None -> {}
+    }
+    heapStore<U64>(block, 48, kernel.cpu)
+    heapStore<U32>(block, 56, kernel.threads)
+    if own { heapStore<U32>(block, 60, U32(library.openHandles)) }
+    heapStore<U64>(block, 64, kernel.resident)
+    heapStore<U64>(block, 72, kernel.mapped)
+    heapStore<U32>(block, 80, code(reason))
+    return .Ok(96)
+}
+
+// Whether `process` has the file at `path` mapped, as its executable or as a
+// library it loaded, including a file replaced since. A dev root
+// (roadmap/18-components.md) restarts what loads a file it changed.
+public function processLoads(process: Handle, path: borrow String) -> Result<Bool, TesseraError> {
+    let object = try processManaged(process)
+    let held = try processOf(object)
+    return kernelProcessMaps(held.pid, path)
+}
+
+// Whether the calling process has the file at `path` mapped: a dev root
+// that changed a file it loads itself starts again to load the new one.
+public function processLoadsOwn(path: borrow String) -> Result<Bool, TesseraError> {
+    return kernelProcessMaps(kernelProcessId(), path)
+}

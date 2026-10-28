@@ -1,0 +1,281 @@
+import Foundation
+import Heap
+import LibTessera
+
+// Block devices (17 §16).
+//
+// The connection's descriptor is the block node the manager opened. Reads
+// and writes are transfers the port's engine finishes, so they run beside
+// everything else the caller waits on; FUA writes, discard and flush are
+// answered during the call and posted at once.
+
+namespace BlockControl {
+    // `BLKGETSIZE64`, `BLKSSZGET`, `BLKPBSZGET`, `BLKIOOPT`, `BLKROGET`,
+    // `BLKDISCARD`.
+    let getSize: U64 = U64(0x80081272)
+    let getLogical: U64 = U64(0x1268)
+    let getPhysical: U64 = U64(0x127B)
+    let getOptimal: U64 = U64(0x1279)
+    let getReadOnly: U64 = U64(0x125E)
+    let discardRange: U64 = U64(0x1277)
+    // `CDROMEJECT`.
+    let cdromEject: U64 = U64(0x5309)
+}
+
+namespace BlockDefault {
+    let logicalBlock: Number = 512
+    // `/sys/block/*/device/type`: a CD or DVD drive is SCSI type 5.
+    let scsiCdrom: String = "5"
+    let kilobyte: Number = 1024
+}
+
+// What a Block connection keeps besides its object.
+struct BlockConnection {
+    var object: Number
+    var logicalBlock: Number
+}
+
+// An `int` the device answers.
+function blockWord(device: borrow Descriptor, request: U64) -> Result<Number, TesseraError> {
+    let blockBytes = zeroedBlock(count: 8, alignment: 16)
+    let block = blockBytes.pointer()
+    let answered = try device.control(request, block)
+    return .Ok(Number(heapLoad<U32>(block, 0)))
+}
+
+function blockSize(device: borrow Descriptor) -> Result<Number, TesseraError> {
+    let blockBytes = zeroedBlock(count: 8, alignment: 16)
+    let block = blockBytes.pointer()
+    let answered = try device.control(BlockControl.getSize, block)
+    return .Ok(Number(heapLoad<U64>(block, 0)))
+}
+
+// A Block connection's record, made with its logical block size the first
+// time a call needs it.
+function blockOf(object: Number) -> Result<Number, TesseraError> {
+    for (index, block) in deviceLibrary.blocks.enumerated() {
+        if block.object == object { return .Ok(index) }
+    }
+    let device = try deviceOf(object)
+    let logical = try blockWord(device, BlockControl.getLogical)
+    deviceLibrary.blocks.append(
+        BlockConnection {
+            object: object,
+            logicalBlock: logical == 0 ? BlockDefault.logicalBlock : logical
+        }
+    )
+    return .Ok(deviceLibrary.blocks.count - 1)
+}
+
+function resolveBlock(block: Ref, rights: RefRights) -> Result<Number, TesseraError> {
+    let object = try resolveConnection(block, .Block, rights)
+    return blockOf(object)
+}
+
+// The request queue's attributes: the disk's own, or for a partition its
+// parent's.
+function queuePath(directory: borrow String) -> Result<String, TesseraError> {
+    let own = directory + "/queue"
+    let present = try pathPresent(own + "/logical_block_size")
+    if present { return .Ok(own) }
+    return .Ok(directory + "/../queue")
+}
+
+function attributeIs(path: borrow String, value: borrow String) -> Bool {
+    return attribute(path).or("") == value
+}
+
+public function blockInfo(block: Ref) -> Result<BlockInfo, TesseraError> {
+    let index = try resolveBlock(block, RefRights.read)
+    let record = deviceLibrary.blocks[index]
+    let device = try deviceOf(record.object)
+    let size = try blockSize(device)
+    let readOnly = try blockWord(device, BlockControl.getReadOnly)
+    let physical = try blockWord(device, BlockControl.getPhysical)
+    let optimal = try blockWord(device, BlockControl.getOptimal)
+    let directory = try sysfsPath(record.object)
+    let queue = try queuePath(directory)
+    var flags = BlockFlags.none
+    if readOnly != 0 { flags = flags | BlockFlags.readOnly }
+    if attributeIs(queue + "/rotational", "1") { flags = flags | BlockFlags.rotational }
+    if attributeIs(directory + "/removable", "1") { flags = flags | BlockFlags.removable }
+    if numberAttribute(queue + "/discard_max_bytes").or(0) > 0 {
+        flags = flags | BlockFlags.discard
+    }
+    if numberAttribute(queue + "/write_zeroes_max_bytes").or(0) > 0 {
+        flags = flags | BlockFlags.writeZeroes
+    }
+    if attributeIs(queue + "/fua", "1") { flags = flags | BlockFlags.forceUnitAccess }
+    return .Ok(
+        BlockInfo {
+            size: U64(size),
+            logicalBlock: U32(record.logicalBlock),
+            physicalBlock: U32(physical),
+            optimalIo: U32(optimal),
+            flags: flags,
+            maxTransfer: U64(
+                numberAttribute(queue + "/max_sectors_kb").or(0) * BlockDefault.kilobyte
+            ),
+            discardGranularity: U64(numberAttribute(queue + "/discard_granularity").or(0)),
+        }
+    )
+}
+
+function multipleOf(value: Number, unit: Number) -> Bool { return value % unit == 0 }
+
+// Offsets, lengths and the buffer's address in whole logical blocks.
+function aligned(index: Number, offset: Number, length: Number, address: Number) -> Bool {
+    let unit = deviceLibrary.blocks[index].logicalBlock
+    return offset >= 0 && multipleOf(offset, unit) && multipleOf(length, unit) && multipleOf(
+        address,
+        unit
+    )
+}
+
+// Completes `Transfer` with the byte count.
+public function blockRead(
+    block: Ref,
+    offset: Number,
+    buffer: borrow Buffer,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    let index = try resolveBlock(block, RefRights.read)
+    if !aligned(index, offset, buffer.length, Number(pointerAddress(buffer.address))) {
+        return .Error(failure(.InvalidArgument))
+    }
+    let device = try deviceOf(deviceLibrary.blocks[index].object)
+    return Reply { port: port, key: key }.attachTransfer(device, .ReadAt, offset, buffer)
+}
+
+// Writes all of `buffer` during the call; interrupted writes carry on.
+function writeAll(
+    device: borrow Descriptor,
+    offset: Number,
+    buffer: borrow Buffer
+) -> Result<Number, TesseraError> {
+    var done: Number = 0
+    while done < buffer.length {
+        match device.writeAt(
+            heapOffset(buffer.address, done),
+            buffer.length - done,
+            offset + done
+        ) {
+            Ok(wrote) -> done += wrote
+            Error(failed) -> {
+                match errnoOf(failed) {
+                    Again -> {}
+                    Interrupted -> {}
+                    else -> return .Error(failed)
+                }
+            }
+        }
+    }
+    try device.syncData()
+    return .Ok(done)
+}
+
+// With FUA the data is on stable storage before the completion, which here
+// means written and then synced during the call.
+public function blockWrite(
+    block: Ref,
+    offset: Number,
+    buffer: borrow Buffer,
+    flags: BlockWriteFlags,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    let index = try resolveBlock(block, RefRights.write)
+    if !BlockWriteFlags.forceUnitAccess.has(flags) || !aligned(
+        index,
+        offset,
+        buffer.length,
+        Number(pointerAddress(buffer.address))
+    ) {
+        return .Error(failure(.InvalidArgument))
+    }
+    let device = try deviceOf(deviceLibrary.blocks[index].object)
+    let reply = Reply { port: port, key: key }
+    if flags == BlockWriteFlags.none {
+        return reply.attachTransfer(device, .WriteAt, offset, buffer)
+    }
+    return match writeAll(device, offset, buffer) {
+        Ok(done) -> reply.post(.Ok(Answer { result0: U64(done), result1: U64(offset) }), .Transfer)
+        Error(failed) -> reply.post(.Error(failed), .Transfer)
+    }
+}
+
+function discardRange(
+    device: borrow Descriptor,
+    offset: Number,
+    length: Number
+) -> Result<Void, TesseraError> {
+    let rangeBytes = zeroedBlock(count: 16, alignment: 16)
+    let range = rangeBytes.pointer()
+    heapStore<U64>(range, 0, U64(offset))
+    heapStore<U64>(range, 8, U64(length))
+    let discarded = try device.control(BlockControl.discardRange, range)
+    return .Ok
+}
+
+public function blockDiscard(
+    block: Ref,
+    offset: Number,
+    length: Number,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    let index = try resolveBlock(block, RefRights.write)
+    if !aligned(index, offset, length, 0) { return .Error(failure(.InvalidArgument)) }
+    let device = try deviceOf(deviceLibrary.blocks[index].object)
+    let reply = Reply { port: port, key: key }
+    return match discardRange(device, offset, length) {
+        Ok -> reply.post(.Ok(Answer { result0: U64(length), result1: U64(offset) }), .Transfer)
+        Error(failed) -> reply.post(.Error(failed), .Transfer)
+    }
+}
+
+public function blockFlush(block: Ref, port: Handle, key: UNumber) -> Result<Void, TesseraError> {
+    let index = try resolveBlock(block, RefRights.write)
+    let device = try deviceOf(deviceLibrary.blocks[index].object)
+    let reply = Reply { port: port, key: key }
+    return match device.syncData() {
+        Ok -> reply.post(.Ok(Answer.none), .Transfer)
+        Error(failed) -> reply.post(.Error(failed), .Transfer)
+    }
+}
+
+// Lets the medium go, as DADiskEject does once the disk's volumes are
+// unmounted. A CD or DVD drive opens its tray, with `CDROMEJECT`; any other
+// SCSI disk, such as a USB stick, is powered off and leaves the system, as
+// udisks's power-off does by deleting the SCSI device, so its entry goes and
+// comes back only when it is plugged in again. A disk with no medium to let
+// go of, such as a virtio disk or a partition, answers `Unsupported`, and
+// the caller treats the eject as done once the volumes are unmounted. The
+// kernel answers `Busy` while the disk is still mounted or another program
+// holds the drive open. Ejecting writes nothing, so a connection opened
+// read-only may eject, as a drive with a read-only medium can only be
+// opened so.
+public function blockEject(block: Ref) -> Result<Void, TesseraError> {
+    let index = try resolveBlock(block, RefRights.read)
+    let object = deviceLibrary.blocks[index].object
+    let directory = try sysfsPath(object)
+    let scsi = directory + "/device"
+    let scsiType = try attribute(scsi + "/type") otherwise return .Error(failure(.Unsupported))
+    if scsiType == BlockDefault.scsiCdrom {
+        let device = try deviceOf(object)
+        let ejected = try device.controlValue(BlockControl.cdromEject, 0)
+        return .Ok
+    }
+    let present = try pathPresent(scsi + "/delete")
+    if !present { return .Error(failure(.Unsupported)) }
+    return writeText(scsi + "/delete", "1")
+}
+
+function blockRelease(object: Number) {
+    var kept: [BlockConnection] = []
+    for block in deviceLibrary.blocks {
+        if block.object != object { kept.append(block) }
+    }
+    deviceLibrary.blocks = kept
+}

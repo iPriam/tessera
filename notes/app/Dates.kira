@@ -1,0 +1,61 @@
+//! Dates as Notes shows them: the times, the dates and the groups the list uses.
+import Foundation
+
+// The dates Notes shows, as Notes on iPad does. Tessera keeps the clock in
+// Coordinated Universal Time and has no time zones yet, as `date` says.
+
+/// The names of the weekdays and months as Notes prints them.
+namespace Names {
+    let months: [String] = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
+}
+
+/// The names of the groups the list puts notes under: today, yesterday, and the earlier periods.
+namespace Groups {
+    let today: String = "Today"
+    let yesterday: String = "Yesterday"
+    let week: String = "Previous 7 Days"
+    let weekDays: UN8 = 7
+}
+
+/// The day `seconds` falls on, counted in days since 1970.
+function dayOf(seconds: UN32) -> UN32 { return UN32(trunc(seconds / CivilTime.secondsPerDay)) }
+
+/// The time of day at `seconds`, as `13:45`.
+function hourMinute(seconds: UN32) -> String {
+    let rest = seconds % CivilTime.secondsPerDay
+    let hours = trunc(rest / CivilTime.secondsPerHour)
+    let minutes = trunc(rest % CivilTime.secondsPerHour / CivilTime.secondsPerMinute)
+    return zeroPadded(hours, 2) + ":" + zeroPadded(minutes, 2)
+}
+
+/// The date at `seconds`, as `11/10/2026`.
+function shortDate(seconds: UN32) -> String {
+    let civil = civilDate(dayOf(seconds))
+    return zeroPadded(civil.day, 2) + "/" + zeroPadded(civil.month, 2) + "/" + String(civil.year)
+}
+
+/// The date and time at `seconds`, as `11 October 2026 at 13:45`, over a note.
+function longDate(seconds: UN32) -> String {
+    let civil = civilDate(dayOf(seconds))
+    return String(civil.day) + " " + Names.months[civil.month - 1] + " " + String(
+        civil.year
+    ) + " at " + hourMinute(seconds)
+}
+
+/// The date in a note's row: the time for a note saved today, else the day.
+function rowDate(seconds: UN32, now: UN32) -> String {
+    if dayOf(seconds) == dayOf(now) { return hourMinute(seconds) }
+    return shortDate(seconds)
+}
+
+/// The group a note's row is under: today, yesterday, the week before, then each month of this year, then each year.
+function groupName(seconds: UN32, now: UN32) -> String {
+    let day = dayOf(seconds)
+    let today = dayOf(now)
+    if day >= today { return Groups.today }
+    if day + 1 == today { return Groups.yesterday }
+    if day + Groups.weekDays >= today { return Groups.week }
+    let civil = civilDate(day)
+    if civil.year == civilDate(today).year { return copy Names.months[civil.month - 1] }
+    return String(civil.year)
+}

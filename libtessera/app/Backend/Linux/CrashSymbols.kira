@@ -1,0 +1,181 @@
+import Foundation
+import Heap
+
+// Naming a crashed process's frames from its images' own symbol tables, as a
+// Mac's ReportCrash names them: `.symtab` where the file keeps it, `.dynsym`
+// where it was stripped to that. Each file was opened through the process's
+// root, so it is the file the process mapped.
+
+namespace CrashElf {
+    let sectionSymbols: U32 = U32(2)
+    let sectionDynamic: U32 = U32(11)
+    let sectionBytes: U64 = U64(64)
+    let symbolBytes: U64 = U64(24)
+    let typeFunction: U8 = U8(2)
+    let typeShared: U16 = U16(3)
+    // The most of a table read: a framework's is a few megabytes.
+    let tableLimit: U64 = U64(67108864)
+}
+
+struct CrashSymbol {
+    let start: U64
+    let end: U64
+    let name: String
+}
+
+// One image's functions, by start; `lowest` is the address its first
+// loaded segment asks for, which a shared object is moved from.
+struct CrashSymbols {
+    var shared: Bool = false
+    var lowest: U64 = U64(0)
+    var functions: [CrashSymbol] = []
+}
+
+// `name + 0x24` for each frame, or empty where nothing names it.
+function frameSymbols(
+    frames: borrow [U64],
+    images: borrow [CrashedImage],
+    opened: borrow Map<String, Number>,
+    tables: borrow mut Map<String, CrashSymbols>
+) -> [String?] {
+    var named: [String?] = []
+    for frame in frames {
+        if crashImageOf(images, frame).isNone() {
+            named.append(.None)
+            continue
+        }
+        let image = match crashImageOf(images, frame) {
+            Some(value) -> value
+            None -> CrashedImage { start: U64(0), end: U64(0), path: "" }
+        }
+        if tables.value(image.path).isNone() {
+            let table = match opened.value(image.path) {
+                Some(fd) -> readSymbolsOf(fd)
+                None -> CrashSymbols {}
+            }
+            tables.set(copy image.path, move table)
+        }
+        let table = match tables.value(image.path) {
+            Some(value) -> value
+            None -> CrashSymbols {}
+        }
+        let address = table.shared ? frame - image.start + table.lowest : frame
+        named.append(symbolText(table.functions, address))
+    }
+    return named
+}
+
+function symbolText(functions: borrow [CrashSymbol], address: U64) -> String? {
+    var low = 0
+    var high = functions.count - 1
+    while low <= high {
+        let middle = trunc((low + high) / 2)
+        if address < functions[middle].start {
+            high = middle - 1
+        } else if address >= functions[middle].end {
+            low = middle + 1
+        } else {
+            return .Some("\(functions[middle].name) + \(address - functions[middle].start)")
+        }
+    }
+    return .None
+}
+
+// `count` bytes at `offset`, or none when the file has fewer.
+function elfBytes(fd: Number, offset: U64, count: U64) -> ByteBlock? {
+    let block = zeroedBlock(count: Number(count) + 1, alignment: 16)
+    if pread(fd, block.pointer(), count, offset) != Number(count) { return .None }
+    return .Some(move block)
+}
+
+function readSymbolsOf(fd: Number) -> CrashSymbols {
+    var table = CrashSymbols {}
+    let header = match elfBytes(fd, U64(0), U64(64)) {
+        Some(value) -> move value
+        None -> return table
+    }
+    let base = header.pointer()
+    if heapLoad<U32>(base, 0) != U32(0x464C457F) { return table }
+    table.shared = heapLoad<U16>(base, 16) == CrashElf.typeShared
+    table.lowest = lowestLoad(fd, heapLoad<U64>(base, 32), U64(heapLoad<U16>(base, 56)))
+    let sectionCount = U64(heapLoad<U16>(base, 60))
+    if sectionCount == U64(0) { return table }
+    let sections = match elfBytes(
+        fd,
+        heapLoad<U64>(base, 40),
+        sectionCount * CrashElf.sectionBytes
+    ) {
+        Some(value) -> move value
+        None -> return table
+    }
+    // The full table where there is one, else the dynamic one.
+    var chosen: Number? = .None
+    for index in 0..Number(sectionCount) {
+        let kind = heapLoad<U32>(sections.pointer(), U64(index) * CrashElf.sectionBytes + U64(4))
+        if kind == CrashElf.sectionSymbols { chosen = .Some(index) }
+        if kind == CrashElf.sectionDynamic && chosen.isNone() { chosen = .Some(index) }
+    }
+    let selected = match chosen {
+        Some(index) -> index
+        None -> return table
+    }
+    let entry = heapOffset(sections.pointer(), U64(selected) * CrashElf.sectionBytes)
+    let symbolsSize = heapLoad<U64>(entry, 32)
+    let link = U64(heapLoad<U32>(entry, 40))
+    if symbolsSize > CrashElf.tableLimit || link >= sectionCount { return table }
+    let names = heapOffset(sections.pointer(), link * CrashElf.sectionBytes)
+    let namesSize = heapLoad<U64>(names, 32)
+    if namesSize > CrashElf.tableLimit { return table }
+    let symbols = match elfBytes(fd, heapLoad<U64>(entry, 24), symbolsSize) {
+        Some(value) -> move value
+        None -> return table
+    }
+    let strings = match elfBytes(fd, heapLoad<U64>(names, 24), namesSize) {
+        Some(value) -> move value
+        None -> return table
+    }
+    var functions: [CrashSymbol] = []
+    var at = U64(0)
+    while at + CrashElf.symbolBytes <= symbolsSize {
+        let symbol = heapOffset(symbols.pointer(), at)
+        at = at + CrashElf.symbolBytes
+        if (heapLoad<U8>(symbol, 4) & U8(15)) != CrashElf.typeFunction { continue }
+        let start = heapLoad<U64>(symbol, 8)
+        let size = heapLoad<U64>(symbol, 16)
+        let nameAt = U64(heapLoad<U32>(symbol, 0))
+        if start == U64(0) || nameAt >= namesSize { continue }
+        functions.append(
+            CrashSymbol {
+                start: start,
+                end: start + (size == U64(0) ? U64(1) : size),
+                name: stringFromCBytes(
+                    heapOffset(strings.pointer(), nameAt),
+                    Number(namesSize - nameAt)
+                )
+            }
+        )
+    }
+    table.functions = functions.sorted({ left, right in return left.start < right.start })
+    return table
+}
+
+// The lowest address a loaded segment asks for.
+function lowestLoad(fd: Number, offset: U64, count: U64) -> U64 {
+    if count == U64(0) || count > U64(256) { return U64(0) }
+    let headers = match elfBytes(fd, offset, count * U64(56)) {
+        Some(value) -> move value
+        None -> return U64(0)
+    }
+    var lowest: U64? = .None
+    for index in 0..Number(count) {
+        let entry = heapOffset(headers.pointer(), U64(index) * U64(56))
+        if fromCode<ElfSegment>(heapLoad<U32>(entry, 0)) != .Load { continue }
+        let address = heapLoad<U64>(entry, 16)
+        lowest = match lowest {
+            Some(held) -> .Some(address < held ? address : held)
+            None -> .Some(address)
+        }
+    }
+    // An image with no loaded segment is not displaced.
+    return lowest.or(U64(0))
+}

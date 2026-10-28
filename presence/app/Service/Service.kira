@@ -1,0 +1,121 @@
+//! The Presence service's state, its connections, and the port and listener it waits on.
+import Foundation
+import LibTessera
+
+// The service's state: its port and listener, its connections, and the link to
+// MosaicDisplay. `main` makes it and lends it to everything that runs.
+
+/// The service's state: its port and listener, its connections, and the link to MosaicDisplay.
+struct Service {
+    var port: Handle
+    var listener: Handle
+    var clients: [Client]
+    var nextClient: Number
+    // The channel to MosaicDisplay on which token checks go; none when PID 1
+    // gave the service none.
+    var link: Handle?
+}
+
+/// A connection: the channel a client talks on, under the id its wait is made under.
+struct Client {
+    var id: Number
+    var channel: Handle
+}
+
+/// The name the Presence service listens under.
+namespace ServiceName {
+    let presence: String = "tessera.presence"
+}
+
+/// The keys this service's waits are made under: a connection's key is its id times `lanes` plus `channel`, and the listener and the termination watch take keys no connection has.
+namespace PortKey {
+    let listener: Number = 1
+    let termination: Number = 2
+    let lanes: Number = 16
+    let channel: Number = 1
+    // The most completions taken in one wait.
+    let batch: Number = 32
+}
+
+/// What a completion key names.
+enum Waker {
+    Listener
+    Termination
+    Channel(Number)
+    Unknown
+}
+
+/// The completion key a connection's waits are made under: its id times the lanes, plus the channel lane.
+function channelKey(client: Number) -> Number { return client * PortKey.lanes + PortKey.channel }
+
+/// What a completion key names: the listener, the termination watch, a connection's channel, or nothing this service made.
+function wakerOf(key: Number) -> Waker {
+    if key == PortKey.listener { return .Listener }
+    if key == PortKey.termination { return .Termination }
+    let owner = floor(key / PortKey.lanes)
+    if key - owner * PortKey.lanes == PortKey.channel { return .Channel(owner) }
+    return .Unknown
+}
+
+/// The port and the listener: the listener is made before the first wait, so a client that connects meanwhile waits in the backlog.
+function startService() -> Result<Service, TesseraError> {
+    let port = try portCreate(.None)
+    match processWatchTermination(port, PortKey.termination) {
+        // The watch is set, and its completion arrives on the port when asked to stop.
+        Ok -> {}
+        Error(failed) -> log warn("cannot hear a request to stop", error: errorName(failed))
+    }
+    let listener = try serviceListen(ServiceName.presence)
+    var service = Service {
+        port: port,
+        listener: listener,
+        clients: [],
+        nextClient: 1,
+        link: .None,
+    }
+    try objectWaitAsync(listener, Signals.readable, .Repeat, port, PortKey.listener)
+    return .Ok(service)
+}
+
+/// Takes completions until asked to stop.
+function run(service: borrow mut Service) -> Result<Void, TesseraError> {
+    while true {
+        let completions = match portWait(service.port, PortKey.batch, Deadline.infinite) {
+            Ok(value) -> value
+            Error(failed) -> if failed.code == .Timeout { continue } else { return .Error(failed) }
+        }
+        for completion in completions {
+            match wakerOf(Number(completion.key)) {
+                Termination -> {
+                    log info("asked to stop")
+                    return .Ok
+                }
+                Listener -> accept(service)
+                Channel(client) -> serveClient(service, client)
+                Unknown -> log warn(
+                    "a completion no wait was made for",
+                    key: completion.key
+                )
+            }
+        }
+    }
+}
+
+/// Closes a handle, logging a warning when it cannot.
+function closeHandle(handle: Handle) {
+    match handleClose(handle) {
+        // The handle is gone, so there is nothing left to do.
+        Ok -> {}
+        Error(failed) -> log warn("a handle could not be closed", error: errorName(failed))
+    }
+}
+
+/// Closes every handle in `handles`, logging a warning when they cannot.
+function closeHandles(handles: borrow [Handle]) {
+    if handles.count == 0 { return }
+    match handleCloseMany(handles) {
+        // The handles are gone, so there is nothing left to do.
+        Ok -> {}
+        Error(failed) -> log warn("handles could not be closed", error: errorName(failed))
+    }
+}

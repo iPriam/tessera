@@ -1,0 +1,357 @@
+import Foundation
+import HomeLayout
+import LibTessera
+import KiraUI
+import KCoreAnimation
+import TesseraUI
+import PlatformKit
+import PlatformUI
+
+// Home's pages as drawn: the grid of a page's applications and folders,
+// each tile wobbling while Home is edited (PlatformUI's EditWobble) with a badge to take it off Home,
+// and the dots under the grid that say which page is shown.
+
+namespace HomePaging {
+    // The page dots, the padding round them that their glass fills while
+    // Home is edited, and the space that keeps them clear of the Dock, as an
+    // iPhone's are. `indicator`, the band over the Dock they stand in, is
+    // the three together: `dot`, `dotPadding` on either side, `aboveDock`.
+    let dot: Number = 7
+    let dotSpacing: Number = 9
+    let dotPadding: Number = 6
+    let aboveDock: Number = 10
+    let indicator: Number = 29
+    // How long a press is held still before Home is edited, and how far it
+    // may wander meanwhile, in milliseconds and points.
+    let longPress: Number = 500
+    let still: Number = 10
+    // How near the screen's side a carried icon turns the page, and how long
+    // it waits there first.
+    let edge: Number = 28
+    let edgeWait: Number = 600
+    // How near an icon's middle, as a share of its side, a carried icon is
+    // dropped into it rather than beside it.
+    let into: Number = 0.4
+    let badge: Number = 22
+    // How far a press pulls down on a page to open system search.
+    let searchPull: Number = 60
+}
+
+// How much a page holds: the grid's columns, times the rows that fit between
+// the status bar and the dots over the Dock.
+function homeSpace(metrics: borrow LauncherMetrics) -> HomeSpace {
+    let room = viewportHeight() - metrics.top - dockBand() - HomePaging.indicator
+    return HomeSpace {
+        perPage: metrics.columns * max(trunc(room / HomeScreenGrid.rowPitch), 1),
+        columns: metrics.columns
+    }
+}
+
+// The place on a page nearest the point `x`, `y` on the screen, or -1 above
+// its icons.
+function homeIndexAt(x: Number, y: Number, metrics: borrow LauncherMetrics) -> Number {
+    let column = min(
+        trunc(max(x - metrics.inset - metrics.icon / 2, 0) / metrics.pitch + 0.5),
+        metrics.columns - 1
+    )
+    // Above the first row, over a widget band, is no place.
+    if y < metrics.top - HomePaging.edge { return -1 }
+    let row = trunc(max(y - metrics.top - metrics.icon / 2, 0) / HomeScreenGrid.rowPitch + 0.5)
+    return row * metrics.columns + column
+}
+
+// Whether the point `x`, `y` is over the middle of the icon at `index`, near
+// enough to drop into it.
+function homeOverIcon(
+    x: Number,
+    y: Number,
+    index: Number,
+    metrics: borrow LauncherMetrics
+) -> Bool {
+    let frame = homeIconFrame(index, metrics)
+    let dx = x - (frame.x + frame.width / 2)
+    let dy = y - (frame.y + frame.height / 2)
+    return abs(dx) < metrics.icon * HomePaging.into && abs(dy) < metrics.icon * HomePaging.into
+}
+
+// Whether the point `x`, `y` is on the icon at `index` itself, where a
+// press picks it up: not the gap around it, nor its badge in the corner,
+// which is a button of its own.
+function homeOnIcon(
+    x: Number,
+    y: Number,
+    index: Number,
+    metrics: borrow LauncherMetrics,
+    editing: Bool
+) -> Bool {
+    if index < 0 { return false }
+    let frame = homeIconFrame(index, metrics)
+    let inside = x >= frame.x && x <= frame.x + frame.width && y >= frame.y && y <= frame.y + frame.height
+    if !inside || !editing { return inside }
+    let badgeX = frame.x - HomePaging.badge / 3 + HomePaging.badge / 2
+    let badgeY = frame.y - HomePaging.badge / 3 + HomePaging.badge / 2
+    let onBadge = abs(x - badgeX) < HomePaging.badge && abs(y - badgeY) < HomePaging.badge
+    return !onBadge
+}
+
+// Whether the point `x`, `y` is on the item at `index` of a page holding
+// `count` items: its icon, its name under it, or its badge over the icon's
+// corner.
+function homeOnItem(
+    x: Number,
+    y: Number,
+    index: Number,
+    count: Number,
+    metrics: borrow LauncherMetrics
+) -> Bool {
+    if index < 0 || index >= count { return false }
+    let frame = homeIconFrame(index, metrics)
+    let reach = HomePaging.badge / 3
+    let bottom = frame.y + frame.height + metrics.labelGap + metrics.label * 1.5
+    return x >= frame.x - reach && x <= frame.x + frame.width && y >= frame.y - reach && y <= bottom
+}
+
+// The application installed under `name`.
+function applicationNamed(applications: borrow [Application], name: borrow String) -> Application? {
+    for application in applications {
+        if application.name == name { return .Some(copy application) }
+    }
+    return .None
+}
+
+// What a tile asks of Home when it is pressed.
+public struct HomeTileActions {
+    // Opens the folder at the tile's place.
+    var openFolder: (HomeSlot) -> Void
+    // Asks whether to take the item at a place off Home.
+    var remove: (HomeSlot) -> Void
+}
+
+// How the tiles of a page are drawn now.
+public struct HomeTileLook {
+    var editing: Bool = false
+    // The item being carried, which leaves its place empty.
+    var carried: HomeSlot? = .None
+    // The item the keyboard is on, which is ringed.
+    var focused: HomeSlot? = .None
+    // The notifications kept, whose count is each application's badge.
+    var kept: NotificationHistory = NotificationHistory {}
+}
+
+// Where a tile stands: its item's place on the saved page, and its place on
+// the screen it is drawn on, which differ past a page's first screen.
+public struct HomeTilePlace {
+    let slot: HomeSlot
+    let at: Number
+}
+
+namespace HomeFocusRing {
+    // How far the ring stands out from the icon, and how thick it is.
+    let outset: Number = 4
+    let width: Number = 3
+}
+
+// A screen's grid: the items it shows of its page, `items`, in rows, the way
+// the home screen lays them out, each at its place on the saved page.
+function homePageGrid(
+    screen: borrow HomeScreenPage,
+    items: borrow [HomeItem],
+    applications: borrow [Application],
+    metrics: borrow LauncherMetrics,
+    look: borrow HomeTileLook,
+    actions: borrow HomeTileActions
+) -> Any Widget {
+    var tiles: [Any Widget] = []
+    for (index, item) in items.enumerated() {
+        let slot = HomeSlot { page: screen.page, index: screen.first + index }
+        let carried = look.carried == .Some(copy slot)
+        let place = HomeTilePlace { slot: move slot, at: index }
+        tiles.append(
+            homeTile(item, move place, applications, metrics, look, actions).opacity(
+                carried ? 0 : 1
+            )
+        )
+    }
+    return homeScreenRows(move tiles, metrics)
+}
+
+// The applications' icons on the screen shown, where each stands on the
+// screen, which a window going home flies into; none while App Library is
+// shown.
+function homeIconsShown(
+    arrangement: borrow HomeArrangement,
+    screens: borrow [HomeScreenPage],
+    current: Number,
+    metrics: borrow LauncherMetrics
+) -> [HomeScreenIcon] {
+    var icons: [HomeScreenIcon] = []
+    if current >= screens.count { return icons }
+    let page = arrangement.screenPage(screens[current])
+    let laid = homePageMetrics(metrics, page)
+    for (index, item) in page.items.enumerated() {
+        match item {
+            App(name) -> icons.append(
+                HomeScreenIcon { application: copy name, icon: homeIconFrame(index, laid) }
+            )
+            // A window going home flies into an application's own icon only.
+            Folder -> {}
+        }
+    }
+    return icons
+}
+
+// One item's tile, wobbling and badged while Home is edited.
+function homeTile(
+    item: borrow HomeItem,
+    place: HomeTilePlace,
+    applications: borrow [Application],
+    metrics: borrow LauncherMetrics,
+    look: borrow HomeTileLook,
+    actions: borrow HomeTileActions
+) -> Any Widget {
+    let editing = look.editing
+    let slot = copy place.slot
+    let tile = match item {
+        App(name) -> homeAppTile(name, place.at, applications, metrics, editing)
+        Folder(folder) -> homeFolderTile(
+            folder,
+            copy slot,
+            applications,
+            metrics,
+            editing,
+            actions.openFolder
+        )
+    }
+    let focused = look.focused == .Some(copy slot)
+    let badged = match item {
+        App(name) -> look.kept.count(name)
+        Folder(folder) -> folderCount(folder, look.kept)
+    }
+    let phase = place.at * 1.3
+    let remove = copy actions.remove
+    let asked = copy slot
+    // The same layers whether Home is edited or not, so starting or ending
+    // the edit moves nothing: the wobble eases to a stop and the badge grows
+    // in or shrinks away.
+    // The badge stands on the icon's top leading corner and wobbles with it.
+    // The tile stays centred in its column, where it stands when Home is not
+    // edited, and the badge is placed from the icon's centre.
+    return EditWobble(phase: phase, active: editing) {
+        ZStack(alignment = .Top) {
+            if focused { homeFocusRing(metrics) }
+            tile
+            if badged > 0 { homeCountBadge(badged, metrics) }
+            // Only the badge takes an item off Home, and only once asked.
+            if editing {
+                editRemovalBadge(
+                    HomePaging.badge,
+                    HomePaging.badge / 2 - metrics.icon / 2 - HomePaging.badge / 3,
+                    -HomePaging.badge / 3,
+                    { in remove(copy asked) }
+                )
+            }
+        }
+    }
+}
+
+// The notifications the applications of `folder` kept, together.
+function folderCount(folder: borrow HomeFolder, kept: borrow NotificationHistory) -> Number {
+    var total: Number = 0
+    for app in folder.apps { total += kept.count(app) }
+    return total
+}
+
+// An item's badge, on the icon's top trailing corner.
+function homeCountBadge(count: Number, metrics: borrow LauncherMetrics) -> Any Widget {
+    return countBadge(count, HomePaging.badge)
+    .offset(
+        x = resolvedLength(metrics.icon / 2 - HomePaging.badge / 3),
+        y = resolvedLength(-HomePaging.badge / 3)
+    )
+}
+
+// The ring round the icon the keyboard is on.
+function homeFocusRing(metrics: borrow LauncherMetrics) -> Any Widget {
+    let side = metrics.icon + HomeFocusRing.outset * 2
+    return RoundedRectangle(cornerRadius = side * IconShape.corner, style = .Continuous)
+    .fill(tileInk)
+    .stroke(lineWidth: resolvedLength(HomeFocusRing.width))
+    .width(resolvedLength(side))
+    .height(resolvedLength(side))
+    .offset(x = resolvedLength(0), y = resolvedLength(-HomeFocusRing.outset))
+}
+
+// An application's tile: its icon and its name. Pressed, the application
+// opens out of its icon, except while Home is edited.
+function homeAppTile(
+    name: borrow String,
+    at: Number,
+    applications: borrow [Application],
+    metrics: borrow LauncherMetrics,
+    editing: Bool
+) -> Any Widget {
+    let opened = applicationNamed(applications, name)
+    let icon = metrics.icon
+    return Button(
+        action = { in
+            if editing { return }
+            match opened {
+                Some(application) -> openApplicationFromIcon(
+                    application,
+                    homeIconFrame(at, metrics)
+                )
+                None -> log warn("a Home icon names no installed application")
+            }
+        }
+    ) {
+        homeTileLabel(flightIcon(name, icon, homeIconFrame(at, metrics)), name, metrics)
+    }
+    .buttonStyle(.Plain)
+}
+
+// A tile's picture with its name under it in white over the wallpaper.
+function homeTileLabel(
+    picture: Any Widget,
+    name: borrow String,
+    metrics: borrow LauncherMetrics
+) -> Any Widget {
+    return VStack(spacing = .Length(metrics.labelGap), alignment = .Center) {
+        picture
+        Text(copy name)
+        .font(size: resolvedLength(metrics.label), weight: .Medium)
+        .textColor(tileInk)
+        .shadow(
+            color: tileShadow,
+            radius: resolvedLength(3),
+            x: resolvedLength(0),
+            y: resolvedLength(1)
+        )
+    }
+    .hugWidth()
+}
+
+// The dots under the grid, one for each shown page, the one shown white; App
+// Library, past the last, is no page and has none. A single page has no dots,
+// as on an iPhone, except while Home is edited: a press on them then opens
+// the pages to hide and move.
+function homePageDots(
+    count: Number,
+    current: Number,
+    editing: Bool,
+    pages: () -> Void
+) -> Any Widget {
+    if count < 2 && !editing { return EmptyView() }
+    var dots: [Any Widget] = []
+    for index in 0..count {
+        dots.append(
+            Circle().fill(
+                RGBAColor { r: 1.0, g: 1.0, b: 1.0, a: index == current ? 1.0 : 0.4 }
+            ).width(resolvedLength(HomePaging.dot)).height(resolvedLength(HomePaging.dot))
+        )
+    }
+    let row = HStack(spacing = .Length(HomePaging.dotSpacing), alignment = .Center, children = dots)
+    .padding(resolvedLength(HomePaging.dotPadding))
+    // Put in place at once when Home starts or stops being edited.
+    if !editing { return row.id("home.dots.shown") }
+    return row.glassEffect().onClick(move pages).id("home.dots.edited")
+}

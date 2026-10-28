@@ -1,0 +1,130 @@
+import Foundation
+
+// Every ioctl request DeviceKit makes, in one place (17 §20.2).
+//
+// A request packs a direction in the top two bits, the size of the structure
+// it points at in the next fourteen, the driver's type byte, then the call.
+// That packing is the same on aarch64 and x86-64. The sizes are the
+// structures' own, from the kernel's uapi headers.
+
+// The direction bits: what the kernel does with the structure.
+enum IoctlDirection: U64 {
+    None = 0
+    Write = 1
+    Read = 2
+    ReadWrite = 3
+}
+
+function ioctlRequest(direction: borrow IoctlDirection, kind: U64, number: U64, size: U64) -> U64 {
+    return (code(direction) << U64(30)) | (size << U64(16)) | (kind << U64(8)) | number
+}
+
+// ─── DRM ('d') ──────────────────────────────────────────────────────────────
+
+namespace Drm {
+    let ioctlType: U64 = U64(0x64)
+    let version: U64 = U64(0xC0406400) // _IOWR('d', 0x00, 64)
+    let gemClose: U64 = U64(0x40086409) // _IOW('d', 0x09, 8)
+    let getCap: U64 = U64(0xC010640C) // _IOWR('d', 0x0c, 16)
+    let setClientCap: U64 = U64(0x4010640D) // _IOW('d', 0x0d, 16)
+    let setMaster: U64 = U64(0x641E) // _IO('d', 0x1e)
+    let dropMaster: U64 = U64(0x641F) // _IO('d', 0x1f)
+    let primeHandleToFd: U64 = U64(0xC00C642D) // _IOWR('d', 0x2d, 12)
+    let primeFdToHandle: U64 = U64(0xC00C642E) // _IOWR('d', 0x2e, 12)
+    let crtcGetSequence: U64 = U64(0xC018643B) // _IOWR('d', 0x3b, 24)
+    let modeGetResources: U64 = U64(0xC04064A0) // _IOWR('d', 0xA0, 64)
+    let modeGetCrtc: U64 = U64(0xC06864A1) // _IOWR('d', 0xA1, 104)
+    let modeGetEncoder: U64 = U64(0xC01464A6) // _IOWR('d', 0xA6, 20)
+    let modeGetConnector: U64 = U64(0xC05064A7) // _IOWR('d', 0xA7, 80)
+    let modeGetProperty: U64 = U64(0xC04064AA) // _IOWR('d', 0xAA, 64)
+    let modeGetPropBlob: U64 = U64(0xC01064AC) // _IOWR('d', 0xAC, 16)
+    let modeRemoveFramebuffer: U64 = U64(0xC00464AF) // _IOWR('d', 0xAF, 4)
+    let modeCreateDumb: U64 = U64(0xC02064B2) // _IOWR('d', 0xB2, 32)
+    let modeMapDumb: U64 = U64(0xC01064B3) // _IOWR('d', 0xB3, 16)
+    let modeDestroyDumb: U64 = U64(0xC00464B4) // _IOWR('d', 0xB4, 4)
+    let modeGetPlaneResources: U64 = U64(0xC01064B5) // _IOWR('d', 0xB5, 16)
+    let modeGetPlane: U64 = U64(0xC02064B6) // _IOWR('d', 0xB6, 32)
+    let modeAddFramebuffer2: U64 = U64(0xC06864B8) // _IOWR('d', 0xB8, 104)
+    let modeObjectProperties: U64 = U64(0xC02064B9) // _IOWR('d', 0xB9, 32)
+    let modeAtomic: U64 = U64(0xC03864BC) // _IOWR('d', 0xBC, 56)
+    let modeCreateBlob: U64 = U64(0xC01064BD) // _IOWR('d', 0xBD, 16)
+    let modeDestroyBlob: U64 = U64(0xC00464BE) // _IOWR('d', 0xBE, 4)
+    let syncobjCreate: U64 = U64(0xC00864BF) // _IOWR('d', 0xBF, 8)
+    let syncobjDestroy: U64 = U64(0xC00864C0) // _IOWR('d', 0xC0, 8)
+    let syncobjHandleToFd: U64 = U64(0xC01864C1) // _IOWR('d', 0xC1, 24)
+    let syncobjFdToHandle: U64 = U64(0xC01864C2) // _IOWR('d', 0xC2, 24)
+    let syncobjQuery: U64 = U64(0xC01864CB) // _IOWR('d', 0xCB, 24)
+    let syncobjTransfer: U64 = U64(0xC02064CC) // _IOWR('d', 0xCC, 32)
+    let syncobjTimelineSignal: U64 = U64(0xC01864CD) // _IOWR('d', 0xCD, 24)
+    let syncobjEventfd: U64 = U64(0xC01864CF) // _IOWR('d', 0xCF, 24)
+    let modeCloseFramebuffer: U64 = U64(0xC00864D0) // _IOWR('d', 0xD0, 8)
+    // `DRM_CLIENT_CAP_*` and `DRM_CAP_*`.
+    let clientCapUniversalPlanes: U64 = U64(2)
+    let clientCapAtomic: U64 = U64(3)
+    let capDumbBuffer: U64 = U64(1)
+    let capPrime: U64 = U64(5)
+    let capTimestampMonotonic: U64 = U64(6)
+    let capSyncobjTimeline: U64 = U64(0x14)
+    // `DRM_MODE_ATOMIC_*` and `DRM_MODE_PAGE_FLIP_EVENT`.
+    let atomicFlipEvent: U32 = U32(1)
+    let atomicTestOnly: U32 = U32(0x100)
+    let atomicNonBlock: U32 = U32(0x200)
+    let atomicAllowModeset: U32 = U32(0x400)
+    // `DRM_MODE_OBJECT_*`.
+    let objectCrtc: U32 = U32(0xCCCCCCCC)
+    let objectConnector: U32 = U32(0xC0C0C0C0)
+    let objectPlane: U32 = U32(0xEEEEEEEE)
+    // `DRM_EVENT_FLIP_COMPLETE`, and `struct drm_event_vblank`'s size.
+    let eventFlipComplete: U32 = U32(2)
+    let eventVblankSize: U64 = U64(32)
+    // `DRM_SYNCOBJ_*` flags.
+    let syncobjImportSyncFile: U32 = U32(1)
+    let syncobjExportSyncFile: U32 = U32(1)
+    let syncobjQueryLastSubmitted: U32 = U32(1)
+    let syncobjWaitAvailable: U32 = U32(4)
+    // `DRM_PRIME_CAP` / handle flags: `DRM_CLOEXEC | DRM_RDWR`.
+    let primeFlags: U32 = U32(0x80002)
+}
+
+// ─── dma-buf ('b') ──────────────────────────────────────────────────────────
+
+namespace DmaBuf {
+    let sync: U64 = U64(0x40086200) // _IOW(0x62, 0, 8)
+    let syncRead: U64 = U64(1)
+    let syncWrite: U64 = U64(2)
+    let syncStart: U64 = U64(0)
+    let syncEnd: U64 = U64(4)
+}
+
+// ─── evdev ('E') ────────────────────────────────────────────────────────────
+
+namespace Evdev {
+    let ioctlType: U64 = U64(0x45)
+    let getId: U64 = U64(0x80084502) // _IOR('E', 0x02, 8)
+    let setEffect: U64 = U64(0x40304580) // _IOW('E', 0x80, 48)
+    let removeEffect: U64 = U64(0x40044581) // _IOW('E', 0x81, 4)
+    let getEffects: U64 = U64(0x80044584) // _IOR('E', 0x84, 4)
+    let grab: U64 = U64(0x40044590) // _IOW('E', 0x90, 4)
+    let setClock: U64 = U64(0x400445A0) // _IOW('E', 0xa0, 4)
+    // `struct input_event` on a 64-bit machine, and the event types.
+    let eventSize: U64 = U64(24)
+}
+
+function evdevGetName(length: U64) -> U64 {
+    return ioctlRequest(.Read, Evdev.ioctlType, U64(0x06), length)
+}
+function evdevGetPhysical(length: U64) -> U64 {
+    return ioctlRequest(.Read, Evdev.ioctlType, U64(0x07), length)
+}
+function evdevGetKeys(length: U64) -> U64 {
+    return ioctlRequest(.Read, Evdev.ioctlType, U64(0x18), length)
+}
+function evdevGetLeds(length: U64) -> U64 {
+    return ioctlRequest(.Read, Evdev.ioctlType, U64(0x19), length)
+}
+function evdevGetBits(eventType: U64, length: U64) -> U64 {
+    return ioctlRequest(.Read, Evdev.ioctlType, U64(0x20) + eventType, length)
+}
+function evdevGetAbs(axis: U64) -> U64 {
+    return ioctlRequest(.Read, Evdev.ioctlType, U64(0x40) + axis, U64(24))
+}

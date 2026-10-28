@@ -1,0 +1,203 @@
+//! The CCID driver's entry point: finds the smart card reader and publishes it to the device registry.
+import Foundation
+import Heap
+import LibTessera
+import DeviceKit
+
+// ccid-driver: a sample user-space driver (roadmap/17-devicekit.md §18).
+//
+// devicekitd starts it for a CCID smart card reader no kernel driver takes,
+// QEMU's `usb-ccid` among them, with a claim token in its arguments. It
+// redeems the token, opens the reader for the Usb family, claims the CCID
+// interface, asks slot 0 for its state and publishes a Driver entry under
+// the reader that says what it found, as a DriverKit dext registers its
+// service. Then it stays: the entry lasts as long as the driver does.
+
+/// The layout of a property record in the properties the driver publishes.
+namespace PropertyRecord {
+    let blockBytes: Number = 512
+    let listHeader: Number = 8
+    let keyAt: Number = 16
+    let wordBytes: Number = 8
+}
+
+/// The C layout of a property's header, before its key.
+@FFI.Struct { layout: c }
+struct PropertyHeader {
+    var kind: U32
+    var keyLength: U32
+    var valueLength: U32
+    var reserved: U32
+}
+
+/// A property's value as the driver publishes it.
+enum PropertyValue {
+    Text(String)
+    Unsigned(Number)
+}
+
+/// A property the driver publishes: its key and its value.
+struct Property {
+    var key: String
+    var value: PropertyValue
+}
+
+/// The step of the driver's start that failed.
+enum Step {
+    Token
+    Port
+    Claim
+    Open
+    Pipes
+    ClaimInterface
+    SlotStatus
+    Publish
+    Wait
+}
+
+/// A step that failed: which step, and the error.
+struct StepFailure {
+    var step: Step
+    var error: TesseraError
+}
+
+/// Runs `step`, returning its value, or the failure it ends with.
+function during<Value>(
+    step: Step,
+    outcome: Result<Value, TesseraError>
+) -> Result<Value, StepFailure> {
+    return match move outcome {
+        Ok(value) -> .Ok(move value)
+        Error(failed) -> .Error(StepFailure { step: step, error: failed })
+    }
+}
+
+/// `during` for a step that answers nothing.
+function completing(step: Step, outcome: Result<Void, TesseraError>) -> Result<Void, StepFailure> {
+    return match outcome {
+        Ok -> .Ok
+        Error(failed) -> .Error(StepFailure { step: step, error: failed })
+    }
+}
+
+/// `at` rounded up to the next word boundary.
+function alignWord(at: Number) -> Number {
+    return trunc(
+        (at + PropertyRecord.wordBytes - 1) / PropertyRecord.wordBytes
+    ) * PropertyRecord.wordBytes
+}
+
+/// Writes `property` at `at`; answers the offset after it.
+function writeProperty(block: RawPtr, at: Number, property: borrow Property) -> Number {
+    let keyLength = property.key.count
+    copyBytes(heapOffset(block, at + PropertyRecord.keyAt), property.key.data, keyLength)
+    let valueAt = alignWord(at + PropertyRecord.keyAt + keyLength)
+    var kind = PropertyType.U64
+    var valueLength = PropertyRecord.wordBytes
+    match property.value {
+        Text(text) -> {
+            kind = .String valueLength = text.count copyBytes(
+                heapOffset(block, valueAt),
+                text.data,
+                valueLength
+            )
+        }
+        Unsigned(number) -> heapStore<U64>(block, valueAt, UNumber(number))
+    }
+    heapStore(
+        block,
+        at,
+        PropertyHeader {
+            kind: kind.rawValue(),
+            keyLength: UN32(keyLength),
+            valueLength: UN32(valueLength),
+            reserved: UN32(0),
+        }
+    )
+    return alignWord(valueAt + valueLength)
+}
+
+/// Publishes the driver's properties to the device registry.
+function publish(
+    driver: Ref,
+    pipes: borrow Pipes,
+    state: borrow CardState
+) -> Result<EntryId, TesseraError> {
+    let properties = [Property { key: "name", value: .Text("CCID smart card reader") }, Property {
+        key: "vendorId",
+        value: .Unsigned(pipes.vendorId)
+    }, Property { key: "productId", value: .Unsigned(pipes.productId) }, Property {
+        key: "cardState",
+        value: .Unsigned(Number(code(state)))
+    },]
+    let blockBytes = zeroedBlock(count: PropertyRecord.blockBytes, alignment: 16)
+    let block = blockBytes.pointer()
+    heapStore<U32>(block, 0, UN32(properties.count))
+    var at = PropertyRecord.listHeader
+    for property in properties { at = writeProperty(block, at, property) }
+    return registryPublish(driver, .Driver, Buffer { address: block, length: Number(at) })
+}
+
+/// Nothing more comes on the port; the entry stays as long as this process does.
+function stay(port: Handle) -> Result<Void, TesseraError> {
+    while true {
+        let woke = try portWait(port, 1, Number(Deadline.infinite))
+        for completion in woke { log info("ignored a completion", key: completion.key) }
+    }
+    return .Ok
+}
+
+/// Runs the driver's start: finds the reader's pipes and publishes it.
+function run() -> Result<Void, StepFailure> {
+    let token = try during(.Token, driverLaunchToken())
+    let port = try during(.Port, portCreate(.None))
+    try completing(.Claim, driverClaim(token, port, PortKey.claim))
+    let claimed = try during(.Claim, completionFor(port, PortKey.claim))
+    let driver = Ref(claimed.result0)
+    log info("claimed an entry", entry: claimed.result1)
+    try completing(
+        .Open,
+        deviceOpen(EntryId(claimed.result1), .Usb, OpenOptions(UN32(0)), port, PortKey.open)
+    )
+    let opened = try during(.Open, completionFor(port, PortKey.open))
+    let usb = Ref(opened.result0)
+    let pipes = try during(.Pipes, findPipes(usb))
+    log info(
+        "found a reader",
+        device: hexText(pipes.vendorId, 4) + ":" + hexText(pipes.productId, 4),
+        interface: pipes.interface,
+        bulkOut: pipes.bulkOut,
+        bulkIn: pipes.bulkIn
+    )
+    try completing(.ClaimInterface, usbClaimInterface(usb, pipes.interface))
+    let state = try during(.SlotStatus, slotStatus(usb, pipes, port))
+    log info("read a slot", slot: 0, card: cardText(state))
+    let published = try during(.Publish, publish(driver, pipes, state))
+    log info("published an entry", id: published.raw)
+    return completing(.Wait, stay(port))
+}
+
+/// Logs the step that failed and why.
+function report(failed: borrow StepFailure) {
+    match failed.step {
+        Token -> log fault("no claim token; devicekitd starts this driver", error: failed.error)
+        Port -> log fault("no port", error: failed.error)
+        Claim -> log warn("cannot claim", error: failed.error)
+        Open -> log warn("cannot open the reader", error: failed.error)
+        Pipes -> log warn("no CCID interface", error: failed.error)
+        ClaimInterface -> log warn("cannot claim the interface", error: failed.error)
+        SlotStatus -> log warn("no slot status", error: failed.error)
+        Publish -> log warn("cannot publish", error: failed.error)
+        Wait -> log fault("the driver's port failed", error: failed.error)
+    }
+}
+
+/// Starts the CCID driver: runs its start, reports a failure, and stays as the driver's entry.
+@Main
+function main() {
+    match run() {
+        // `run` stays until its port fails.
+        Ok -> {}
+        Error(failed) -> report(failed)
+    }
+}

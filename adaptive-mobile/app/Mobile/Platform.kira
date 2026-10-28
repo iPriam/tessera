@@ -1,0 +1,203 @@
+//! The Adaptive Mobile platform's state and its answers to each thing MosaicDisplay tells it: surfaces that appear
+//! or go, the keys, the presses, the notifications and the lock screen.
+import Foundation
+import LibTessera
+import PlatformKit
+import TesseraDisplayClient
+import KiraUI
+import TesseraUI
+import PlatformUI
+import AppKit
+
+/// What the platform holds across its sessions with MosaicDisplay, and its
+/// answer to each thing MosaicDisplay tells a platform (DisplayPlatform).
+construct Mobile() extends DisplayPlatform {
+    // What is open, as PlatformKit keeps it.
+    var state: PlatformState
+    // The bridge to the applications and the home screen, which every copy of the handle reaches.
+    var bridge: BridgeHandle = makeBridgeHandle()
+    // The System channel, for the settings the platform follows.
+    var settings: PlatformSettingWatch = platformSettingWatch()
+    // The session's channel to MosaicDisplay, once one began.
+    var channel: Handle? = .None
+    // The lock screen, closed over the output at start.
+    var lock: LockState = LockState {}
+    // The surface that takes the keyboard when the lock screen opens.
+    var front: DisplaySurfaceId? = .None
+    // The platform's own surface, once a session began.
+    var own: DisplaySurfaceId? = .None
+    // The home screen's surface, once the compositor has said which it is.
+    var home: DisplaySurfaceId? = .None
+    // What is installed, which the Dock keeps and opens; the windows whose
+    // application has not been named to the platform yet; and the band the
+    // Dock takes along the bottom now.
+    var installed: [Application] = []
+    var unnamed: [DisplaySurfaceId] = []
+    var dock: Number = 0
+    // The output the session drew on, and the mode the platform last asked
+    // the compositor for: the stack, or Stage Manager while it is on.
+    var output: SurfaceFrame = SurfaceFrame { x: 0, y: 0, width: 0, height: 0 }
+    var mode: CompositorMode = .Stack
+    // The notification banner on screen, newest first.
+    var banners: [ShownNotification] = []
+    // The part of the output the banners took when the compositor was last
+    // told, which a touch on goes to the platform.
+    var overlay: SurfaceFrame = SurfaceFrame { x: 0, y: 0, width: 0, height: 0 }
+    // Where the compositor was last asked to draw each piece of the
+    // platform's glass: the Dock's and the banners'.
+    var glass: PlatformGlassClaim = PlatformGlassClaim {}
+    // Control Center: whether it is down, and Focus.
+    var controls: ControlCenterState = ControlCenterState {}
+    // The time zone the clocks read in, Settings' `time.zone`.
+    var zone: TimeZone = utcTimeZone()
+    // The status bar's ink, read from the picture under it.
+    var tone: StatusBarTone = StatusBarTone {}
+    // The home indicator's ink, which follows the picture along the bottom.
+    var indicatorTone: StatusBarTone = StatusBarTone {}
+    // Whether a window is being swiped home, with the Dock shown behind it;
+    // and the window flying out of its icon or into it, or about to, which
+    // the Dock stays up for until MosaicDisplay says it has landed.
+    var peeking: Bool = false
+    var flying: DisplaySurfaceId? = .None
+    // The surfaces that asked for the status bar to be hidden while they are
+    // in front (`.statusBarHidden`), and the band it takes along the top now.
+    var barHidden: [DisplaySurfaceId] = []
+    var bar: Number = 0
+    // Whether the home screen is being edited, which gives the top of the
+    // screen to its own edit bar.
+    var homeEditing: Bool = false
+    // The applications last opened from the Dock, which go back into it when
+    // they go home rather than into their icon on the home screen.
+    var fromDock: [String] = []
+
+    function onConfigure(borrow mut self, configuration: borrow DisplayConfiguration) {
+        if own != .Some(configuration.surface) { return }
+        output.width = Number(configuration.width)
+        output.height = Number(configuration.height)
+    }
+
+    function onSurfaceCreated(borrow mut self, surface: borrow DisplaySurface) {
+        surfaceAppeared(self, surface)
+    }
+
+    function onSurfaceDestroyed(borrow mut self, surface: DisplaySurfaceId) {
+        if self.home == .Some(surface) {
+            self.homeEditing = false
+            self.barHidden = surfacesBut(self.barHidden, surface)
+        }
+        surfaceWent(self, surface)
+    }
+
+    function onGrabFired(borrow mut self, key: borrow DisplayKey) {
+        grabFired(self, key)
+    }
+
+    function onSurfacePressed(borrow mut self, surface: DisplaySurfaceId) {
+        surfacePressed(self, surface)
+    }
+
+    function onIdleChanged(borrow mut self, state: borrow DisplayIdleState) {
+        idleChanged(self, state)
+    }
+
+    function onBarBackdrop(borrow mut self, backdrop: borrow DisplayBackdrop) {
+        let now = unixMillis()
+        tone.heard(Number(backdrop.bar), now)
+        indicatorTone.heard(Number(backdrop.bottom), now)
+        keepTone(self)
+    }
+
+    function onWindowRequested(borrow mut self, request: borrow DisplayWindowRequest) {
+        windowRequested(self, request)
+    }
+
+    function onActivateRequested(borrow mut self, surface: DisplaySurfaceId) {
+        activateRequested(self, surface)
+    }
+
+    function onChannelChanged(borrow mut self, declared: borrow DisplayChannelValue) {
+        match declared.channel {
+            Badge -> {}
+            StatusBarHidden -> statusBarAsked(self, declared.surface, declared.value != 0)
+            HomeEditing -> homeEdited(self, declared.surface, declared.value != 0)
+        }
+    }
+
+    function onSurfacePlaced(borrow mut self, placement: borrow DisplayPlacement) {
+        surfacePlaced(self, placement)
+    }
+
+    function onNotification(borrow mut self, notification: borrow DisplayNotification) {
+        log info(
+            "a notification arrived",
+            notification: notification.id,
+            priority: notification.priority
+        )
+    }
+
+    /// The platform asks for no verification; an answer is only noted.
+    function onVerifyResult(borrow mut self, trusted: Bool) {
+        log info("the compositor verified the prompt", ok: trusted)
+    }
+}
+
+/// An application surface appeared: the platform tracks it, notes the home
+/// screen, and focuses it, once the lock screen has opened.
+function surfaceAppeared(mobile: borrow mut Mobile, announced: borrow DisplaySurface) {
+    let surface = announced.surface
+    log info("an application surface appeared", surface: surface.raw)
+    match announced.role {
+        Desktop -> mobile.home = .Some(surface)
+        // Any other role is an application like the rest.
+        None, Application, Platform, Presence -> {}
+    }
+    if !trackWindow(mobile.bridge, mobile.state, announced) { mobile.unnamed.append(surface) }
+    if announced.role != .Desktop {
+        match stripPutAway(mobile, PlatformSurfaceId(surface.raw)) {
+            Ok -> {}
+            Error(failure) -> reportStripPutAwayFailure(failure)
+        }
+    }
+    // An application opening over the home screen grows out of its icon,
+    // over the Dock, which stays until it has landed.
+    if announced.role == .Application && atHome(mobile) && !mobile.lock.locked {
+        awaitFlight(mobile, surface)
+    }
+    mobile.front = .Some(surface)
+    keepDock(mobile)
+    if !mobile.lock.locked {
+        focus(mobile, surface)
+        return
+    }
+    // The compositor focuses what it admits; while the lock screen is up the
+    // keyboard is the platform's again.
+    match mobile.own {
+        Some(own) -> focus(mobile, own)
+        None -> {}
+    }
+    log info("the lock screen holds the keyboard", surface: surface.raw)
+}
+
+/// An application surface went: the platform stops tracking it, and the
+/// application with its last window.
+function surfaceWent(mobile: borrow mut Mobile, surface: DisplaySurfaceId) {
+    log info("an application surface went", surface: surface.raw)
+    match mobile.state.windowClosed(PlatformSurfaceId(surface.raw)) {
+        Ok -> {}
+        Error(failure) -> log info("a surface went that the platform was not tracking", failure)
+    }
+    mobile.fromDock = stillOpen(mobile, mobile.fromDock)
+    if mobile.front == .Some(surface) { mobile.front = .None }
+    if mobile.flying == .Some(surface) { mobile.flying = .None }
+    mobile.barHidden = surfacesBut(mobile.barHidden, surface)
+    keepDock(mobile)
+}
+
+/// The applications of `names` that are still open.
+function stillOpen(mobile: borrow Mobile, names: borrow [String]) -> [String] {
+    var open: [String] = []
+    for name in names {
+        if mobile.state.applicationNamed(name).isSome() { open.append(copy name) }
+    }
+    return open
+}

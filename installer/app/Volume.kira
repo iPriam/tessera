@@ -1,0 +1,164 @@
+//! The installation's volume: its disk, its mounts, its format and its layout.
+import Foundation
+import LibTessera
+
+// The volume: formatting a disk, laying it out, and recording which system
+// is current.
+
+/// Where the installation's volume is, on which disk and where its top is mounted, and where the system image is and where it is mounted.
+struct Installation {
+    let disk: String
+    let volume: String
+    let image: ImageSource
+    let imageAt: String
+}
+
+/// Where the system image is: a disk the installer image's PID 1 has, or a file on the recovery media.
+enum ImageSource {
+    Disk(String)
+    File(String)
+}
+
+/// The path of `inside`, a path from the volume's top, where it is mounted.
+function onVolume(installation: borrow Installation, inside: borrow String) -> String {
+    return installation.volume + "/" + inside
+}
+
+/// Mounts the volume, formatting it first when it is new: mkfs.btrfs is run without `-f`, so it refuses a disk that carries any file system.
+function mountVolume(installation: borrow Installation) -> Result<Void, String> {
+    match mountTop(installation) {
+        Ok -> {
+            log info("mounted the volume", disk: installation.disk)
+            return .Ok
+        }
+        Error(failed) -> log info("the disk holds no volume yet", error: errorName(failed))
+    }
+    match format(installation.disk, VolumeLayout.label, false) {
+        Ok -> {}
+        Error(problem) -> return .Error(problem)
+    }
+    match mountTop(installation) {
+        Ok -> {
+            log info("mounted the new volume", disk: installation.disk)
+            return .Ok
+        }
+        Error(failed) -> return .Error("the new volume would not mount: \(errorName(failed))")
+    }
+}
+
+/// Mounts the top of the volume, the root under which its subvolumes are laid out.
+function mountTop(installation: borrow Installation) -> Result<Void, TesseraError> {
+    if !isDirectory(installation.volume) {
+        match makeDirectory(installation.volume) {
+            Ok -> {}
+            Error(failure) -> absorb failure
+        }
+    }
+    return volumeMount(installation.disk, installation.volume, .Btrfs, VolumeOptions.none)
+}
+
+/// Formats `disk` as a btrfs volume named `name`, with the page size and options the system needs.
+function format(disk: borrow String, name: borrow String, over: Bool) -> Result<Void, String> {
+    var arguments = ["-q", "-L", copy name, "-s", String(memoryPageSize())]
+    if over { arguments.append("-f") }
+    arguments.append("/dev/" + disk)
+    let command = ProcessCommand { program: formatterPath(), arguments: arguments }
+    let child = match command.start() {
+        Ok(started) -> started
+        Error(failure) -> return .Error("mkfs.btrfs did not start: \(traceText(failure))")
+    }
+    let ended = child.wait()
+    match child.release() {
+        Ok -> {}
+        Error(failure) -> log warn("mkfs.btrfs's process was not released", traceText(failure))
+    }
+    match ended {
+        Ok(exit) -> match exit {
+            Status(status) -> {
+                if status != 0 {
+                    return .Error("mkfs.btrfs refused the disk or failed, with status \(status)")
+                }
+                log info("put a btrfs on the disk", disk, name)
+                return .Ok
+            }
+            Signalled(signal) -> return .Error("mkfs.btrfs was killed by signal \(signal)")
+        }
+        Error(failure) -> return .Error("mkfs.btrfs could not be waited for: \(traceText(failure))")
+    }
+}
+
+/// The path of btrfs-progs's formatter: /bin/mkfs.btrfs in both the installer image and the recovery media.
+function formatterPath() -> String {
+    return "/" + SystemDirectory.programs + "/mkfs.btrfs"
+}
+
+/// The data subvolume's directories, made when it is.
+namespace DataSkeleton {
+    let directories: [String] = ["Applications", "BuildCache", "Cache", "appdata", "system"]
+}
+
+/// Makes `boot/` and `system/`, and the `data` subvolume holding the skeleton, each when missing.
+function layOut(installation: borrow Installation) -> Result<Void, String> {
+    for directory in [VolumeLayout.boot, VolumeLayout.systems] {
+        match makeMissing(onVolume(installation, directory)) {
+            Ok -> {}
+            Error(problem) -> return .Error(problem)
+        }
+    }
+    let data = onVolume(installation, VolumeLayout.data)
+    if isDirectory(data) { return .Ok }
+    match volumeCreateSubvolume(data) {
+        Ok -> {}
+        Error(failed) -> return .Error("the data subvolume could not be made: \(errorName(failed))")
+    }
+    log info("made the data subvolume")
+    for directory in DataSkeleton.directories {
+        match makeMissing(data + "/" + directory) {
+            Ok -> {}
+            Error(problem) -> return .Error(problem)
+        }
+    }
+    return .Ok
+}
+
+/// Makes `path` as a directory when it is missing.
+function makeMissing(path: borrow String) -> Result<Void, String> {
+    if isDirectory(path) { return .Ok }
+    match makeDirectory(path) {
+        Ok -> return .Ok
+        Error(failure) -> return .Error("\(path) could not be made: \(traceText(failure))")
+    }
+}
+
+/// Records `version` as the current system: written beside the record, then renamed over it, so the record is either the old one or the new one.
+function recordCurrent(
+    installation: borrow Installation,
+    version: borrow String
+) -> Result<Void, String> {
+    let record = onVolume(installation, VolumeLayout.current)
+    let written = record + ".new"
+    match writeFile(written, version + "\n") {
+        Ok -> {}
+        Error(failure) -> return .Error("\(written) could not be written: \(traceText(failure))")
+    }
+    match renamePath(written, record) {
+        Ok -> {}
+        Error(failure) -> return .Error("\(record) could not be replaced: \(traceText(failure))")
+    }
+    log info("recorded the current system", version)
+    return .Ok
+}
+
+/// The version `boot/current` names, when there is one.
+function currentVersion(installation: borrow Installation) -> String? {
+    match readFile(onVolume(installation, VolumeLayout.current)) {
+        Ok(contents) -> {
+            let version = contents.text.trim()
+            return version.count > 0 ? .Some(version) : .None
+        }
+        Error(failure) -> {
+            absorb failure
+            return .None
+        }
+    }
+}

@@ -1,0 +1,350 @@
+import Foundation
+import Heap
+
+// The bootstrap protocol and entitlements (§11.4–11.6).
+//
+// A process LibTessera launched starts with its bootstrap channel as its
+// startup channel and the Startup message queued on it. `runtimeInit` reads
+// the message, turns its handles into this process's table, and points the
+// standard streams at the StdIn, StdOut and StdErr entries so programs that
+// write to them still work.
+//
+// A process with no Startup message was started by the system, before any
+// LibTessera process existed: it is a system process, holds every
+// entitlement, and is given a Node for the root (`SystemRoot`), a Job for
+// its own job, and its standard streams as StdIn, StdOut and StdErr.
+
+// A process's standard streams, numbered as the kernel numbers them.
+@Derive(Copy)
+enum StandardStream: U32 {
+    Input = 0
+    Output = 1
+    Error = 2
+}
+
+let standardStreams: [StandardStream] = [.Input, .Output, .Error]
+
+// The Startup entry that carries `stream`.
+function standardStreamTag(stream: borrow StandardStream) -> StartupTag {
+    return match stream {
+        Input -> StartupTag.stdIn
+        Output -> StartupTag.stdOut
+        Error -> StartupTag.stdErr
+    }
+}
+
+@Derive(Copy)
+public struct StartupEntry {
+    var tag: StartupTag
+    // The rights to narrow the handle to; none passes it as it is.
+    var rights: Rights?
+    var handle: Handle
+}
+
+@Derive(Copy)
+public struct StartupInfo {
+    var flags: StartupFlags
+    var appId: UNumber
+    var processId: UNumber
+    var jobId: UNumber
+}
+
+// What a handle in the Startup message is for. 15 is Tessera's addition:
+// the root Node, given to system processes only. 16 to 4095 are reserved for
+// Tessera, and 4096 and up are free for an app's own helper protocols.
+@Derive(Copy)
+public distinct StartupTag = UNumber
+
+public namespace StartupTag {
+    let system: StartupTag = StartupTag(1)
+    let presence: StartupTag = StartupTag(2)
+    let containerData: StartupTag = StartupTag(3)
+    let containerCache: StartupTag = StartupTag(4)
+    let containerTemp: StartupTag = StartupTag(5)
+    let bundle: StartupTag = StartupTag(6)
+    let entitlements: StartupTag = StartupTag(7)
+    let launch: StartupTag = StartupTag(8)
+    let stdIn: StartupTag = StartupTag(9)
+    let stdOut: StartupTag = StartupTag(10)
+    let stdErr: StartupTag = StartupTag(11)
+    let parentChannel: StartupTag = StartupTag(12)
+    let job: StartupTag = StartupTag(13)
+    let executable: StartupTag = StartupTag(14)
+    let systemRoot: StartupTag = StartupTag(15)
+    // The first tag an app may give its own meaning.
+    let firstApp: StartupTag = StartupTag(4096)
+}
+
+// `StartupMessage.flags`.
+@Derive(Copy)
+public distinct StartupFlags = UNumber
+
+public namespace StartupFlags {
+    let none: StartupFlags = StartupFlags(0)
+    let isMain: StartupFlags = StartupFlags(1)
+    let debugImage: StartupFlags = StartupFlags(2)
+    let certified: StartupFlags = StartupFlags(4)
+}
+
+let startupMagic: U32 = U32(0x54535254)
+
+// Whether the process holds `name`. A system process holds them all, and
+// so does a process given the entitlement `*`.
+public function entitlementHas(name: borrow String) -> Bool { return entitlementHeld(name) }
+
+function entitlementHeld(name: borrow String) -> Bool {
+    runtimeEnsure()
+    if library.systemProcess { return true }
+    for index in 0..library.entitlements.count {
+        if library.entitlements[index] == "*" || library.entitlements[index] == name { return true }
+    }
+    return false
+}
+
+function runtimeEnsure() {
+    if library.startupDone { return }
+    // A runtime that did not start answers each call with that call's own
+    // failure, so there is nothing to pass on here.
+    match runtimeInit() {
+        Ok -> {}
+        Error(failed) -> absorb failed
+    }
+}
+
+// The handle the Startup message gave for `tag`; none when it gave none.
+public function startupHandle(tag: StartupTag) -> Handle? {
+    runtimeEnsure()
+    for index in 0..library.startupTags.count {
+        if library.startupTags[index] == tag { return .Some(library.startupHandles[index]) }
+    }
+    // No Launcher hands one over yet (§25.4): the library connects it.
+    if tag == StartupTag.system {
+        match systemStartupHandle() {
+            Ok(handle) -> return .Some(handle)
+            Error(failed) -> {
+                // The broker cannot be reached: there is no System channel.
+                absorb failed
+                return .None
+            }
+        }
+    }
+    // A system process's job is found when first asked for: PID 1 starts
+    // before the kernel can say which job anything is in.
+    if tag == StartupTag.job && library.systemProcess {
+        let found = match jobOfSelf() {
+            Ok(value) -> value
+            Error(failed) -> {
+                // A job that cannot be found is no job to answer.
+                if failed.code != .NotFound {
+                    log warn("the job of this process could not be found", error: errorName(failed))
+                }
+                return .None
+            }
+        }
+        return match found {
+            Some(job) -> {
+                library.startupTags.append(StartupTag.job)
+                library.startupHandles.append(job)
+                return .Some(job)
+            }
+            None -> .None
+        }
+    }
+    return .None
+}
+
+public function startupInfo() -> StartupInfo {
+    runtimeEnsure()
+    return library.startup
+}
+
+// Reads the Startup message, once. Every call that needs it runs this
+// first, so a program may also leave it to them.
+public function runtimeInit() -> Result<Void, TesseraError> {
+    if library.startupDone { return .Ok }
+    library.startupDone = true
+    let started = try kernelStartupChannel()
+    let bootstrapBacking = try started otherwise return systemProcessInit()
+    let message = match channelReceive(bootstrapBacking) {
+        Ok(value) -> value
+        Error(failed) -> {
+            // A packet end that brings no message was not left by a
+            // Tessera parent: the process was started by the system.
+            kernelRelease(bootstrapBacking)
+            absorb failed
+            return systemProcessInit()
+        }
+    }
+    let at = messagePayloadOffset(message)
+    if messagePayloadLength(message) < U64(48) || heapLoad<U32>(message.block, at) != startupMagic {
+        messageDiscard(message)
+        kernelRelease(bootstrapBacking)
+        return systemProcessInit()
+    }
+    library.systemProcess = false
+    let body = heapOffset(message.block, at)
+    let count = heapLoad<U32>(body, 8)
+    library.startup = StartupInfo {
+        flags: StartupFlags(heapLoad<U32>(body, 12)),
+        appId: heapLoad<U64>(body, 16),
+        processId: heapLoad<U64>(body, 24),
+        jobId: heapLoad<U64>(body, 32),
+    }
+    let handles = messageHandles(message)
+    for index in 0..count {
+        let entry = U64(48 + index * 8)
+        let handleIndex = heapLoad<U32>(body, entry + U64(4))
+        if handleIndex < handles.count {
+            library.startupTags.append(StartupTag(heapLoad<U32>(body, entry)))
+            library.startupHandles.append(handles[handleIndex])
+        }
+    }
+    deallocate(message.block)
+    let bootstrap = objectCreate(.Channel(.Plain), bootstrapBacking)
+    let bootstrapHandle = try handleForNew(bootstrap, Rights.processDefault)
+    library.bootstrapHandle = .Some(bootstrapHandle)
+    try entitlementsLoad(startupHandle(StartupTag.entitlements))
+    return startupStandardStreams()
+}
+
+// A system process gets the root, its standard streams and, when asked, its job.
+function systemProcessInit() -> Result<Void, TesseraError> {
+    library.systemProcess = true
+    let root = try kernelSystemRoot()
+    // Map and Execute too: the system starts its programs from the root, and
+    // `Process.launch` needs Read | Execute on each.
+    let rootHandle = try handleForNew(
+        objectCreate(.Node, root),
+        Rights.processDefault | Rights.nodeAll | Rights.map | Rights.execute
+    )
+    library.startupTags.append(StartupTag.systemRoot)
+    library.startupHandles.append(rootHandle)
+    // The streams the system started it with, so it can hand its children
+    // the console. The output streams are opened to append: a console has no
+    // offsets, so they are written at `FileOffset.append`.
+    for index in 0..standardStreams.count {
+        let stream = standardStreams[index]
+        let opened = try kernelStandardStream(stream)
+        match opened {
+            Some(backing) -> {
+                var mode = OpenMode.write | OpenMode.append
+                var rights = Rights.write
+                if stream == .Input {
+                    mode = OpenMode.read
+                    rights = Rights.read
+                }
+                let object = objectCreate(.File(FileObject { mode: mode }), backing)
+                let handle = try handleForNew(
+                    object,
+                    rights | Rights.duplicate | Rights.transfer | Rights.wait | Rights.inspect
+                )
+                library.startupTags.append(standardStreamTag(stream))
+                library.startupHandles.append(handle)
+            }
+            None -> {}
+        }
+    }
+    return .Ok
+}
+
+// Points the standard streams at the entries the parent gave.
+function startupStandardStreams() -> Result<Void, TesseraError> {
+    for index in 0..standardStreams.count {
+        let stream = standardStreams[index]
+        let handle = match startupHandle(standardStreamTag(stream)) {
+            Some(value) -> value
+            None -> continue
+        }
+        match handleSlotOf(handle) {
+            Some(slot) -> {
+                let object = objectOfSlot(slot)
+                let backing = try backingOf(object)
+                try kernelSetStandardStream(stream, backing)
+            }
+            None -> {}
+        }
+    }
+    return .Ok
+}
+
+// The `EntitlementSet` (§11.6): `u64` count, then for each a `String` name
+// (`u64` length, bytes padded to 8) and an `Optional<Bytes>` value.
+function entitlementsLoad(given: Handle?) -> Result<Void, TesseraError> {
+    // A parent that gives no set gives no entitlements.
+    let memory = try given otherwise return .Ok
+    let object = try resolveObject(memory, .Memory, Rights.none)
+    let held = try memoryOf(object)
+    let size = held.size
+    if size < U64(8) { return .Error(failure(.InvalidArgument)) }
+    let blockBytes = zeroedBlock(count: Number(size + U64(8)), alignment: 16)
+    let block = blockBytes.pointer()
+    let backing = try backingOf(object)
+    try kernelReadAt(backing, block, size, held.offset)
+    let count = heapLoad<U64>(block, 0)
+    var at = U64(8)
+    for _ in 0..Number(count) {
+        if at + U64(8) > size { return .Error(failure(.InvalidArgument)) }
+        let length = heapLoad<U64>(block, at)
+        at += U64(8)
+        if at + length > size { return .Error(failure(.InvalidArgument)) }
+        library.entitlements.append(stringFromCBytes(heapOffset(block, at), length))
+        at += ((length + U64(7)) & ~U64(7))
+        if at + U64(8) > size { return .Error(failure(.InvalidArgument)) }
+        let present = heapLoad<U64>(block, at)
+        at += U64(8)
+        if present != U64(0) {
+            if at + U64(8) > size { return .Error(failure(.InvalidArgument)) }
+            let valueLength = heapLoad<U64>(block, at)
+            at += U64(8) + ((valueLength + U64(7)) & ~U64(7))
+        }
+    }
+    return .Ok
+}
+
+// The entitlements every program holds (§11.6).
+let defaultEntitlements: [String] = ["tessera.audio.playback", "tessera.haptics", "tessera.trace"]
+
+// The set a child is given: the parent's own. A system parent gives `*`.
+// A confined child is an application, and a bundle declares nothing yet,
+// so it is given the defaults the parent holds and nothing else: its
+// declaration, which is empty, met with the parent's set.
+function entitlementsForChild(confined: Bool) -> Result<Handle, TesseraError> {
+    var names: [String] = []
+    if confined {
+        for name in defaultEntitlements {
+            if entitlementHeld(name) { names.append(copy name) }
+        }
+    } else if library.systemProcess { names.append("*") } else {
+        for index in 0..library.entitlements.count { names.append(library.entitlements[index]) }
+    }
+    var size = U64(8)
+    for index in 0..names.count {
+        size = size + U64(16) + ((U64(names[index].count) + U64(7)) & ~U64(7))
+    }
+    let page = kernelPageSize()
+    let rounded = (size + page - U64(1)) & ~(page - U64(1))
+    let backing = try kernelMemoryCreate(rounded, false)
+    let blockBytes = zeroedBlock(count: size, alignment: 16)
+    let block = blockBytes.pointer()
+    heapStore<U64>(block, 0, U64(names.count))
+    var at = U64(8)
+    for index in 0..names.count {
+        let length = U64(names[index].count)
+        heapStore<U64>(block, at, length)
+        if length > U64(0) {
+            copyBytes(heapOffset(block, Number(at + U64(8))), names[index].data, length)
+        }
+        at += U64(8) + ((length + U64(7)) & ~U64(7))
+        heapStore<U64>(block, at, U64(0))
+        at += U64(8)
+    }
+    match kernelWriteAt(backing, block, size, U64(0)) {
+        Ok -> {}
+        Error(failed) -> {
+            kernelRelease(backing)
+            return .Error(failed)
+        }
+    }
+    let object = memoryFromBacking(backing, rounded, MemoryOptions.none)
+    return handleForNew(object, Rights.read | Rights.map | Rights.inspect | Rights.transfer)
+}

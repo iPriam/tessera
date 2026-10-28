@@ -1,0 +1,37 @@
+import Foundation
+import PlatformKit
+import TesseraDisplayClient
+
+// Badge artwork belongs to the platform; placement belongs to the display.
+// Keep the front window's artwork as well as the waiting windows' so moving
+// either way, and reversing a transition, never loses the badge texture.
+public struct StageStripItem {
+    let surface: PlatformSurfaceId
+    let name: String
+}
+
+public function stageBadgeItems(state: borrow PlatformState) -> [StageStripItem] {
+    var surfaces = state.stripSurfaces(StageBadgeAtlas.slots - 1)
+    match state.stagedSurface() {
+        Some(front) -> for surface in state.surfaces {
+            if surface.id == front { surfaces.append(copy surface) }
+        }
+        None -> {}
+    }
+    // Windows put away keep their artwork too: one going home flies into its
+    // icon after the platform has hidden it, and grows out of it coming back.
+    let hidden = state.hiddenApplicationSurfaces()
+    for surface in state.surfaces {
+        if surfaces.count >= StageBadgeAtlas.slots { break }
+        if hidden.contains(surface.id) { surfaces.append(copy surface) }
+    }
+    var items: [StageStripItem] = []
+    for surface in surfaces {
+        let name = match state.applicationName(surface.application) {
+            Some(value) -> value
+            None -> ""
+        }
+        items.append(StageStripItem { surface: surface.id, name: move name })
+    }
+    return items
+}

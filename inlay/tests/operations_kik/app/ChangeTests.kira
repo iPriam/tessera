@@ -1,0 +1,56 @@
+import Foundation
+import FileOperations
+
+@Test
+function newFoldersTakeTheNextFreeName() {
+    let folder = freshFolder("new")
+    let first = try makeNewFolder(folder) otherwise ""
+    let second = try makeNewFolder(folder) otherwise ""
+    expect!(lastPathPart(first) == "untitled folder")
+    expect!(lastPathPart(second) == "untitled folder 2")
+    expect!(isDirectory(second))
+    expect!(removed(removeTree(folder)))
+}
+
+@Test
+function renameRefusesBadAndTakenNames() {
+    let folder = freshFolder("rename")
+    let file = childPath(folder, "a.txt")
+    writeText(file, "kept")
+    writeText(childPath(folder, "b.txt"), "other")
+    let taken = match renameEntry(file, "b.txt") {
+        Ok -> false
+        Error(failure) -> match failure {
+            AlreadyExists -> true
+            InvalidName, Missing, Refused, IntoItself -> false
+        }
+    }
+    expect!(taken)
+    let invalid = match renameEntry(file, "x/y") {
+        Ok -> false
+        Error(failure) -> match failure {
+            InvalidName -> true
+            AlreadyExists, Missing, Refused, IntoItself -> false
+        }
+    }
+    expect!(invalid)
+    let renamed = try renameEntry(file, "c.txt") otherwise ""
+    expect!(textAt(renamed) == "kept")
+    expect!(!pathExists(file))
+    expect!(removed(removeTree(folder)))
+}
+
+@Test
+function duplicatesCopyWholeFolders() {
+    let folder = freshFolder("duplicate")
+    let inner = childPath(folder, "Project")
+    expect!(made(makeDirectory(inner)))
+    writeText(childPath(inner, "notes.txt"), "plan")
+    let copied = try duplicateEntry(inner) otherwise ""
+    expect!(lastPathPart(copied) == "Project copy")
+    expect!(textAt(childPath(copied, "notes.txt")) == "plan")
+    let file = try duplicateEntry(childPath(inner, "notes.txt")) otherwise ""
+    expect!(lastPathPart(file) == "notes copy.txt")
+    expect!(removed(removeTree(folder)))
+    expect!(!pathExists(folder))
+}

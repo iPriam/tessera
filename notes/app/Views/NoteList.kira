@@ -1,0 +1,93 @@
+//! The list of notes in the Notes window, grouped by when they were saved.
+import KiraUI
+
+/// The list's lengths at the mobile size, scaled with the type as `scaledMetric` does.
+namespace NoteListMetrics {
+    let width: Number = 400
+    let rowPadding: Number = 14
+    let rowRadius: Number = 12
+    let margin: Number = 20
+}
+
+/// The notes in the list: with no notes the column says so, centred in it.
+construct NoteList(notes: [Note]) extends Widget {
+    body {
+        noteListContent(notes)
+        .width(scaledMetric(NoteListMetrics.width))
+    }
+}
+
+/// The list's content: its groups of notes, or a word saying there are none.
+function noteListContent(notes: borrow [Note]) -> Any Widget {
+    if notes.count == 0 {
+        return ContentUnavailableView(title = "No Notes", systemImage = .SquarePencil)
+    }
+    return ScrollView {
+        VStack(spacing = .Large, alignment = .Leading) {
+            For(group in grouped(notes, secondsNow())) {
+                noteGroup(group)
+            }
+        }
+        .padding(scaledMetric(NoteListMetrics.margin))
+    }
+}
+
+/// One group of the list, under its name.
+function noteGroup(group: borrow NoteGroup) -> Any Widget {
+    let chosen = chosenNoteKey()
+    let now = secondsNow()
+    var rows: [Any Widget] = []
+    for index in 0..group.notes.count {
+        let note = group.notes[index]
+        let selected = isChosen(note, chosen)
+        if index > 0 && !selected && !isChosen(group.notes[index - 1], chosen) {
+            rows.append(Divider().inset(horizontal = .Medium))
+        }
+        rows.append(noteRow(note, selected, now))
+    }
+    return VStack(spacing = .ExtraSmall, alignment = .Leading) {
+        Text(copy group.name)
+        .typography(.title3)
+        .fontWeight(.Bold)
+        VStack(spacing: .None, alignment: .Leading, children: rows)
+    }
+}
+
+/// Whether `note` is the chosen one.
+function isChosen(note: borrow Note, chosen: borrow String?) -> Bool {
+    match chosen {
+        Some(key) -> return note.key() == key
+        None -> return false
+    }
+}
+
+/// One note's row: pressed, it shows the note beside the list.
+function noteRow(note: borrow Note, selected: Bool, now: UN32) -> Any Widget {
+    let key = note.key()
+    let row = VStack(spacing = .Micro, alignment = .Leading) {
+        Text(note.shownTitle())
+        .typography(.headline)
+        HStack(spacing = .Small) {
+            Text(rowDate(note.saved, now))
+            .typography(.subheadline)
+            Text(note.preview())
+            .typography(.subheadline)
+            .opacity(0.6)
+        }
+    }
+    .padding(scaledMetric(NoteListMetrics.rowPadding))
+    .fillWidth()
+    .onClick(
+        { in
+            show(chosenFolder(), .Some(copy key))
+            return
+        }
+    )
+    if selected {
+        return row
+        .foregroundColor(.Black)
+        .backgroundColor(.Yellow)
+        .cornerRadius(scaledMetric(NoteListMetrics.rowRadius))
+    }
+    return row
+}

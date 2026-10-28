@@ -1,0 +1,78 @@
+import KiraUI
+import KCoreAnimation
+
+// The window: a bar with back, forward, reload and the address, and under it
+// the page, which is a texture the web process drew.
+construct BrowserView(engine: WebEngine, model: BrowserModel) extends Widget {
+    body {
+        VStack(spacing = .None, alignment = .Leading) {
+            HStack(spacing = .Small) {
+                Button(action = { in
+                    engine.goBack()
+                    return
+                }) {
+                    Icon(symbol = .ChevronLeft)
+                }
+                .disabled(!engine.canGoBack)
+                Button(action = { in
+                    engine.goForward()
+                    return
+                }) {
+                    Icon(symbol = .ChevronRight)
+                }
+                .disabled(!engine.canGoForward)
+                Button(action = { in
+                    if engine.loading { engine.stop() } else { engine.reload() }
+                    return
+                }) {
+                    Icon(symbol = engine.loading ? .Xmark : .ArrowClockwise)
+                }
+                TextField(
+                    title = "Search or enter address",
+                    text = Binding<String> {
+                        get: { in
+                            return copy model.field
+                        },
+                        set: { text in
+                            var held = model
+                            held.field = move text
+                            return
+                        }
+                    }
+                ).onSubmit({ in
+                    engine.load(addressFromText(model.field))
+                    return
+                })
+            }
+            .padding(scaledMetric(8))
+            if engine.loading {
+                ProgressView(value = engine.progress)
+            }
+            pageView(engine, model)
+        }
+    }
+}
+
+function pageView(engine: WebEngine, model: BrowserModel) -> Any Widget {
+    if engine.failed {
+        return ContentUnavailableView(title = "The web engine did not start", systemImage = .Xmark)
+    }
+    return GestureTextureView(
+        key = 1,
+        texture = engine.shown,
+        onScroll = { dx, dy in
+            engine.scroll(unixMillis(), dx, dy, model.pressX, model.pressY)
+            return
+        },
+        onDragStart = { dx, dy in
+            return
+        },
+        onDragMove = { dx, dy in
+            engine.pointerMove(unixMillis(), model.pressX + dx, model.pressY + dy)
+            return
+        },
+        onDragEnd = { dx, dy in
+            return
+        }
+    )
+}

@@ -1,0 +1,156 @@
+//! The connections to Presence: each verification request is checked with MosaicDisplay and answered with its verdict.
+import Foundation
+import LibTessera
+
+// Connections: verification requests, each answered with the verdict's error.
+//
+// A request names a token. Presence sends the check to MosaicDisplay on the
+// link, and answers the caller with what MosaicDisplay said: `Ok` for a valid
+// token, `NotFrontmost` for a token whose surface is not the front one, and
+// `NoInteraction` for anything else. A valid token is spent by the check.
+
+/// Takes every connection waiting on the listener.
+function accept(service: borrow mut Service) {
+    while true {
+        let channel = match serviceAccept(service.listener) {
+            Ok(value) -> value
+            Error(failed) -> {
+                if failed.code != .ShouldWait {
+                    log warn("a connection could not be taken", error: errorName(failed))
+                }
+                return
+            }
+        }
+        let id = service.nextClient
+        service.nextClient += 1
+        match objectWaitAsync(
+            channel,
+            Signals.readable | Signals.peerClosed,
+            .Repeat,
+            service.port,
+            channelKey(id)
+        ) {
+            Ok -> service.clients.append(Client { id: id, channel: channel })
+            Error(failed) -> {
+                log warn("a connection cannot be waited on", error: errorName(failed))
+                closeHandle(channel)
+            }
+        }
+    }
+}
+
+/// Cancels what is armed under `key`; a closing client may have nothing armed, and then there is nothing to cancel.
+function cancelWaits(port: Handle, key: Number) {
+    match portCancel(port, key) {
+        // The waits are cancelled, and how many there were is not needed.
+        Ok -> {}
+        Error(failed) -> {
+            if failed.code != .NotFound {
+                log warn("a wait could not be cancelled", key, error: errorName(failed))
+            }
+        }
+    }
+}
+
+/// The index of connection `id` in the service's connections, or none when it is not one.
+function clientIndex(service: borrow Service, id: Number) -> Number? {
+    for (index, client) in service.clients.enumerated() {
+        if client.id == id { return .Some(index) }
+    }
+    return .None
+}
+
+/// Closes a connection and forgets it.
+function closeClient(service: borrow mut Service, id: Number) {
+    let index = match clientIndex(service, id) {
+        Some(value) -> value
+        // Already closed; there is no connection left to release.
+        None -> return
+    }
+    cancelWaits(service.port, channelKey(id))
+    closeHandle(service.clients[index].channel)
+    var kept: [Client] = []
+    for other in service.clients {
+        if other.id != id { kept.append(other) }
+    }
+    service.clients = kept
+}
+
+/// Waits until MosaicDisplay has written its verdict on `link`, or the link has gone; the wait is not bounded, since a link that stops answering ends with its peer.
+function awaitVerdict(link: Handle) -> Result<Void, TesseraError> {
+    let port = try portCreate(.None)
+    var result: Result<Void, TesseraError> = .Ok
+    match objectWaitAsync(link, Signals.readable | Signals.peerClosed, .Once, port, 1) {
+        Ok -> match portWait(port, 1, Deadline.infinite) {
+            Ok -> {}
+            Error(failed) -> result = .Error(failed)
+        }
+        Error(failed) -> result = .Error(failed)
+    }
+    closeHandle(port)
+    return result
+}
+
+/// Asks MosaicDisplay about the token and answers the caller with its verdict.
+function verifyRequest(service: borrow Service, channel: Handle, token: borrow VerifyToken) {
+    let operation = code(Operation.Verify)
+    let link = match service.link {
+        Some(value) -> value
+        None -> {
+            log warn("a verification has no display link")
+            answer(channel, operation, .NoInteraction)
+            return
+        }
+    }
+    let check = InteractionToken {
+        idLow: token.idLow,
+        idHigh: token.idHigh,
+        surfaceId: token.surfaceId,
+        issued: UNumber(0),
+    }
+    match checkedToken(link, move check) {
+        Ok(reply) -> {
+            log info("a token was checked")
+            answer(channel, operation, verdictError(verdictOf(reply.verdict)))
+        }
+        Error(failure) -> {
+            log warn("a token could not be checked", error: errorName(failure))
+            answer(channel, operation, .NoInteraction)
+        }
+    }
+}
+
+/// The check of `token` on `link`: sends it, waits for the verdict, and returns MosaicDisplay's reply; each transport failure reaches the caller intact.
+function checkedToken(
+    link: Handle,
+    token: InteractionToken
+) -> Result<TokenCheckMessage, TesseraError> {
+    try sendTokenCheck(link, tokenCheck(move token))
+    try awaitVerdict(link)
+    return receiveTokenCheck(link)
+}
+
+/// Answers everything a connection has sent, and closes it once its peer has gone.
+function serveClient(service: borrow mut Service, id: Number) {
+    while true {
+        let index = match clientIndex(service, id) {
+            Some(value) -> value
+            // A completion can outlive its connection.
+            None -> return
+        }
+        let channel = service.clients[index].channel
+        match receive(channel) {
+            Ok(request) -> match request {
+                Verify(token) -> verifyRequest(service, channel, token)
+            }
+            Error(failed) -> match failed {
+                Channel(error) -> {
+                    if error.code != .ShouldWait { closeClient(service, id) }
+                    return
+                }
+                UnknownOperation(operation) -> answer(channel, operation, .Unsupported)
+                Refused(refusal) -> answer(channel, code(refusal.operation), refusal.reason)
+            }
+        }
+    }
+}

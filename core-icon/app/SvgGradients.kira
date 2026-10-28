@@ -1,0 +1,160 @@
+import Foundation
+import RenderBox
+
+// The paint a `fill` or `stroke` names: `none`, a colour, or `url(#id)` of a
+// gradient, whose stops may come from another gradient it `href`s.
+
+extend SvgPainter {
+    function paintNamed(text: borrow String) -> SvgPaint {
+        let trimmed = text.trim()
+        if trimmed == "none" || trimmed.count == 0 { return .None }
+        if !trimmed.startsWith("url(") {
+            return .Color(try parsedSvgColor(trimmed) otherwise RGBAColor {})
+        }
+        let source = try referenced(trimmed) otherwise return .None
+        return .Gradient(gradientOf(source))
+    }
+
+    // The gradient `source` defines, with the stops of the gradient it
+    // refers to when it has none of its own.
+    function gradientOf(source: borrow SvgElement) -> SvgGradient {
+        var gradient = SvgGradient {
+            boundingBox: source.attribute("gradientUnits") != .Some("userSpaceOnUse"),
+            stops: stopsOf(source)
+        }
+        match source.attribute("gradientTransform") {
+            Some(written) -> gradient.transform = svgTransform(written)
+            // The gradient is in the units it names.
+            None -> {}
+        }
+        if gradient.stops.count == 0 {
+            let reference = gradientReference(source)
+            match reference {
+                Some(written) -> match referenced(written) {
+                    Some(linked) -> gradient.stops = stopsOf(linked)
+                    None -> {}
+                }
+                // A gradient that names nothing has no stops, and paints nothing.
+                None -> {}
+            }
+        }
+        gradient.edgeMode = match source.attribute("spreadMethod") {
+            Some(method) -> method.trim() == "reflect" ? .Mirror : (
+                method.trim() == "repeat" ? .Repeat : .Clamp
+            )
+            None -> .Clamp
+        }
+        gradient.shape = gradientShapeOf(source, gradient.boundingBox)
+        return gradient
+    }
+}
+
+// SVG's modern href takes precedence over its older namespaced spelling.
+function gradientReference(source: borrow SvgElement) -> String? {
+    return match source.attribute("href") {
+        Some(written) -> .Some(written)
+        None -> source.attribute("xlink:href")
+    }
+}
+
+// A gradient coordinate: a number, or a percentage of the box or of one.
+function gradientCoordinate(
+    source: borrow SvgElement,
+    name: borrow String,
+    fallback: Number
+) -> Number {
+    let written = try source.attribute(name) otherwise return fallback
+    let trimmed = written.trim()
+    if trimmed.endsWith("%") {
+        let number = try parseNumber(
+            trimmed.substring(0, trimmed.count - 1)
+        ) otherwise return fallback
+        return number / 100
+    }
+    return try svgLength(.Some(trimmed)) otherwise fallback
+}
+
+function gradientShapeOf(source: borrow SvgElement, boundingBox: Bool) -> SvgGradientShape {
+    if source.name == "radialGradient" {
+        let centre = Point {
+            x: gradientCoordinate(source, "cx", 0.5),
+            y: gradientCoordinate(source, "cy", 0.5)
+        }
+        let focus = Point {
+            x: gradientCoordinate(source, "fx", centre.x),
+            y: gradientCoordinate(source, "fy", centre.y)
+        }
+        return .Radial(
+            SvgCircle { centre: centre, radius: gradientCoordinate(source, "r", 0.5), focus: focus }
+        )
+    }
+    let reach: Number = boundingBox ? 1 : 0
+    return .Linear(
+        SvgLine {
+            start: Point {
+                x: gradientCoordinate(source, "x1", 0),
+                y: gradientCoordinate(source, "y1", 0)
+            },
+            end: Point {
+                x: gradientCoordinate(source, "x2", reach),
+                y: gradientCoordinate(source, "y2", 0)
+            }
+        }
+    )
+}
+
+// The `<stop>`s inside `source`, in order, each no earlier than the last.
+function stopsOf(source: borrow SvgElement) -> [GradientStop] {
+    var stops: [GradientStop] = []
+    var floor: Number = 0
+    for child in source.children {
+        if child.name != "stop" { continue }
+        let offset = clamp(max(gradientCoordinate(child, "offset", 0), floor), 0, 1)
+        floor = offset
+        let color = try parsedSvgColor(
+            try child.attribute("stop-color") otherwise "black"
+        ) otherwise RGBAColor {}
+        let alpha = color.a * (try opacityAttribute(child, "stop-opacity") otherwise 1)
+        stops.append(
+            GradientStop {
+                color: RGBAColor { r: color.r, g: color.g, b: color.b, a: alpha },
+                location: offset
+            }
+        )
+    }
+    return stops
+}
+
+// The gradient RenderBox draws for `gradient`, its stops `opacity` as opaque.
+function renderBoxGradient(gradient: borrow SvgGradient, opacity: Number) -> Gradient {
+    var stops: [GradientStop] = []
+    for stop in gradient.stops {
+        let c = stop.color
+        stops.append(
+            GradientStop {
+                color: RGBAColor { r: c.r, g: c.g, b: c.b, a: c.a * opacity },
+                location: stop.location
+            }
+        )
+    }
+    let geometry = match gradient.shape {
+        Linear(line) -> GradientGeometry.Axial(
+            AxialGradient { startPoint: copy line.start, endPoint: copy line.end }
+        )
+        Radial(circle) -> GradientGeometry.Radial(
+            RadialGradient {
+                startCenter: copy circle.focus,
+                startRadius: 0,
+                endCenter: copy circle.centre,
+                endRadius: circle.radius
+            }
+        )
+    }
+    return Gradient {
+        geometry: geometry,
+        stops: stops,
+        colorSpace: .StandardRgb,
+        edgeMode: gradient.edgeMode,
+        interpolation: .Linear
+    }
+}

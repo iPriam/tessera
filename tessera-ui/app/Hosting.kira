@@ -1,0 +1,478 @@
+//! One session of an application or platform with MosaicDisplay: frames drawn
+//! when the interface changed, keys delivered, the links to the platform read,
+//! requests sent to PID 1 and its answers shown.
+
+import Foundation
+import KiraUI
+import KCoreAnimation
+import Ember
+import LibTessera
+import TesseraDisplayClient
+import AppKit
+
+/// An application or platform, what it draws with and what it waits on.
+struct Hosting {
+    var host: Host
+    var drawing: Drawing
+    var waits: Waits
+    // The process's links to the platform and what the home screen said, shared with
+    // the platform's own closures.
+    var bridge: BridgeHandle
+    // The marks of this process's launch, until its first frame is shown.
+    var launch: LaunchTimeline
+    // A platform's hooks; none for an application.
+    var hooks: DynamicPlatformHooks? = .None
+    // A display link PID 1 handed over while a session ran: MosaicDisplay
+    // started again, and the session on the old link is about to end.
+    var replacement: DisplayLink? = .None
+    var pipe: FramePipe = FramePipe {}
+}
+
+/// The frames on their way to the screen. One is drawn while the one before
+/// it still flips: a frame is asked for once at most one committed frame is
+/// not yet done, which the third texture leaves room for (Renderer.kira).
+struct FramePipe {
+    // Asked for and not yet granted, then granted and not yet drawn.
+    var asked: UNumber? = .None
+    var granted: UNumber? = .None
+    // Committed and not yet told done.
+    var flying: [UNumber] = []
+    // The generation of textures each slot was last attached with, by slot
+    // from 1: a slot whose texture was made again is exported again.
+    var attached: [Number] = [0, 0, 0]
+
+    /// Whether a new frame may be asked for: none is asked or granted, and at most one is still flying.
+    function canAsk(borrow self) -> Bool {
+        return asked.isNone() && granted.isNone() && flying.count <= 1
+    }
+}
+
+/// How a session ended.
+enum Ending {
+    // The person quit the application.
+    Quit
+    Ended(SessionEnd)
+}
+
+/// What a turn of the session left it to do.
+enum Turn {
+    Continue
+    Quit
+}
+
+/// Runs one session on `link` until it ends: its frames, input and waits; returns how it ended.
+function hostSession(
+    link: borrow DisplayLink,
+    hosting: borrow mut Hosting,
+    rootBuilder: borrow () -> Any Widget
+) -> Ending {
+    let opened = match openSession(link) {
+        Ok(value) -> value
+        Error(end) -> return .Ended(end)
+    }
+    launchMark(hosting.launch, "session")
+    let session = opened.session
+    hosting.host.size = copy opened.size
+    hosting.host.scale = opened.scale
+    hosting.host.output = copy opened.output
+    hosting.host.focus = copy opened.focus
+    hosting.host.insets = copy opened.insets
+    hosting.host.stale = true
+    hosting.host.menusOwed = true
+    // A new session imports every texture afresh.
+    hosting.pipe = FramePipe {}
+    match hosting.hooks {
+        Some(hooks) -> hooks.began(
+            DynamicPlatformSession {
+                channel: copy session.channel,
+                surface: session.surface,
+                size: copy opened.size
+            }
+        )
+        // An application begins with its first frame.
+        None -> {}
+    }
+    while true {
+        match turn(session, hosting, rootBuilder) {
+            Ok(next) -> match next {
+                Continue -> continue
+                Quit -> return .Quit
+            }
+            Error(end) -> return .Ended(end)
+        }
+    }
+}
+
+/// Draws what changed, then waits for what comes next and takes it.
+function turn(
+    session: borrow Session,
+    hosting: borrow mut Hosting,
+    rootBuilder: borrow () -> Any Widget
+) -> Result<Turn, SessionEnd> {
+    match takeWindowCommand() {
+        Some(command) -> match command {
+            Close -> return .Ok(.Quit)
+            Minimize -> try askWindow(session, .Minimize)
+            ToggleMaximize -> try askWindow(session, .Zoom)
+        }
+        None -> {}
+    }
+    match hosting.host.options.embedded {
+        Some(content) -> if content.tick(hosting.drawing.renderer.device.graphics()) {
+            hosting.host.stale = true
+        }
+        None -> {}
+    }
+    match hosting.pipe.granted {
+        Some(serial) -> try drawGranted(session, hosting, rootBuilder, FrameSerial(serial))
+        None -> {}
+    }
+    if hosting.host.due() && hosting.pipe.canAsk() {
+        let serial = FrameSerial(hosting.host.frames + 1)
+        try session.requestFrame(serial)
+        hosting.pipe.asked = .Some(serial.raw)
+        launchMark(hosting.launch, "asked")
+    }
+    hosting.host.publish(hosting.bridge)
+    try tellLaunchIcon(session)
+    sendWorkspaceRequests(hosting.waits)
+    match hosting.hooks {
+        Some(hooks) -> hooks.arm(hosting.waits.port)
+        None -> {}
+    }
+    // Input taken while the frame's answers were awaited -- a press let go
+    // during the frame its going down drew -- is already owed a frame, and
+    // nothing else may come to wake the wait for it. An interface still
+    // moving -- a transition or a spring on its way -- is owed the next frame
+    // too, which the display paces by granting it; nothing else would wake
+    // the wait for it, and the picture would stop partway until the next
+    // input came.
+    // A redraw the interface asked for that has come is taken here, and
+    // whatever wakes the wait next the interface is built again for it.
+    let redraw = redrawWaitLimit(.None)
+    if redraw == .Some(0) { hosting.host.stale = true }
+    var asked = hosting.host.options.waitLimit()
+    // A frame owed waits for the display only while the pipe is full.
+    if hosting.host.due() && hosting.pipe.canAsk() { asked = .Some(0) }
+    match redraw {
+        Some(left) -> asked = match asked {
+            Some(value) -> .Some(min(value, left))
+            None -> .Some(left)
+        }
+        None -> {}
+    }
+    let limit = hosting.waits.applications.waitLimit(hosting.waits.volumes.waitLimit(move asked))
+    let woke = match hosting.waits.next(copy session.channel, move limit, hosting.bridge) {
+        Ok(value) -> value
+        Error(failure) -> return .Error(.Broken(failure))
+    }
+    match woke {
+        Time, Volumes, Applications -> hosting.host.stale = true
+        Message -> try takeMessages(session, hosting)
+        Answer -> {
+            takeWorkspaceAnswer(hosting.waits)
+            hosting.host.stale = true
+        }
+        Parent -> takeParentMessage(hosting)
+        System -> if hosting.waits.takeSystem() { hosting.host.stale = true }
+        Link(key) -> linkWoke(hosting, key)
+        Platform(key) -> {
+            match hosting.hooks {
+                Some(hooks) -> hooks.woke(key)
+                None -> log warn("a platform's wait completed in an application", key: key)
+            }
+            hosting.host.stale = true
+        }
+    }
+    // What the application lists of /Applications is read again on every
+    // look after it changed.
+    if hosting.waits.applications.takeChange() { noteApplicationsChange() }
+    return .Ok(.Continue)
+}
+
+/// Tells the display the icon an application is about to be opened from,
+/// before PID 1 is asked to open it.
+function tellLaunchIcon(session: borrow Session) -> Result<Void, SessionEnd> {
+    let icon = try takeLaunchIcon() otherwise return .Ok
+    return session.sendMessage(
+        .SetLaunchOrigin(
+            DisplayLaunchOrigin {
+                surface: session.surface,
+                icon: StageFrame { x: icon.x, y: icon.y, width: icon.width, height: icon.height },
+                corner: icon.corner,
+            }
+        )
+    )
+}
+
+/// Asks the display for `action` on the session's window: the platform
+/// decides whether it moves, goes to the Dock or zooms. Closing the window
+/// quits, as the application has one.
+function askWindow(
+    session: borrow Session,
+    action: DisplayWindowAction
+) -> Result<Void, SessionEnd> {
+    return session.sendMessage(
+        .RequestWindow(DisplayWindowRequest { surface: session.surface, action: action })
+    )
+}
+
+/// Takes the link PID 1 sent while the session ran: a link to the platform is
+/// AppKit's, and a display link waits for the session to end.
+function takeParentMessage(hosting: borrow mut Hosting) {
+    let received = match takeServiceLink() {
+        Ok(value) -> value
+        Error(failure) -> {
+            log warn("a link from PID 1 could not be read", error: errorName(failure))
+            hosting.waits.parentGone()
+            return
+        }
+    }
+    match received {
+        Some(link) -> match link {
+            Platform(platformLink) -> adoptLink(hosting, platformLink)
+            Display(displayLink) -> {
+                match hosting.replacement {
+                    Some(older) -> closeDisplayLink(older)
+                    None -> {}
+                }
+                hosting.replacement = .Some(displayLink)
+            }
+        }
+        None -> {
+            log info("PID 1 closed its channel")
+            hosting.waits.parentGone()
+        }
+    }
+}
+
+/// Takes `link` to or from the platform. An application owes the platform its menus
+/// on a new link.
+function adoptLink(hosting: borrow mut Hosting, link: borrow PlatformLink) {
+    match adoptPlatformLink(
+        copy hosting.bridge,
+        link.channel,
+        link.clientIndex,
+        link.application
+    ) {
+        Ok -> log info("took a link to the platform", client: link.clientIndex)
+        Error(failure) -> log warn("a link to the platform was not taken", failure: failure)
+    }
+    hosting.host.menusOwed = true
+    hosting.host.stale = true
+    hosting.host.homeEditingSent = false
+}
+
+/// Reads what arrived on a link: the menus an application has, on the platform's
+/// side, and the items chosen and the Dock the home screen draws, on the
+/// application's.
+function linkWoke(hosting: borrow mut Hosting, key: Number) {
+    match platformLinkWoke(copy hosting.bridge, key) {
+        Ok -> {}
+        Error(failure) -> log warn("a link to the platform could not be read", failure: failure)
+    }
+    let ran = !hosting.host.platform && performChosenItems(hosting.bridge)
+    if hosting.host.platform || ran || takeDockChange(copy hosting.bridge) {
+        hosting.host.stale = true
+    }
+}
+
+/// Draws granted frame `serial` and commits it; the display tells it done
+/// once it is on the screen, which `take` hears.
+function drawGranted(
+    session: borrow Session,
+    hosting: borrow mut Hosting,
+    rootBuilder: borrow () -> Any Widget,
+    serial: FrameSerial
+) -> Result<Void, SessionEnd> {
+    hosting.pipe.granted = .None
+    match hosting.hooks {
+        Some(hooks) -> hosting.host.badges = hooks.badges()
+        None -> {}
+    }
+    let textures = match hosting.drawing.renderer.fit(
+        hosting.host.drawnPixels(),
+        hosting.host.roomPixels()
+    ) {
+        Ok(value) -> value
+        Error(failure) -> return .Error(.NoTextures(failure))
+    }
+    // This frame draws everything taken so far. What arrives while it is
+    // shown -- a configure that resizes the window, above all -- is the next
+    // frame's, and is not forgotten when this one completes.
+    let changed = hosting.host.stale || hosting.host.touched()
+    hosting.host.stale = false
+    hosting.host.drawOwed = false
+    launchMark(hosting.launch, "fitted")
+    try drawFrame(hosting, rootBuilder, textures, serial, changed)
+    launchMark(hosting.launch, "drawn")
+    if hosting.host.isWindow() { try sendBackdrop(session, hosting) }
+    if !hosting.host.platform {
+        try sendStatusBarHidden(session, hosting)
+        try sendHomeEditing(session, hosting)
+        publishHomeScreenIcons(hosting.bridge)
+    }
+    if hosting.host.platform {
+        try sendPlatformBadges(session, hosting.host.badges)
+        try sendPlatformGlass(session, hosting)
+    }
+    let memory = textures.memoryFor(serial)
+    let slot = serial.raw % 3 + 1
+    let fresh = hosting.pipe.attached[slot - 1] != textures.generation
+    try session.commitFrame(hosting.drawing.exporter, memory, textures.drawn, serial, slot, fresh)
+    launchMark(hosting.launch, "committed")
+    hosting.pipe.attached[slot - 1] = textures.generation
+    hosting.pipe.flying.append(serial.raw)
+    hosting.host.frames = serial.raw
+    if hosting.host.moving() { hosting.host.drawOwed = true }
+    return .Ok
+}
+
+/// Takes the display's answer to a frame, when `message` is one.
+function takeFrameStep(hosting: borrow mut Hosting, message: borrow DisplayMessage) -> Bool {
+    match frameStep(message) {
+        Some(step) -> match step {
+            Granted(serial) -> {
+                if hosting.pipe.asked == .Some(serial) {
+                    hosting.pipe.asked = .None
+                    hosting.pipe.granted = .Some(serial)
+                    launchMark(hosting.launch, "granted")
+                }
+            }
+            Done(serial) -> {
+                launchShown(hosting.launch)
+                var flying: [UNumber] = []
+                for sent in hosting.pipe.flying {
+                    if sent != serial { flying.append(sent) }
+                }
+                hosting.pipe.flying = flying
+            }
+        }
+        None -> return false
+    }
+    return true
+}
+
+/// Builds the interface `rootBuilder` gives and draws it into the granted frame's texture.
+function drawFrame(
+    hosting: borrow mut Hosting,
+    rootBuilder: borrow () -> Any Widget,
+    textures: borrow FrameTextures,
+    serial: FrameSerial,
+    changed: Bool
+) -> Result<Void, SessionEnd> {
+    var frame = match hosting.drawing.renderer.device.frame() {
+        Ok(value) -> value
+        Error(failure) -> return .Error(.NotDrawn(failure))
+    }
+    if changed || hosting.host.buildOwed(frame) {
+        hosting.host.build(rootBuilder, frame)
+    } else {
+        hosting.host.carry(frame)
+    }
+    // The interface is laid out at its own size, and the whole of the
+    // textures is the viewport, so it is drawn into their top-left corner.
+    let scale = hosting.host.scale
+    let drawn = hosting.drawing.renderer.encode(
+        hosting.host.state.compositor,
+        frame,
+        Size { width: textures.size.width / scale, height: textures.size.height / scale },
+        scale
+    )
+    log debug("drew a frame", frame: serial.raw, commands: drawn)
+    hosting.drawing.renderer.present(frame, textures.textureFor(serial), hosting.host.canvas())
+    traceGpu(frame)
+    return .Ok
+}
+
+/// Takes the messages the display sent between frames, each that is waiting.
+/// None may be: the one the wait was for can have been taken while a frame's
+/// answer was awaited.
+function takeMessages(
+    session: borrow Session,
+    hosting: borrow mut Hosting
+) -> Result<Void, SessionEnd> {
+    while true {
+        let polled = try session.pollMessage()
+        match polled {
+            Some(message) -> try take(session, hosting, message)
+            None -> return .Ok
+        }
+    }
+    return .Ok
+}
+
+/// Takes `message`: what any session reads in place, a key or the pointer for
+/// the interface or the platform, and anything else for the platform's hooks.
+function take(
+    session: borrow Session,
+    hosting: borrow mut Hosting,
+    message: borrow DisplayMessage
+) -> Result<Void, SessionEnd> {
+    if takeFrameStep(hosting, message) { return .Ok }
+    let arrived = try session.arrival(message)
+    match arrived {
+        // Handled where it arrived.
+        Absorbed -> {}
+        Refocused(focus) -> hosting.host.refocused(move focus)
+        Resized(size) -> {
+            hosting.host.size = move size
+            hosting.host.stale = true
+            // A platform lays out chrome in output coordinates as well as
+            // drawing a resized buffer. Give it the configure after the
+            // session acknowledged it, before its next interface build.
+            match hosting.hooks {
+                Some(hooks) -> hooks.message(copy message)
+                None -> {}
+            }
+        }
+        Inset(insets) -> {
+            hosting.host.insets = move insets
+            hosting.host.stale = true
+        }
+        IconFlight -> hosting.host.stale = true
+        Moded(mode) -> {
+            hosting.host.adoptMode(mode)
+            if hosting.host.isWindow() {
+                try session.sendMessage(
+                    .SetMargin(
+                        DisplayMargin {
+                            surface: session.surface,
+                            margin: hosting.host.margin,
+                            corner: windowCornerRadius()
+                        }
+                    )
+                )
+            }
+        }
+        Moves -> match keyIn(message) {
+            Some(key) -> takeKey(hosting, key)
+            None -> {
+                let pointer = try takePointer(session, hosting, message)
+                if pointer { return .Ok }
+                match hosting.hooks {
+                    Some(hooks) -> {
+                        hooks.message(copy message)
+                        hosting.host.stale = true
+                    }
+                    None -> log debug("the display sent something the application does not read")
+                }
+            }
+        }
+    }
+    return .Ok
+}
+
+/// A key: the platform's first, when this is the platform, else the interface's.
+function takeKey(hosting: borrow mut Hosting, key: borrow DisplayKey) {
+    match hosting.hooks {
+        Some(hooks) -> {
+            if hooks.key(copy key) {
+                hosting.host.stale = true
+                return
+            }
+        }
+        None -> {}
+    }
+    deliverKey(key, hosting.host)
+}

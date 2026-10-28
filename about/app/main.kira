@@ -1,0 +1,17 @@
+//! The About app: a window that shows the system's name, version and machine.
+//!
+import KiraUI
+import TesseraUI
+
+/// Reads the release file, then runs the About window until the person quits it.
+@Main
+function main() {
+    let release = readRelease()
+    RunTesseraApplication(
+        "About",
+        { in
+            return AboutView(release = release)
+        },
+        ApplicationOptions {}
+    )
+}

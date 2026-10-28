@@ -1,0 +1,127 @@
+import Foundation
+import Heap
+import LibTessera
+import DeviceKit
+
+// A pointer that says where it is rather than how far it moved: a tablet, or
+// the pointer a virtual machine's window gives the guest, which puts the
+// cursor under the host's own as a Mac in UTM does. Each axis runs over the
+// range the device reports, and that range is the whole output, whatever
+// size the output is now.
+
+// The usages a pointer reports as motion, on the generic desktop page (X, Y
+// and the wheel) and the consumer page (AC Pan, a sideways scroll).
+@Open
+enum PointerAxis: UN32 {
+    X = 0x10030
+    Y = 0x10031
+    Wheel = 0x10038
+    Pan = 0xC0238
+}
+
+// The range of a tablet's X and Y; empty, with a maximum no greater than its
+// minimum, on a pointer that only moves.
+struct PointerAxes {
+    var xMinimum: Number = 0
+    var xMaximum: Number = 0
+    var yMinimum: Number = 0
+    var yMaximum: Number = 0
+}
+
+// `AxisInfo` as DeviceKit's `inputAxes` writes it, after an 8-byte header: the
+// usage @0, the resolution @4, the minimum @8 and the maximum @12.
+namespace AxisRecord {
+    let header: Number = 8
+    let bytes: Number = 24
+    let most: Number = 16
+}
+
+// The absolute axes the device at `device` reports.
+function pointerAxes(device: Ref) -> Result<PointerAxes, TesseraError> {
+    let out = zeroedBlock(
+        count: AxisRecord.header + AxisRecord.most * AxisRecord.bytes,
+        alignment: 16
+    )
+    let count = match inputAxes(
+        device,
+        Buffer {
+            address: out.pointer(),
+            length: AxisRecord.header + AxisRecord.most * AxisRecord.bytes
+        }
+    ) {
+        Ok(value) -> min(value, AxisRecord.most)
+        Error(reason) -> return .Error(reason)
+    }
+    var axes = PointerAxes {}
+    for index in 0..count {
+        let at = AxisRecord.header + index * AxisRecord.bytes
+        let usage = Number(heapLoad<U32>(out.pointer(), at))
+        let minimum = Number(heapLoad<N32>(out.pointer(), at + 8))
+        let maximum = Number(heapLoad<N32>(out.pointer(), at + 12))
+        match fromCode<PointerAxis>(UN32(usage)) {
+            X -> {
+                axes.xMinimum = minimum
+                axes.xMaximum = maximum
+            }
+            Y -> {
+                axes.yMinimum = minimum
+                axes.yMaximum = maximum
+            }
+            // Any other axis places nothing.
+            else -> {}
+        }
+    }
+    if axes.xMaximum > axes.xMinimum && axes.yMaximum > axes.yMinimum {
+        log info(
+            "a pointer says where it is",
+            width: axes.xMaximum - axes.xMinimum,
+            height: axes.yMaximum - axes.yMinimum
+        )
+    }
+    return .Ok(axes)
+}
+
+// Where an absolute record puts the pointer on an output `extent` points
+// along the axis.
+function placedOnAxis(value: Number, minimum: Number, maximum: Number, extent: Number) -> Number? {
+    if maximum <= minimum { return .None }
+    let along = clamp((value - minimum) / (maximum - minimum), 0.0, 1.0)
+    return .Some(floor(along * (extent - 1)))
+}
+
+// Takes an absolute record: the pointer is put where it says, as motion from
+// where it was, so the motion the frame delivers is what it moved.
+function takeAbsolute(
+    server: borrow mut Server,
+    axes: borrow PointerAxes,
+    usage: Number,
+    value: Number
+) {
+    let scanout = server.display.scanout
+    match fromCode<PointerAxis>(UN32(usage)) {
+        X -> match placedOnAxis(value, axes.xMinimum, axes.xMaximum, scanout.pointWidth()) {
+            Some(x) -> server.pointing.x = .Some(x)
+            // Outside the axis's range it places nothing.
+            None -> {}
+        }
+        Y -> match placedOnAxis(value, axes.yMinimum, axes.yMaximum, scanout.pointHeight()) {
+            Some(y) -> server.pointing.y = .Some(y)
+            // Outside the axis's range it places nothing.
+            None -> {}
+        }
+        // Any other axis places nothing.
+        else -> {}
+    }
+}
+
+// Turns where the pointer was put into motion from where it is.
+function settleAbsolute(server: borrow Server, pending: borrow mut PendingPointer) {
+    match pending.x {
+        Some(x) -> pending.dx += x - server.pointerX
+        None -> {}
+    }
+    match pending.y {
+        Some(y) -> pending.dy += y - server.pointerY
+        None -> {}
+    }
+}

@@ -1,0 +1,253 @@
+//! Writing the system onto the volume: the copies, the snapshots and the progress they report.
+import Foundation
+import LibTessera
+
+// Writing a system: the image's tree copied into a subvolume, every file of
+// it sealed with fs-verity and the composefs image beside them, which is then
+// snapshotted read-only as `system/<version>`. The systems the volume keeps
+// are the new one and the one that was current before it, until the new one
+// is known good; a dev snapshot is of the old system and is dropped, so the
+// next dev boot takes it again from the new one.
+
+/// How far a copy is: the files written of all of them, said to the caller of an install as they are written.
+struct CopyProgress {
+    let channel: Handle?
+    var done: Number
+    var total: Number
+}
+
+/// How many files are written between two progress reports.
+namespace ProgressStep {
+    // Files written between two progress answers.
+    let files: Number = 32
+}
+
+/// Writes the media's system onto the volume's system subvolume, reporting progress as it goes.
+function writeSystem(
+    installation: borrow Installation,
+    version: borrow String,
+    progress: borrow mut CopyProgress
+) -> Result<Void, String> {
+    let target = onVolume(installation, "\(VolumeLayout.systems)/\(version)")
+    let previous = currentVersion(installation)
+    if isDirectory(target) {
+        log info("the volume already holds this system", version)
+        return .Ok
+    }
+    match makeDirectory(installation.imageAt) {
+        Ok -> {}
+        Error(failure) -> absorb failure
+    }
+    let mounted = match installation.image {
+        Disk(disk) -> volumeMount(disk, installation.imageAt, .Squashfs, VolumeOptions.readOnly)
+        File(path) -> volumeMountImage(
+            path,
+            installation.imageAt,
+            .Squashfs,
+            VolumeOptions.readOnly
+        )
+    }
+    match mounted {
+        Ok -> {}
+        Error(failed) -> return .Error("the system image would not mount: \(errorName(failed))")
+    }
+    let written = writeMounted(installation, version, target, progress)
+    match volumeUnmount(installation.imageAt, VolumeUnmountOptions.none) {
+        Ok -> {}
+        Error(failed) -> log warn("the system image stays mounted", error: errorName(failed))
+    }
+    match written {
+        Ok -> {}
+        Error(problem) -> return .Error(problem)
+    }
+    log info("wrote the system", version)
+    dropOldSystems(installation, version, previous)
+    return .Ok
+}
+
+/// Copies the mounted image into a subvolume of its own, then snapshots it read-only: btrfs makes a subvolume read-only only as a snapshot of another.
+function writeMounted(
+    installation: borrow Installation,
+    version: borrow String,
+    target: borrow String,
+    progress: borrow mut CopyProgress
+) -> Result<Void, String> {
+    let staging = onVolume(installation, "\(VolumeLayout.systems)/.\(version)")
+    if isDirectory(staging) {
+        match volumeDeleteSubvolume(staging) {
+            Ok -> {}
+            Error(failed) -> return .Error(
+                "a half-written system could not be removed: \(errorName(failed))"
+            )
+        }
+    }
+    match volumeCreateSubvolume(staging) {
+        Ok -> {}
+        Error(failed) -> return .Error(
+            "the system's subvolume could not be made: \(errorName(failed))"
+        )
+    }
+    progress.total = countFiles(installation.imageAt)
+    match copyTree(installation.imageAt, staging, progress) {
+        Ok -> {}
+        Error(problem) -> return .Error(problem)
+    }
+    match volumeSnapshot(staging, target, true) {
+        Ok -> {}
+        Error(failed) -> return .Error(
+            "the system could not be sealed read-only: \(errorName(failed))"
+        )
+    }
+    match volumeDeleteSubvolume(staging) {
+        Ok -> {}
+        Error(failed) -> log warn("the staging subvolume stays", error: errorName(failed))
+    }
+    return .Ok
+}
+
+/// How many files and links the tree at `path` holds, for the progress to be a share of.
+function countFiles(path: borrow String) -> Number {
+    let names = match listDirectory(path) {
+        Ok(listing) -> listing.entries
+        Error(failure) -> {
+            absorb failure
+            return 0
+        }
+    }
+    var count = 0
+    for name in names {
+        let entry = path + "/" + name
+        match linkStatus(entry) {
+            Ok(status) -> match status.kind {
+                Directory -> count += countFiles(entry)
+                File, Link -> count += 1
+                Other -> {}
+            }
+            Error(failure) -> absorb failure
+        }
+    }
+    return count
+}
+
+/// One more file written.
+function advance(progress: borrow mut CopyProgress) {
+    progress.done += 1
+    let step = progress.done - floor(progress.done / ProgressStep.files) * ProgressStep.files
+    if step != 0 && progress.done != progress.total { return }
+    match progress.channel {
+        Some(channel) -> sendProgress(channel, progress.done, progress.total)
+        None -> {}
+    }
+}
+
+/// Deletes every system but `kept` and `previous`, and the dev snapshot.
+function dropOldSystems(
+    installation: borrow Installation,
+    kept: borrow String,
+    previous: borrow String?
+) {
+    let systems = onVolume(installation, VolumeLayout.systems)
+    let names = match listDirectory(systems) {
+        Ok(listing) -> listing.entries
+        Error(failure) -> {
+            log warn("the systems could not be listed", traceText(failure))
+            return
+        }
+    }
+    for name in names {
+        var keep = name == kept
+        match previous {
+            Some(version) -> if name == version { keep = true }
+            None -> {}
+        }
+        if !keep {
+            match volumeDeleteSubvolume(systems + "/" + name) {
+                Ok -> log info("deleted an old system", name)
+                Error(failed) -> log warn("an old system stays", name, error: errorName(failed))
+            }
+        }
+    }
+}
+
+/// Copies the tree at `from` into the directory `to`, with its permissions, and seals every file with fs-verity as a system's composefs image records it.
+function copyTree(
+    from: borrow String,
+    to: borrow String,
+    progress: borrow mut CopyProgress
+) -> Result<Void, String> {
+    let names = match listDirectory(from) {
+        Ok(listing) -> listing.entries
+        Error(failure) -> return .Error("\(from) could not be listed: \(traceText(failure))")
+    }
+    for name in names {
+        let source = from + "/" + name
+        let target = to + "/" + name
+        let status = match linkStatus(source) {
+            Ok(read) -> read
+            Error(failure) -> return .Error("\(source) could not be read: \(traceText(failure))")
+        }
+        match status.kind {
+            Directory -> {
+                if !isDirectory(target) {
+                    match makeDirectory(target) {
+                        Ok -> {}
+                        Error(failure) -> return .Error(
+                            "\(target) could not be made: \(traceText(failure))"
+                        )
+                    }
+                }
+                match copyTree(source, target, progress) {
+                    Ok -> {}
+                    Error(problem) -> return .Error(problem)
+                }
+            }
+            File -> {
+                match copyFile(source, target) {
+                    Ok -> {}
+                    Error(failure) -> return .Error(
+                        "\(source) could not be copied: \(traceText(failure))"
+                    )
+                }
+            }
+            Link -> {
+                let pointed = match readSymbolicLink(source) {
+                    Ok(read) -> read
+                    Error(failure) -> return .Error(
+                        "\(source) could not be read: \(traceText(failure))"
+                    )
+                }
+                match makeSymbolicLink(pointed, target) {
+                    Ok -> {}
+                    Error(failure) -> return .Error(
+                        "\(target) could not be linked: \(traceText(failure))"
+                    )
+                }
+                advance(progress)
+                continue
+            }
+            Other -> {
+                log warn("left out what is neither a file, a directory nor a link", source)
+                continue
+            }
+        }
+        match setFileMode(target, status.mode) {
+            Ok -> {}
+            Error(failure) -> return .Error(
+                "\(target)'s mode could not be set: \(traceText(failure))"
+            )
+        }
+        match status.kind {
+            File -> {
+                match volumeSealFile(target) {
+                    Ok -> {}
+                    Error(failed) -> return .Error(
+                        "\(target) could not be sealed: \(errorName(failed))"
+                    )
+                }
+                advance(progress)
+            }
+            Directory, Link, Other -> {}
+        }
+    }
+    return .Ok
+}

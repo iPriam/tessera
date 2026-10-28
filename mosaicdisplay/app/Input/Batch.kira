@@ -1,0 +1,109 @@
+import Foundation
+import TesseraDisplayClient
+
+// Keys between two input frames, held until the frame that ends them and then
+// delivered: to the platform when it grabbed the key, and otherwise to the
+// platform while it holds the input and the focused surface the rest of the
+// time. Each carries the modifiers held and the text it types through the
+// keymap (Keymap.kira), and a key held down repeats (Repeat.kira).
+
+// A key or a button as read, and when, in milliseconds of the monotonic
+// clock.
+struct PendingKey {
+    var code: UNumber
+    var state: DisplayKeyState
+    var time: UNumber = 0
+}
+
+// Keys that wake a blanked output only wake it, and reach no client
+// (Idle.kira); the modifiers still follow them.
+function flushKeys(server: borrow mut Server) -> Result<Void, TesseraError> {
+    let woke = try wakeForInput(server)
+    for key in server.pending {
+        followModifiers(server, key.code, key.state)
+        if woke { continue }
+        deliverKey(server, key)
+        followRepeat(server, key)
+    }
+    server.pending = []
+    return .Ok
+}
+
+// Delivers one key off the keyboard.
+function deliverKey(server: borrow mut Server, key: borrow PendingKey) {
+    log info("a key", key: key.code, state: displayKeyStateName(key.state))
+    if arrayContains(server.grabbed, key.code) {
+        // The platform grabbed this key, so it fires to the platform before the
+        // focused surface sees it.
+        match server.platform {
+            Some(platform) -> tell(
+                platform,
+                .GrabFired(
+                    keyEvent(
+                        server,
+                        DisplaySurfaceId.none,
+                        key,
+                        .Hardware,
+                        DisplayInteractionToken {}
+                    )
+                )
+            )
+            // No platform to fire to; a grabbed key goes nowhere else.
+            None -> {}
+        }
+        return
+    }
+    match keyTarget(server) {
+        // A focused client that has just quit cannot take the key; its
+        // session's end moves focus on, and the keyboard keeps working.
+        Some(index) -> {
+            let surface = server.clients[index].surface
+            let token = keyToken(server, surface, key)
+            tell(
+                server.clients[index].channel,
+                .Key(keyEvent(server, surface, key, .Hardware, move token))
+            )
+        }
+        // Nothing is focused, so the key has no surface to go to.
+        None -> {}
+    }
+}
+
+// `key` as the protocol carries it to `surface`: with the modifiers held now,
+// and the text it types, none as it comes up.
+function keyEvent(
+    server: borrow Server,
+    surface: DisplaySurfaceId,
+    key: borrow PendingKey,
+    provenance: DisplayProvenance,
+    token: DisplayInteractionToken
+) -> DisplayKey {
+    let text = match key.state {
+        // A key with no text, and a release, carry an empty text: the protocol
+        // field is a string, not an optional.
+        Pressed, Repeated -> typedText(server.keymap, key.code, server.modifiers).or("")
+        Released -> ""
+    }
+    return DisplayKey {
+        surface: surface,
+        key: key.code,
+        state: key.state,
+        provenance: provenance,
+        modifiers: server.modifiers,
+        text: text,
+        time: key.time,
+        token: token,
+    }
+}
+
+// The client a key that is not grabbed goes to: the platform while it holds
+// the input, and the focused surface otherwise.
+function keyTarget(server: borrow Server) -> Number? {
+    if server.inputHeld {
+        match platformIndex(server) {
+            Some(platform) -> return .Some(platform)
+            None -> {}
+        }
+    }
+    return server.focus
+}

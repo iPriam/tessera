@@ -1,0 +1,276 @@
+import Foundation
+import Heap
+
+// Jobs (§11.1–11.3).
+//
+// A job's backing is the kernel's job and `backing2` a watch on it that
+// reports when its last process has gone. The policy the library applied is
+// kept in the job's state, so a later one can be checked against it.
+
+@Derive(Copy)
+public struct JobPolicy {
+    var maxProcesses: UNumber
+    var maxThreads: UNumber
+    var maxHandlesPerProcess: UNumber
+    var memoryLimit: UNumber
+    var cpuShare: UNumber
+    // The highest QoS anything beneath the job may run at; none for no cap.
+    var maxQos: Qos?
+    var flags: JobDeny
+}
+
+// `JobPolicy.flags`: what nothing beneath the job may do.
+@Derive(Copy)
+public distinct JobDeny = UNumber
+
+public namespace JobDeny {
+    let none: JobDeny = JobDeny(0)
+    // No further `Process.launch`.
+    let launch: JobDeny = JobDeny(1)
+    let network: JobDeny = JobDeny(2)
+    let jit: JobDeny = JobDeny(4)
+}
+
+let jobPolicyNone: JobPolicy = JobPolicy {
+    maxProcesses: U32(0),
+    maxThreads: U32(0),
+    maxHandlesPerProcess: U32(0),
+    memoryLimit: U64(0),
+    cpuShare: U32(0),
+    maxQos: .None,
+    flags: JobDeny.none
+}
+
+// A new job's state: beneath the job `parent` (0 for one above this
+// process), under no policy but `deny`, watched by `watch`; `path` names it
+// when this process made it.
+function jobFresh(parent: U64, deny: JobDeny, watch: Number, path: String = "") -> JobObject {
+    var policy = jobPolicyNone
+    policy.flags = deny
+    return JobObject {
+        policy: policy,
+        killed: false,
+        populated: false,
+        parent: parent,
+        watch: watch,
+        path: path,
+    }
+}
+
+// A job this process made goes with its object. Its processes may still be
+// on their way out of a kill, and the kernel keeps a job until they are
+// gone; such a job is tried again when the next one is made.
+function jobTeardown(job: borrow JobObject) -> Result<Void, TesseraError> {
+    kernelRelease(job.watch)
+    if job.path.isEmpty() { return .Ok }
+    let removed = try jobRemoved(job.path)
+    if !removed { library.emptiedJobs.append(copy job.path) }
+    return .Ok
+}
+
+// Removes the jobs left behind still emptying that have emptied since.
+function jobSweepEmptied() -> Result<Void, TesseraError> {
+    var left: [String] = []
+    for path in library.emptiedJobs {
+        let removed = try jobRemoved(path)
+        if !removed { left.append(copy path) }
+    }
+    library.emptiedJobs = move left
+    return .Ok
+}
+
+// Whether the job at `path` is gone: removed now, or gone already. One that
+// cannot be removed for any other reason is let go, so it is not asked again.
+function jobRemoved(path: borrow String) -> Result<Bool, TesseraError> {
+    return match kernelJobRemovePath(path) {
+        Ok -> .Ok(true)
+        Error(failed) -> {
+            if failed.code == .Busy { return .Ok(false) }
+            if failed.code == .NotFound { return .Ok(true) }
+            return .Error(failed)
+        }
+    }
+}
+
+// A process was launched into the job; from now on it ends when it empties.
+function jobMarkPopulated(object: Number) {
+    match library.objects[object].state {
+        Job(state) -> {
+            var job = move state
+            job.populated = true
+            setJob(object, move job)
+        }
+        None, Port, Event, EventPair, Timer, Channel, Memory, Thread, Process, Node, File, Watch, Endpoint, Stream, WakeLock, Presence -> {}
+    }
+}
+
+// A limit is tighter when the old one was unset (0) or the new one is set and
+// no larger.
+function limitTighter32(old: U32, new: U32) -> Bool {
+    return old == U32(0) || (new != U32(0) && new <= old)
+}
+
+// Whether the QoS cap `new` is no looser than `old`.
+function qosTighter(old: borrow Qos?, new: borrow Qos?) -> Bool {
+    return match old {
+        None -> true
+        Some(cap) -> match new {
+            None -> false
+            Some(narrowed) -> code(narrowed) <= code(cap)
+        }
+    }
+}
+
+function limitTighter64(old: U64, new: U64) -> Bool {
+    return old == U64(0) || (new != U64(0) && new <= old)
+}
+
+function policyTighter(old: borrow JobPolicy, new: borrow JobPolicy) -> Bool {
+    if !limitTighter32(old.maxProcesses, new.maxProcesses) { return false }
+    if !limitTighter32(old.maxThreads, new.maxThreads) { return false }
+    if !limitTighter32(old.maxHandlesPerProcess, new.maxHandlesPerProcess) { return false }
+    if !limitTighter64(old.memoryLimit, new.memoryLimit) { return false }
+    if !limitTighter32(old.cpuShare, new.cpuShare) { return false }
+    if !qosTighter(old.maxQos, new.maxQos) { return false }
+    return new.flags.has(old.flags)
+}
+
+function jobApply(object: Number, policy: borrow JobPolicy) -> Result<Void, TesseraError> {
+    var job = try jobOf(object)
+    let backing = try backingOf(object)
+    try kernelJobLimits(backing, policy)
+    job.policy = policy
+    setJob(object, move job)
+    return .Ok
+}
+
+// A job object around the kernel's job `backing`, at `path` when this
+// process made it.
+function jobFromBacking(
+    backing: Number,
+    parentId: U64,
+    path: String = ""
+) -> Result<Number, TesseraError> {
+    let watch = try kernelJobWatch(backing)
+    return .Ok(objectCreate(.Job(jobFresh(parentId, JobDeny.none, watch, move path)), backing))
+}
+
+// The job of the calling process, none on a kernel that keeps no jobs.
+function jobOfSelf() -> Result<Handle?, TesseraError> {
+    let found = try kernelJobSelf()
+    let backing = try found otherwise return .Ok(.None)
+    let object = match jobFromBacking(backing, U64(0)) {
+        Ok(value) -> value
+        Error(failed) -> {
+            kernelRelease(backing)
+            return .Error(failed)
+        }
+    }
+    let handle = try handleForNew(object, Rights.processDefault)
+    return .Ok(.Some(handle))
+}
+
+public function jobCreate(parent: Handle, policy: JobPolicy) -> Result<Handle, TesseraError> {
+    let above = try resolveObject(parent, .Job, Rights.manage)
+    let held = try jobOf(above)
+    if !policyTighter(held.policy, policy) { return .Error(failure(.AccessDenied)) }
+    let parentBacking = try backingOf(above)
+    try jobSweepEmptied()
+    let name = "job-" + stringFromUnsigned(kernelProcessId()) + "-" + stringFromUnsigned(
+        library.nextJobName
+    )
+    library.nextJobName += U64(1)
+    let backing = try kernelJobCreate(parentBacking, name)
+    // Without its path the job stays behind once it is done with, as one
+    // given to this process does.
+    let path = match kernelDisplayPath(backing) {
+        Ok(value) -> "/" + value
+        Error(failed) -> {
+            log debug("a job made here has no path", error: errorName(failed))
+            ""
+        }
+    }
+    let object = match jobFromBacking(backing, library.objects[above].id, move path) {
+        Ok(value) -> value
+        Error(failed) -> {
+            kernelRelease(backing)
+            // The watch's failure is the one to report; a job left behind
+            // empty holds nothing.
+            match kernelJobRemove(parentBacking, name) {
+                Ok -> {}
+                Error(failed) -> absorb failed
+            }
+            return .Error(failed)
+        }
+    }
+    match jobApply(object, policy) {
+        Ok -> {}
+        Error(failed) -> {
+            objectDestroy(object)
+            // The policy's failure is the one to report; a job left behind
+            // empty holds nothing.
+            match kernelJobRemove(parentBacking, name) {
+                Ok -> {}
+                Error(failed) -> absorb failed
+            }
+            return .Error(failed)
+        }
+    }
+    return handleForNew(object, Rights.processDefault)
+}
+
+// Kills every process beneath the job.
+public function jobKill(job: Handle) -> Result<Void, TesseraError> {
+    let object = try resolveObject(job, .Job, Rights.manage)
+    var held = try jobOf(object)
+    let backing = try backingOf(object)
+    try kernelJobKill(backing)
+    held.killed = true
+    setJob(object, move held)
+    return .Ok
+}
+
+// A new policy may only tighten the one in force.
+public function jobSetPolicy(job: Handle, policy: JobPolicy) -> Result<Void, TesseraError> {
+    let object = try resolveObject(job, .Job, Rights.manage)
+    let held = try jobOf(object)
+    if !policyTighter(held.policy, policy) { return .Error(failure(.AccessDenied)) }
+    return jobApply(object, policy)
+}
+
+// Ended: killed or once populated, and now empty.
+function jobEnded(object: Number, job: borrow JobObject) -> Result<Bool, TesseraError> {
+    if !job.killed && !job.populated { return .Ok(false) }
+    let populated = try kernelJobPopulated(job.watch)
+    return .Ok(!populated)
+}
+
+// `JobInfo`, 48 bytes.
+// `JobInfo.state`.
+@Derive(Copy)
+enum JobState: U32 {
+    Active = 0
+    Killing = 1
+    Dead = 2
+}
+
+function jobInfoWrite(
+    object: Number,
+    job: borrow JobObject,
+    block: RawPtr
+) -> Result<U64, TesseraError> {
+    let backing = try backingOf(object)
+    let kernel = try kernelJobState(backing)
+    var state = JobState.Active
+    if job.killed {
+        state = kernel.populated ? .Killing : .Dead
+    }
+    heapStore<U64>(block, 0, library.objects[object].id)
+    heapStore<U64>(block, 8, job.parent)
+    heapStore<U32>(block, 16, kernel.processes)
+    heapStore<U32>(block, 20, kernel.descendants)
+    heapStore<U32>(block, 24, code(state))
+    heapStore<U64>(block, 32, kernel.memory)
+    heapStore<U64>(block, 40, kernel.cpu)
+    return .Ok(48)
+}

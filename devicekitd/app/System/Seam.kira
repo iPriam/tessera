@@ -1,0 +1,97 @@
+import Foundation
+import Heap
+import LibTessera
+
+// The manager's calls into the kernel, through LibTessera's backend seam
+// (17 §6.3, §20.4).
+//
+// The device manager is DeviceKit's, and Linux's: it speaks in descriptors,
+// `open` flags and the kernel's socket structures. It makes no system call
+// itself; LibTessera's backend makes each one and answers a value or a
+// `TesseraError` whose detail is the errno.
+
+// A kernel descriptor this process holds.
+@Derive(Copy)
+struct Descriptor {
+    var number: Number
+}
+
+// The flags a file is opened with, or a memory object is made with.
+@Derive(Copy)
+distinct LinuxOpen = U64
+
+namespace LinuxOpen {
+    let readOnly: LinuxOpen = LinuxOpen(0)
+    let readWrite: LinuxOpen = LinuxOpen(2)
+    let closeOnExec: LinuxOpen = LinuxOpen(0x80000)
+    let nonBlock: LinuxOpen = LinuxOpen(0x800)
+    // `MFD_CLOEXEC`.
+    let memoryCloseOnExec: LinuxOpen = LinuxOpen(1)
+}
+
+// The errnos the manager tells apart.
+@Derive(Copy)
+@Derive(CaseIterable)
+enum LinuxErrno: U32 {
+    NotPermitted = 1
+    NoEntry = 2
+    NoDeviceOrAddress = 6
+    Again = 11
+    AccessDenied = 13
+    Busy = 16
+    NoDevice = 19
+}
+
+function errnoOf(failed: borrow TesseraError) -> LinuxErrno? {
+    return caseWithCode(allCases_LinuxErrno(), failed.detail)
+}
+
+// Whether a call failed only because nothing is ready yet.
+function wouldBlock(failed: borrow TesseraError) -> Bool {
+    if failed.code == .ShouldWait { return true }
+    return match errnoOf(failed) {
+        Some(errno) -> errno == .Again
+        None -> false
+    }
+}
+
+function openPath(path: borrow String, flags: LinuxOpen) -> Result<Descriptor, TesseraError> {
+    let number = try backendOpen(path, (flags | LinuxOpen.closeOnExec).raw, U64(0))
+    return .Ok(Descriptor { number: number })
+}
+
+function closeDescriptor(descriptor: borrow Descriptor) {
+    match backendClose(descriptor.number) {
+        // The descriptor is gone, so there is nothing left to do.
+        Ok -> {}
+        Error(failed) -> log warn("a descriptor could not be closed", error: errorName(failed))
+    }
+}
+
+function closeHandle(handle: Handle) {
+    match handleClose(handle) {
+        // The handle is gone, so there is nothing left to do.
+        Ok -> {}
+        Error(failed) -> log warn("a handle could not be closed", error: errorName(failed))
+    }
+}
+
+// The monotonic clock, in nanoseconds. A clock that cannot be read is the
+// caller's to act on.
+function now() -> Result<Number, TesseraError> {
+    return match timeRead(.Monotonic) {
+        Ok(value) -> .Ok(Number(value))
+        Error(failed) -> .Error(failed)
+    }
+}
+
+namespace Link {
+    let bytes: Number = 4096
+}
+
+// Where the symbolic link `path` points.
+function readLink(path: borrow String) -> Result<String, TesseraError> {
+    let block = zeroedBlock(count: Link.bytes + 1, alignment: 16)
+    let length = try backendReadLink(path, block.pointer(), Link.bytes)
+    return .Ok(stringFromCBytes(block.pointer(), min(length, Link.bytes)))
+}

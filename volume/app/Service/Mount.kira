@@ -1,0 +1,194 @@
+//! Mounting volumes under /Volumes: the formats they hold and the mount points they are given.
+import Foundation
+import LibTessera
+import DeviceKit
+
+// Mounting what the scan found, as diskarbitrationd mounts a disk it has
+// probed.
+//
+// Every volume that holds a file system this service knows is mounted at
+// `/Volumes/<name>`, the name being the file system's own label or, without
+// one, the node's. A volume the device marks read-only is mounted
+// read-only. Nothing on a mounted volume is run, and nothing on it is a
+// device node or makes its runner more privileged: every mount is `noexec`,
+// `nodev` and `nosuid`, which is what keeps code to the system volume
+// (roadmap/05-storage-and-state.md). A volume something has mounted already,
+// such as the system or data volume PID 1 mounted, or this service before it
+// was restarted, is left where it is.
+//
+// The kernel mounts the device from its node's path. That is the one place
+// this service names a node: the kernel opens it, not this process.
+
+/// The volume format a content names, or none when it names none this service mounts.
+function formatOf(content: borrow Content) -> VolumeFormat? {
+    return match content {
+        Ext4 -> .Some(VolumeFormat.Ext4)
+        Btrfs -> .Some(VolumeFormat.Btrfs)
+        Fat -> .Some(VolumeFormat.Fat)
+        Erofs -> .Some(VolumeFormat.Erofs)
+        Squashfs -> .Some(VolumeFormat.Squashfs)
+        Unknown -> .None
+        Gpt -> .None
+        Mbr -> .None
+        Empty -> .None
+    }
+}
+
+/// The name a volume format is reported by.
+function formatName(format: borrow VolumeFormat) -> String {
+    return match format {
+        None -> "none"
+        Ext4 -> "ext4"
+        Btrfs -> "btrfs"
+        Fat -> "fat"
+        Erofs -> "erofs"
+        Squashfs -> "squashfs"
+    }
+}
+
+/// Whether a format is a container whose volumes are mounted separately.
+function isContainer(format: borrow VolumeFormat) -> Bool {
+    return match format {
+        Squashfs -> true
+        Erofs -> true
+        None -> false
+        Ext4 -> false
+        Btrfs -> false
+        Fat -> false
+    }
+}
+
+/// A volume mounted in the mount table: its node and the path it is mounted at.
+struct Mounted {
+    var source: String
+    var target: String
+}
+
+/// The mount table, as the entries mounted in it.
+function mountTable() -> Result<[Mounted], TesseraError> {
+    let text = try volumeMounts()
+    var table: [Mounted] = []
+    for line in text.split("\n") {
+        let fields = line.split(" ")
+        if fields.count >= 2 { table.append(Mounted { source: fields[0], target: fields[1] }) }
+    }
+    return .Ok(table)
+}
+
+/// The name of the directory a volume is mounted in under `/Volumes`.
+function directoryName(volume: borrow Volume) -> String {
+    let name = try volume.label otherwise return volume.name
+    if name.contains("/") || name == "." || name == ".." { return volume.name }
+    return name
+}
+
+/// Whether `path` is already the mount point of a volume the service holds.
+function mountPointTaken(service: borrow Service, path: borrow String) -> Bool {
+    for volume in service.volumes {
+        match volume.mountPoint {
+            Some(taken) -> if taken == path { return true }
+            // Unmounted, so it holds no mount point.
+            None -> {}
+        }
+    }
+    return false
+}
+
+/// The path `node` is mounted at in `table`, when it is.
+function mountedAt(table: borrow [Mounted], node: borrow String) -> String? {
+    for mounted in table {
+        if mounted.source == node { return .Some(mounted.target) }
+    }
+    return .None
+}
+
+/// Mounts volume `volume` at its mount point under `/Volumes`.
+function mount(
+    service: borrow mut Service,
+    index: Number,
+    table: borrow [Mounted]
+) -> Result<Void, TesseraError> {
+    let volume = service.volumes[index]
+    let format = try formatOf(volume.content) otherwise return .Ok
+    if volume.node.count == 0 { return .Ok }
+    match mountedAt(table, volume.node) {
+        Some(target) -> {
+            service.volumes[index].mountPoint = .Some(target)
+            log info("a volume is already mounted", disk: volume.name, mountPoint: target)
+            return .Ok
+        }
+        // Not mounted yet: it is mounted below.
+        None -> {}
+    }
+    var path = VolumesPath.prefix + directoryName(volume)
+    if mountPointTaken(service, path) { path = VolumesPath.prefix + volume.name }
+    // An empty directory left from before is a mount point too.
+    try makeMountPoint(service, path)
+    let filesystem = formatName(format)
+    let container = isContainer(format)
+    let readOnly = container || volume.flags.has(BlockFlags.readOnly)
+    var options = VolumeOptions.noDevices | VolumeOptions.noSetIdentity
+    if !container { options = options | VolumeOptions.noExecute }
+    if readOnly { options = options | VolumeOptions.readOnly }
+    try volumeMount(volume.node, path, move format, options)
+    service.volumes[index].mountPoint = .Some(path)
+    announceMounted(service, volume.name, path, filesystem, readOnly)
+    announce(service, path, true)
+    return .Ok
+}
+
+/// Announces a volume mounted or unmounted at `path`.
+function announceMounted(
+    service: borrow mut Service,
+    disk: borrow String,
+    path: borrow String,
+    filesystem: borrow String,
+    readOnly: Bool
+) {
+    match rootNames(service, path) {
+        Ok(holds) -> log info(
+            "mounted a volume",
+            disk,
+            mountPoint: path,
+            filesystem,
+            readOnly,
+            holds
+        )
+        Error(failed) -> {
+            log info("mounted a volume", disk, mountPoint: path, filesystem, readOnly)
+            log warn("a volume's root could not be read", mountPoint: path, error: errorName(failed))
+        }
+    }
+}
+
+/// Mounts every volume the service holds that is not mounted yet.
+function mountAll(service: borrow mut Service) {
+    match volumesDirectory(service) {
+        Ok(directory) -> {}
+        Error(failed) -> {
+            log fault(
+                "cannot make the volumes directory; nothing is mounted",
+                directory: "/" + SystemDirectory.volumes,
+                error: errorName(failed)
+            )
+            return
+        }
+    }
+    let table = match mountTable() {
+        Ok(value) -> value
+        Error(failed) -> {
+            log fault("cannot read what is mounted; nothing is mounted", error: errorName(failed))
+            return
+        }
+    }
+    for index in 0..service.volumes.count {
+        match mount(service, index, table) {
+            Ok -> {}
+            Error(failed) -> log warn(
+                "cannot mount a volume",
+                disk: service.volumes[index].name,
+                error: errorName(failed)
+            )
+        }
+    }
+}

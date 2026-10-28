@@ -1,0 +1,211 @@
+import Foundation
+import Ember
+import KCoreAnimation
+
+// Where a client's buffer is drawn: in the strip in `Stage` when it is not in
+// front, or else where it was put. None when it is not drawn.
+function placedFrame(
+    server: borrow Server,
+    index: Number,
+    client: borrow Client,
+    content: borrow Content,
+    scale: Number,
+    progress: Number = -1
+) -> Geometry? {
+    let window = try presentedWindow(server, index, progress) otherwise return .None
+    if client.role == .Platform { return .Some(drawnFrame(client, content, scale)) }
+    if client.margin == 0 { return .Some(window) }
+    // The buffer is scaled from the window it was drawn for, which a window
+    // resized on its way to a new frame is a frame or two behind, and its
+    // margin with it.
+    let drawnWidth = content.width / scale - client.margin * 2
+    let drawnHeight = content.height / scale - client.margin * 2
+    let sx = window.width / max(drawnWidth, 1)
+    let sy = window.height / max(drawnHeight, 1)
+    return .Some(
+        Geometry {
+            x: window.x - client.margin * sx,
+            y: window.y - client.margin * sy,
+            width: content.width / scale * sx,
+            height: content.height / scale * sy,
+        }
+    )
+}
+
+// Where a client's buffer is drawn: its window, and round it the margin its
+// buffer reaches for the shadow it draws, at the size the buffer is, `scale`
+// pixels a point.
+function drawnFrame(client: borrow Client, content: borrow Content, scale: Number) -> Geometry {
+    if client.role == .Platform {
+        return Geometry {
+            x: client.frame.x,
+            y: client.frame.y,
+            width: content.width / scale,
+            height: content.height / scale
+        }
+    }
+    if client.margin == 0 { return client.frame }
+    return Geometry {
+        x: client.frame.x - client.margin,
+        y: client.frame.y - client.margin,
+        width: content.width / scale,
+        height: content.height / scale,
+    }
+}
+
+// One surface's texture as a quad over `frame`, untransformed, cut to
+// `clipping` with its corners rounded by `clipRadius`, continuous ones when
+// `clipShape` is 1.
+function drawSurface(
+    composer: borrow Composer,
+    texture: borrow GraphicsTexture,
+    frame: borrow Geometry,
+    clipping: Geometry? = .None,
+    opacity: Number = 1,
+    extentX: Number = 1,
+    extentY: Number = 1,
+    clipRadius: Number = 0,
+    clipShape: Number = 0
+) {
+    if frame.width <= 0 || frame.height <= 0 { return }
+    composer.batch.setExternalTextures(composer.device.graphics(), U32(texture.viewId), U32(0))
+    let clip = match clipping { Some(value) -> value None -> copy frame }
+    // Crop geometry and UVs together. Atlas tiles submit only their small
+    // visible quad, rather than covering the screen and discarding fragments.
+    let left = max(frame.x, clip.x)
+    let top = max(frame.y, clip.y)
+    let right = min(frame.x + frame.width, clip.x + clip.width)
+    let bottom = min(frame.y + frame.height, clip.y + clip.height)
+    if right <= left || bottom <= top || opacity <= 0 { return }
+    composer.batch.emitQuad(
+        left,
+        top,
+        right,
+        bottom,
+        (left - frame.x) / frame.width * extentX,
+        (top - frame.y) / frame.height * extentY,
+        (right - frame.x) / frame.width * extentX,
+        (bottom - frame.y) / frame.height * extentY,
+        (right - left) * 0.5,
+        (bottom - top) * 0.5,
+        0.0,
+        0.0,
+        2.0,
+        0.0,
+        1.0,
+        1.0,
+        1.0,
+        opacity,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        left,
+        top,
+        right,
+        bottom,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        clipRadius,
+        clipShape
+    )
+}
+
+// The translucent black a dimmed output is darkened under, over the whole
+// picture and the cursor, as a lowered backlight darkens both.
+function drawShade(composer: borrow Composer, scanout: borrow Scanout) {
+    let width = scanout.pointWidth()
+    let height = scanout.pointHeight()
+    composer.batch.pushRect(
+        0.0,
+        0.0,
+        width,
+        height,
+        RGBAColor { r: 0.0, g: 0.0, b: 0.0, a: IdleTimes.shade },
+        RGBAColor { r: 0.0, g: 0.0, b: 0.0, a: 0.0 },
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        width,
+        height,
+        0.0,
+        RGBAColor { r: 0.0, g: 0.0, b: 0.0, a: 0.0 },
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        .Normal
+    )
+}
+
+// The platform's picture, `frame` cut to `clip`, with `hole` left out: the
+// bands above and below it, and those beside it.
+function drawSurfaceAround(
+    composer: borrow Composer,
+    texture: borrow GraphicsTexture,
+    frame: borrow Geometry,
+    clip: borrow Geometry,
+    hole: borrow Geometry,
+    extentX: Number,
+    extentY: Number
+) {
+    let bands = [
+        Geometry { x: clip.x, y: clip.y, width: clip.width, height: hole.y - clip.y },
+        Geometry {
+            x: clip.x,
+            y: hole.y + hole.height,
+            width: clip.width,
+            height: clip.y + clip.height - hole.y - hole.height,
+        },
+        Geometry { x: clip.x, y: hole.y, width: hole.x - clip.x, height: hole.height },
+        Geometry {
+            x: hole.x + hole.width,
+            y: hole.y,
+            width: clip.x + clip.width - hole.x - hole.width,
+            height: hole.height,
+        },
+    ]
+    for band in bands {
+        if band.width <= 0 || band.height <= 0 { continue }
+        drawSurface(composer, texture, frame, .Some(copy band), 1, extentX, extentY)
+    }
+}

@@ -1,0 +1,377 @@
+import Foundation
+import Heap
+import LibTessera
+import DeviceKit
+import TesseraDisplayClient
+
+// Input devices that come and go while the display runs
+// (roadmap/06-devices-and-input.md, "Hotplug").
+//
+// A DeviceKit registry watch on input devices wakes the loop. Its first read
+// names every device already there, so the devices at boot and the ones
+// plugged in later are taken the same way. As on a Mac, every keyboard types
+// and every pointer moves the one cursor: each is opened and listened to under
+// a port key of its own, and their keys share one set of modifiers and one
+// repeat. A device that goes is closed and what it held down is let go;
+// clients are told the machine has no keys, or no pointer, only when the last
+// goes. A keyboard pulled out leaves the display running.
+
+// An input device the server holds open: its registry entry, its connection,
+// and the number its port key carries past its kind's (`PortKey`).
+struct HeldInput {
+    var entry: EntryId
+    var device: Ref
+    var serial: Number
+    // The range of a tablet's axes (Tablet.kira); empty on a keyboard and on
+    // a pointer that only moves.
+    var axes: PointerAxes = PointerAxes {}
+}
+
+// A watch's read: a header, then 24-byte changes, the kind @0 and the entry @8.
+// roadmap/17-devicekit.md §7.5's `RegistryChange`.
+@FFI.Struct { layout: c }
+struct RegistryChangeRecord {
+    var kind: U32
+    var entryClass: EntryClass
+    var entry: U64
+    var generation: U64
+}
+
+namespace InputWatch {
+    let headerBytes: Number = 8
+    let changeBytes: Number = 24
+    let changes: Number = 32
+}
+
+// Opens the watch and takes every input device already there; without a
+// watch, takes them from one look at the registry, and none plugged in later
+// is seen.
+function startInput(server: borrow mut Server) {
+    let spec = zeroedBlock(count: RegistryMatch.specBytes, alignment: 16)
+    heapStore(
+        spec.pointer(),
+        MatchSpecRecord {
+            entryClass: EntryClass.InputDevice,
+            family: Family.None,
+            flags: UN32(0),
+            count: UN32(0)
+        }
+    )
+    match registryWatch(Buffer { address: spec.pointer(), length: RegistryMatch.specBytes }) {
+        Ok(watch) -> {
+            server.inputWatch = .Some(watch)
+            updateInputWatch(server, watch)
+        }
+        Error(reason) -> inputWatchUnavailable(server, reason)
+    }
+    if server.keyboards.count == 0 { log warn("no input device has a keyboard") }
+    if server.pointers.count == 0 { log info("no input device moves a pointer") }
+}
+
+function inputWatchUnavailable(server: borrow mut Server, reason: borrow TesseraError) {
+    log warn(
+        "input devices cannot be watched; one plugged in later is not seen",
+        error: errorName(reason)
+    )
+    takePresentInput(server)
+}
+
+// The input devices the registry names now: each the server does not hold is
+// taken, and each it holds that is no longer named is let go.
+function takePresentInput(server: borrow mut Server) {
+    match entriesOf(.InputDevice) {
+        Ok(entries) -> reconcileInput(server, entries)
+        Error(reason) -> log warn("the input devices could not be listed", error: errorName(reason))
+    }
+}
+
+function reconcileInput(server: borrow mut Server, entries: borrow [EntryId]) {
+    for held in server.keyboards {
+        if !entries.contains(held.entry) { inputLeft(server, held.entry) }
+    }
+    for held in server.pointers {
+        if !entries.contains(held.entry) { inputLeft(server, held.entry) }
+    }
+    for entry in entries { inputArrived(server, entry) }
+}
+
+// Where `entry` is in `held`.
+function heldIndex(held: borrow [HeldInput], entry: EntryId) -> Number? {
+    for (index, device) in held.enumerated() {
+        if device.entry == entry { return .Some(index) }
+    }
+    return .None
+}
+
+// Where the device whose port key carries `serial` is in `held`.
+function servingIndex(held: borrow [HeldInput], serial: Number) -> Number? {
+    for (index, device) in held.enumerated() {
+        if device.serial == serial { return .Some(index) }
+    }
+    return .None
+}
+
+// The number the next device's port key carries.
+function nextInputSerial(server: borrow mut Server) -> Number {
+    server.inputSerial = (server.inputSerial + 1) % PortKey.span
+    return server.inputSerial
+}
+
+function armInputWatch(server: borrow Server, watch: Ref) -> Result<Void, TesseraError> {
+    return refWaitAsync(
+        watch,
+        DeviceEvents.readable,
+        .Once,
+        server.port,
+        UNumber(PortKey.inputWatch)
+    )
+}
+
+// The watch woke the loop: what changed, then the watch armed again.
+function inputWatchWoke(server: borrow mut Server) {
+    let watch = try server.inputWatch otherwise return
+    updateInputWatch(server, watch)
+}
+
+function updateInputWatch(server: borrow mut Server, watch: Ref) {
+    match drainAndArmInput(server, watch) {
+        Ok -> {}
+        Error(reason) -> lostInputWatch(server, watch, reason)
+    }
+}
+
+function lostInputWatch(server: borrow mut Server, watch: Ref, reason: borrow TesseraError) {
+    closeRef(watch)
+    server.inputWatch = .None
+    inputWatchUnavailable(server, reason)
+}
+
+function drainAndArmInput(server: borrow mut Server, watch: Ref) -> Result<Void, TesseraError> {
+    try readInputChanges(server, watch)
+    return armInputWatch(server, watch)
+}
+
+// ShouldWait is a drained nonblocking watch, not an unsuccessful read.
+function inputChangeCount(watch: Ref, buffer: Buffer) -> Result<Number, TesseraError> {
+    match registryWatchRead(watch, buffer) {
+        Ok(count) -> return .Ok(count)
+        Error(reason) -> if reason.code == .ShouldWait {
+            return .Ok(0)
+        } else {
+            return .Error(reason)
+        }
+    }
+}
+
+// Every change queued on `watch`, applied in order.
+function readInputChanges(server: borrow mut Server, watch: Ref) -> Result<Void, TesseraError> {
+    let size = InputWatch.headerBytes + InputWatch.changes * InputWatch.changeBytes
+    let block = zeroedBlock(count: size, alignment: 16)
+    while true {
+        let count = try inputChangeCount(watch, Buffer { address: block.pointer(), length: size })
+        if count == 0 { return .Ok }
+        for item in 0..count {
+            let at = InputWatch.headerBytes + item * InputWatch.changeBytes
+            let change: RegistryChangeRecord = heapLoad(block.pointer(), at)
+            applyInputChange(server, change)
+        }
+    }
+    return .Ok
+}
+
+let registryChangeKinds: [RegistryChangeKind] = [
+    RegistryChangeKind.Matched,
+    RegistryChangeKind.Terminated,
+    RegistryChangeKind.PropertiesChanged,
+    RegistryChangeKind.Resync,
+]
+
+function changeKindOf(raw: U32) -> RegistryChangeKind? {
+    for kind in registryChangeKinds {
+        if kind.rawValue() == raw { return .Some(kind) }
+    }
+    return .None
+}
+
+function applyInputChange(server: borrow mut Server, change: borrow RegistryChangeRecord) {
+    let entry = EntryId(change.entry)
+    match changeKindOf(change.kind) {
+        Some(kind) -> match kind {
+            Matched -> inputArrived(server, entry)
+            Terminated -> inputLeft(server, entry)
+            // A device's properties changing leaves what it is to the server
+            // alone.
+            PropertiesChanged -> {}
+            Resync -> {
+                log warn("the input watch overran; the input devices are looked at again")
+                takePresentInput(server)
+            }
+        }
+        None -> log warn("an input change of a kind the server does not know", kind: change.kind)
+    }
+}
+
+// A device that appeared: held as a keyboard if it has keys, and as a
+// pointer if it moves one.
+function inputArrived(server: borrow mut Server, entry: EntryId) {
+    if heldIndex(server.keyboards, entry).isNone() {
+        match hasKeys(entry) {
+            Ok(keys) -> if keys { adoptKeyboard(server, entry) }
+            Error(failed) -> log info(
+                "an input device would not say what it is",
+                error: errorName(failed)
+            )
+        }
+    }
+    if heldIndex(server.pointers, entry).isNone() {
+        match movesPointer(entry) {
+            Ok(moves) -> if moves { adoptPointer(server, entry) }
+            Error(failed) -> log info(
+                "an input device would not say what it is",
+                error: errorName(failed)
+            )
+        }
+    }
+}
+
+// A device that went: whatever the server held it as is let go.
+function inputLeft(server: borrow mut Server, entry: EntryId) {
+    match heldIndex(server.keyboards, entry) {
+        Some(index) -> loseKeyboard(server, index)
+        None -> {}
+    }
+    match heldIndex(server.pointers, entry) {
+        Some(index) -> losePointer(server, index)
+        None -> {}
+    }
+}
+
+// Opens `entry` for its input, as `kind` names the device in the log.
+function openInput(server: borrow Server, entry: EntryId) -> Result<Ref, TesseraError> {
+    return openEntry(entry, .Input, OpenOptions.none, server.display.flips, OpenKey.input)
+}
+
+function adoptKeyboard(server: borrow mut Server, entry: EntryId) {
+    match openedKeyboard(server, entry) {
+        Ok -> {}
+        Error(reason) -> log warn(
+            "the keyboard could not be adopted",
+            entry: entry.raw,
+            error: errorName(reason)
+        )
+    }
+}
+
+function openedKeyboard(server: borrow mut Server, entry: EntryId) -> Result<Void, TesseraError> {
+    let device = try openInput(server, entry)
+    let held = HeldInput { entry: entry, device: device, serial: nextInputSerial(server) }
+    match armKeyboard(server, held) {
+        Ok -> {}
+        Error(reason) -> return closeUnarmedInput(device, reason)
+    }
+    server.keyboards.append(held)
+    log info("found a keyboard", entry: entry.raw, keyboards: server.keyboards.count)
+    if server.keyboards.count == 1 {
+        broadcastInputCapability(server, [DisplayInputKind.Key], true)
+    }
+    return .Ok
+}
+
+function adoptPointer(server: borrow mut Server, entry: EntryId) {
+    match openedPointer(server, entry) {
+        Ok -> {}
+        Error(reason) -> log warn(
+            "the pointer could not be adopted",
+            entry: entry.raw,
+            error: errorName(reason)
+        )
+    }
+}
+
+function closeUnarmedInput(device: Ref, reason: borrow TesseraError) -> Result<Void, TesseraError> {
+    closeRef(device)
+    return .Error(reason)
+}
+
+function openedPointer(server: borrow mut Server, entry: EntryId) -> Result<Void, TesseraError> {
+    let device = try openInput(server, entry)
+    var held = HeldInput { entry: entry, device: device, serial: nextInputSerial(server) }
+    held.axes = match pointerAxes(device) {
+        Ok(value) -> value
+        Error(reason) -> return closeUnarmedInput(device, reason)
+    }
+    match armPointer(server, held) {
+        Ok -> {}
+        Error(reason) -> return closeUnarmedInput(device, reason)
+    }
+    server.pointers.append(held)
+    log info("found a pointer", entry: entry.raw, pointers: server.pointers.count)
+    if server.pointers.count == 1 { showPointer(server) }
+    return .Ok
+}
+
+// The keyboard at `index` is gone: the keys held down are let go, as no
+// keyboard can say which of them it held, nothing repeats, and once it was
+// the last every client hears there are no keys.
+function loseKeyboard(server: borrow mut Server, index: Number) {
+    closeRef(server.keyboards[index].device)
+    server.keyboards = without(server.keyboards, index)
+    server.pending = []
+    stopRepeat(server)
+    server.modifiersDown = []
+    server.modifiers = DisplayModifiers { capsLock: server.modifiers.capsLock }
+    log info("a keyboard went away", keyboards: server.keyboards.count)
+    if server.keyboards.count == 0 {
+        broadcastInputCapability(server, [DisplayInputKind.Key], false)
+    }
+}
+
+// The pointer at `index` is gone: a drag ends and its buttons are let go, and
+// once it was the last every client hears there is no pointer. The cursor
+// stays where it was, as a Mac leaves it when its mouse is unplugged.
+function losePointer(server: borrow mut Server, index: Number) {
+    closeRef(server.pointers[index].device)
+    server.pointers = without(server.pointers, index)
+    server.pointing = PendingPointer {}
+    if server.buttonsDown > 0 {
+        server.buttonsDown = 0
+        server.buttonsHeld = []
+        endMove(server)
+        endResize(server)
+        server.pressedOn = .None
+    }
+    log info("a pointer went away", pointers: server.pointers.count)
+    if server.pointers.count == 0 {
+        broadcastInputCapability(server, [DisplayInputKind.Pointer], false)
+    }
+}
+
+// `held` without the device at `index`.
+function without(held: borrow [HeldInput], index: Number) -> [HeldInput] {
+    var kept: [HeldInput] = []
+    for (at, device) in held.enumerated() {
+        if at != index { kept.append(device) }
+    }
+    return kept
+}
+
+// Closes every input device and the watch, as the server stops.
+function closeInput(server: borrow mut Server) {
+    for held in server.keyboards { closeRef(held.device) }
+    for held in server.pointers { closeRef(held.device) }
+    server.keyboards = []
+    server.pointers = []
+    match server.inputWatch {
+        Some(watch) -> closeRef(watch)
+        None -> {}
+    }
+    server.inputWatch = .None
+}
+
+// Tells a client admitted after boot which inputs the machine has now.
+function tellPresentInput(server: borrow Server, client: borrow Client) {
+    var kinds: [DisplayInputKind] = []
+    if server.keyboards.count > 0 { kinds.append(.Key) }
+    if server.pointers.count > 0 { kinds.append(.Pointer) }
+    if kinds.count > 0 { tellInputCapability(client, kinds, true) }
+}

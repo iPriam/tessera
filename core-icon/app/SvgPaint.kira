@@ -1,0 +1,121 @@
+import Foundation
+import RenderBox
+
+// What an SVG shape is filled or stroked with: a colour, a gradient a
+// `<defs>` holds, or nothing. Colours are sRGB, alpha not premultiplied, as
+// CoreSVG hands them to Core Graphics.
+
+public enum SvgGradientShape {
+    // From `start` to `end`.
+    Linear(SvgLine)
+    // Out from the focus `focus` to the circle round `centre`.
+    Radial(SvgCircle)
+}
+
+public struct SvgLine {
+    let start: Point
+    let end: Point
+}
+
+public struct SvgCircle {
+    let centre: Point
+    let radius: Number
+    let focus: Point
+}
+
+// A gradient, its geometry in the units it names: the shape's bounding box
+// when it says `objectBoundingBox`, as it does by default, else the user
+// units the shape is drawn in.
+public struct SvgGradient {
+    var shape: SvgGradientShape = .Linear(SvgLine { start: Point {}, end: Point { x: 1 } })
+    var stops: [GradientStop] = []
+    var boundingBox: Bool = true
+    var transform: AffineTransform = AffineTransform {}
+    var edgeMode: GradientEdgeMode = .Clamp
+}
+
+public enum SvgPaint {
+    None
+    Color(RGBAColor)
+    Gradient(SvgGradient)
+}
+
+namespace HexDigits {
+    let all: String = "0123456789abcdef"
+    let byte: Number = 255
+}
+
+function hexValue(text: borrow String) -> Number? {
+    var value = 0
+    for index in 0..text.count {
+        let digit = try HexDigits.all.indexOf(
+            text.substring(index, index + 1).lowercased()
+        ) otherwise return .None
+        value = value * 16 + digit
+    }
+    return .Some(value)
+}
+
+// `#rgb`, `#rgba`, `#rrggbb` or `#rrggbbaa`.
+function hexColor(text: borrow String) -> RGBAColor? {
+    let digits = text.substring(1, text.count)
+    let short = digits.count == 3 || digits.count == 4
+    let width = short ? 1 : 2
+    if !(short || digits.count == 6 || digits.count == 8) { return .None }
+    var channels: [Number] = []
+    for index in 0..(digits.count / width) {
+        let piece = digits.substring(index * width, index * width + width)
+        let value = try hexValue(short ? piece + piece : piece) otherwise return .None
+        channels.append(value / HexDigits.byte)
+    }
+    return .Some(
+        RGBAColor {
+            r: channels[0],
+            g: channels[1],
+            b: channels[2],
+            a: channels.count == 4 ? channels[3] : 1
+        }
+    )
+}
+
+// `rgb(255, 0, 0)`, `rgba(255 0 0 / 50%)`, percentages for any channel.
+function functionColor(text: borrow String) -> RGBAColor? {
+    let inside = try text.indexOf("(") otherwise return .None
+    let parts = text.substring(inside + 1, text.count).split(")")[0]
+    var channels: [Number] = []
+    let separated = joined(joined(parts.split("/"), ",").split(" "), ",")
+    for piece in separated.split(",") {
+        let trimmed = piece.trim()
+        if trimmed.count == 0 { continue }
+        let percent = trimmed.endsWith("%")
+        let number = try parseNumber(
+            percent ? trimmed.substring(0, trimmed.count - 1) : trimmed
+        ) otherwise return .None
+        let scaled = percent ? number / 100 : (
+            channels.count < 3 ? number / HexDigits.byte : number
+        )
+        channels.append(scaled)
+    }
+    if channels.count < 3 { return .None }
+    return .Some(
+        RGBAColor {
+            r: channels[0],
+            g: channels[1],
+            b: channels[2],
+            a: channels.count >= 4 ? channels[3] : 1
+        }
+    )
+}
+
+// The colour `text` writes; none when it is not one.
+public function parsedSvgColor(text: borrow String) -> RGBAColor? {
+    let trimmed = text.trim()
+    if trimmed.startsWith("#") { return hexColor(trimmed) }
+    if trimmed.startsWith("rgb") { return functionColor(trimmed) }
+    let lowered = trimmed.lowercased()
+    if lowered == "transparent" { return .Some(RGBAColor { a: 0 }) }
+    for (name, hex) in SvgNamedColors.all {
+        if name == lowered { return hexColor(hex) }
+    }
+    return .None
+}

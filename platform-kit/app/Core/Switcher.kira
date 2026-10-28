@@ -1,0 +1,195 @@
+//! The application switcher: which applications it can switch to, and in what order.
+import Foundation
+
+/// Whether the application can be switched to: it is running and is not a platform.
+function isSwitchable(application: borrow PlatformApplication) -> Bool {
+    return application.running && application.kind != .Platform
+}
+
+/// When `id` was last in front: the place in the stacking order of its window
+/// furthest in front, shown or minimized; none without a window.
+function recency(state: borrow PlatformState, id: PlatformApplicationId) -> Number? {
+    var latest: Number? = .None
+    for surface in state.surfaces {
+        if surface.application != id { continue }
+        latest = match latest {
+            Some(value) -> .Some(max(value, surface.zOrder))
+            None -> .Some(surface.zOrder)
+        }
+    }
+    return latest
+}
+
+/// Whether `a` was in front more lately than `b`; an application with no
+/// window comes after every one with a window.
+function moreRecent(a: borrow Number?, b: borrow Number?) -> Bool {
+    return match a {
+        Some(first) -> match b {
+            Some(second) -> first > second
+            None -> true
+        }
+        None -> false
+    }
+}
+
+/// An application, and when it was last in front.
+struct RankedApplication {
+    let application: PlatformApplication
+    let rank: Number?
+}
+
+/// Where the switcher's selection is in `order`, if it has one.
+function selectionIn(state: borrow PlatformState, order: borrow [PlatformApplication]) -> Number? {
+    let selected = try state.switcherSelection otherwise return .None
+    for (index, application) in order.enumerated() {
+        if application.id == selected { return .Some(index) }
+    }
+    return .None
+}
+
+extend PlatformState {
+    /// Whether application `id` is one the switcher can switch to.
+    function applicationIsSwitchable(borrow self, id: PlatformApplicationId) -> Bool {
+        return match applicationIndex(self, id) {
+            Some(index) -> isSwitchable(applications[index])
+            None -> false
+        }
+    }
+
+    /// Every application the switcher can bring forward, the one in front
+    /// first and the rest in the order they were last in front, as a Mac's
+    /// Command-Tab orders them.
+    function switchableApplications(borrow self) -> [PlatformApplication] {
+        var ranked: [RankedApplication] = []
+        for application in applications {
+            if isSwitchable(application) {
+                ranked.append(
+                    RankedApplication {
+                        application: copy application,
+                        rank: recency(self, application.id)
+                    }
+                )
+            }
+        }
+        var order: [PlatformApplication] = []
+        for placed in ranked.sorted({ a, b in return moreRecent(a.rank, b.rank) }) {
+            order.append(copy placed.application)
+        }
+        return order
+    }
+
+    /// The first application the switcher can switch to, in its order, if there is one.
+    function firstSwitchableApplication(borrow self) -> PlatformApplicationId? {
+        let order = switchableApplications()
+        if order.count == 0 { return .None }
+        return .Some(order[0].id)
+    }
+
+    /// The visible surface of `application` furthest in front, if it has one.
+    function topmostSurfaceOf(
+        borrow self,
+        application: PlatformApplicationId,
+    ) -> PlatformSurfaceId? {
+        var target: PlatformSurface? = .None
+        for surface in surfaces {
+            if surface.application == application && surface.visible == .Visible
+                && isAtOrAbove(surface, target) { target = .Some(surface) }
+        }
+        return idOf(target)
+    }
+
+    /// Opens the switcher on the application in front, and gives focus to the
+    /// platform while it is open.
+    function openSwitcher(borrow mut self) {
+        if switcherOpen { return }
+        switcherOpen = true
+        switcherReturnFocus = focusedSurface()
+        switcherSelection = firstSwitchableApplication()
+        launcherOpen = false
+        returnFocusToPlatform()
+    }
+
+    /// Closes the switcher, giving focus back to where it was when it opened.
+    function closeSwitcher(borrow mut self) {
+        if !switcherOpen { return }
+        let returnFocus = switcherReturnFocus
+        switcherOpen = false
+        switcherSelection = .None
+        switcherReturnFocus = .None
+        match returnFocus {
+            Some(surface) -> setFocus(surface)
+            // Nothing had focus when the switcher opened; the platform takes it below.
+            None -> {}
+        }
+        if focusedSurface().isNone() { returnFocusToPlatform() }
+    }
+
+    /// Moves the switcher's selection on to the application last in front
+    /// before the selected one, coming round to the start. The new selection,
+    /// if there is one.
+    function selectNextApplication(borrow mut self) -> PlatformApplicationId? {
+        return stepSelection(1)
+    }
+
+    /// Moves the switcher's selection back, coming round to the end.
+    function selectPreviousApplication(borrow mut self) -> PlatformApplicationId? {
+        return stepSelection(-1)
+    }
+
+    /// Moves the switcher's selection to the application at `position` in
+    /// its order, counting from zero. The new selection, if there is one there.
+    function selectApplicationAt(borrow mut self, position: Number) -> PlatformApplicationId? {
+        if !switcherOpen { return .None }
+        let order = switchableApplications()
+        if position < 0 || position >= order.count { return .None }
+        switcherSelection = .Some(order[position].id)
+        return switcherSelection
+    }
+
+    /// Moves the switcher's selection by `step` among the switchable applications; answers the application now selected.
+    function stepSelection(borrow mut self, step: Number) -> PlatformApplicationId? {
+        if !switcherOpen { return .None }
+        let order = switchableApplications()
+        let count = order.count
+        if count == 0 {
+            switcherSelection = .None
+            return .None
+        }
+        let at = match selectionIn(self, order) {
+            Some(index) -> (index + step + count) % count
+            None -> step > 0 ? 0 : count - 1
+        }
+        switcherSelection = .Some(order[at].id)
+        return switcherSelection
+    }
+
+    /// Brings the selected application's surface in front and closes the
+    /// switcher, whatever happens. The surface the switch brought in front, if
+    /// there was one; a failure to bring it in front is returned.
+    function commitSwitcher(borrow mut self) -> Result<PlatformSurfaceId?, PlatformStateFailure> {
+        if !switcherOpen { return .Ok(.None) }
+        let selected = match switcherSelection {
+            Some(value) -> value
+            None -> {
+                closeSwitcher()
+                return .Ok(.None)
+            }
+        }
+        let activated: PlatformSurfaceId? = match topmostSurfaceOf(selected) {
+            Some(target) -> match activateSurface(target) {
+                Ok -> .Some(target)
+                Error(failure) -> {
+                    closeSwitcher()
+                    return .Error(failure)
+                }
+            }
+            None -> .None
+        }
+        // A committed switch keeps the focus it gave. Closing would otherwise
+        // hand focus back to what was in front when the switcher opened, and the
+        // next switch would start from there again.
+        if activated.isSome() { switcherReturnFocus = .None }
+        closeSwitcher()
+        return .Ok(activated)
+    }
+}

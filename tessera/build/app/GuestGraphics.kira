@@ -1,0 +1,442 @@
+import Foundation
+import Build
+import Kten
+
+// The guest half of Tessera's GPU stack: the Vulkan a program inside the
+// machine calls, and the driver that forwards it out. Mesa's venus driver
+// turns Vulkan calls into the venus protocol the host renderer decodes;
+// libdrm talks to the kernel's DRM device; zlib and expat are what Mesa's
+// shared code reaches for whatever driver is built; the Vulkan loader is the
+// one native library a Tessera program links.
+//
+// Each tarball is a download checked against its SHA-256. The build is one
+// command whose stages unpack each project, Mesa under its patches, and keep
+// it in the command's workspace (UpstreamSource.kira), then configure, build
+// and install each in turn into a prefix there, cross-compiled with the LLVM
+// bundle against the sysroot. The workspace keeps every tree and build
+// directory, so a changed input rebuilds what ninja finds it touches, and an
+// edit to the build itself rebuilds nothing. The prefix is emptied and installed again each
+// run, because a pkg-config file names it by path, and copied out whole.
+
+namespace GuestGraphicsSources {
+    let zlib: Upstream = Upstream {
+        top: "zlib-1.3.1",
+        url: "https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz",
+        sha256: "9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23"
+    }
+    let expat: Upstream = Upstream {
+        top: "expat-2.7.1",
+        url: "https://github.com/libexpat/libexpat/releases/download/R_2_7_1/expat-2.7.1.tar.xz",
+        sha256: "354552544b8f99012e5062f7d570ec77f14b412a3ff5c7d8d0dae62c0d217c30"
+    }
+    let libdrm: Upstream = Upstream {
+        top: "libdrm-2.4.125",
+        url: "https://dri.freedesktop.org/libdrm/libdrm-2.4.125.tar.xz",
+        sha256: "d4bae92797a50f81a93524762e0410a49cd84cfa0f997795bc0172ac8fb1d96a"
+    }
+    let mesa: Upstream = Upstream {
+        top: "mesa-25.0.7",
+        url: "https://archive.mesa3d.org/mesa-25.0.7.tar.xz",
+        sha256: "592272df3cf01e85e7db300c449df5061092574d099da275d19e97ef0510f8a6"
+    }
+    // Headers and loader at the same tag: the loader's generated code is
+    // written against one header version.
+    let headers: Upstream = Upstream {
+        top: "Vulkan-Headers-1.4.321",
+        url: "https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/v1.4.321.tar.gz",
+        sha256: "7c1874f9186d9e7d5245e279cdccaa77a66ed8f52871b428630aeb771dc7623c"
+    }
+    let loader: Upstream = Upstream {
+        top: "Vulkan-Loader-1.4.321",
+        url: "https://github.com/KhronosGroup/Vulkan-Loader/archive/refs/tags/v1.4.321.tar.gz",
+        sha256: "00669f6bb2db35c8df07f0b118c09bfe0ebffecaad7d80647a429eece0e37ac3"
+    }
+    // The one change Tessera carries in venus, exposing dma-buf external
+    // memory so a GPU-rendered image can be named as a scanout, and the one
+    // for a guest whose pages are larger than the host's.
+    let mesaPatches: [String] = [
+        "patches/mesa-25.0.7-venus-scanout/venus-scanout.patch",
+        "patches/mesa-25.0.7-venus-page-size/venus-page-size.patch"
+    ]
+}
+
+// What every project of the guest stack is built with: the prefix it installs
+// into, the meson cross file, the sysroot and the flag naming it, the linker,
+// and the host and architecture the compilers run for.
+struct CrossBuild {
+    let installed: Argument
+    let crossFile: Artifact
+    let sysroot: Artifact
+    let sysrootFlag: Argument
+    let linker: String
+    let host: Host
+    let architecture: Architecture
+}
+
+// Every library of the guest stack, installed under one prefix: lib/,
+// include/ and share/.
+function guestGraphics(
+    graph: borrow mut Graph,
+    host: borrow Host,
+    architecture: Architecture,
+    sysroot: borrow Artifact
+) -> Artifact {
+    let name = architecture.name()
+    let llvm = "\(host.llvm)/bin"
+    let installed: Argument = .Joined([.Workspace, .Text("/prefix")])
+    let build = CrossBuild {
+        installed: copy installed,
+        crossFile: guestCrossFile(graph, host, architecture),
+        sysroot: copy sysroot,
+        sysrootFlag: .Joined([.Text("--sysroot="), .Input(copy sysroot)]),
+        linker: "-fuse-ld=\(llvm)/ld.lld",
+        host: copy host,
+        architecture: architecture
+    }
+    var stages = guestSourceStages(graph)
+    stages.appendAll(guestBuildStages(build))
+    stages.append(
+        CommandStage {
+            tool: "cp",
+            arguments: [.Text("-R"), .Joined([copy installed, .Text("/.")]), .Output("graphics")]
+        }
+    )
+    let built = graph.command(
+        CommandAction {
+            label: "guest GPU stack (\(name))",
+            tool: "rm",
+            arguments: [.Text("-rf"), copy installed],
+            environment: [
+                EnvironmentEntry { name: "PATH", value: "\(host.pythonBin()):\(host.path)" },
+                EnvironmentEntry { name: "HOME", value: copy host.home }
+            ],
+            variables: [guestPkgConfig(installed)],
+            outputs: [Output { name: "graphics", kind: .Tree }],
+            workspace: "gpu-guest-\(name)",
+            followedBy: stages
+        }
+    )
+    return built[0]
+}
+
+// Only the prefix: nothing of the build host's is a guest library.
+function guestPkgConfig(installed: borrow Argument) -> CommandVariable {
+    return CommandVariable {
+        name: "PKG_CONFIG_LIBDIR",
+        value: .Joined(
+            [copy installed, .Text("/lib/pkgconfig:"), copy installed, .Text("/share/pkgconfig")]
+        )
+    }
+}
+
+// The stages that bring each project's kept tree up to its release, Mesa's
+// under Tessera's patches.
+function guestSourceStages(graph: borrow mut Graph) -> [CommandStage] {
+    var mesaPatches: [UpstreamChange] = []
+    for path in GuestGraphicsSources.mesaPatches { mesaPatches.append(.Patch(graph.source(path))) }
+    let none: [UpstreamChange] = []
+    return [
+        upstreamStage(graph, "zlib", GuestGraphicsSources.zlib, none),
+        upstreamStage(graph, "expat", GuestGraphicsSources.expat, none),
+        upstreamStage(graph, "libdrm", GuestGraphicsSources.libdrm, none),
+        upstreamStage(graph, "mesa", GuestGraphicsSources.mesa, mesaPatches),
+        upstreamStage(graph, "vulkan-headers", GuestGraphicsSources.headers, none),
+        upstreamStage(graph, "vulkan-loader", GuestGraphicsSources.loader, none)
+    ]
+}
+
+// meson's cross file for the architecture's clang.
+function guestCrossFile(
+    graph: borrow mut Graph,
+    host: borrow Host,
+    architecture: Architecture
+) -> Artifact {
+    let name = architecture.name()
+    let target = architecture.multiarch()
+    let llvm = "\(host.llvm)/bin"
+    return graph.write(
+        "\(name)/gpu/cross.ini",
+        textLines(
+            [
+                "[binaries]",
+                "c = ['\(llvm)/clang', '--target=\(target)']",
+                "cpp = ['\(llvm)/clang++', '--target=\(target)']",
+                "ar = '\(llvm)/llvm-ar'",
+                "strip = '\(llvm)/llvm-strip'",
+                "pkg-config = 'pkg-config'",
+                "",
+                "[host_machine]",
+                "system = 'linux'",
+                "cpu_family = '\(name)'",
+                "cpu = '\(name)'",
+                "endian = 'little'"
+            ]
+        ),
+        FileMode.data
+    )
+}
+
+// Each project configured, built and installed in turn.
+function guestBuildStages(build: borrow CrossBuild) -> [CommandStage] {
+    var stages = zlibStages(build)
+    stages.appendAll(
+        cmakeStages(
+            "expat",
+            build,
+            [
+                "-DEXPAT_SHARED_LIBS=OFF", "-DEXPAT_BUILD_TOOLS=OFF", "-DEXPAT_BUILD_EXAMPLES=OFF",
+                "-DEXPAT_BUILD_TESTS=OFF", "-DEXPAT_BUILD_DOCS=OFF"
+            ]
+        )
+    )
+    // Every vendor driver off: the guest's only device is virtio-gpu.
+    stages.appendAll(
+        mesonStages(
+            "libdrm",
+            build,
+            [
+                "-Dintel=disabled", "-Dradeon=disabled", "-Damdgpu=disabled", "-Dnouveau=disabled",
+                "-Dvmwgfx=disabled", "-Dfreedreno=disabled", "-Dvc4=disabled", "-Detnaviv=disabled",
+                "-Dman-pages=disabled", "-Dtests=false"
+            ]
+        )
+    )
+    // `virtio` is venus: Mesa names the driver after the transport. No
+    // gallium, GL, window system or LLVM, since the guest has no display and
+    // no other GPU, and no shader cache, a file on a disk the guest lacks,
+    // nor the zstd that only compresses it.
+    stages.appendAll(
+        mesonStages(
+            "mesa",
+            build,
+            [
+                "-Dvulkan-drivers=virtio", "-Dgallium-drivers=", "-Dplatforms=",
+                "-Dglx=disabled", "-Degl=disabled", "-Dgbm=disabled", "-Dllvm=disabled",
+                "-Dvideo-codecs=", "-Dtools=", "-Dvulkan-layers=",
+                "-Dzstd=disabled", "-Dshader-cache=disabled"
+            ]
+        )
+    )
+    // The loader finds its headers as an installed CMake package. No window
+    // system support: there is no display in the guest to present to.
+    let none: [String] = []
+    stages.appendAll(cmakeStages("vulkan-headers", build, none))
+    stages.appendAll(
+        cmakeStages(
+            "vulkan-loader",
+            build,
+            [
+                "-DBUILD_TESTS=OFF", "-DBUILD_WSI_XLIB_SUPPORT=OFF", "-DBUILD_WSI_XCB_SUPPORT=OFF",
+                "-DBUILD_WSI_WAYLAND_SUPPORT=OFF", "-DBUILD_WSI_DIRECTFB_SUPPORT=OFF"
+            ]
+        )
+    )
+    return stages
+}
+
+// zlib's own configure, outside its tree: its CMake build renames a header
+// inside the source. It takes its tools from the environment alone. Static,
+// as expat is, so the driver carries both.
+function zlibStages(build: borrow CrossBuild) -> [CommandStage] {
+    let llvm = "\(build.host.llvm)/bin"
+    let target = build.architecture.multiarch()
+    let directory: Argument = .Joined([.Workspace, .Text("/zlib")])
+    return [
+        CommandStage {
+            tool: "env",
+            arguments: [
+                .Text("CHOST=\(target)"),
+                .Joined(
+                    [.Text(
+                        "CC=\(llvm)/clang --target=\(target) \(build.linker) -fPIC "
+                    ), copy build.sysrootFlag]
+                ),
+                .Text("AR=\(llvm)/llvm-ar"),
+                .Text("RANLIB=\(llvm)/llvm-ranlib"),
+                .Text("sh"),
+                .Joined([upstreamSource("zlib"), .Text("/configure")]),
+                .Text("--static"),
+                .Joined([.Text("--prefix="), copy build.installed])
+            ],
+            directory: copy directory
+        },
+        CommandStage {
+            tool: "make",
+            arguments: [.Text("-j\(processorCount())"), .Text("install")],
+            directory: directory
+        }
+    ]
+}
+
+// Configuring, building and installing the meson project kept in the
+// workspace's `<directory>-source`, in its `directory`, cross-compiled.
+function mesonStages(
+    directory: borrow String,
+    build: borrow CrossBuild,
+    options: borrow [String]
+) -> [CommandStage] {
+    let meson = "\(build.host.pythonBin())/meson"
+    let output: Argument = .Joined([.Workspace, .Text("/\(directory)")])
+    let flag = copy build.sysrootFlag
+    var arguments: [Argument] = [
+        .Text("setup"),
+        .Text("--reconfigure"),
+        copy output,
+        upstreamSource(directory),
+        .Text("--cross-file"),
+        .Input(copy build.crossFile),
+        .Text("--buildtype=release"),
+        .Text("--libdir=lib"),
+        .Joined([.Text("--prefix="), copy build.installed]),
+        .Joined([.Text("-Dc_args="), copy flag]),
+        .Joined([.Text("-Dcpp_args="), copy flag]),
+        .Joined([.Text("-Dc_link_args=\(build.linker) "), copy flag]),
+        .Joined([.Text("-Dcpp_link_args=\(build.linker) "), copy flag])
+    ]
+    for option in options { arguments.append(.Text(copy option)) }
+    return [
+        CommandStage { tool: copy meson, arguments: arguments },
+        CommandStage { tool: "ninja", arguments: [.Text("-C"), copy output, .Text("install")] }
+    ]
+}
+
+// The same for a CMake project, built with ninja.
+function cmakeStages(
+    directory: borrow String,
+    build: borrow CrossBuild,
+    options: borrow [String]
+) -> [CommandStage] {
+    let output: Argument = .Joined([.Workspace, .Text("/\(directory)")])
+    var arguments: [Argument] = [
+        .Text("-S"),
+        upstreamSource(directory),
+        .Text("-B"),
+        copy output
+    ]
+    arguments.appendAll(cmakeCross(build))
+    for option in options { arguments.append(.Text(copy option)) }
+    return [
+        CommandStage { tool: "cmake", arguments: arguments },
+        CommandStage {
+            tool: "cmake",
+            arguments: [.Text("--build"), copy output, .Text("--target"), .Text("install")]
+        }
+    ]
+}
+
+// CMake's settings for a release cross-compiled with the LLVM bundle.
+function cmakeCross(build: borrow CrossBuild) -> [Argument] {
+    let llvm = "\(build.host.llvm)/bin"
+    let target = build.architecture.multiarch()
+    return [
+        .Text("-G"),
+        .Text("Ninja"),
+        .Text("-DCMAKE_BUILD_TYPE=Release"),
+        .Text("-DCMAKE_SYSTEM_NAME=Linux"),
+        .Text("-DCMAKE_SYSTEM_PROCESSOR=\(build.architecture.name())"),
+        .Text("-DCMAKE_C_COMPILER=\(llvm)/clang"),
+        .Text("-DCMAKE_CXX_COMPILER=\(llvm)/clang++"),
+        .Text("-DCMAKE_C_COMPILER_TARGET=\(target)"),
+        .Text("-DCMAKE_CXX_COMPILER_TARGET=\(target)"),
+        // The loader's trampolines are assembly, which CMake compiles for
+        // the build host unless told otherwise.
+        .Text("-DCMAKE_ASM_COMPILER=\(llvm)/clang"),
+        .Text("-DCMAKE_ASM_COMPILER_TARGET=\(target)"),
+        .Text("-DCMAKE_AR=\(llvm)/llvm-ar"),
+        .Text("-DCMAKE_RANLIB=\(llvm)/llvm-ranlib"),
+        .Text("-DCMAKE_EXE_LINKER_FLAGS=\(build.linker)"),
+        .Text("-DCMAKE_SHARED_LINKER_FLAGS=\(build.linker)"),
+        .Text("-DCMAKE_POSITION_INDEPENDENT_CODE=ON"),
+        .Text("-DCMAKE_INSTALL_LIBDIR=lib"),
+        .Joined([.Text("-DCMAKE_SYSROOT="), .Input(copy build.sysroot)]),
+        .Joined([.Text("-DCMAKE_INSTALL_PREFIX="), copy build.installed]),
+        .Joined(
+            [.Text("-DVulkanHeaders_DIR="), copy build.installed, .Text(
+                "/share/cmake/VulkanHeaders"
+            )]
+        )
+    ]
+}
+
+// The libraries of the tree `prefix` holds under lib/ whose names start with
+// one of `names`, at `directory` in a tree of their own, a link kept a link
+// so a library is carried once under each name it has.
+function librariesFrom(
+    graph: borrow mut Graph,
+    label: borrow String,
+    prefix: borrow Artifact,
+    directory: borrow String,
+    names: borrow [String]
+) -> Artifact {
+    var wanted: [Kten] = []
+    for name in names { wanted.append(.Text(copy name)) }
+    let within = copy directory
+    let starts = copy names
+    return graph.native(
+        NativeAction {
+            label: copy label,
+            code: sourceDigest!("package"),
+            parameters: ktenBare(
+                [ktenField("directory", .Text(copy directory)), ktenField("names", .List(wanted))]
+            ),
+            inputs: [copy prefix],
+            outputs: [Output { name: lastNameOf(label), kind: .Tree }],
+            work: { run in return layLibraries(within, starts, run) }
+        }
+    )[0]
+}
+
+function layLibraries(
+    directory: borrow String,
+    names: borrow [String],
+    run: borrow NativeRun
+) -> Result<Void, BuildFailure> {
+    let output = "\(run.outputs[0])/\(directory)"
+    match makePathTree(output) {
+        Ok -> {}
+        Error(failure) -> return .Error(.Failed("\(output) cannot be made: \(traceText(failure))"))
+    }
+    var laid = 0
+    for entry in run.trees[0] {
+        if !entry.path.startsWith("lib/") || entry.path.substring(4, entry.path.count).contains(
+            "/"
+        ) {
+            continue
+        }
+        let file = lastNameOf(entry.path)
+        var matched = false
+        for name in names {
+            if file.startsWith(name) { matched = true }
+        }
+        if !matched { continue }
+        let target = "\(output)/\(file)"
+        match entry.kind {
+            File -> {
+                match copyFile("\(run.inputs[0])/\(entry.path)", target) {
+                    Ok(length) -> {}
+                    Error(failure) -> return .Error(
+                        .Failed("\(entry.path) cannot be copied: \(traceText(failure))")
+                    )
+                }
+                match setFileMode(target, FileMode.program) {
+                    Ok -> {}
+                    Error(failure) -> return .Error(
+                        .Failed("\(file) cannot be made runnable: \(traceText(failure))")
+                    )
+                }
+            }
+            Link -> match makeSymbolicLink(entry.content, target) {
+                Ok -> {}
+                Error(failure) -> return .Error(
+                    .Failed("\(entry.path) cannot be linked: \(traceText(failure))")
+                )
+            }
+            Directory -> continue
+        }
+        laid += 1
+    }
+    if laid == 0 {
+        return .Error(.Failed("the guest GPU stack holds none of \(joined(names, ", "))"))
+    }
+    return .Ok
+}

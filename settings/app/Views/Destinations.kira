@@ -1,0 +1,47 @@
+import Foundation
+import KiraUI
+import PlatformUI
+
+// The panes another program can open Settings at (PlatformUI's
+// `SettingsPane`), as system search does: the request waits in Settings under
+// `settings.destination`, read when the window is first built and again
+// whenever Settings change, then forgotten so it is followed once.
+
+// The path to `pane`: its sidebar row's route, then each pane on the way.
+function routesTo(
+    pane: SettingsPane,
+    release: borrow Release,
+    choices: SettingsChoices
+) -> [Any NavigationRoute] {
+    let general = GeneralRoute(release = copy release, choices = choices)
+    let display = DisplayRoute(choices = choices)
+    let dateTime = DateTimeRoute(choices = choices)
+    let routes: [Any NavigationRoute] = match pane {
+        General -> [general]
+        About -> [AboutRoute(release = copy release)]
+        Display -> [display]
+        AutoLock -> [display, AutoLockRoute(choices = choices)]
+        HomeScreen -> [HomeScreenRoute()]
+        Focus -> [FocusRoute()]
+        Notifications -> [NotificationsRoute()]
+        Wallpaper -> [WallpaperRoute()]
+        Battery -> [BatteryRoute()]
+        Passcode -> [PasscodeRoute()]
+        Storage -> [StorageRoute()]
+        Apps -> [AppsRoute()]
+        DateTime -> [general, dateTime]
+        Keyboard -> [general, KeyboardRoute()]
+        TimeZone -> [general, dateTime, TimeZoneRoute(choices = choices)]
+    }
+    return routes
+}
+
+// The pane asked for and not yet shown, which is forgotten as it is taken.
+function takeDestination() -> SettingsPane? {
+    let word = storedSetting(SettingsDestinationSetting.key, "")
+    if word.count == 0 { return .None }
+    changeSetting(SettingsDestinationSetting.key, .None)
+    let pane = settingsPaneNamed(word)
+    if pane.isNone() { log warn("Settings was asked for a pane it does not have", pane: word) }
+    return pane
+}

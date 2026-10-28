@@ -1,0 +1,36 @@
+import Foundation
+
+// Expressions that have no value, and the message each one shows.
+
+@Test
+function whitespaceOnlyInputAsksForAnExpression() {
+    expect!(outcome("   ") == "Enter an expression")
+}
+
+@Test
+function danglingOrAdjacentOperandsAreMalformed() {
+    expect!(outcome("2+") == "Not a valid expression")
+    expect!(outcome("*3") == "Not a valid expression")
+    expect!(outcome("2 3") == "Not a valid expression")
+    expect!(outcome("2a") == "Not a valid expression")
+    expect!(outcome("1.2.3") == "Not a valid expression")
+}
+
+@Test
+function divisionByAZeroValueIsRefused() {
+    expect!(outcome("1/0") == "Cannot divide by zero")
+    expect!(outcome("1/(2-2)") == "Cannot divide by zero")
+}
+
+@Test
+function unbalancedBracketsAreReportedOnBothSides() {
+    expect!(outcome("(2") == "Unbalanced parentheses")
+    expect!(outcome("2)") == "Unbalanced parentheses")
+}
+
+@Test
+function expressionsShowWithTheKeypadSigns() {
+    expect!(shownExpression("6*7-2") == "6×7−2")
+    expect!(shownExpression("8/4+1") == "8÷4+1")
+    expect!(shownExpression("") == "")
+}

@@ -1,0 +1,117 @@
+import Foundation
+import Build
+
+// Application bundles on a disk image, as a Mac application ships in a .dmg
+// (roadmap/12-apps.md):
+//
+//     kira build container <name> <bundle.app>...
+//
+// The bundles, absolute or from the project root, are packed into a
+// read-only SquashFS image. Unless `-container-signed no` is given, the
+// image is signed with the Ed25519 key `-container-key` names, by default
+// the developer's own key in the build root, made the first time: the image
+// is padded to a whole 4096-byte block and ends in one more block holding
+// "TESSERA-SIGNED-1", the public key and the signature over every byte
+// before it. PID 1 checks it before installing.
+//
+// When `kira build boot -desktop` or `-dev` is running, the step plugs
+// the image in as a USB stick through QEMU's monitor. The Volume service
+// mounts a disk image read-only with its programs runnable, under the
+// disk's name in /Volumes; the desktop then offers the bundles at its top,
+// and PID 1 opens them from there.
+
+namespace ContainerImage {
+    let magic: String = "TESSERA-SIGNED-1"
+    let block: UNumber = 4096
+    // zlib's level, as mksquashfs's gzip is.
+    let level: Number = 9
+    let key: String = "keys/developer-ed25519.pem"
+}
+
+// The `container` step, when the command line names it.
+function describeContainer(graph: borrow mut Graph, host: borrow Host, architecture: Architecture) {
+    let keyOption = graph.option(
+        textChoice("container-key", "the Ed25519 key a container image is signed with")
+    )
+    let signed = graph.option(
+        Choice {
+            name: "container-signed",
+            summary: "whether a container image is signed",
+            values: ["yes", "no"],
+            fallback: "yes"
+        }
+    ) == "yes"
+    if !graph.requested("container") { return }
+    let passed = graph.passed("container")
+    if passed.count < 2 {
+        graph.problems.append("container: usage: kira build container <name> <bundle.app>...")
+        return
+    }
+    let name = copy passed[0]
+    let prefix = "\(architecture.name())/container/\(name)"
+    var parts: [TreePart] = []
+    for index in 1..passed.count {
+        let bundle = joinedPath(graph.root, passed[index])
+        let base = lastNameOf(bundle)
+        if !base.endsWith(".app") {
+            graph.problems.append("container: \(passed[index]) is not an application bundle")
+            continue
+        }
+        let executable = "\(bundle)/Contents/MacOS/\(base.substring(0, base.count - 4))"
+        if !fileExists(executable) {
+            graph.problems.append("container: \(passed[index]) has no \(executable)")
+            continue
+        }
+        parts.append(.Place(TreePlace { path: copy base, artifact: graph.sourceTree(bundle, []) }))
+    }
+    let tree = graph.tree("\(prefix)/tree", parts)
+    var image = graph.squashfs("\(prefix)/image.squashfs", tree, ContainerImage.level)
+    if signed {
+        let keyPath = keyOption.count > 0 ? keyOption : "\(host.buildRoot)/\(ContainerImage.key)"
+        let key = graph.signingKey(keyPath, true)
+        let padded = graph.padded("\(prefix)/image.padded", image, ContainerImage.block)
+        let signature = graph.sign("\(prefix)/image.sig", padded, key)
+        var header: [UN8] = []
+        for byte in ContainerImage.magic.utf8() { header.append(byte) }
+        for byte in key.publicKey { header.append(byte) }
+        let lead = graph.writeBytes("\(prefix)/signature-lead", header, 420)
+        var zeros: [UN8] = []
+        for at in 0..(Number(ContainerImage.block) - header.count - 64) { zeros.append(UN8(0)) }
+        let tail = graph.writeBytes("\(prefix)/signature-tail", zeros, 420)
+        image = graph.concatenated("\(prefix)/\(name).img", [padded, lead, signature, tail], 420)
+    }
+    let machine = copy host
+    let label = copy name
+    graph.step(
+        Step {
+            name: "container",
+            summary: "application bundles on a signed disk image, plugged into the running machine; `<name> <bundle.app>...`",
+            produces: [image],
+            run: .Some({ run in return plugContainer(machine, architecture, label, run) })
+        }
+    )
+}
+
+// Plugs the image into the running machine, if there is one.
+function plugContainer(
+    host: borrow Host,
+    architecture: Architecture,
+    name: borrow String,
+    run: borrow StepRun
+) -> Number {
+    let monitor = Monitor {
+        path: "\(host.logDirectory())/qemu-\(architecture.name())-services.monitor"
+    }
+    if !pathExists(monitor.path) {
+        log info(
+            "built a container image; no machine is running to plug it into",
+            image: run.paths[0]
+        )
+        return 0
+    }
+    let drive = "container\(floor(unixMillis()))"
+    monitor.send("drive_add 0 if=none,id=\(drive),file=\(run.paths[0]),format=raw,readonly=on")
+    monitor.send("device_add usb-storage,bus=xhci.0,drive=\(drive),id=\(drive)")
+    log info("plugged in a container image; pull it out with device_del", name: name, drive: drive)
+    return 0
+}

@@ -1,0 +1,379 @@
+import Foundation
+import Heap
+import LibTessera
+import DeviceKit
+
+// Disks and partitions, and what each holds.
+//
+// Every DeviceKit BlockDevice and Partition entry is opened, asked for its
+// geometry and probed (`Probe.kira`), as diskarbitrationd probes a disk
+// before it mounts anything. Then every volume that holds a file system is
+// mounted (`Mount.kira`).
+//
+// A `List` answer is one 160-byte record per volume: the registry entry @0,
+// size in bytes @8, logical block @16, DeviceKit `BlockInfo.flags` @20,
+// content @24, partition (1) or whole disk (0) @28, the node's name @32 (64
+// bytes, NUL-padded) and where it is mounted @96 (64 bytes, NUL-padded,
+// empty when it is not).
+
+struct Volume {
+    var entry: EntryId
+    // The whole disk: the volume itself, or a partition's parent.
+    var disk: EntryId
+    var name: String
+    var node: String
+    // The file system's own name for itself, if it has one.
+    var label: String?
+    var mountPoint: String?
+    var size: Number
+    var logicalBlock: Number
+    var flags: BlockFlags
+    var content: Content
+    var partition: Bool
+}
+
+// Whether a registry entry is a whole disk or one of a disk's partitions.
+enum EntryKind {
+    WholeDisk
+    Partition
+}
+
+@FFI.Struct { layout: c }
+struct VolumeRecord {
+    var entry: U64
+    var size: U64
+    var logicalBlock: U32
+    var flags: U32
+    var content: U32
+    var partition: U32
+    var name: VolumeText
+    var mountPoint: VolumeText
+}
+
+@FFI.Array { element: U8, count: 64 }
+struct VolumeText {}
+
+namespace VolumeField {
+    let nameAt: Number = 32
+    let mountPointAt: Number = 96
+    let textBytes: Number = 64
+}
+
+// roadmap/17-devicekit.md §7.4's `MatchSpec`, without property constraints.
+@FFI.Struct { layout: c }
+struct MatchSpecRecord {
+    var entryClass: EntryClass
+    var family: Family
+    var flags: U32
+    var count: U32
+}
+
+// §7's `EntryInfo`, one record of `Registry.match`'s list.
+@FFI.Struct { layout: c }
+struct EntryInfoRecord {
+    var id: U64
+    var entryClass: EntryClass
+    var family: Family
+    var parent: U64
+    var generation: U64
+    var flags: U32
+    var childCount: U32
+    var name: U64
+}
+
+// §7.3's `Property` before its key; the value follows the key at the next
+// 8-byte boundary.
+@FFI.Struct { layout: c }
+struct PropertyHeader {
+    var kind: U32
+    var keyLength: U32
+    var valueLength: U32
+    var reserved: U32
+}
+
+// A `MatchSpec` for every entry of `entryClass`.
+function classSpec(entryClass: borrow EntryClass) -> ByteBlock {
+    let spec = zeroedBlock(count: RegistryRecord.specBytes, alignment: 16)
+    heapStore(
+        spec.pointer(),
+        MatchSpecRecord {
+            entryClass: entryClass,
+            family: Family.None,
+            flags: UN32(0),
+            count: UN32(0)
+        }
+    )
+    return move spec
+}
+
+// The registry's `EntryInfo` list is a header, then 48-byte records.
+namespace RegistryRecord {
+    let specBytes: Number = 16
+    let listBytes: Number = 32768
+    let headerBytes: Number = 8
+    let entryBytes: Number = 48
+    let propertyBytes: Number = 256
+    let keyAt: Number = 16
+}
+
+namespace OpenRetry {
+    // ENXIO, as DeviceLost's detail.
+    let notReady: U64 = U64(6)
+    let tries: Number = 20
+    // 50 ms, on the monotonic clock's nanoseconds.
+    let interval: UNumber = UNumber(50000000)
+}
+
+namespace OpenKey {
+    let device: UNumber = UNumber(1)
+    let read: UNumber = UNumber(2)
+}
+
+function sameEntry(left: EntryId, right: EntryId) -> Bool { return UNumber(left) == UNumber(right) }
+
+function volumeIndex(service: borrow Service, entry: EntryId) -> Number? {
+    for index in 0..service.volumes.count {
+        if sameEntry(service.volumes[index].entry, entry) { return .Some(index) }
+    }
+    return .None
+}
+
+function isEjected(service: borrow Service, disk: EntryId) -> Bool {
+    for ejected in service.ejected {
+        if sameEntry(ejected, disk) { return true }
+    }
+    return false
+}
+
+// The entries of a registry class.
+function entriesOf(entryClass: borrow EntryClass) -> [EntryId] {
+    let spec = classSpec(entryClass)
+    let list = zeroedBlock(count: RegistryRecord.listBytes, alignment: 16)
+    let count = match registryMatch(
+        Buffer { address: spec.pointer(), length: RegistryRecord.specBytes },
+        Buffer { address: list.pointer(), length: RegistryRecord.listBytes }
+    ) {
+        Ok(value) -> value
+        Error(failed) -> {
+            log warn("the registry could not be matched", error: errorName(failed))
+            return []
+        }
+    }
+    var found: [EntryId] = []
+    for index in 0..count {
+        let offset = RegistryRecord.headerBytes + index * RegistryRecord.entryBytes
+        let record: EntryInfoRecord = heapLoad(list.pointer(), offset)
+        found.append(EntryId(record.id))
+    }
+    return found
+}
+
+// Read-only: the service only reads what a disk holds, and the kernel
+// mounts it from its node, so a disk with a read-only medium, such as a CD,
+// opens as well as any other.
+//
+// A disk just attached is listed before its driver takes an open, which
+// then fails with ENXIO; it is asked again for a while before it is given up.
+function openDevice(service: borrow Service, entry: EntryId) -> Result<Ref, TesseraError> {
+    // Every try but the last waits before the next; the last is made below.
+    for _ in 1..OpenRetry.tries {
+        match openDeviceOnce(service, entry) {
+            Ok(device) -> return .Ok(device)
+            // A disk whose driver is not ready yet is asked again below; any
+            // other failure is returned at once.
+            Error(failed) -> {
+                let early = failed.code == .DeviceLost && failed.detail == OpenRetry.notReady
+                if !early { return .Error(failed) }
+            }
+        }
+        let now = try timeRead(.Monotonic)
+        try threadSleep(now + OpenRetry.interval)
+    }
+    return openDeviceOnce(service, entry)
+}
+
+function openDeviceOnce(service: borrow Service, entry: EntryId) -> Result<Ref, TesseraError> {
+    try deviceOpen(entry, .Block, OpenOptions.readOnly, service.openPort, OpenKey.device)
+    let done = try awaitCompletion(service.openPort)
+    return .Ok(Ref(done.result0))
+}
+
+function nodeOf(entry: EntryId) -> String {
+    return match registryNode(entry) {
+        Ok(value) -> value
+        Error(failed) -> {
+            if failed.code != .NotFound {
+                log warn("a disk's node could not be read", error: errorName(failed))
+            }
+            ""
+        }
+    }
+}
+
+// The last component of a node's path.
+function nodeName(node: borrow String) -> String {
+    var start = 0
+    for index in 0..node.count {
+        if node.charAt(index) == 47 { start = index + 1 }
+    }
+    return node.substring(start, node.count)
+}
+
+// A number property of an entry, if it has one.
+function numberProperty(entry: EntryId, key: borrow String) -> Number? {
+    let block = zeroedBlock(count: RegistryRecord.propertyBytes, alignment: 16)
+    let output = Buffer { address: block.pointer(), length: RegistryRecord.propertyBytes }
+    match registryProperty(entry, key, output) {
+        Ok(size) -> {}
+        Error(failed) -> {
+            if failed.code != .NotFound {
+                log warn("a registry property could not be read", key, error: errorName(failed))
+            }
+            return .None
+        }
+    }
+    let header: PropertyHeader = heapLoad(block.pointer())
+    if header.kind != PropertyType.U64.rawValue() { return .None }
+    let valueOffset = ceil((RegistryRecord.keyAt + header.keyLength) / 8) * 8
+    if valueOffset + 8 > RegistryRecord.propertyBytes { return .None }
+    return .Some(Number(blockLoad<U64>(block, valueOffset)))
+}
+
+// The disk a partition is on: its parent in the service plane.
+function diskOf(entry: EntryId, kind: borrow EntryKind) -> EntryId {
+    if kind == .WholeDisk { return entry }
+    return match registryParent(entry, .Service) {
+        Ok(value) -> value
+        Error(failed) -> {
+            log warn("a partition's disk is unknown", error: errorName(failed))
+            entry
+        }
+    }
+}
+
+function add(service: borrow mut Service, entry: EntryId, kind: borrow EntryKind) {
+    // A loop device with nothing behind it, or a drive with no medium, holds
+    // nothing to list, and is not worth an open to find that out.
+    match numberProperty(entry, "size") {
+        Some(size) -> if size == 0 { return }
+        None -> return
+    }
+    let disk = diskOf(entry, kind)
+    if isEjected(service, disk) { return }
+    let node = nodeOf(entry)
+    let name = nodeName(node)
+    let device = match openDevice(service, entry) {
+        Ok(value) -> value
+        Error(failed) -> {
+            // DeviceLost stands for several errnos; the detail says which.
+            log warn(
+                "cannot open a disk",
+                disk: name,
+                error: errorName(failed),
+                detail: failed.detail
+            )
+            return
+        }
+    }
+    let info = match blockInfo(device) {
+        Ok(value) -> value
+        Error(failed) -> {
+            log warn("a disk has no geometry", disk: name, error: errorName(failed))
+            closeRef(device)
+            return
+        }
+    }
+    let probed = probe(service, device, Number(info.size), Number(info.logicalBlock))
+    closeRef(device)
+    let found = match probed {
+        Ok(value) -> value
+        Error(failed) -> {
+            // A drive with no medium in it, or one that fails to read, holds
+            // nothing anyone could use, so it is not listed.
+            log info(
+                "a disk could not be read; it is left out",
+                disk: name,
+                error: errorName(failed)
+            )
+            return
+        }
+    }
+    if info.size == UNumber(0) { return }
+    service.volumes.append(
+        Volume {
+            entry: entry,
+            disk: disk,
+            name: name,
+            node: node,
+            label: found.label,
+            mountPoint: .None,
+            size: Number(info.size),
+            logicalBlock: Number(info.logicalBlock),
+            flags: info.flags,
+            content: found.content,
+            partition: kind == .Partition,
+        }
+    )
+    let access = info.flags.has(BlockFlags.readOnly) ? "read-only" : "read-write"
+    log info(
+        "found a disk",
+        disk: name,
+        bytes: info.size,
+        blockBytes: info.logicalBlock,
+        access,
+        content: contentName(found.content)
+    )
+}
+
+function scan(service: borrow mut Service) {
+    service.volumes = []
+    for disk in entriesOf(.BlockDevice) { add(service, disk, .WholeDisk) }
+    for partition in entriesOf(.Partition) { add(service, partition, .Partition) }
+    mountAll(service)
+}
+
+function mountPointText(volume: borrow Volume) -> String {
+    return match volume.mountPoint {
+        Some(path) -> path
+        None -> ""
+    }
+}
+
+// `volume` as the 160-byte record `List` and `Watch` send.
+function storeRecord(record: RawPtr, volume: borrow Volume) {
+    heapStore(
+        record,
+        VolumeRecord {
+            entry: UNumber(volume.entry),
+            size: UNumber(volume.size),
+            logicalBlock: UN32(volume.logicalBlock),
+            flags: volume.flags.raw,
+            content: volume.content.rawValue(),
+            partition: volume.partition ? UN32(1) : UN32(0),
+            name: VolumeText {},
+            mountPoint: VolumeText {},
+        }
+    )
+    storeText(record, VolumeField.nameAt, volume.name, VolumeField.textBytes)
+    storeText(record, VolumeField.mountPointAt, mountPointText(volume), VolumeField.textBytes)
+}
+
+function list(service: borrow Service, channel: Handle) {
+    let count = Number(service.volumes.count)
+    let length = count * VolumeWire.recordBytes
+    // Eight bytes more than the records, so an empty list still has a block.
+    let block = zeroedBlock(count: length + 8, alignment: 16)
+    for index in 0..service.volumes.count {
+        storeRecord(
+            heapOffset(block.pointer(), index * VolumeWire.recordBytes),
+            service.volumes[index]
+        )
+    }
+    answerWith(
+        channel,
+        code(Operation.List),
+        .Ok,
+        count,
+        Buffer { address: block.pointer(), length: length }
+    )
+}

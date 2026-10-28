@@ -1,0 +1,8 @@
+//! The system volume's package: the init Tessera runs from its read-only system volume.
+/// The Tessera system package: the init that runs once the system volume is the root.
+construct TesseraSystem extends Package {
+    let version: String = "0.1.0"
+    let kind: PackageKind = .App
+    let moduleRoot: String = "TesseraSystem"
+    let dependencies: [Dependency] = [Dependency { name: "LibTessera", path: "../libtessera" }]
+}

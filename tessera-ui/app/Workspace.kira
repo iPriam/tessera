@@ -1,0 +1,197 @@
+//! What an application's interface asks of PID 1, as NSWorkspace asks
+//! launchd: open, install or uninstall an application. A button's action runs
+//! while the toolkit dispatches a key, away from the session, so a request is
+//! queued in Kira UI's state store, the same ambient store a window command
+//! waits in, and the session sends it once the key is handled. PID 1's answer
+//! comes back the same way. LibTessera spells the requests and reads the
+//! answers.
+
+import Foundation
+import KiraUI
+import LibTessera
+
+/// The requests not sent yet, and the sentence PID 1 answered with last.
+struct WorkspaceInbox {
+    var pending: [WorkspaceRequest] = []
+    // The icon the last application asked for is opened from, not yet told
+    // to the display.
+    var launchIcon: LaunchIcon? = .None
+    // The icon of this window's a window flies out of or into now, which the
+    // display asked to be left out of the picture.
+    var flyingIcon: LaunchIcon? = .None
+    var notice: String? = .None
+    // Whether /Applications changed since the application last asked.
+    var applicationsChanged: Bool = false
+}
+
+/// The persistent slot that holds the workspace's inbox for the application's life.
+namespace WorkspaceSlot {
+    let key: PersistentStateKey = PersistentStateKey { name: "kiraui.tessera.workspace" }
+}
+
+/// The notice shown when a workspace request could not be sent.
+namespace WorkspaceNotice {
+    let unsent: String = "The request could not be sent to the system."
+}
+
+/// The workspace inbox, created in the ambient state on first use.
+function workspaceInbox() -> RawPtr {
+    if !ambientStateHas(WorkspaceSlot.key) {
+        ambientStatePut(WorkspaceSlot.key, nativeUserData(nativeState(WorkspaceInbox {})))
+    }
+    return ambientStateGet(WorkspaceSlot.key)
+}
+
+/// Queues a workspace request for the system and clears any notice the last one left.
+function queueWorkspaceRequest(request: WorkspaceRequest) {
+    var waiting = nativeRecover<WorkspaceInbox>(workspaceInbox())
+    waiting.pending.append(move request)
+    waiting.notice = .None
+}
+
+/// Asks PID 1 to open `application`.
+public function openApplication(application: borrow Application) {
+    queueWorkspaceRequest(application.openRequest())
+}
+
+/// Where on the window an application's icon stands, in points from its top
+/// left, and the icon's corner.
+public struct LaunchIcon {
+    /// The icon's distance from the window's left edge, in points.
+    let x: Number
+    /// The icon's distance from the window's top edge, in points.
+    let y: Number
+    /// The icon's width, in points.
+    let width: Number
+    /// The icon's height, in points.
+    let height: Number
+    /// The icon's corner radius, in points.
+    let corner: Number = 0
+}
+
+/// Asks PID 1 to open `application` from its icon at `icon`, as an iPad's home
+/// screen does: the display grows the application's first picture out of the
+/// icon, which is left out of the window until it has grown.
+public function openApplicationFromIcon(application: borrow Application, icon: LaunchIcon) {
+    var waiting = nativeRecover<WorkspaceInbox>(workspaceInbox())
+    waiting.launchIcon = .Some(move icon)
+    queueWorkspaceRequest(application.openRequest())
+}
+
+/// The icon of this window's a window is flying out of or into now, as an
+/// iPad's home screen leaves out the icon an application grows out of or goes
+/// back into, its wallpaper showing there; none while nothing flies.
+public function flyingLaunchIcon() -> LaunchIcon? {
+    let waiting = nativeRecover<WorkspaceInbox>(workspaceInbox())
+    return copy waiting.flyingIcon
+}
+
+/// The display says a window flies out of or into `icon`, or that it landed.
+function noteFlyingIcon(icon: LaunchIcon?) {
+    match icon {
+        Some(at) -> log info("a window flies by one of this surface's icons", x: at.x, y: at.y)
+        None -> log info("the window flying by this surface's icon landed")
+    }
+    var waiting = nativeRecover<WorkspaceInbox>(workspaceInbox())
+    waiting.flyingIcon = move icon
+}
+
+/// The icon to tell the display of, once.
+function takeLaunchIcon() -> LaunchIcon? {
+    var waiting = nativeRecover<WorkspaceInbox>(workspaceInbox())
+    let taken = move waiting.launchIcon
+    waiting.launchIcon = .None
+    return taken
+}
+
+/// Asks PID 1 to install `application`, from the disk image it is on, in
+/// /Applications.
+public function installApplication(
+    application: borrow Application
+) -> Result<Void, WorkspaceRefusal> {
+    let request = try application.installRequest()
+    queueWorkspaceRequest(move request)
+    return .Ok
+}
+
+/// Asks PID 1 to uninstall `application`, an image installed from a disk
+/// image. Its documents are kept.
+public function uninstallApplication(
+    application: borrow Application
+) -> Result<Void, WorkspaceRefusal> {
+    let request = try application.uninstallRequest()
+    queueWorkspaceRequest(move request)
+    return .Ok
+}
+
+/// What PID 1 said about the last request, until the next.
+public function workspaceNotice() -> String? {
+    let waiting = nativeRecover<WorkspaceInbox>(workspaceInbox())
+    return copy waiting.notice
+}
+
+/// Puts away what PID 1 said, as the button that answers an alert of it does.
+public function dismissWorkspaceNotice() {
+    var waiting = nativeRecover<WorkspaceInbox>(workspaceInbox())
+    waiting.notice = .None
+}
+
+/// Whether an application was installed or uninstalled since this was last
+/// asked, for an application that watches `.Applications` and keeps a list of
+/// them, as a platform's Dock does.
+public function takeApplicationsChange() -> Bool {
+    var waiting = nativeRecover<WorkspaceInbox>(workspaceInbox())
+    let changed = waiting.applicationsChanged
+    waiting.applicationsChanged = false
+    return changed
+}
+
+/// Records that the set of installed applications changed.
+function noteApplicationsChange() {
+    var waiting = nativeRecover<WorkspaceInbox>(workspaceInbox())
+    waiting.applicationsChanged = true
+}
+
+/// The requests queued since the last call, which are now the caller's to send.
+function takeWorkspaceRequests() -> [WorkspaceRequest] {
+    var waiting = nativeRecover<WorkspaceInbox>(workspaceInbox())
+    let taken = move waiting.pending
+    waiting.pending = []
+    return taken
+}
+
+/// Shows `notice` in the workspace until it is dismissed or a new request is queued.
+function showWorkspaceNotice(notice: String) {
+    var waiting = nativeRecover<WorkspaceInbox>(workspaceInbox())
+    waiting.notice = .Some(move notice)
+}
+
+/// Sends PID 1 what the interface asked of it since the last turn, and waits
+/// for the answer to the last. One that cannot be sent is said to the person,
+/// as PID 1 would say why it failed.
+function sendWorkspaceRequests(waits: borrow mut Waits) {
+    for request in takeWorkspaceRequests() {
+        match askWorkspace(request) {
+            Ok(channel) -> {
+                waits.awaitAnswer(channel)
+                log info("asked PID 1", request: request)
+            }
+            Error(failure) -> {
+                log warn("could not ask PID 1", request: request, failure: failure)
+                showWorkspaceNotice(WorkspaceNotice.unsent)
+            }
+        }
+    }
+}
+
+/// Shows what PID 1 answered, if it said anything.
+function takeWorkspaceAnswer(waits: borrow mut Waits) {
+    match waits.readAnswer() {
+        Ok(answered) -> match answered {
+            Said(sentence) -> showWorkspaceNotice(move sentence)
+            // Not here yet, or nothing to say: the request did what it asked.
+            NotYet, Silent -> {}
+        }
+        Error(failure) -> log warn("PID 1's answer could not be read", failure: failure)
+    }
+}

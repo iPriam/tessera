@@ -1,0 +1,83 @@
+import Foundation
+import HomeLayout
+import KiraUI
+import TesseraUI
+import PlatformUI
+
+// The controls Home's edit adds around its pages: the bar's pills and Edit's
+// menu, what carrying an icon onto the Dock does, and where the keyboard's
+// ring goes.
+
+namespace HomeEditBar {
+    // How far in from the screen's top and sides its pills stand, and their
+    // text and padding: small capsules, as an iPad's Edit and Done are.
+    let top: Number = 12
+    let inset: Number = 20
+    let text: Number = 15
+    let across: Number = 14
+    let down: Number = 6
+    // The gap under the pills before Edit's menu, and the menu's corners.
+    let gap: Number = 8
+    let menuCorner: Number = 18
+    // How far down the pills reach, which a tap that ends the edit is under.
+    let reach: Number = 48
+}
+
+// One of the edit bar's pills.
+function homeEditPill(title: String, action: () -> Void) -> Any Widget {
+    return Button(action = action) {
+        Text(title)
+        .font(size: resolvedLength(HomeEditBar.text), weight: .SemiBold)
+        .textColor(tileInk)
+        .edgePadding(EdgeSet.horizontal, resolvedLength(HomeEditBar.across))
+        .edgePadding(EdgeSet.vertical, resolvedLength(HomeEditBar.down))
+    }
+    .buttonStyle(.Plain)
+    .glassEffect()
+    .hugWidth()
+}
+
+// One choice in Edit's menu.
+function homeEditChoice(title: String, symbol: Symbol, action: () -> Void) -> Any Widget {
+    return Button(action = action) {
+        HStack(spacing = .Small, alignment = .Center) {
+            Icon(symbol = symbol)
+            .font(size: resolvedLength(HomeEditBar.text))
+            Text(title)
+            .font(size: resolvedLength(HomeEditBar.text), weight: .Medium)
+        }
+        .textColor(tileInk)
+        .edgePadding(EdgeSet.horizontal, resolvedLength(10))
+        .edgePadding(EdgeSet.vertical, resolvedLength(8))
+    }
+    .buttonStyle(.Plain)
+}
+
+// The application at `slot`, carried and let go over the Dock at `x`, is
+// kept there, at the place it was let go, or moves there when the Dock keeps
+// it already; it stays on Home too.
+function carriedToDock(slot: borrow HomeSlot, x: Number) {
+    match loadArrangement().itemAt(slot) {
+        Some(item) -> match item {
+            App(name) -> placeDockFavourite(
+                name,
+                dockIndexAt(x, viewportWidth(), keptInDock().count)
+            )
+            // A folder is not something the Dock keeps.
+            Folder -> {}
+        }
+        // The item went while it was carried, as when it was uninstalled.
+        None -> {}
+    }
+}
+
+// The name of the folder at `slot`, or nothing when no folder is there.
+function folderNamed(arrangement: borrow HomeArrangement, slot: borrow HomeSlot) -> String {
+    return match arrangement.itemAt(slot) {
+        Some(item) -> match item {
+            Folder(folder) -> copy folder.name
+            App -> ""
+        }
+        None -> ""
+    }
+}

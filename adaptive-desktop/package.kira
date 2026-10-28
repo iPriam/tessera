@@ -1,0 +1,15 @@
+construct AdaptiveDesktop extends Package {
+    let version: String = "0.1.0"
+    let kind: PackageKind = .App
+    let moduleRoot: String = "AdaptiveDesktop"
+    let dependencies: [Dependency] = [
+        Dependency { name: "ArgumentParser", path: "../argument-parser" },
+        Dependency { name: "LibTessera", path: "../libtessera" },
+        Dependency { name: "TesseraDisplayClient", path: "../display-client" },
+        Dependency { name: "KiraUI", path: "../kira-ui" },
+        Dependency { name: "TesseraUI", path: "../tessera-ui" },
+        Dependency { name: "PlatformUI", path: "../platform-ui" },
+        Dependency { name: "PlatformKit", path: "../platform-kit" },
+        Dependency { name: "AppKit", path: "../appkit" }
+    ]
+}

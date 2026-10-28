@@ -1,0 +1,294 @@
+import Foundation
+
+// The plain services boot, and the device services every services boot
+// checks once the machine is off.
+
+extend TestMachine {
+    // Fails the boot, saying `what` failed, unless every entry `specs`
+    // names is in the log.
+    function require(borrow mut self, specs: borrow [String], what: borrow String) -> Bool {
+        let written = read()
+        for spec in specs {
+            if !written.has(spec) { return fail("services \(what) failed", 80) }
+        }
+        return true
+    }
+}
+
+// Opens the platform's lock screen, which covers the display and holds the
+// keyboard from the start (roadmap/13-security-and-updates.md): presses the
+// space bar until the platform says it opened, so focus reaches the
+// applications under it. Space is no key the platform grabs, and no key the
+// checks count as reaching an application.
+function openLockScreen(machine: borrow mut TestMachine) {
+    machine.await(200, { written in return written.has("]: running|locked: true") })
+    for press in 0..(20 * machine.pollScale) {
+        if machine.read().has("]: the lock screen opened") { return }
+        if !machine.running() { return }
+        machine.monitor.send("sendkey spc")
+        for poll in 0..10 {
+            if machine.read().has("]: the lock screen opened") { return }
+            processSleep(100)
+        }
+    }
+}
+
+// Each Display Check posts a notification as it starts, and the platform
+// shows it as a banner once it has read the client's link; a boot with two
+// clients runs until both are up, or ten seconds.
+function awaitBanners(machine: borrow mut TestMachine) {
+    machine.await(
+        100,
+        { written in
+            return written.has(
+                "a notification banner appeared|body: \"Client 2 is on the display\""
+            )
+                && written.has(
+                    "a notification banner appeared|body: \"Client 3 is on the display\""
+                )
+        }
+    )
+}
+
+// The plain services boot: the platform and one Display Check client, a
+// key routed to the focused one, a malformed packet that ends only that
+// client, and the SystemServices it reports.
+function plainScenario(
+    machine: borrow mut TestMachine,
+    architecture: Architecture,
+    outputSize: borrow String,
+    screen: borrow String
+) -> Bool {
+    // Input means something only once both client framebuffers flipped and
+    // the display server acted on the platform's focus grant: the key below
+    // ends the application's session, after which a queued grant finds no
+    // surface.
+    openLockScreen(machine)
+    machine.await(
+        200,
+        { written in
+            return written.has("TesseraUI.DisplayCheck]: a frame is on the display|frame: 2")
+                && written.has("the platform granted focus|surface: 2")
+        }
+    )
+    let sides = outputSize.split("x")
+    let width = match sides[0].toNumber() {
+        Some(value) -> value
+        None -> 0
+    }
+    let height = match sides[1].toNumber() {
+        Some(value) -> value
+        None -> 0
+    }
+    // What the host shows of the guest's display: the pixels the guest's GPU
+    // rendered, read through the scanout's mapping.
+    match removePath(screen) {
+        Ok -> {}
+        Error(failure) -> absorb failure
+    }
+    machine.monitor.ask("screendump \(screen)", 3)
+    if !picturedScreen(screen, width, height) {
+        return machine.fail(
+            "services display failed: the host does not show the composed picture (\(screen))",
+            0
+        )
+    }
+    machine.monitor.send("sendkey a")
+    let key = "TesseraUI.DisplayCheck]: a key arrived|key: 4|state: \"pressed\""
+    machine.await(50, { written in return written.has(key) })
+    // The platform connects first and takes surface 1, so the application
+    // is surface 2, the one focus and input must reach.
+    if !focusReached(machine.read()) || !machine.read().has(key) {
+        return machine.fail("services focused-input routing failed", 100)
+    }
+    // The UI follows the input round-trip with one short protocol record:
+    // MosaicDisplay must end only that client's session, keep the scanout
+    // and the machine.
+    machine.await(50, { written in return written.has("an application surface went|surface: 2") })
+    let isolated = machine.read()
+    if !isolated.has("TesseraUI.DisplayCheck]: sent a malformed display packet")
+        || !isolated.has("a display client disconnected or sent an invalid frame|surface: 2")
+        || !isolated.has("an application surface went|surface: 2")
+        || !machine.running() {
+        return machine.fail("services malformed-client isolation failed", 100)
+    }
+    // Once frame 2 is complete the UI asks for nothing else: an idle event
+    // loop must not make a third grant or flip. Counted from the client,
+    // since MosaicDisplay's lines are one call site for every surface, and a
+    // Kira log site prints its first four lines and then its powers of two.
+    processSleep(200)
+    let paced = machine.read()
+    if paced.count("TesseraUI.DisplayCheck]: a frame is on the display") != 2
+        || paced.has("TesseraUI.DisplayCheck]: a frame was granted|frame: 3") {
+        return machine.fail(
+            "services frame pacing regressed: expected exactly two requested flips",
+            80
+        )
+    }
+    // The platform asked for freeform, so the application is laid out again
+    // live, and answers the fresh Configure from its event loop.
+    let checks: [([String], String)] = [
+        (
+            [
+                "configured a surface|surface: 2|x: 143|y: 89|width: 853|height: 533|serial: 2",
+                "TesseraUI.Session]: reconfigured|client: 2|width: 853|height: 533|serial: 2",
+                "a surface acknowledged a configure|surface: 2|serial: 2"
+            ],
+            "live re-layout"
+        ),
+        // The keyboard is the one input device, and the application is told.
+        (
+            ["TesseraUI.Session]: the compositor reports an input|client: 2|input: DisplayInputKind.Key"],
+            "input capability"
+        ),
+        (["AdaptiveDesktop.main]: arranged|arrangement: \"freeform\""], "arrangement"),
+        (["an application surface appeared|surface: 2"], "surface list"),
+        (
+            ["TesseraUI.Session]: the display is in a mode|client: 2|mode: \"freeform\""],
+            "mode broadcast"
+        ),
+        // MosaicDisplay reads the keyboard, so its key is tagged hardware at
+        // the door: the fact the trusted path stands on.
+        (
+            ["TesseraUI.DisplayCheck]: a key arrived|key: 4|provenance: DisplayProvenance.Hardware"],
+            "input provenance"
+        ),
+        (["granting focus|surface: 2", "the platform granted focus|surface: 2"], "grant focus"),
+        // A channel value the platform reads without the widget tree.
+        (["a surface set its badge|surface: 2|badge: 7"], "channel forward"),
+        (["a notification arrived|notification: 1|priority: 2"], "notification")
+    ]
+    for (specs, what) in checks {
+        if !machine.require(specs, what) { return false }
+    }
+    // The platform grabbed F12, key 69: it fires to the platform before any
+    // application, and the application never sees it.
+    machine.monitor.send("sendkey f12")
+    machine.await(50, { written in return written.has("a grab fired|key: 69") })
+    if !machine.read().has("a grab fired|key: 69")
+        || machine.read().has("TesseraUI.DisplayCheck]: a key arrived|key: 69|state: \"pressed\"") {
+        return machine.fail("services grab routing failed", 80)
+    }
+    // The trusted path: verify passes only with a prompt present and the last
+    // input real hardware, so after the grabbed key and not after the key
+    // the platform injects next. The verify the platform asks for as it
+    // starts may go either way, so both answers are waited for.
+    let trusted = [
+        "verified the system prompt|ok: true",
+        "verified the system prompt|ok: false",
+        "the compositor verified the prompt|ok: true"
+    ]
+    machine.await(
+        50,
+        { written in
+            return written.has(trusted[0]) && written.has(trusted[1]) && written.has(trusted[2])
+        }
+    )
+    if !machine.require(trusted, "trusted path") { return false }
+    let kernelMachine = architecture == .X86_64 ? "Architecture.Intel64" : "Architecture.Arm64"
+    if !machine.require(
+        ["read the kernel|kernel: Backend.Linux|machine: \(kernelMachine)"],
+        "kernel report"
+    ) {
+        return false
+    }
+    // Injected input reaches the surface, but a verify after it is refused.
+    machine.await(50, { written in return written.has("injected a synthetic key|key: 104") })
+    if !machine.require(["injected a synthetic key|key: 104"], "synthetic injection") {
+        return false
+    }
+    if !machine.require(["read the monotonic clock|seconds: "], "clock report") { return false }
+    if !machine.require(["armed a timer|remaining: "], "timer report") { return false }
+    return machine.require(["opened an anonymous memory file"], "memfd report")
+}
+
+// Whether MosaicDisplay focused surface 2 and the client heard so.
+function focusReached(written: borrow BootLog) -> Bool {
+    var message = ""
+    var server = false
+    var client = false
+    for line in written.lines {
+        if messageLine(line) { message = copy line }
+        if message.contains("]: focused a surface") && endsWithField(line, "= surface: 2") {
+            server = true
+        }
+        if message.contains("TesseraUI.Session]: the focus moved") && endsWithField(
+            line,
+            "= focus: Focus.Focused"
+        ) {
+            client = true
+        }
+    }
+    return server && client
+}
+
+// The first line the device services should have printed and did not, or
+// none (roadmap/17-devicekit.md section 25): the Devices, Power and Volume
+// services listen, the Volume service probes the scratch disk, the platform
+// reads the power page and plays its chime, and devicekitd starts the
+// drivers, which claim their devices and publish what they found.
+function missingServiceLine(written: borrow BootLog, mode: borrow BootMode) -> String? {
+    var lines = [
+        "log:a service checked in|service: \"tessera.devices\"",
+        "log:a service checked in|service: \"tessera.power\"",
+        "log:a service checked in|service: \"tessera.volume\"",
+        "log:Devices.main]: listening|audioOutputs: ",
+        "log:Power.main]: listening|powerSources: ",
+        "log:Volume.main]: listening|volumes: ",
+        "log:a service checked in|service: \"tessera.pasteboard\"",
+        "log:Pasteboard.main]: listening",
+        "log:a service checked in|service: \"tessera.trash\"",
+        "log:Trash.main]: listening",
+        "log:a service checked in|service: \"tessera.presence\"",
+        "log:Presence.main]: listening",
+        "log:found a disk|disk: \"vda\"|bytes: 4194304|access: \"read-only\"|content: \"ext4\"",
+        "log:mounted a volume|disk: \"vda\"|mountPoint: \"/Volumes/scratch\"|filesystem: \"ext4\"|readOnly: true|holds: \"lost+found",
+        "log:started a driver|driver: \"ccid-driver\"",
+        "log:found a reader|device: \"08e6:4433\"",
+        "log:read a slot|card: \"no card\"",
+        "log:CcidDriver.main]: published an entry",
+        "log:loaded a driver extension|bundle: \"ccid-driver.dext\"|personalities: 1",
+        "log:loaded a driver extension|bundle: \"tablet-driver.dext\"|personalities: 1",
+        "log:a driver published an entry|program: \"/System/Library/DriverExtensions/ccid-driver.dext/ccid-driver\"",
+        "log:started a driver|driver: \"tablet-driver\"",
+        "log:found a tablet|device: \"0627:0001\"|interface: 0",
+        "log:claimed the interface from the kernel's driver|interface: 0",
+        "log:read the report descriptor|bytes: ",
+        "log:a driver published an entry|program: \"/System/Library/DriverExtensions/tablet-driver.dext/tablet-driver\""
+    ]
+    for line in scenarioServiceLines(mode) { lines.append(line) }
+    // The system's init binds the data subvolume's Applications, Cache and
+    // BuildCache onto the root (roadmap/05).
+    for path in ["/Applications", "/Cache", "/BuildCache"] {
+        lines.append("log:bound a data directory at the root|path: \"\(path)\"")
+    }
+    if written.has("AdaptiveDesktop.main]: starting") {
+        for line in [
+            "log:a program holds a System channel|program: \"/bin/adaptive-desktop\"",
+            "log:AdaptiveDesktop.Desktop.Devices]: watching for devices",
+            // The log cuts the names short, so they are matched as far as
+            // it prints them.
+            "log:listed the services|count: 5|names: \"tessera.devices, tessera.power, tessera.volume, tessera.settings, tessera.instal",
+            "log:read the power state|externalPower: ExternalPower.Mains",
+            "log:played the startup chime|bytes: "
+        ] { lines.append(copy line) }
+    }
+    // The stop: the services that watch for the request leave through main.
+    // Only the first are asserted: on aarch64 devices and volume can still be
+    // busy with a disk just pulled when the deadline passes.
+    for line in [
+        "log:every service is stopped; powering off",
+        "log:Power.Service.Service]: asked to stop",
+        "log:stopped the services|exited: \"bootstrap, devicekitd, "
+    ] { lines.append(copy line) }
+    for line in lines {
+        if !written.seen(line) { return .Some("no \"\(line)\"") }
+    }
+    // `diskutil list /dev/vda` leaves the data disk out.
+    if !mode.restart && !mode.multi && !mode.media && !mode.mobile && !mode.browser && written.shows(
+        "/dev/vdb (internal):"
+    ) {
+        return .Some("diskutil list /dev/vda listed vdb")
+    }
+    return .None
+}

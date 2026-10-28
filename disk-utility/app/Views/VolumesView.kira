@@ -1,0 +1,46 @@
+//! The volumes view: the volumes mounted in /Volumes, with their access and paths.
+import LibTessera
+import KiraUI
+
+/// What a volume's access reads as: a disk image cannot be written, a data volume can.
+function accessText(access: borrow VolumeAccess) -> String {
+    return match access {
+        ReadOnly -> "Read only"
+        Writable -> "Read and write"
+        Unknown(reason) -> "Unknown: " + reason
+    }
+}
+
+/// One row for each volume, its name beside its access and its path under it.
+function volumeRows(volumes: borrow [Volume]) -> Any Widget {
+    var rows: [Any Widget] = []
+    for volume in volumes {
+        rows.append(
+            LabeledContent(label = copy volume.name) {
+                VStack(spacing = .ExtraSmall, alignment = .Trailing) {
+                    Text(accessText(volume.access))
+                    Text(copy volume.path)
+                    .typography(.callout)
+                    .foregroundColor(.Secondary)
+                }
+            }
+        )
+    }
+    return VStack(spacing: .Small, children: rows)
+}
+
+/// The volumes mounted in /Volumes.
+construct VolumesView(volumes: [Volume]) extends Widget {
+    body {
+        Form {
+            Section {
+                volumeRows(volumes)
+            } header: {
+                Text("Volumes")
+            } footer: {
+                Text(volumes.count == 0 ? "No volume is mounted in /Volumes" : "A disk image cannot be written; a data volume can")
+            }
+        }
+        .navigationTitle("Disk Utility")
+    }
+}

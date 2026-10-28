@@ -1,0 +1,46 @@
+//! When a platform dims and blanks the output for want of input: the idle times it is given and the state it holds.
+import Foundation
+
+// When a platform has the output dim and blank for want of input
+// (roadmap/11-adaptive-desktop.md, "Idle"). MosaicDisplay keeps the time; the
+// platform says how long, and closes its lock screen when the output blanks.
+
+/// How many seconds without input the output dims after, and blanks after. Zero is never.
+public struct IdleTimes {
+    /// Seconds without input before the output dims. Zero is never.
+    var dim: Number = 0
+    /// Seconds without input before the output blanks. Zero is never.
+    var blank: Number = 0
+}
+
+/// The idle policy's defaults: when the output blanks without input, and how the setting is read.
+public namespace IdlePolicy {
+    /// Adaptive Desktop blanks after ten minutes, the default of a Mac, in seconds.
+    let desktopBlank: Number = 600
+    /// Adaptive Mobile blanks after two minutes, the auto-lock default of an iPad, in seconds.
+    let mobileBlank: Number = 120
+    /// How many seconds before blanking the output dims, as an iPhone does.
+    let dimBefore: Number = 10
+}
+
+/// The times for an output that blanks after `blank` seconds.
+///
+/// The output dims `IdlePolicy.dimBefore` seconds before it blanks, when the blank time is longer than that. Otherwise it does not dim.
+public function idleTimes(blank: Number) -> IdleTimes {
+    let dim = blank > IdlePolicy.dimBefore ? blank - IdlePolicy.dimBefore : 0
+    return IdleTimes { dim: dim, blank: blank }
+}
+
+/// The Settings entry and value the idle time is read from.
+public namespace IdleSetting {
+    /// The name of the Settings entry that holds the seconds without input before the output blanks. The value `0` means never.
+    let key: String = "display.sleep"
+}
+
+/// The seconds the stored setting holds, or `.None` when it holds no number or a negative one.
+///
+/// `stored` is the setting's text as Settings writes it. Zero is returned as `.Some(0)`, which means never.
+public function storedDisplaySleep(stored: borrow String) -> Number? {
+    let seconds = try parseNumber(stored) otherwise return .None
+    return seconds >= 0 ? .Some(seconds) : .None
+}

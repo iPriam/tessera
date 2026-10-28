@@ -1,0 +1,177 @@
+import Foundation
+import KiraUI
+import PlatformUI
+
+// Wallpaper, as an iPad's: the lock screen and Home side by side as they will
+// look, the pictures to choose among, how the picture is zoomed and moved,
+// and where it is set. Nothing changes until it is set; Cancel goes back to
+// what is set now.
+
+namespace WallpaperLook {
+    // The previews' size and corners.
+    let width: Number = 132
+    let height: Number = 228
+    let corner: Number = 16
+    // A picture's swatch.
+    let swatch: Number = 64
+    // How far past filling the screen a picture can be zoomed.
+    let zoom: Number = 3
+}
+
+construct WallpaperPane() extends Widget {
+    // Each choice as Settings keeps it.
+    @State var draft: String = wallpaperText(wallpaperChoice(.Lock))
+    @State var home: String = wallpaperText(wallpaperChoice(.Home))
+    @State var lock: String = wallpaperText(wallpaperChoice(.Lock))
+
+    body {
+        let chosen = wallpaperChoiceFrom(draft)
+        Form {
+            Section {
+                HStack(spacing = .Large, alignment = .Center) {
+                    Spacer()
+                    wallpaperPreview("Lock Screen", chosen)
+                    wallpaperPreview("Home Screen", chosen)
+                    Spacer()
+                }
+            } footer: {
+                Text(draftShown() ? "What is set now." : "Not set yet.")
+            }
+
+            Section(children: pictureRows(), header: Text("Pictures"))
+
+            Section {
+                LabeledContent(label = "Zoom") {
+                    Slider(
+                        value = (chosen.zoom - 1) / WallpaperLook.zoom,
+                        width = 180,
+                        onChange = { share in
+                            var moved = wallpaperChoiceFrom(draft)
+                            moved.zoom = 1 + share * WallpaperLook.zoom
+                            draft = wallpaperText(moved)
+                            return
+                        }
+                    )
+                }
+                LabeledContent(label = "Across") {
+                    Slider(
+                        value = chosen.x,
+                        width = 180,
+                        onChange = { share in
+                            var moved = wallpaperChoiceFrom(draft)
+                            moved.x = share
+                            draft = wallpaperText(moved)
+                            return
+                        }
+                    )
+                }
+                LabeledContent(label = "Down") {
+                    Slider(
+                        value = chosen.y,
+                        width = 180,
+                        onChange = { share in
+                            var moved = wallpaperChoiceFrom(draft)
+                            moved.y = share
+                            draft = wallpaperText(moved)
+                            return
+                        }
+                    )
+                }
+            } header: {
+                Text("Position")
+            } footer: {
+                Text("Across and Down move the picture once it is zoomed past the screen.")
+            }
+
+            Section {
+                Button(
+                    title = "Set as Lock Screen",
+                    action = { in
+                        chooseWallpaper(wallpaperChoiceFrom(draft), false, true)
+                        lock = copy draft
+                        return
+                    }
+                )
+                Button(
+                    title = "Set as Home Screen",
+                    action = { in
+                        chooseWallpaper(wallpaperChoiceFrom(draft), true, false)
+                        home = copy draft
+                        return
+                    }
+                )
+                Button(
+                    title = "Set Both",
+                    action = { in
+                        chooseWallpaper(wallpaperChoiceFrom(draft), true, true)
+                        home = copy draft
+                        lock = copy draft
+                        return
+                    }
+                )
+                Button(
+                    title = "Cancel",
+                    action = { in
+                        draft = copy lock
+                        return
+                    }
+                )
+            }
+        }
+        .navigationTitle("Wallpaper")
+    }
+
+    // Whether the draft is what both places show now.
+    function draftShown() -> Bool {
+        return draft == home && draft == lock
+    }
+
+    // One row per bundled picture, its swatch, its name and a check when it
+    // is the draft's.
+    function pictureRows() -> [Any Widget] {
+        var rows: [Any Widget] = []
+        for picture in bundledWallpapers() {
+            let name = copy picture.name
+            let chosen = wallpaperChoiceFrom(draft).picture == name
+            rows.append(
+                Button(
+                    action = { in
+                        draft = wallpaperText(WallpaperChoice { picture: copy name })
+                        return
+                    }
+                ) {
+                    HStack(spacing = .Medium, alignment = .Center) {
+                        Wallpaper(
+                            preview = .Some(WallpaperChoice { picture: copy name }),
+                            width = WallpaperLook.swatch,
+                            height = WallpaperLook.swatch
+                        )
+                        .frame(width = WallpaperLook.swatch, height = WallpaperLook.swatch)
+                        .clipShape(.Squircle(8))
+                        Text(copy name)
+                        Spacer()
+                        Icon(symbol = .Checkmark)
+                        .foregroundColor(chosen ? .Accent : .Clear)
+                    }
+                }.buttonStyle(.Plain)
+            )
+        }
+        return rows
+    }
+}
+
+// The draft as `title`'s screen shows it, a small screen with its name under.
+function wallpaperPreview(title: String, choice: borrow WallpaperChoice) -> Any Widget {
+    return VStack(spacing = .Small, alignment = .Center) {
+        Wallpaper(
+            preview = .Some(copy choice),
+            width = WallpaperLook.width,
+            height = WallpaperLook.height
+        )
+        .frame(width = WallpaperLook.width, height = WallpaperLook.height)
+        .clipShape(.Squircle(WallpaperLook.corner))
+        Text(title)
+        .font(size: resolvedLength(13))
+        .foregroundColor(.Secondary)
+    }
+}

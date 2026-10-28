@@ -1,0 +1,87 @@
+import Foundation
+
+// The tile: a rounded square, and the questions the splash asks about a point
+// near it.
+//
+// Nothing here knows about a screen, a buffer or a card. Every function answers a
+// question about a point, so the same arithmetic draws the mark at any size.
+// Distances are in pixels, with fractional coverage at the edges.
+
+// The tile, at the proportion the artwork places it: 500 of a 2246-tall frame.
+function tileSide(height: Number) -> Number { return trunc(height * 500 / 2246) }
+
+// The tile and the mark at one size, in pixels, tile-local: the tile's side and
+// corner radius, half the stroke's width, and the mark's segments as their
+// ends, each `(ax, ay, bx, by)`.
+struct SplashPainter {
+    let side: Number
+    let radius: Number
+    let reach: Number
+    let segments: [(Number, Number, Number, Number)]
+}
+
+// The painter for a tile `side` pixels across. The corner is 85 of the
+// artwork's 500 units, and the stroke 37 thousandths of the side either way.
+function splashPainter(side: Number) -> SplashPainter {
+    let pixels = side
+    var segments: [(Number, Number, Number, Number)] = []
+    for segment in markSegments {
+        segments.append(
+            (
+                segment.0 * pixels / 500.0,
+                segment.1 * pixels / 500.0,
+                segment.2 * pixels / 500.0,
+                segment.3 * pixels / 500.0
+            )
+        )
+    }
+    return SplashPainter {
+        side: pixels,
+        radius: pixels * 85.0 / 500.0,
+        reach: pixels * 37.0 / 1000.0,
+        segments: segments,
+    }
+}
+
+// How far `(u, v)` is outside the rounded square: negative inside it, zero on
+// its edge. Square everywhere but the corners, where it is a circle's.
+function tileDistance(painter: borrow SplashPainter, u: Number, v: Number) -> Number {
+    let centre = painter.side / 2.0
+    let straight = centre - painter.radius
+    let across = abs(u - centre) - straight
+    let down = abs(v - centre) - straight
+    let outU = max(across, 0.0)
+    let outV = max(down, 0.0)
+    return sqrt(outU * outU + outV * outV) + min(max(across, down), 0.0) - painter.radius
+}
+
+// How far `(u, v)` is from the segment `a` to `b`. The closest point is
+// `a + t(b - a)` with `t` clamped to the ends, which is what gives the stroke
+// its round caps.
+function segmentDistance(
+    segment: borrow (Number, Number, Number, Number),
+    u: Number,
+    v: Number
+) -> Number {
+    let dx = segment.2 - segment.0
+    let dy = segment.3 - segment.1
+    let length = dx * dx + dy * dy
+    var along: Number = 0.0
+    if length > 0.0 {
+        along = clamp(((u - segment.0) * dx + (v - segment.1) * dy) / length, 0.0, 1.0)
+    }
+    let offsetU = segment.0 + along * dx - u
+    let offsetV = segment.1 + along * dy - v
+    return sqrt(offsetU * offsetU + offsetV * offsetV)
+}
+
+// How far `(u, v)` is outside the mark's stroke: negative on it.
+function markDistance(painter: borrow SplashPainter, u: Number, v: Number) -> Number {
+    // The artwork always contains segments; seed with its first distance.
+    var nearest = segmentDistance(painter.segments[0], u, v)
+    for segment in painter.segments {
+        let distance = segmentDistance(segment, u, v)
+        if distance < nearest { nearest = distance }
+    }
+    return nearest - painter.reach
+}

@@ -1,0 +1,201 @@
+import Foundation
+import ArgumentParser
+import CoreIcon
+
+namespace TessiconExit {
+    let done: Number = 0
+    let failed: Number = 1
+}
+
+@Derive(Parsable)
+struct SvgArguments {
+    let path: String
+    let size: Number
+    let output: String
+}
+
+ParsableCommand SvgCommand {
+    let configuration: CommandConfiguration {
+        return CommandConfiguration { name: "svg", abstract: "Draw one SVG into a square PNG" }
+    }
+
+    let arguments: [ArgumentSpec] {
+        return [
+            argument(name: "path", help: "The SVG file"),
+            option(name: "layout", help: "framed, as macOS shows it, or edge, as iOS does")
+            .defaulting("framed"),
+            option(name: "size", help: "The PNG's side, in pixels").short("s").whole().defaulting(
+                "512"
+            ),
+            option(name: "output", help: "The PNG to write").short("o")
+        ]
+    }
+
+    function run(arguments: borrow ParsedArguments) -> Number {
+        let svg = parse_SvgArguments(arguments)
+        let text = match readFile(svg.path) {
+            Ok(contents) -> contents.text
+            Error(failure) -> {
+                printError("tessicon: cannot read \(svg.path): \(traceText(failure))")
+                return TessiconExit.failed
+            }
+        }
+        let image = match renderedOrSaid(svgImage(text, svg.size)) {
+            Some(image) -> image
+            None -> return TessiconExit.failed
+        }
+        return written(svg.output, image)
+    }
+}
+
+// The rendered image, or the reason it could not be rendered, said.
+function renderedOrSaid(result: Result<IconImage, IconRenderFailure>) -> IconImage? {
+    return match result {
+        Ok(image) -> .Some(image)
+        Error(failure) -> {
+            printError("tessicon: cannot render: \(traceText(failure))")
+            return .None
+        }
+    }
+}
+
+// Writes `image` as a PNG at `path`.
+function written(path: borrow String, image: borrow IconImage) -> Number {
+    return match writeFileBytes(path, encodePng(image)) {
+        Ok -> TessiconExit.done
+        Error(failure) -> {
+            printError("tessicon: cannot write \(path): \(traceText(failure))")
+            TessiconExit.failed
+        }
+    }
+}
+
+@Derive(Parsable)
+struct RenderArguments {
+    let bundle: String
+    let look: String
+    let tone: String
+    let system: String
+    let tint: String
+    let layout: String
+    let size: Number
+    let output: String
+}
+
+// The tint a command line names, as `#rrggbb`.
+function namedTint(text: borrow String) -> IconColor? {
+    return match parsedSvgColor(text) {
+        Some(color) -> .Some(IconColor { red: color.r, green: color.g, blue: color.b })
+        None -> .None
+    }
+}
+
+// The style and layout a render's options choose, or what is wrong with
+// them.
+function chosenPicture(render: borrow RenderArguments) -> Result<(IconStyle, IconLayout), String> {
+    let style = try chosenStyle(render)
+    return match render.layout {
+        "framed" -> .Ok((style, .Framed))
+        "edge" -> .Ok((style, .Edge))
+        else -> .Error("no layout is called \(render.layout)")
+    }
+}
+
+// The style a render's options choose, or what is wrong with them: the look,
+// in the tone asked for, or in the system's when the tone is automatic.
+function chosenStyle(render: borrow RenderArguments) -> Result<IconStyle, String> {
+    let tint = match namedTint(render.tint) {
+        Some(color) -> color
+        None -> return .Error("\(render.tint) is not a colour")
+    }
+    let dark = match render.tone {
+        "light" -> false
+        "dark" -> true
+        "auto" -> match render.system {
+            "dark" -> true
+            "light" -> false
+            else -> return .Error("the system is light or dark, not \(render.system)")
+        }
+        else -> return .Error("no tone is called \(render.tone)")
+    }
+    return match render.look {
+        "default" -> .Ok(dark ? .Dark : .Default)
+        "clear" -> .Ok(dark ? .ClearDark : .ClearLight)
+        "tinted" -> .Ok(dark ? .TintedDark(tint) : .TintedLight(tint))
+        else -> .Error("no look is called \(render.look)")
+    }
+}
+
+ParsableCommand RenderCommand {
+    let configuration: CommandConfiguration {
+        return CommandConfiguration {
+            name: "render",
+            abstract: "Render a .tessicon into a square PNG"
+        }
+    }
+
+    let arguments: [ArgumentSpec] {
+        return [
+            argument(name: "bundle", help: "The .tessicon folder"),
+            option(name: "look", help: "default, clear or tinted").short("l").defaulting("default"),
+            option(name: "tone", help: "light, dark or auto").defaulting("auto"),
+            option(name: "system", help: "What auto follows: light or dark").defaulting("light"),
+            option(name: "tint", help: "A tinted style's colour, #rrggbb").short("t").defaulting(
+                "#ff9f0a"
+            ),
+            option(name: "layout", help: "framed, as macOS shows it, or edge, as iOS does")
+            .defaulting("framed"),
+            option(name: "size", help: "The PNG's side, in pixels").short("s").whole().defaulting(
+                "1024"
+            ),
+            option(name: "output", help: "The PNG to write").short("o")
+        ]
+    }
+
+    function run(arguments: borrow ParsedArguments) -> Number {
+        let render = parse_RenderArguments(arguments)
+        let (style, layout) = match chosenPicture(render) {
+            Ok(picture) -> picture
+            Error(complaint) -> {
+                printError("tessicon: \(complaint)")
+                return TessiconExit.failed
+            }
+        }
+        let bundle = match readIconBundle(render.bundle) {
+            Ok(bundle) -> bundle
+            Error(failure) -> {
+                printError("tessicon: cannot read \(render.bundle): \(traceText(failure))")
+                return TessiconExit.failed
+            }
+        }
+        let image = match renderedOrSaid(renderedIcon(bundle, move style, render.size, layout)) {
+            Some(image) -> image
+            None -> return TessiconExit.failed
+        }
+        return written(render.output, image)
+    }
+}
+
+ParsableCommand RootCommand {
+    let configuration: CommandConfiguration {
+        return CommandConfiguration {
+            name: "tessicon",
+            abstract: "Render .tessicon icons and their artwork"
+        }
+    }
+
+    let arguments: [ArgumentSpec] {
+        return []
+    }
+
+    function run(arguments: borrow ParsedArguments) -> Number {
+        printError("tessicon: name a command; --help lists them")
+        return TessiconExit.failed
+    }
+}
+
+@Main
+function main() -> Number {
+    let children: [Any ParsableCommand] = [SvgCommand(), RenderCommand()]
+    return runCommandRouter(RootCommand(), children, commandLineArguments())
+}

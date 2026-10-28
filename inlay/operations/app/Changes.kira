@@ -1,0 +1,153 @@
+//! New Folder, Rename, Duplicate and Delete Immediately.
+
+import Foundation
+
+/// Why a change to a file or folder was not made.
+public enum ChangeFailure {
+    /// The name is empty, holds a `/`, or is `.` or `..`.
+    InvalidName(String)
+    /// Something has the name already.
+    AlreadyExists(String)
+    /// Nothing is at the path.
+    Missing(String)
+    /// The volume refused: it is read-only, full, or failing.
+    Refused(String)
+    /// A folder would go inside itself.
+    IntoItself(String)
+}
+
+namespace NewFolderName {
+    let untitled: String = "untitled folder"
+}
+
+namespace DuplicateName {
+    let copySuffix: String = " copy"
+}
+
+/// Makes a new folder in `parent`, named `untitled folder` or the first
+/// numbered name free, and answers its path.
+///
+/// # Errors
+///
+/// [`ChangeFailure.Refused`] when the volume does not make it.
+public function makeNewFolder(parent: borrow String) -> Result<String, ChangeFailure> {
+    let path = childPath(parent, freeName(parent, NewFolderName.untitled))
+    match makeDirectory(path) {
+        Ok -> return .Ok(path)
+        Error(failure) -> {
+            absorb failure
+            return .Error(.Refused(path))
+        }
+    }
+}
+
+/// Whether `name` can name an entry.
+public function validName(name: borrow String) -> Bool {
+    return name.count > 0 && !name.contains("/") && name != "." && name != ".."
+}
+
+/// Renames the entry at `path` to `name` in the same folder, and answers its
+/// new path. The same name changes nothing.
+///
+/// # Errors
+///
+/// [`ChangeFailure`] when the name is invalid or taken, the entry is gone, or
+/// the volume refuses.
+public function renameEntry(
+    path: borrow String,
+    name: borrow String
+) -> Result<String, ChangeFailure> {
+    if !validName(name) { return .Error(.InvalidName(copy name)) }
+    if !pathExists(path) { return .Error(.Missing(copy path)) }
+    let target = childPath(parentPath(path), name)
+    if target == path { return .Ok(target) }
+    if pathExists(target) { return .Error(.AlreadyExists(target)) }
+    match renamePath(path, target) {
+        Ok -> return .Ok(target)
+        Error(failure) -> {
+            absorb failure
+            return .Error(.Refused(copy path))
+        }
+    }
+}
+
+/// Copies the entry at `path` beside itself, named with ` copy` before its
+/// extension, and answers the copy's path.
+///
+/// # Errors
+///
+/// [`ChangeFailure`] when the entry is gone or the volume refuses.
+public function duplicateEntry(path: borrow String) -> Result<String, ChangeFailure> {
+    if !pathExists(path) { return .Error(.Missing(copy path)) }
+    let folder = parentPath(path)
+    let (stem, extension) = nameParts(lastPathPart(path))
+    let target = childPath(folder, freeName(folder, stem + DuplicateName.copySuffix + extension))
+    try copyTree(path, target)
+    return .Ok(target)
+}
+
+/// Copies the file or folder at `from` to `to`, which must not exist.
+///
+/// # Errors
+///
+/// [`ChangeFailure.Refused`] naming the first entry not copied.
+public function copyTree(from: borrow String, to: borrow String) -> Result<Void, ChangeFailure> {
+    if !isDirectory(from) {
+        match copyFile(from, to) {
+            Ok(bytes) -> {
+                absorb bytes
+                return .Ok
+            }
+            Error(failure) -> {
+                absorb failure
+                return .Error(.Refused(copy from))
+            }
+        }
+    }
+    match makeDirectory(to) {
+        Ok -> {}
+        Error(failure) -> {
+            absorb failure
+            return .Error(.Refused(copy to))
+        }
+    }
+    let entries = match entriesIn(from) {
+        Ok(found) -> found
+        Error(failure) -> {
+            absorb failure
+            return .Error(.Missing(copy from))
+        }
+    }
+    for entry in entries {
+        try copyTree(entry.path, childPath(to, entry.name))
+    }
+    return .Ok
+}
+
+/// Removes the file or folder at `path` and everything in it, at once, with
+/// no Trash.
+///
+/// # Errors
+///
+/// [`ChangeFailure.Refused`] naming the first entry the volume kept.
+public function removeTree(path: borrow String) -> Result<Void, ChangeFailure> {
+    if isDirectory(path) {
+        let entries = match entriesIn(path) {
+            Ok(found) -> found
+            Error(failure) -> {
+                absorb failure
+                return .Error(.Missing(copy path))
+            }
+        }
+        for entry in entries {
+            try removeTree(entry.path)
+        }
+    }
+    match removePath(path) {
+        Ok -> return .Ok
+        Error(failure) -> {
+            absorb failure
+            return .Error(.Refused(copy path))
+        }
+    }
+}

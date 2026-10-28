@@ -1,0 +1,36 @@
+import KiraUI
+import TesseraUI
+
+// Kira UI redraws when the minute turns, so Date & Time's clock keeps up.
+// The window opens on General, chosen in the sidebar as an iPad's is, or on
+// the pane another program asked for; the path is set the first time the
+// window is built, and again when Settings change with a pane asked for.
+@Main
+function main() {
+    let release = readRelease()
+    let choices = readChoices()
+    var opened = false
+    var heard: Number = 0
+    RunTesseraApplication(
+        "Settings",
+        { in
+            if !opened || settingsGeneration() != heard {
+                heard = settingsGeneration()
+                let asked = takeDestination()
+                match asked {
+                    Some(pane) -> navigationStore(routesTo(pane, release, choices))
+                    None -> if !opened {
+                        let start: [Any NavigationRoute] = [GeneralRoute(
+                            release = copy release,
+                            choices = choices
+                        )]
+                        navigationStore(move start)
+                    }
+                }
+                opened = true
+            }
+            return SettingsView(release = release, choices = choices)
+        },
+        ApplicationOptions { watches: [.Minute] }
+    )
+}

@@ -1,0 +1,51 @@
+Make file2alias's uuid_t survive a Darwin host.
+
+file2alias defines its own uuid_t -- a struct with a b[16] member -- because
+the kernel's is a struct and a Linux C library has no opinion about the name.
+Darwin's does: <sys/types.h> defines uuid_t as unsigned char[16] and it arrives
+through <stdio.h> before this file's own definition, so the typedef is a
+redefinition with a different type and every access through the tee device id's
+uuid field is rejected as a member reference into an array.
+
+Both cannot exist in one translation unit. The SDK's is kept out through the
+guard macro its own header honours, and the struct form is defined in its place
+before any system header is read -- first rather than merely early, because
+<unistd.h> reaches this file through modpost.h and declares functions taking a
+uuid_t, which needs one in scope by then.
+
+All of it is inside #ifdef __APPLE__; on any other host the file is unchanged.
+
+--- a/scripts/mod/file2alias.c	2026-09-06 14:47:28
++++ b/scripts/mod/file2alias.c	2026-09-06 14:47:28
+@@ -8,7 +8,19 @@
+  *
+  * This software may be used and distributed according to the terms
+  * of the GNU General Public License, incorporated herein by reference.
++ */
++
++#ifdef __APPLE__
++/*
++ * Darwin defines uuid_t as unsigned char[16], and this file needs the kernel's
++ * struct form. _UUID_T is the guard the SDK's own header honours, so defining
++ * it here -- before <stdio.h> pulls <sys/types.h> in -- leaves the name to us,
++ * and defining the type immediately keeps the SDK declarations that take a
++ * uuid_t compiling.
+  */
++#define _UUID_T
++typedef struct { unsigned char b[16]; } uuid_t;
++#endif
+ 
+ #include <stdarg.h>
+ #include <stdio.h>
+@@ -107,9 +119,11 @@
+ 	__u8 b[16];
+ } guid_t;
+ 
++#ifndef _UUID_T
+ typedef struct {
+ 	__u8 b[16];
+ } uuid_t;
++#endif
+ 
+ #define	UUID_STRING_LEN		36
+ 

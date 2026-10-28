@@ -1,0 +1,36 @@
+import Foundation
+import HomeLayout
+
+@Test
+function aPageLargerThanTheOutputGoesOnOverScreens() {
+    let big = HomeSpace { perPage: 10, columns: 2 }
+    let home = withInstalled(
+        HomeArrangement {},
+        ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"],
+        false,
+        big
+    )
+    expect!(home.pages.count == 1)
+    let screens = home.screenPages(smallSpace)
+    expect!(screens.count == 3)
+    expect!(screens[1].first == 4)
+    expect!(screens[2].count == 2)
+    let last = namesOn(HomeArrangement { pages: [home.screenPage(screens[2])] }, 0) == ["I", "J"]
+    expect!(last)
+    expect!(home.screenPages(big).count == 1)
+}
+
+@Test
+function theRingStepsAcrossScreens() {
+    let home = arranged(["A", "B", "C", "D", "E"])
+    let screens = home.screenPages(smallSpace)
+    let (screen, index) = steppedFocus(screens, 0, 3, 1)
+    expect!(screen == 1)
+    expect!(index == 0)
+    let (back, last) = steppedFocus(screens, 1, 0, -1)
+    expect!(back == 0)
+    expect!(last == 3)
+    let (stay, clamped) = steppedFocus(screens, 1, 0, 2)
+    expect!(stay == 1)
+    expect!(clamped == 0)
+}

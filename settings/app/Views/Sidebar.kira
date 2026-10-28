@@ -1,0 +1,90 @@
+import KiraUI
+import PlatformKit
+
+// The sidebar: the machine first, as an iPad's puts the person's account,
+// then the panes in the order an iPad's keeps them, Home's only on the touch
+// platform.
+construct SettingsSidebar(release: Release, choices: SettingsChoices) extends Widget {
+    body {
+        List {
+            Section {
+                NavigationLink(value = AboutRoute(release = copy release)) {
+                    HStack(spacing = .Medium, alignment = .Center) {
+                        SettingsIcon(symbol = .Desktopcomputer, tint = .Gray)
+                        VStack(spacing = .Length(2.0), alignment = .Leading) {
+                            Text("Tessera")
+                            .typography(.headline)
+
+                            Text(machineLine(release))
+                            .typography(.footnote)
+                            .foregroundColor(.Secondary)
+                        }
+                    }
+                }
+            }
+
+            Section {
+                NavigationLink(value = GeneralRoute(release = copy release, choices = choices)) {
+                    PaneLabel(title = "General", symbol = .Gear, tint = .Gray)
+                }
+
+                NavigationLink(value = DisplayRoute(choices = choices)) {
+                    PaneLabel(title = "Display & Brightness", symbol = .SunMaxFill, tint = .Blue)
+                }
+
+                // Home is the touch platform's alone: a Mac has no home
+                // screen, so a desktop's Settings has no pane for it.
+                if interfaceMode() == .AdaptiveMobile {
+                    NavigationLink(value = HomeScreenRoute()) {
+                        PaneLabel(
+                            title = "Home Screen & App Library",
+                            symbol = .SquareGrid2x2Fill,
+                            tint = .Blue
+                        )
+                    }
+                }
+
+                NavigationLink(value = NotificationsRoute()) {
+                    PaneLabel(title = "Notifications", symbol = .BellFill, tint = .Red)
+                }
+
+                NavigationLink(value = FocusRoute()) {
+                    PaneLabel(title = "Focus", symbol = .MoonFill, tint = .Indigo)
+                }
+
+                NavigationLink(value = WallpaperRoute()) {
+                    PaneLabel(title = "Wallpaper", symbol = .PhotoOnRectangle, tint = .Cyan)
+                }
+
+                NavigationLink(value = PasscodeRoute()) {
+                    PaneLabel(title = "Passcode", symbol = .LockFill, tint = .Red)
+                }
+
+                NavigationLink(value = BatteryRoute()) {
+                    PaneLabel(title = "Battery", symbol = .BatteryFull, tint = .Green)
+                }
+            }
+
+            Section {
+                NavigationLink(value = StorageRoute()) {
+                    PaneLabel(title = "Storage", symbol = .SquareStack3dUp, tint = .Indigo)
+                }
+
+                NavigationLink(value = BackupRoute()) {
+                    PaneLabel(title = "Backup", symbol = .Arrow2Circlepath, tint = .Green)
+                }
+
+                NavigationLink(value = AppsRoute()) {
+                    PaneLabel(title = "Apps", symbol = .SquareGrid2x2Fill, tint = .Purple)
+                }
+            }
+        }
+        .navigationTitle("Settings")
+    }
+}
+
+// What the machine card says under its name: the version it runs.
+function machineLine(release: borrow Release) -> String {
+    if release.version.count == 0 { return "Tessera" }
+    return "Version \(release.version)"
+}

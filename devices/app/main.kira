@@ -1,0 +1,34 @@
+import Foundation
+import LibTessera
+
+// devices: the Devices service (roadmap/17-devicekit.md §25).
+//
+// One thread and one LibTessera port. The listener and every connection are
+// waited on with `Object.waitAsync`; a stream's device, and the registry
+// watches that say a device came or went (`Changes.kira`), with DeviceKit's
+// `Ref.waitAsync`. Haptic samples and flushes are timed by the port's
+// deadline.
+
+@Main
+function main() {
+    match startService() {
+        Ok(service) -> serveDevices(service)
+        Error(failed) -> log fault("the service could not start", error: errorName(failed))
+    }
+}
+
+function serveDevices(started: borrow Service) {
+    var service = started
+    match watchStart(service) {
+        Ok -> {}
+        Error(failed) -> log warn(
+            "cannot watch for devices; devices that come and go are not posted",
+            error: errorName(failed)
+        )
+    }
+    match devicesOf(service, .AudioOutput) {
+        Ok(found) -> log info("listening", audioOutputs: found.count)
+        Error(failed) -> log warn("the audio outputs cannot be listed", error: errorName(failed))
+    }
+    run(service)
+}

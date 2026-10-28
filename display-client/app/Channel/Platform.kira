@@ -1,0 +1,58 @@
+import Foundation
+
+// A platform: the session that draws the system around the applications and
+// decides where their windows go and which has focus. MosaicDisplay tells it
+// what only a platform acts on, and every platform answers each of those
+// itself. A platform that leaves one out does not compile (3234), so a
+// message MosaicDisplay sends is never dropped by a platform that forgot it.
+//
+//     DisplayPlatform Mobile {
+//         function onActivateRequested(borrow mut self, surface: DisplaySurfaceId) { ... }
+//         ...
+//     }
+//
+//     mobile.deliver(arrived)
+public construct DisplayPlatform {
+    // The output's size, or a surface's, changed.
+    @Required function onConfigure(borrow mut self, configuration: borrow DisplayConfiguration)
+    @Required function onSurfaceCreated(borrow mut self, surface: borrow DisplaySurface)
+    @Required function onSurfaceDestroyed(borrow mut self, surface: DisplaySurfaceId)
+    @Required function onGrabFired(borrow mut self, key: borrow DisplayKey)
+    @Required function onSurfacePressed(borrow mut self, surface: DisplaySurfaceId)
+    @Required function onIdleChanged(borrow mut self, state: borrow DisplayIdleState)
+    @Required function onBarBackdrop(borrow mut self, backdrop: borrow DisplayBackdrop)
+    @Required function onWindowRequested(borrow mut self, request: borrow DisplayWindowRequest)
+    // PID 1 asked for an application that is open already to come forward.
+    @Required function onActivateRequested(borrow mut self, surface: DisplaySurfaceId)
+    @Required function onChannelChanged(borrow mut self, declared: borrow DisplayChannelValue)
+    @Required function onSurfacePlaced(borrow mut self, placement: borrow DisplayPlacement)
+    @Required function onNotification(borrow mut self, notification: borrow DisplayNotification)
+    @Required function onVerifyResult(borrow mut self, trusted: Bool)
+
+    // Hands `arrived` to the member that answers it. A message the platform
+    // sends, or one only an application hears, is nothing for it to act on.
+    function deliver(borrow mut self, arrived: borrow DisplayMessage) {
+        match arrived {
+            Configure(configuration) -> onConfigure(configuration)
+            SurfaceCreated(surface) -> onSurfaceCreated(surface)
+            SurfaceDestroyed(surface) -> onSurfaceDestroyed(surface)
+            GrabFired(key) -> onGrabFired(key)
+            SurfacePressed(surface) -> onSurfacePressed(surface)
+            IdleChanged(state) -> onIdleChanged(state)
+            BarBackdrop(backdrop) -> onBarBackdrop(backdrop)
+            WindowRequested(request) -> onWindowRequested(request)
+            ActivateRequested(surface) -> onActivateRequested(surface)
+            ChannelChanged(declared) -> onChannelChanged(declared)
+            SurfacePlaced(placement) -> onSurfacePlaced(placement)
+            Notification(posted) -> onNotification(posted)
+            VerifyResult(trusted) -> onVerifyResult(trusted)
+            Hello, Welcome, Attach, Commit, Key, FrameDone, FrameRequest, FrameReady, FocusIn,
+                FocusOut, AckConfigure, SetMode, ModeChanged, InputCapability, GrantFocus,
+                InstallGrab, SetChannel, PresentSystem, Verify, InjectInput, Notify, SetBar,
+                PointerMotion, PointerButton, PointerAxis, PointerEnter, PointerLeave, SetDock,
+                RequestWindow, GrantMove, GrantResize, HoldInput, PlaceSurface, SetHidden,
+                SetMargin, Insets, Output, SetOverlay, SetIdle, SetGlass, SetStageBadge,
+                SetLaunchOrigin -> {}
+        }
+    }
+}

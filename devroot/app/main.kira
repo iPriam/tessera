@@ -1,0 +1,309 @@
+import Foundation
+import Heap
+import LibTessera
+
+// The dev root service (roadmap/18-components.md in the tessera repository).
+//
+// It runs on a machine booted with `tessera.dev` and waits for a volume
+// labelled `devroot`, which the Volume service mounts at /Volumes/devroot. The
+// volume's `request` file says what to do:
+//
+//     id <anything that differs from the last request>
+//     install <name> [force]       from <name>.root on the same volume
+//     uninstall <name> [force]
+//     reset                        drop every root at the next boot
+//     sample <seconds> <hz>        sample every CPU into `samples` on the volume
+//
+// Each line is carried out in order, the paths every one changed are sent to
+// PID 1 to restart what loads them, and the log says how it went. A request
+// is carried out once: the same id on a volume plugged in again is not.
+//
+// Two printed lines, which the log's limit on repeats never holds back, tell
+// `kira build devroot` a request was taken and how it ended.
+
+namespace RequestVolume {
+    let path: String = "/" + SystemDirectory.volumes + "/devroot"
+    let request: String = "/" + SystemDirectory.volumes + "/devroot/request"
+    let idPrefix: String = "id "
+}
+
+// The mount point is made before the volume is mounted on it, and nothing
+// says when the mount is done, so the request is looked for a few times
+// after anything appears in /Volumes.
+namespace RequestPolling {
+    let attempts: Number = 40
+    let interval: Number = 250000000
+}
+
+namespace VolumeWatch {
+    let eventBytes: Number = 4096
+}
+
+enum RequestAction {
+    Install
+    Uninstall
+    Reset
+    Sample
+    Crashes
+}
+
+struct RequestLine {
+    let action: RequestAction
+    let root: String
+    let force: Bool
+}
+
+function requestLine(line: borrow String) -> Result<RequestLine, RootFailure> {
+    let words = line.trim().split(" ")
+    let action: RequestAction = match words[0] {
+        "install" -> .Install
+        "uninstall" -> .Uninstall
+        "reset" -> .Reset
+        "sample" -> .Sample
+        "crashes" -> .Crashes
+        else -> return .Error(.UnknownAction(copy words[0]))
+    }
+    if action == .Reset || action == .Crashes {
+        return .Ok(RequestLine { action: action, root: "", force: false })
+    }
+    if words.count < 2 { return .Error(.NoRoot) }
+    return .Ok(
+        RequestLine {
+            action: action,
+            root: copy words[1],
+            force: words.count >= 3 && words[2] == "force"
+        }
+    )
+}
+
+// Carries out one line of a request.
+function carryOut(
+    files: borrow Files,
+    line: borrow String,
+    changed: borrow mut [String]
+) -> Result<Void, RootFailure> {
+    let request = try requestLine(line)
+    match request.action {
+        Install -> return installRoot(
+            files,
+            request.root,
+            "\(RequestVolume.path)/\(request.root).root",
+            request.force,
+            changed
+        )
+        Uninstall -> return uninstallRoot(files, request.root, request.force, changed)
+        Reset -> return askForReset(files)
+        Sample -> return writeSamples(files, line)
+        Crashes -> return writeCrashes(files)
+    }
+}
+
+// Drops every root at once (roadmap/18-components.md §5): PID 1 deletes
+// `system/dev` at the next boot and takes it again from the sealed system,
+// which the files this service keeps go with.
+function askForReset(files: borrow Files) -> Result<Void, RootFailure> {
+    match files.writeText("/" + SystemFile.developerRootsReset, "") {
+        Ok -> {
+            log info("every root goes at the next boot")
+            return .Ok
+        }
+        Error(failed) -> return .Error(.Storage(failed))
+    }
+}
+
+// The request on the volume, carried out unless its id is `handled`; the id
+// of the request on the volume, or `handled` when there is none.
+function serveRequest(files: borrow Files, handled: borrow String?) -> Result<String?, TesseraError> {
+    let text = try files.readTextIfPresent(RequestVolume.request)
+    let request = try text otherwise return .Ok(copy handled)
+    let lines = request.split("\n")
+    let first = lines[0].trim()
+    if !first.startsWith(RequestVolume.idPrefix) || handled == .Some(copy first) {
+        return .Ok(copy handled)
+    }
+    log info("carrying out a dev root request", request: first)
+    print("dev root request taken: \(first)")
+    var changed: [String] = []
+    var failures: Number = 0
+    for index in 1..lines.count {
+        if !lines[index].trim().isEmpty() {
+            match carryOut(files, lines[index], changed) {
+                Ok -> {}
+                Error(failure) -> {
+                    log warn(
+                        "a dev root request line was not carried out",
+                        line: lines[index],
+                        reason: describe(failure)
+                    )
+                    failures++
+                }
+            }
+        }
+    }
+    if changed.count > 0 { requestRestart(changed) }
+    log info("carried out a dev root request", request: first, failures, changed: changed.count)
+    // Let go of the stick before saying so: the host pulls it on that line.
+    ejectRequestVolume()
+    print("dev root request done: \(first) with \(failures) failures")
+    match loadsAny(changed) {
+        Ok(loads) -> {
+            if loads { startAgain(files, first) }
+        }
+        Error(failed) -> log warn(
+            "cannot tell what the dev root loads, so not starting again",
+            error: errorName(failed)
+        )
+    }
+    return .Ok(.Some(first))
+}
+
+// Whether this process loads one of `paths`: its own program or a library.
+// A path that cannot be asked about does not stop the others being asked; if
+// none loads, the failure is returned.
+function loadsAny(paths: borrow [String]) -> Result<Bool, TesseraError> {
+    var failure: TesseraError? = .None
+    for path in paths {
+        match processLoadsOwn(path) {
+            Ok(loads) -> { if loads { return .Ok(true) } }
+            Error(failed) -> {
+                log warn("cannot tell what the dev root loads", path: path, error: errorName(failed))
+                failure = .Some(failed)
+            }
+        }
+    }
+    match failure {
+        Some(failed) -> return .Error(failed)
+        None -> return .Ok(false)
+    }
+}
+
+// Ends this process for PID 1 to start again, which loads the files the
+// request just changed. PID 1 restarts every other service that loads them
+// but not the one asking, which would end it halfway through its request.
+function startAgain(files: borrow Files, handled: borrow String) {
+    match files.writeText(StorePath.handled, handled) {
+        Ok -> {}
+        Error(failed) -> {
+            // Started again without the id, it would carry the request out
+            // again if the stick were still there; it stays as it is.
+            log warn(
+                "cannot keep the request's id, so not starting again",
+                error: errorName(failed)
+            )
+            return
+        }
+    }
+    log info("starting again to load the dev root's own changes")
+    processExit(0)
+}
+
+// The id of the request carried out last, if one was kept.
+function lastHandled(files: borrow Files) -> Result<String?, TesseraError> {
+    return files.readTextIfPresent(StorePath.handled)
+}
+
+// Reads every event the watch holds; only that something appeared matters.
+function drainWatch(watch: Handle, events: borrow Buffer) {
+    while true {
+        match watchRead(watch, events) {
+            Ok -> {}
+            Error(failed) -> {
+                if failed.code != .ShouldWait {
+                    log warn("cannot read the watch on /Volumes", error: errorName(failed))
+                }
+                return
+            }
+        }
+    }
+}
+
+// Sleeps for `nanoseconds`.
+function pause(nanoseconds: Number) -> Result<Void, TesseraError> {
+    let started = try timeRead(.Monotonic)
+    return threadSleep(started + nanoseconds)
+}
+
+// Looks for a new request on the volume for a while; the id of the last one
+// carried out.
+function awaitRequest(files: borrow Files, handled: borrow String?) -> Result<String?, TesseraError> {
+    for look in 0..RequestPolling.attempts {
+        let found = try serveRequest(files, handled)
+        if found != handled { return .Ok(found) }
+        if look + 1 < RequestPolling.attempts { try pause(RequestPolling.interval) }
+    }
+    return .Ok(copy handled)
+}
+
+@Main
+function main() {
+    log info("starting", store: StorePath.root)
+    let files = match filesAtRoot() {
+        Ok(value) -> value
+        Error(failed) -> {
+            log fault("no port for the dev root's calls", error: errorName(failed))
+            return
+        }
+    }
+    match prepareStore(files) {
+        Ok -> {}
+        Error(failed) -> {
+            log fault(
+                "cannot keep dev roots: the store cannot be made",
+                store: StorePath.root,
+                error: errorName(failed)
+            )
+            return
+        }
+    }
+    let volumes = match files.lookup(
+        "/" + SystemDirectory.volumes,
+        Rights.enumerate | Rights.inspect | Rights.traverse
+    ) {
+        Ok(value) -> value
+        Error(failed) -> {
+            log fault("there is no /Volumes to watch", error: errorName(failed))
+            return
+        }
+    }
+    let watch = match nodeWatch(volumes, WatchMask.created) {
+        Ok(value) -> value
+        Error(failed) -> {
+            log fault("cannot watch /Volumes", error: errorName(failed))
+            return
+        }
+    }
+    // Without a kept id the request on the volume is taken as new, as on a
+    // first boot; the failure to read the id is said.
+    let lastId = match lastHandled(files) {
+        Ok(found) -> found
+        Error(failed) -> {
+            log warn("cannot read the last request's id", error: errorName(failed))
+            .None
+        }
+    }
+    var handled = match serveRequest(files, lastId) {
+        Ok(value) -> value
+        Error(failed) -> {
+            log fault("cannot read the dev root request", error: errorName(failed))
+            return
+        }
+    }
+    let eventsBytes = zeroedBlock(count: VolumeWatch.eventBytes, alignment: 16)
+    let events = Buffer { address: eventsBytes.pointer(), length: VolumeWatch.eventBytes }
+    while true {
+        match files.answered(
+            objectWaitAsync(watch, Signals.readable, .Once, files.port, FileCall.key)
+        ) {
+            Ok -> {}
+            Error(failed) -> {
+                log fault("the watch on /Volumes failed", error: errorName(failed))
+                return
+            }
+        }
+        drainWatch(watch, events)
+        match awaitRequest(files, handled) {
+            Ok(value) -> handled = value
+            Error(failed) -> log warn("cannot wait for a dev root request", error: errorName(failed))
+        }
+    }
+}

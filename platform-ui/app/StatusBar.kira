@@ -1,0 +1,146 @@
+import Foundation
+import KiraUI
+
+// The status bar (roadmap/11-adaptive-desktop.md, "The system bar"): the bar
+// of a touch platform, an iPad's, along the top of the screen over the home
+// screen and over the application in front, with no menus. The time and the
+// date stand at its leading end, the network and the battery at its trailing
+// end, all in one ink: white, or black over a light picture
+// (StatusBarTone.kira). A finger pulled down from it brings down what an
+// iPad's top edge does: the lock screen from its leading part, Control Center
+// from its trailing half.
+
+// How the status bar is laid out, in points: the kit's "Status bar and Menu
+// bar- iPad", whose time, date and status text are 14-point Medium.
+namespace StatusBarMetrics {
+    let height: Number = 32
+    // A tall screen, a phone's, takes the taller band an iPhone's status bar
+    // has, with its text and symbols larger: from this height-to-width ratio.
+    let tallRatio: Number = 1.6
+    let tallHeight: Number = 54
+    let tallText: Number = 17
+    let tallSymbol: Number = 17
+    // How far in from the screen's edges its ends stand.
+    let inset: Number = 16
+    let text: Number = 14
+    // The gap between the time and the date.
+    let dateSpacing: Number = 8
+    // How far apart its status items stand.
+    let itemSpacing: Number = 5
+}
+
+// Where along the status bar a finger pulled down from it began.
+public enum StatusBarEdge {
+    Leading
+    Trailing
+}
+
+// How far down, in points, a finger let go must have pulled, counting where
+// the flick would carry it, to bring something down.
+namespace StatusBarPull {
+    let brings: Number = 48.0
+}
+
+// A finger pulling down from the status bar: still on it this many points
+// down, or let go short of bringing anything down.
+public enum StatusBarDrag {
+    Following(Number)
+    LetGo
+}
+
+// What a status bar that brings nothing down does when it is pulled.
+public function statusBarStays(edge: StatusBarEdge) {}
+
+// What a status bar whose pull nothing follows does as the finger moves.
+public function statusBarUnfollowed(edge: StatusBarEdge, drag: StatusBarDrag) {}
+
+// What a finger pulling down lands on, drawn as nothing.
+let statusBarTarget: RGBAColor = RGBAColor { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }
+
+// Whether a screen `width` by `height` points is a tall one, a phone's.
+public function statusBarTall(width: Number, height: Number) -> Bool {
+    return height >= width * StatusBarMetrics.tallRatio
+}
+
+// The band the status bar takes along the top of the screen: taller on a
+// tall screen.
+public function statusBarHeight(tall: Bool) -> Number {
+    return tall ? StatusBarMetrics.tallHeight : StatusBarMetrics.height
+}
+
+// The status bar, at the wall clock `realtime`, with `items` at its trailing
+// end, inked `ink`. A finger pulled down from it calls `pulled` with the end
+// it began at: its trailing half is where Control Center comes down from, as
+// an iPad's top right corner is. As the finger moves, and when it is let go
+// short, `following` is told, so what comes down can follow it.
+public construct StatusBar(
+    realtime: Number,
+    items: StatusItems = StatusItems {},
+    ink: RGBAColor = statusBarLightInk,
+    pulled: (StatusBarEdge) -> Void = statusBarStays,
+    following: (StatusBarEdge, StatusBarDrag) -> Void = statusBarUnfollowed,
+    // Whether the time and the date show: not over the lock screen, whose
+    // own time is large below it.
+    clock: Bool = true,
+) extends Widget {
+    body {
+        let pull = pulled
+        let follow = following
+        let width = viewportWidth()
+        let tall = statusBarTall(viewportWidth(), viewportHeight())
+        let text = tall ? StatusBarMetrics.tallText : StatusBarMetrics.text
+        let symbol = tall ? StatusBarMetrics.tallSymbol : StatusSymbol.size
+        HStack(alignment = .Center) {
+            HStack(spacing = .Length(StatusBarMetrics.dateSpacing), alignment = .Center) {
+                if clock {
+                    Text(clockTime(realtime))
+                    if !tall { Text(clockShortDate(realtime)) }
+                }
+            }
+            .hugWidth()
+            .font(size: resolvedLength(text), weight: .Medium)
+            Spacer()
+            Rectangle()
+            .fill(statusBarTarget)
+            .fillWidth()
+            .fillHeight()
+            StatusIcons(
+                items = barItems(items),
+                spacing = StatusBarMetrics.itemSpacing,
+                size = symbol
+            )
+        }
+        .textColor(copy ink)
+        .edgePadding(EdgeSet.horizontal, resolvedLength(StatusBarMetrics.inset))
+        .fillWidth()
+        .height(resolvedLength(statusBarHeight(tall)))
+        .gesture(
+            DragGesture().onChanged { value in
+                follow(
+                    statusBarEdgeAt(value.startLocation.x, width),
+                    .Following(max(value.translation.height, 0.0))
+                )
+            }.onEnded { value in
+                let edge = statusBarEdgeAt(value.startLocation.x, width)
+                if value.predictedEndTranslation.height > StatusBarPull.brings {
+                    pull(edge)
+                } else {
+                    follow(edge, .LetGo)
+                }
+            }
+        )
+    }
+}
+
+// The end of a status bar `width` points wide a finger at `x` began at.
+function statusBarEdgeAt(x: Number, width: Number) -> StatusBarEdge {
+    return x < width / 2.0 ? .Leading : .Trailing
+}
+
+// What the status bar's trailing end shows of `items`: the network and the
+// battery, and nothing else.
+function barItems(items: borrow StatusItems) -> StatusItems {
+    var shown = copy items
+    shown.focus = false
+    return shown
+}

@@ -1,0 +1,40 @@
+import Foundation
+import LibTessera
+
+// What the kernel command line asked for, and what to do when the machine
+// cannot honour it.
+
+namespace BootFlag {
+    // Mount the system volume and hand the machine to the init inside it.
+    let system: String = "tessera.system"
+    // Set by the initramfs's init on the init it hands over to: this init is
+    // the system's own, running from the system volume.
+    let handedOver: String = "tessera.handed-over"
+    // A development machine: boot `system/dev`, unsealed, and run the dev
+    // root service (roadmap/18-components.md).
+    let dev: String = "tessera.dev"
+}
+
+// Whether `flag` was passed to this program by the kernel.
+function bootFlag(arguments: borrow [String], flag: borrow String) -> Bool {
+    for argument in arguments {
+        if argument == flag { return true }
+    }
+    return false
+}
+
+// Stops the machine, saying why first.
+//
+// Refusing has to be deliberate: PID 1 returning is a kernel panic with a
+// message about init, not about the seal.
+function refuseToBoot(reason: borrow String) {
+    log fault("refusing to boot", reason)
+    match machineStop(.PowerOff) {
+        Ok -> log fault("power off answered without powering off after a refusal to boot")
+        Error(failed) -> log fault(
+            "power off was refused after a refusal to boot",
+            error: errorName(failed)
+        )
+    }
+    idleForever()
+}

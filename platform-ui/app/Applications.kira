@@ -1,0 +1,115 @@
+import Foundation
+import LibTessera
+import PlatformKit
+import TesseraDisplayClient
+import AppKit
+import KiraUI
+import TesseraUI
+
+// What every platform with a Dock does the same way between what is
+// installed, what PID 1 says each window is, and PlatformKit's state
+// (roadmap/11-adaptive-desktop.md, "The Dock").
+
+// What is installed, `first` in the order given and then the rest, kept in
+// `state`'s Dock in that order. The installed applications, to open from.
+public function keepInstalledInDock(
+    state: borrow mut PlatformState,
+    first: borrow [String]
+) -> [Application] {
+    let installed = installedApplications()
+    var ordered: [Application] = []
+    for name in first {
+        for application in installed {
+            if application.name == name { ordered.append(copy application) }
+        }
+    }
+    for application in installed {
+        if !first.contains(application.name) { ordered.append(copy application) }
+    }
+    var names: [String] = []
+    for application in ordered { names.append(copy application.name) }
+    state.keepInDock(move names)
+    return ordered
+}
+
+// Records a surface the compositor announced in `state`, in front of the
+// others: the desktop by its role, any other as a window of the application
+// PID 1 named it. Whether its name is known yet; one that is not is named by
+// `nameWindows` once it is.
+public function trackWindow(
+    bridge: borrow BridgeHandle,
+    state: borrow mut PlatformState,
+    announced: borrow DisplaySurface
+) -> Bool {
+    let surface = PlatformSurfaceId(announced.surface.raw)
+    let named = match announced.role {
+        Desktop -> {
+            state.windowOpened(surface, "Desktop", .Desktop)
+            true
+        }
+        None, Application, Platform, Presence -> {
+            let name = match applicationOf(copy bridge, announced.surface.raw) {
+                Some(value) -> value
+                None -> ""
+            }
+            let known = name.count > 0
+            state.windowOpened(surface, move name, .Application)
+            known
+        }
+    }
+    match state.activateSurface(surface) {
+        // The surface is in front and focused.
+        Ok -> {}
+        Error(failure) -> log warn(
+            "a new window could not be brought forward",
+            surface: surface.raw,
+            failure
+        )
+    }
+    return named
+}
+
+// Names each of `unnamed` whose application PID 1 has named since. Those
+// still waiting.
+public function nameWindows(
+    bridge: borrow BridgeHandle,
+    state: borrow mut PlatformState,
+    unnamed: borrow [DisplaySurfaceId]
+) -> [DisplaySurfaceId] {
+    var waiting: [DisplaySurfaceId] = []
+    for surface in unnamed {
+        let name = match applicationOf(copy bridge, surface.raw) {
+            Some(value) -> value
+            None -> ""
+        }
+        if name.count == 0 {
+            waiting.append(surface)
+            continue
+        }
+        match state.nameWindow(PlatformSurfaceId(surface.raw), move name) {
+            Ok -> log info("a window was named", surface: surface.raw)
+            Error(failure) -> log warn("a window's first application could not be ended", failure)
+        }
+    }
+    return waiting
+}
+
+// Why a request to open an installed application could not be carried out.
+public enum OpenApplicationFailure {
+    NotInstalled(String)
+}
+
+// Asks PID 1 to open the application named `name` among `installed`.
+public function openInstalled(
+    installed: borrow [Application],
+    name: borrow String
+) -> Result<Void, OpenApplicationFailure> {
+    for application in installed {
+        if application.name == name {
+            log info("opening an application", application: name)
+            openApplication(application)
+            return .Ok
+        }
+    }
+    return .Error(.NotInstalled(copy name))
+}

@@ -1,0 +1,110 @@
+//! The Control Center and the status bar's pulls on Adaptive Mobile: which control is acted on, and how the
+//! edge and the drag show the panel as the person moves it.
+import Foundation
+import LibTessera
+import PlatformKit
+import PlatformUI
+import TesseraDisplayClient
+import KiraUI
+
+// Control Center on Adaptive Mobile, as on an iPad
+// (roadmap/11-adaptive-desktop.md, "Control Center"): a finger pulled down
+// from the trailing half of the status bar brings it down over the dimmed
+// screen (`statusBarPulled`), and while it
+// is out the platform holds the keyboard and the pointer. A tap off its
+// modules puts it away. Focus holds notification banners back, and its switch
+// holds over Focus's schedule until the schedule next changes; Stage Manager
+// is the switch F6 is, and Windowed Apps lets windows float free (Stage.kira).
+
+/// Does what a person did in Control Center.
+function controlCenterAct(mobile: borrow mut Mobile, action: ControlCenterAction) {
+    if mobile.lock.locked { return }
+    match action {
+        Toggle -> {
+            if mobile.controls.open {
+                closeControlCenter(mobile)
+            } else {
+                openControlCenter(mobile)
+            }
+        }
+        Close -> closeControlCenter(mobile)
+        Focus -> {
+            let moment = focusMoment(mobile.zone, unixMillis())
+            toggleFocus(moment)
+            mobile.controls.focus = focusChoice().active(moment)
+        }
+        StageManager -> toggleStage(mobile)
+        WindowedApps -> toggleWindowed(mobile)
+    }
+    redrawAfter(0)
+}
+
+/// A finger pulled down from the status bar: from its trailing half it brings
+/// Control Center down, and from the rest the lock screen, as an iPad's top
+/// edge brings down the Lock Screen it shows notifications on.
+function statusBarPulled(mobile: borrow mut Mobile, edge: StatusBarEdge) {
+    if mobile.lock.locked { return }
+    match edge {
+        Leading -> lockScreen(mobile)
+        Trailing -> openControlCenter(mobile)
+    }
+    redrawAfter(0)
+}
+
+/// A finger pulling down from the status bar's leading part, which the lock
+/// screen follows down over the open screen; let go short, it goes back up.
+function statusBarFollowing(mobile: borrow mut Mobile, edge: StatusBarEdge, drag: StatusBarDrag) {
+    if mobile.lock.locked || edge != .Leading { return }
+    match drag {
+        Following(down) -> mobile.lock.follow(down)
+        LetGo -> {
+            let seconds = lockScreenOpeningSeconds(navigation())
+            mobile.lock.letGo(unixMillis(), seconds)
+            // The lock screen is taken away once it is back up.
+            redrawAfter(seconds)
+        }
+    }
+}
+
+/// Brings Control Center down, holding the input for it.
+function openControlCenter(mobile: borrow mut Mobile) {
+    if mobile.controls.open { return }
+    match holdInput(mobile, true) {
+        Ok(held) -> if !held { return }
+        Error(failed) -> {
+            log warn("could not hold the input", held: true, error: errorName(failed))
+            return
+        }
+    }
+    mobile.controls.open = true
+    keepBar(mobile)
+    log info("Control Center opened")
+}
+
+/// Puts Control Center away, and lets the input go.
+function closeControlCenter(mobile: borrow mut Mobile) {
+    if !mobile.controls.open { return }
+    mobile.controls.open = false
+    keepBar(mobile)
+    // The lock screen keeps the input it held under Control Center.
+    match holdInput(mobile, mobile.lock.locked) {
+        Ok(_) -> {}
+        Error(failed) -> log warn(
+            "could not hold the input",
+            held: mobile.lock.locked,
+            error: errorName(failed)
+        )
+    }
+    log info("Control Center closed")
+}
+
+/// Holds the keyboard and the pointer for the platform, or lets them go;
+/// whether it was asked.
+function holdInput(mobile: borrow Mobile, held: Bool) -> Result<Bool, TesseraError> {
+    let channel = match mobile.channel {
+        Some(value) -> value
+        None -> return .Ok(false)
+    }
+    try sendHoldInput(channel, held)
+    return .Ok(true)
+}

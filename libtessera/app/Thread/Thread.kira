@@ -1,0 +1,180 @@
+import Foundation
+import Heap
+
+// Threads (§7.1–7.3).
+//
+// A new thread needs its first instructions to run on a stack the parent
+// built, and the TLS calls read and write a register. Kira has no inline
+// assembly and no way to call an address, so `Thread.spawn`, `Thread.tlsBase`
+// and `Thread.setTlsBase` answer `Unsupported` until the compiler gives the
+// runtime a thread entry. Every other call works on the calling thread.
+
+@Derive(Copy)
+public enum Qos: U32 {
+    Background = 0
+    Utility = 1
+    Default = 2
+    UserInitiated = 3
+    UserInteractive = 4
+    Realtime = 5
+}
+
+public struct ThreadOptions {
+    var stackSize: UNumber
+    var guardSize: UNumber
+    var qos: Qos
+    var flags: ThreadFlags
+    var name: String
+}
+
+@Derive(Copy)
+public struct RealtimePolicy {
+    var period: UNumber
+    var computation: UNumber
+    var constraint: UNumber
+}
+
+// `ThreadOptions.flags`.
+@Derive(Copy)
+public distinct ThreadFlags = UNumber
+
+public namespace ThreadFlags {
+    let none: ThreadFlags = ThreadFlags(0)
+    // No handle is returned; the thread's end still shows in its Job and
+    // Process.
+    let detached: ThreadFlags = ThreadFlags(1)
+}
+
+public function threadSpawn(
+    entry: RawPtr,
+    argument: UNumber,
+    options: borrow ThreadOptions
+) -> Result<Handle, TesseraError> {
+    if options.name.count > 64 { return .Error(failure(.InvalidArgument)) }
+    if options.qos == .Realtime && !entitlementHeld("tessera.thread.realtime") {
+        return .Error(failure(.NotEntitled))
+    }
+    return .Error(failure(.Unsupported))
+}
+
+// Ends the calling thread. The last thread's exit ends the process.
+public function threadExit(code: Number) {
+    kernelThreadExit(code)
+}
+
+// The handle `Thread.current` gave the thread `id`.
+struct CurrentThread {
+    var id: U64
+    var handle: Handle
+}
+
+// A handle to the calling thread. It is the same handle on every call the
+// thread makes while it stays open.
+public function threadCurrent() -> Handle {
+    let id = kernelThreadId()
+    var at: Number? = .None
+    for index in 0..library.threadHandles.count {
+        if library.threadHandles[index].id == id { at = .Some(index) }
+    }
+    match at {
+        Some(index) -> {
+            let cached = library.threadHandles[index].handle
+            if handleSlotOf(cached).isSome() { return cached }
+        }
+        None -> {}
+    }
+    let object = objectCreateUnbacked(.Thread(ThreadObject { id: id, qos: .Default }))
+    let rights = Rights.inspect | Rights.setProperty | Rights.manage | Rights.wait | Rights.duplicate
+    let handle = mintOrInvalid(object, rights)
+    match at {
+        Some(index) -> library.threadHandles[index].handle = handle
+        None -> library.threadHandles.append(CurrentThread { id: id, handle: handle })
+    }
+    return handle
+}
+
+public function threadId(thread: Handle) -> Result<UNumber, TesseraError> {
+    let object = try resolveObject(thread, .Thread, Rights.none)
+    let state = try threadOf(object)
+    return .Ok(state.id)
+}
+
+// The calling thread's own scheduling class.
+public function threadSetQos(thread: Handle, qos: Qos) -> Result<Void, TesseraError> {
+    let object = try resolveObject(thread, .Thread, Rights.manage)
+    if qos == .Realtime && !entitlementHeld("tessera.thread.realtime") {
+        return .Error(failure(.NotEntitled))
+    }
+    var thread = try threadOf(object)
+    try kernelSetQos(thread.id, qos)
+    thread.qos = qos
+    setThread(object, move thread)
+    return .Ok
+}
+
+// A deadline class with the policy's computation, constraint and period.
+public function threadSetRealtime(
+    thread: Handle,
+    policy: RealtimePolicy
+) -> Result<Void, TesseraError> {
+    let object = try resolveObject(thread, .Thread, Rights.manage)
+    if !entitlementHeld("tessera.thread.realtime") { return .Error(failure(.NotEntitled)) }
+    if policy.computation == U64(
+        0
+    ) || policy.computation > policy.constraint || policy.constraint > policy.period {
+        return .Error(failure(.InvalidArgument))
+    }
+    var thread = try threadOf(object)
+    try kernelSetRealtime(thread.id, policy.computation, policy.constraint, policy.period)
+    thread.qos = .Realtime
+    setThread(object, move thread)
+    return .Ok
+}
+
+// Sleeps until the monotonic `deadline`.
+public function threadSleep(deadline: UNumber) -> Result<Void, TesseraError> {
+    return kernelSleepUntil(deadline)
+}
+
+public function threadYield() {
+    kernelYield()
+}
+
+// Ends the thread at once. The only thread a handle can name is one of the
+// caller's own, so this is the caller's exit.
+public function threadKill(thread: Handle) -> Result<Void, TesseraError> {
+    let object = try resolveObject(thread, .Thread, Rights.manage)
+    let state = try threadOf(object)
+    if state.id != kernelThreadId() { return .Error(failure(.NotFound)) }
+    kernelThreadExit(0)
+    return .Ok
+}
+
+public function threadTlsBase() -> RawPtr { return nullPointer() }
+
+public function threadSetTlsBase(base: RawPtr) -> Result<Void, TesseraError> {
+    return .Error(failure(.Unsupported))
+}
+
+// `ThreadInfo`, 48 bytes.
+// `ThreadInfo.state`.
+@Derive(Copy)
+enum ThreadState: U32 {
+    Created = 0
+    Running = 1
+    Blocked = 2
+    Terminated = 3
+}
+
+function threadInfoWrite(thread: borrow ThreadObject, block: RawPtr) -> U64 {
+    heapStore<U64>(block, 0, thread.id)
+    heapStore<U64>(block, 8, kernelProcessId())
+    // A thread the library can name is running.
+    heapStore<U32>(block, 16, code(ThreadState.Running))
+    heapStore<U32>(block, 20, code(thread.qos))
+    heapStore<U64>(block, 24, U64(0))
+    if thread.id == kernelThreadId() {
+        heapStore<U64>(block, 32, clockValue(.ThreadCpu))
+    }
+    return U64(48)
+}

@@ -1,0 +1,71 @@
+// simplifiedShapeAwareGradientMask: the same mask with a vertical gradient
+// over `bounds` (x, y, width, height): `opacityBounds` inside and
+// `contourOpacityBounds` along the edge, each (bottom, top); outside the
+// shape it fades to opaque within a point.
+import Stitch
+
+type SimplifiedShapeAwareGradientMaskArguments {
+    let toUser: Float4
+    let toUserTranslation: Float2
+    let borderWidth: Float
+    let opacityBounds: Float2
+    let contourOpacityBounds: Float2
+    let sdfScale: Float
+    let sdfZero: Float
+    let bounds: Float4
+    let fieldInverseSize: Float2
+}
+
+type FullscreenIn {
+    @builtin(vertex_index)
+    let vid: UInt
+}
+
+type FullscreenOut {
+    @builtin(position)
+    let clip_position: Float4
+}
+
+type StitchOut {
+    let color: Float4
+}
+
+shader SimplifiedShapeAwareGradientMask {
+    group Draw {
+        uniform arguments: SimplifiedShapeAwareGradientMaskArguments
+        texture field: Texture2d
+        sampler fieldSampler: Sampler
+    }
+
+    vertex {
+        input FullscreenIn
+        output FullscreenOut
+
+        function entry(input: FullscreenIn) -> FullscreenOut {
+            let out: FullscreenOut
+            out.clip_position = Stitch.fullscreen(input.vid)
+            return out
+        }
+    }
+
+    fragment {
+        input FullscreenOut
+        output StitchOut
+
+        function entry(input: FullscreenOut) -> StitchOut {
+            let a = arguments
+            let position = Stitch.userPoint(input.clip_position.xy, a.toUser, a.toUserTranslation)
+            let texel = sample(field, fieldSampler, position * a.fieldInverseSize)
+            let d = Stitch.insideDistance(texel, a.sdfScale, a.sdfZero)
+            let inward = Stitch.saturate(d / a.borderWidth)
+            let down = Stitch.saturate((position.y - a.bounds.y) / a.bounds.w)
+            let inside = mix(a.opacityBounds.y, a.opacityBounds.x, down)
+            let contour = mix(a.contourOpacityBounds.y, a.contourOpacityBounds.x, down)
+            let shaded = Stitch.smooth01(mix(contour, inside, inward))
+            let opacity = mix(1.0, shaded, Stitch.saturate(d + 1.0))
+            let result: StitchOut
+            result.color = Float4(opacity, opacity, opacity, opacity)
+            return result
+        }
+    }
+}

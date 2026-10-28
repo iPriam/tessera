@@ -1,0 +1,143 @@
+import Foundation
+import LibTessera
+
+// The Dynamic Platform the machine runs, and switching it while it runs
+// (roadmap/15-form-factors.md).
+//
+// The setting `platform.dynamic` names it. At boot PID 1 reads the setting
+// from the file the Settings service keeps, since that service is not running
+// yet; without a value the boot words choose, and without those the chassis:
+// a tablet runs Adaptive Mobile, anything else Adaptive Desktop. When the setting changes, the running platform asks PID 1 to
+// switch: PID 1 ends it and starts the one named in the same slot, so it is
+// the same display client to MosaicDisplay, and links it to every
+// application as it links a platform started again.
+
+// The file the Settings service keeps the settings in.
+namespace PlatformChoice {
+    // The SMBIOS chassis type, and the ones that are tablets: Tablet,
+    // Convertible and Detachable, as DeviceInfo tells them.
+    let chassisPath: String = "/sys/class/dmi/id/chassis_type"
+    let tablets: [String] = ["30", "31", "32"]
+}
+
+// The platform program to start: `platform.dynamic`'s value, then the boot
+// words', then the chassis's.
+function chosenPlatform(calls: Handle, bootArguments: borrow [String]) -> String {
+    match settingOnDisk(calls, PlatformSetting.key) {
+        Some(value) -> {
+            if platformSettingValid(value) { return value }
+            log warn("the platform setting names no platform", platform: value)
+        }
+        // Not chosen: the boot and the chassis decide.
+        None -> {}
+    }
+    if bootFlag(bootArguments, "tessera.media") { return PlatformSetting.media }
+    if bootFlag(bootArguments, "tessera.adaptive-mobile") { return PlatformSetting.adaptiveMobile }
+    match nodeExists(calls, PlatformChoice.chassisPath) {
+        Ok(exists) -> if exists {
+            match readWholeFile(calls, PlatformChoice.chassisPath) {
+                Ok(bytes) -> {
+                    let chassis = match textFromBytes(bytes) {
+                        Some(value) -> value.trim()
+                        None -> ""
+                    }
+                    if PlatformChoice.tablets.contains(chassis) {
+                        return PlatformSetting.adaptiveMobile
+                    }
+                }
+                Error(failed) -> log warn(
+                    "could not read the machine's chassis type",
+                    error: errorName(failed)
+                )
+            }
+        }
+        Error(failed) -> log warn(
+            "could not check the machine's chassis type",
+            path: PlatformChoice.chassisPath,
+            error: errorName(failed)
+        )
+    }
+    return PlatformSetting.adaptiveDesktop
+}
+
+// The service that runs the platform program `name`. An adaptive platform
+// blanks sooner under `tessera.idle-test`.
+function platformService(name: borrow String, idleTest: Bool) -> Service {
+    let adaptive = name != PlatformSetting.media
+    return Service {
+        name: copy name,
+        path: "/" + SystemDirectory.programs + "/" + name,
+        arguments: idleTest && adaptive ? [copy name, "--display-sleep", "20"] : [],
+        restart: true,
+        displayRole: DisplayRole.Platform,
+    }
+}
+
+// Ends the platform in `slot` and starts the one `name` names in its place.
+function switchPlatform(
+    calls: Handle,
+    fleet: borrow mut Fleet,
+    slot: Number,
+    name: borrow String,
+    port: Handle,
+    bootArguments: borrow [String]
+) {
+    if !platformSettingValid(name) {
+        log warn("the platform asked to switch to no platform", platform: name)
+        return
+    }
+    let running = copy fleet.services[slot].name
+    if running == name { return }
+    log info("switching the Dynamic Platform", from: running, to: name)
+    endService(calls, fleet, slot)
+    let service = platformService(name, bootFlag(bootArguments, "tessera.idle-test"))
+    // The person who switched is at the machine and past the lock screen,
+    // so the platform switched in starts with it open. Only this start: one
+    // started again after it ends starts locked, as at boot.
+    fleet.services[slot] = switchedIn(service)
+    fleet.deaths[slot] = Deaths {}
+    restartSlot(calls, fleet, slot, port)
+    fleet.services[slot] = move service
+    log info("switched the Dynamic Platform", platform: name)
+}
+
+// `service` started with the lock screen open.
+function switchedIn(service: borrow Service) -> Service {
+    var arguments = copy service.arguments
+    if arguments.count == 0 { arguments.append(copy service.name) }
+    arguments.append("--unlocked")
+    var opened = copy service
+    opened.arguments = move arguments
+    return opened
+}
+
+// The value of setting `key` in the settings file itself, which PID 1 reads
+// before the Settings service runs; none when it holds none or cannot be
+// read, which is said in the log.
+function settingOnDisk(calls: Handle, key: borrow String) -> String? {
+    let path = "/" + SystemFile.settings
+    match nodeExists(calls, path) {
+        Ok(exists) -> if !exists { return .None }
+        Error(failed) -> {
+            log warn("could not check for the settings", path: path, error: errorName(failed))
+            return .None
+        }
+    }
+    let bytes = match readWholeFile(calls, path) {
+        Ok(value) -> value
+        Error(failed) -> {
+            log warn("could not read the settings", error: errorName(failed))
+            return .None
+        }
+    }
+    let text = try textFromBytes(bytes) otherwise ""
+    for setting in settingsFromLines(text) {
+        if setting.key == key { return .Some(copy setting.value) }
+    }
+    return .None
+}
+
+// Whether the first-run setup was completed, so Welcome need not open.
+function setupCompleted(calls: Handle) -> Bool {
+    return settingOnDisk(calls, SetupSetting.completed) == .Some(copy SetupSetting.yes)
+}

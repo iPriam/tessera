@@ -1,0 +1,56 @@
+import Foundation
+import KiraUI
+
+// Startup Disk: the volumes Tessera can start from, and Restart.
+
+public construct StartupDiskPane(model: RecoveryModel) extends Widget {
+    @State var chosen: Number = 0
+
+    body {
+        var tiles: [Any Widget] = []
+        for index in 0..model.disks.count {
+            let at = index
+            tiles.append(
+                DiskTile(
+                    disk = copy model.disks[index],
+                    selected = chosen == index,
+                    choose = { in
+                        chosen = at
+                        return
+                    }
+                )
+            )
+        }
+        VStack(spacing = .Large, alignment = .Leading) {
+            Text("Select the disk you want to use to start up your computer")
+            .font(size = resolvedLength(15.0), weight = .Bold)
+            .fillWidth()
+            HStack(alignment = .Center) {
+                Spacer()
+                HStack(spacing = .Large, alignment = .Center, children = tiles)
+                Spacer()
+            }
+            .edgePadding(EdgeSet.all, resolvedLength(12.0))
+            .fillWidth()
+            .background(fill = BackgroundFill(style = .Surface, radius = .Large))
+            Text(
+                chosen < model.disks.count ? "You have selected " + diskTitle(
+                    model.disks[chosen]
+                ) + "." : ""
+            )
+            .font(size = resolvedLength(12.0))
+            .foregroundColor(.Secondary)
+            Spacer()
+            HStack(spacing = .Small, alignment = .Center) {
+                Spacer()
+                Button(action = { in return }) {
+                    Text("Restart…")
+                }
+                .buttonStyle(.BorderedProminent)
+            }
+        }
+        .fillWidth()
+        .fillHeight()
+        .scenePadding()
+    }
+}

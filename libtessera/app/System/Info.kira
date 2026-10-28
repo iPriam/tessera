@@ -1,0 +1,330 @@
+import Foundation
+import Heap
+
+// `System.info` (§20.3). Until the system publishes its read-only page, each
+// topic is gathered from the kernel backend when asked.
+
+// What `System.info` describes.
+@Derive(Copy)
+public enum InfoTopic: U32 {
+    Version = 0
+    Machine = 1
+    Backend = 2
+    Device = 3
+    Limits = 4
+    Session = 5
+}
+
+// `MachineInfo.arch`.
+@Derive(Copy)
+enum Architecture: U32 {
+    Arm64 = 0
+    X64 = 1
+    RiscV64 = 2
+}
+
+// `BackendInfo.kind`.
+@Derive(Copy)
+enum BackendKind: U32 {
+    Linux = 0
+    Xnu = 1
+    Native = 2
+}
+
+// `DeviceInfoTopic.deviceClass`.
+@Derive(Copy)
+enum DeviceInfoClass: U32 {
+    Mobile = 0
+    Desktop = 1
+    Console = 2
+    Media = 3
+}
+
+// `DeviceInfoTopic.dynamicPlatform`.
+@Derive(Copy)
+enum DynamicPlatform: U32 {
+    AdaptiveMobile = 0
+    AdaptiveDesktop = 1
+    Console = 2
+    Media = 3
+}
+
+// `DeviceInfoTopic.formFactor`.
+@Derive(Copy)
+enum FormFactor: U32 {
+    Phone = 0
+    Tablet = 1
+    PassportFold = 2
+    BookFold = 3
+    TriFold = 4
+    Laptop = 5
+    Desktop = 6
+    Handheld = 7
+    Tv = 8
+}
+
+function fnv64(text: borrow String) -> U64 { return wireOrdinal(text) }
+
+// The CalVer and ABI version come from `Info.klist`.
+function versionWrite(block: RawPtr) -> Result<U64, TesseraError> {
+    runtimeEnsure()
+    let build = try kernelBuildText()
+    heapStore<U32>(block, 0, U32(klist!("Info.klist", "BundleVersion")))
+    heapStore<U32>(block, 4, U32(klist!("Info.klist", "ABIVersion")))
+    heapStore<U64>(block, 8, fnv64(build))
+    heapStore<U32>(
+        block,
+        16,
+        (library.startup.flags & (StartupFlags.debugImage | StartupFlags.certified)).raw >> U32(1)
+    )
+    return .Ok(32)
+}
+
+function machineWrite(block: RawPtr) -> Result<U64, TesseraError> {
+    let cpus = try kernelCpuCount()
+    let performance = try kernelPerformanceCpus(cpus)
+    let memory = try kernelMemoryTotal()
+    let cacheLine = try kernelCacheLine()
+    let model = try kernelModelName()
+    let features = try kernelCpuFeatures()
+    heapStore<U32>(block, 0, code(kernelArchitecture()))
+    heapStore<U32>(block, 4, U32(kernelPageSize()))
+    heapStore<U32>(block, 8, cpus)
+    heapStore<U32>(block, 12, performance)
+    heapStore<U64>(block, 16, memory)
+    heapStore<U32>(block, 24, cacheLine)
+    heapStore<U64>(block, 32, features)
+    heapStore<U64>(block, 40, fnv64(model))
+    return .Ok(64)
+}
+
+function infoBackendWrite(block: RawPtr) -> Result<U64, TesseraError> {
+    let version = try kernelBackendVersion()
+    heapStore<U32>(block, 0, code(kernelBackendKind))
+    for index in 0..3 { heapStore<U32>(block, (4 + index * 4), version[index]) }
+    heapStore<U64>(block, 16, U64(0))
+    return .Ok(32)
+}
+
+// What the device is (`DeviceInfoTopic`): the class and form factor from the
+// SMBIOS chassis type -- portables are Desktop-class laptops, tablets
+// Mobile-class tablets, anything else a desktop -- and the Dynamic Platform
+// it runs: the one `platform.dynamic` names, or without it the one the boot
+// words do (`tessera.adaptive-mobile`, `tessera.media`), as PID 1 chooses
+// (roadmap/15-form-factors.md). Running another platform than the chassis's
+// makes the machine that platform's device, so everything on it draws for the
+// platform it runs.
+function deviceWrite(block: RawPtr) -> Result<U64, TesseraError> {
+    runtimeEnsure()
+    let chassis = try kernelChassisType()
+    var deviceClass = DeviceInfoClass.Desktop
+    var platform = DynamicPlatform.AdaptiveDesktop
+    var form = FormFactor.Desktop
+    match chassis {
+        Some(kind) -> match kind {
+            Portable, Laptop, Notebook, SubNotebook -> form = .Laptop
+            Tablet, Convertible, Detachable -> {
+                deviceClass = .Mobile
+                platform = .AdaptiveMobile
+                form = .Tablet
+            }
+            // Any other chassis is a desktop.
+            else -> {}
+        }
+        // Without DMI the machine is taken for a desktop.
+        None -> {}
+    }
+    let booted = try kernelBootWords()
+    match chosenPlatform(booted) {
+        Some(chosen) -> match chosen {
+            Media -> {
+                deviceClass = .Media
+                platform = .Media
+                form = .Tv
+            }
+            AdaptiveMobile -> {
+                if platform != .AdaptiveMobile {
+                    deviceClass = .Mobile
+                    platform = .AdaptiveMobile
+                    form = .Tablet
+                }
+            }
+            AdaptiveDesktop -> {
+                // A tablet switched to Adaptive Desktop stays a tablet.
+                deviceClass = .Desktop
+                platform = .AdaptiveDesktop
+            }
+            // No setting names the console platform; it is not chosen this way.
+            Console -> {}
+        }
+        // Nothing chose a platform: the chassis decides.
+        None -> {}
+    }
+    heapStore<U32>(block, 0, code(deviceClass))
+    heapStore<U32>(block, 4, code(platform))
+    heapStore<U32>(block, 8, code(form))
+    heapStore<U8>(block, 12, library.startup.flags.has(StartupFlags.certified) ? U8(1) : U8(0))
+    heapStore<U8>(block, 13, U8(0))
+    return .Ok(32)
+}
+
+// The setting that names the Dynamic Platform the machine runs, and the
+// platform programs it can name. PID 1 starts the one named at boot, and the
+// running platform asks PID 1 to switch when it changes.
+public namespace PlatformSetting {
+    let key: String = "platform.dynamic"
+    let adaptiveDesktop: String = "adaptive-desktop"
+    let adaptiveMobile: String = "adaptive-mobile"
+    let media: String = "media"
+}
+
+// The platform `platform.dynamic` names, or the boot line chose without it.
+function chosenPlatform(booted: borrow [String]) -> DynamicPlatform? {
+    let named = settingValue(PlatformSetting.key, "")
+    if named.count > 0 { return platformNamed(named) }
+    if booted.contains(BootPlatform.media) { return .Some(.Media) }
+    if booted.contains(BootPlatform.adaptiveMobile) { return .Some(.AdaptiveMobile) }
+    return .None
+}
+
+// The platform a `platform.dynamic` value names, if it names one.
+function platformNamed(name: borrow String) -> DynamicPlatform? {
+    for platform in [DynamicPlatform.AdaptiveDesktop, DynamicPlatform.AdaptiveMobile, DynamicPlatform.Media] {
+        if platformSettingName(platform) == name { return .Some(platform) }
+    }
+    return .None
+}
+
+// The `platform.dynamic` value naming `platform`'s program.
+function platformSettingName(platform: DynamicPlatform) -> String {
+    return match platform {
+        AdaptiveDesktop -> PlatformSetting.adaptiveDesktop
+        AdaptiveMobile -> PlatformSetting.adaptiveMobile
+        Media -> PlatformSetting.media
+        // The console platform has no program of its own to name.
+        Console -> ""
+    }
+}
+
+// Whether `name` is a platform program `platform.dynamic` can name.
+public function platformSettingValid(name: borrow String) -> Bool {
+    return platformNamed(name).isSome()
+}
+
+// The running platform, `running` its program, heard that
+// `platform.dynamic` changed: when the setting names another platform, PID 1
+// is asked to switch to it, which ends this one.
+public function followPlatformSetting(running: borrow String) {
+    let named = settingValue(PlatformSetting.key, "")
+    if named.count == 0 || named == running { return }
+    if !platformSettingValid(named) {
+        log warn("the platform setting names no platform", platform: named)
+        return
+    }
+    log info("asking PID 1 to switch the Dynamic Platform", from: running, to: named)
+    match askWorkspace(.SwitchPlatform(named)) {
+        Ok(answer) -> match handleClose(answer) {
+            Ok -> {}
+            Error(failed) -> absorb failed
+        }
+        Error(failed) -> log warn("could not ask PID 1 to switch the platform", failure: failed)
+    }
+}
+
+// The boot words that choose a Dynamic Platform, as PID 1 reads them.
+namespace BootPlatform {
+    let media: String = "tessera.media"
+    let adaptiveMobile: String = "tessera.adaptive-mobile"
+}
+
+// `DeviceInfoTopic`, read whole: what the device is and which Dynamic
+// Platform it runs. The numbers are the topic's codes.
+public struct DeviceDescription {
+    // Mobile 0, Desktop 1, Console 2, Media 3.
+    let deviceClass: Number
+    // AdaptiveMobile 0, AdaptiveDesktop 1, Console 2, Media 3.
+    let dynamicPlatform: Number
+    // Phone 0, Tablet 1, PassportFold 2, BookFold 3, TriFold 4, Laptop 5,
+    // Desktop 6, Handheld 7, Tv 8.
+    let formFactor: Number
+    let certified: Bool
+    let attested: Bool
+}
+
+// What `System.info(.Device)` says of the device.
+public function deviceDescription() -> Result<DeviceDescription, TesseraError> {
+    let blockBytes = zeroedBlock(count: 96, alignment: 16)
+    let block = blockBytes.pointer()
+    try deviceWrite(block)
+    return .Ok(
+        DeviceDescription {
+            deviceClass: heapLoad<U32>(block, 0),
+            dynamicPlatform: heapLoad<U32>(block, 4),
+            formFactor: heapLoad<U32>(block, 8),
+            certified: heapLoad<U8>(block, 12) != U8(0),
+            attested: heapLoad<U8>(block, 13) != U8(0),
+        }
+    )
+}
+
+function limitsWrite(block: RawPtr) -> Result<U64, TesseraError> {
+    let threads = try kernelThreadLimit()
+    heapStore<U32>(block, 0, U32(handleLimit))
+    heapStore<U32>(block, 4, U32(channelMaxBytes))
+    heapStore<U32>(block, 8, U32(channelMaxHandles))
+    heapStore<U32>(block, 12, U32(64))
+    heapStore<U64>(block, 16, U64(4 * 1024 * 1024))
+    heapStore<U32>(block, 24, U32(portUserCapacity))
+    heapStore<U32>(block, 28, U32(8 * 1024 * 1024))
+    heapStore<U32>(block, 32, U32(4096))
+    heapStore<U32>(block, 36, U32(255))
+    heapStore<U64>(block, 40, U64(0x7FFFFFFFFFFFFFFF))
+    heapStore<U64>(block, 48, kernelAddressSpaceBytes())
+    heapStore<U32>(block, 56, threads)
+    var processes = U32(0xFFFFFFFF)
+    match startupHandle(StartupTag.job) {
+        Some(job) -> {
+            match handleSlotOf(job) {
+                Some(slot) -> {
+                    let slotBacking = try backingOf(objectOfSlot(slot))
+                    processes = try kernelJobProcessLimit(slotBacking)
+                }
+                None -> {}
+            }
+        }
+        None -> {}
+    }
+    heapStore<U32>(block, 60, processes)
+    heapStore<U32>(block, 64, U32(32))
+    heapStore<U32>(block, 68, U32(4096))
+    return .Ok(96)
+}
+
+function sessionWrite(block: RawPtr) -> U64 {
+    let info = startupInfo()
+    heapStore<U64>(block, 0, info.appId)
+    heapStore<U64>(block, 8, info.processId != U64(0) ? info.processId : kernelProcessId())
+    heapStore<U64>(block, 16, info.jobId)
+    heapStore<U8>(block, 24, info.flags.has(StartupFlags.isMain) ? U8(1) : U8(0))
+    return U64(32)
+}
+
+public function systemInfo(
+    topic: InfoTopic,
+    version: UNumber,
+    out: borrow Buffer
+) -> Result<UNumber, TesseraError> {
+    if version != 1 { return .Error(failure(.Unsupported)) }
+    let blockBytes = zeroedBlock(count: 96, alignment: 16)
+    let block = blockBytes.pointer()
+    let written: Result<U64, TesseraError> = match topic {
+        Version -> versionWrite(block)
+        Machine -> machineWrite(block)
+        Backend -> infoBackendWrite(block)
+        Device -> deviceWrite(block)
+        Limits -> limitsWrite(block)
+        Session -> .Ok(sessionWrite(block))
+    }
+    let size = try written
+    return .Ok(try infoDeliver(block, size, out))
+}

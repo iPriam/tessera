@@ -1,0 +1,19 @@
+// PlatformUI: the components every Dynamic Platform draws with, built on Kira
+// UI and PlatformKit (roadmap/15-form-factors.md). A private framework, as
+// AppKit is: an application never draws a platform's components.
+construct PlatformUI extends Package {
+    let version: String = "0.1.0"
+    let kind: PackageKind = .Library
+    let moduleRoot: String = "PlatformUI"
+    let dependencies: [Dependency] = [
+        Dependency { name: "KiraUI", path: "../kira-ui" },
+        Dependency { name: "LibTessera", path: "../libtessera" },
+        Dependency { name: "AppKit", path: "../appkit" },
+        Dependency { name: "KCoreAnimation", path: "../kcoreanimation" },
+        Dependency { name: "PlatformKit", path: "../platform-kit" },
+        Dependency { name: "TesseraDisplayClient", path: "../display-client" },
+        Dependency { name: "TesseraUI", path: "../tessera-ui" },
+        Dependency { name: "Calculation", path: "../calculation" }
+    ]
+    let assets: [String] = ["Resources/Wallpaper.png", "Resources/WallpaperDark.png"]
+}

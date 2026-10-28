@@ -1,0 +1,275 @@
+import Foundation
+import Heap
+import LibTessera
+
+// Registry watches (17 §7.5) and the kernel's hotplug stream behind them.
+//
+// A watch is a `NETLINK_KOBJECT_UEVENT` socket. Each read drains what the
+// kernel sent, walks the registry again, and compares what matches the spec
+// with what matched before: an entry that appeared is `Matched`, one that went
+// is `Terminated`, and one a `change` uevent named is `PropertiesChanged`.
+
+// One change a watch holds for its reader.
+struct Change {
+    var kind: RegistryChangeKind
+    var entryClass: EntryClass
+    var entry: EntryId
+}
+
+// An entry a watch's spec matched at the last look.
+struct Matched {
+    var entry: EntryId
+    var entryClass: EntryClass
+}
+
+struct Watch {
+    var object: Number
+    var spec: Match
+    var known: [Matched]
+    var started: Bool
+    var queue: [Change]
+}
+
+namespace WatchLimit {
+    // A reader this many changes behind gets one `Resync` and matches again.
+    let queue: Number = 4096
+    let recordBytes: Number = 24
+}
+
+namespace Netlink {
+    let kobjectUevent: U64 = U64(15)
+    // The kernel's broadcast group.
+    let kernelGroup: U32 = U32(1)
+    let addressBytes: Number = 12
+}
+
+// A non-blocking uevent socket bound to the kernel's broadcast group.
+function ueventSocket() -> Result<Descriptor, TesseraError> {
+    let socket = try socketObject(
+        Socket.netlink,
+        Socket.datagram | Socket.nonBlock | Socket.closeOnExec,
+        Netlink.kobjectUevent
+    )
+    // `struct sockaddr_nl`: the family @0, the groups @8.
+    let addressBytes = zeroedBlock(count: Netlink.addressBytes, alignment: 16)
+    let address = addressBytes.pointer()
+    heapStore<U16>(address, 0, U16(Socket.netlink))
+    heapStore<U32>(address, 8, Netlink.kernelGroup)
+    match socket.bind(address, Netlink.addressBytes) {
+        Ok -> return .Ok(socket)
+        Error(failed) -> {
+            socket.close()
+            return .Error(failed)
+        }
+    }
+}
+
+// A uevent: the sysfs path it names, and whether it was a `change`.
+struct UeventNotice {
+    var path: String
+    var changed: Bool
+}
+
+// One uevent message: `ACTION=` and `DEVPATH=` among its NUL-separated
+// fields.
+function readNotice(block: RawPtr, length: Number) -> UeventNotice? {
+    var action = ""
+    var devicePath = ""
+    var at = 0
+    while at < length {
+        let field = stringFromCBytes(heapOffset(block, at), Number(length - at))
+        if field.startsWith("ACTION=") { action = field.substring(7, field.count) }
+        if field.startsWith("DEVPATH=") { devicePath = field.substring(8, field.count) }
+        at += field.count + 1
+    }
+    if devicePath.count == 0 { return .None }
+    return .Some(UeventNotice { path: "/sys" + devicePath, changed: action == "change" })
+}
+
+// Every uevent waiting on `socket`.
+function drainUevents(socket: borrow Descriptor) -> [UeventNotice] {
+    var notices: [UeventNotice] = []
+    let blockBytes = zeroedBlock(count: Uevent.bufferBytes, alignment: 16)
+    let block = blockBytes.pointer()
+    while true {
+        let got = match socket.read(block, Uevent.bufferBytes) {
+            Ok(value) -> value
+            Error(failed) -> {
+                match errnoOf(failed) {
+                    Again -> {}
+                    // The socket overran; what was lost shows in the walk.
+                    NoBufferSpace -> {}
+                    else -> log warn(
+                        "a registry watch's uevent socket failed",
+                        errno: errnoOf(failed)
+                    )
+                }
+                break
+            }
+        }
+        if got == 0 { break }
+        match readNotice(block, got) {
+            Some(notice) -> notices.append(notice)
+            None -> {}
+        }
+    }
+    if notices.count > 0 { deviceLibrary.registry.generation += U64(1) }
+    return notices
+}
+
+function watchOf(object: Number) -> Result<Number, TesseraError> {
+    for (index, watch) in deviceLibrary.registry.watches.enumerated() {
+        if watch.object == object { return .Ok(index) }
+    }
+    return .Error(failure(.InvalidHandle))
+}
+
+public function registryWatch(spec: borrow Buffer) -> Result<Ref, TesseraError> {
+    let parsed = try readMatch(spec)
+    let socket = try ueventSocket()
+    let object = createObject(.RegistryWatch, .None, .Some(socket))
+    deviceLibrary.registry.watches.append(
+        Watch { object: object, spec: parsed, known: [], started: false, queue: [] }
+    )
+    return .Ok(mintRef(object, defaultRights(.RegistryWatch)))
+}
+
+function knows(known: borrow [Matched], entry: EntryId) -> Bool {
+    for matched in known {
+        if matched.entry == entry { return true }
+    }
+    return false
+}
+
+// What matches the watch's spec now.
+function matchingNow(spec: borrow Match) -> Result<[Matched], TesseraError> {
+    var now: [Matched] = []
+    let entries = try scan()
+    for entry in entries {
+        if spec.admits(entry) {
+            now.append(Matched { entry: entry.id, entryClass: entry.entryClass })
+        }
+    }
+    return .Ok(now)
+}
+
+// Moves what changed since the last look into the watch's queue.
+function refreshWatch(watch: Number) -> Result<Void, TesseraError> {
+    let socket = try deviceLibrary.objects[deviceLibrary.registry.watches[watch].object].device otherwise return .Error(failure(.InvalidHandle))
+    let notices = drainUevents(socket)
+    if deviceLibrary.registry.watches[watch].started && notices.count == 0 { return .Ok }
+    let now = try matchingNow(deviceLibrary.registry.watches[watch].spec)
+    let before = deviceLibrary.registry.watches[watch].known
+    var queue = deviceLibrary.registry.watches[watch].queue
+    for matched in now {
+        if !knows(before, matched.entry) {
+            queue.append(
+                Change { kind: .Matched, entryClass: matched.entryClass, entry: matched.entry }
+            )
+        }
+    }
+    for matched in before {
+        if !knows(now, matched.entry) {
+            queue.append(
+                Change { kind: .Terminated, entryClass: matched.entryClass, entry: matched.entry }
+            )
+        }
+    }
+    for notice in notices {
+        if !notice.changed { continue }
+        let id = entryIdOf(notice.path)
+        for matched in now {
+            if matched.entry == id && knows(before, id) {
+                queue.append(
+                    Change { kind: .PropertiesChanged, entryClass: matched.entryClass, entry: id }
+                )
+            }
+        }
+    }
+    if queue.count > WatchLimit.queue {
+        queue = [Change { kind: .Resync, entryClass: .Unknown, entry: EntryId(0) }]
+    }
+    deviceLibrary.registry.watches[watch].queue = queue
+    deviceLibrary.registry.watches[watch].known = now
+    deviceLibrary.registry.watches[watch].started = true
+    return .Ok
+}
+
+// The queued changes as a `RegistryChange` list, as many as fit; the answer
+// is the count.
+public function registryWatchRead(watch: Ref, out: borrow Buffer) -> Result<Number, TesseraError> {
+    let object = try resolve(watch, .RegistryWatch, RefRights.read)
+    let index = try watchOf(object)
+    try refreshWatch(index)
+    let queue = deviceLibrary.registry.watches[index].queue
+    if queue.count == 0 { return .Error(failure(.ShouldWait)) }
+    try requireRoom(out, Number(8 + WatchLimit.recordBytes))
+    let room = trunc((out.length - 8) / WatchLimit.recordBytes)
+    var count = queue.count
+    if count > room { count = room }
+    writeListHeader(out.address, count, WatchLimit.recordBytes)
+    for item in 0..count {
+        let at = 8 + item * WatchLimit.recordBytes
+        heapStore<U32>(out.address, at, code(queue[item].kind))
+        heapStore<U32>(out.address, at + 4, code(queue[item].entryClass))
+        heapStore<U64>(out.address, at + 8, queue[item].entry.raw)
+        heapStore<U64>(out.address, at + 16, deviceLibrary.registry.generation)
+    }
+    var rest: [Change] = []
+    for at in count..queue.count { rest.append(queue[at]) }
+    deviceLibrary.registry.watches[index].queue = rest
+    return .Ok(Number(count))
+}
+
+function readableAnswer() -> Answer {
+    return Answer { result0: U64(DeviceEvents.readable.raw), result1: U64(0) }
+}
+
+// `READABLE` on a watch: at once when changes are queued or the first read
+// is still owed, otherwise when the kernel sends a uevent.
+function watchArm(
+    object: Number,
+    reply: borrow Reply,
+    options: borrow SourceOptions
+) -> Result<Void, TesseraError> {
+    let index = try watchOf(object)
+    let watch = deviceLibrary.registry.watches[index]
+    if !watch.started || watch.queue.count > 0 { return reply.post(.Ok(readableAnswer()), .Event) }
+    let completion = packet(reply.key, successOutcome, readableAnswer(), .Event)
+    return reply.attach(try deviceOf(object), SourceEvents.readable, completion, options)
+}
+
+// A connection's kernel-reported events (Changed on hotplug, Reset on a
+// wedged adapter) come from the same stream: a uevent socket the connection
+// keeps.
+function connectionArmUevent(
+    object: Number,
+    wanted: DeviceEvents,
+    options: borrow SourceOptions,
+    reply: borrow Reply
+) -> Result<Void, TesseraError> {
+    let index = try connectionOf(object) otherwise return .Error(failure(.InvalidHandle))
+    let socket = match deviceLibrary.connections[index].uevents {
+        Some(value) -> value
+        None -> {
+            let made = try ueventSocket()
+            deviceLibrary.connections[index].uevents = .Some(made)
+            made
+        }
+    }
+    let answer = Answer { result0: U64((wanted & DeviceEvents.changed).raw), result1: U64(0) }
+    return reply.attach(
+        socket,
+        SourceEvents.readable,
+        packet(reply.key, successOutcome, answer, .Event),
+        options
+    )
+}
+
+function watchRelease(object: Number) {
+    var kept: [Watch] = []
+    for watch in deviceLibrary.registry.watches {
+        if watch.object != object { kept.append(watch) }
+    }
+    deviceLibrary.registry.watches = kept
+}

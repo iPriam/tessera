@@ -1,0 +1,108 @@
+import Foundation
+import KiraUI
+
+// The first pane: the four utilities, one chosen, and Continue to open it.
+
+struct Utility {
+    let pane: Number
+    let image: String
+    let title: String
+    let detail: String
+}
+
+function utilities() -> [Utility] {
+    return [
+        Utility {
+            pane: RecoveryPane.install,
+            image: "install",
+            title: "Install Tessera",
+            detail: "Install a new copy of Tessera on a disk."
+        },
+        Utility {
+            pane: RecoveryPane.diskUtility,
+            image: "disk-utility",
+            title: "Disk Utility",
+            detail: "Partition, erase or repair a disk."
+        },
+        Utility {
+            pane: RecoveryPane.startupDisk,
+            image: "startup-disk",
+            title: "Startup Disk",
+            detail: "Choose the disk Tessera starts from."
+        },
+        Utility {
+            pane: RecoveryPane.terminal,
+            image: "terminal",
+            title: "Terminal",
+            detail: "Run commands on the installer's system."
+        },
+    ]
+}
+
+construct UtilityRow(utility: Utility, selected: Bool, choose: () -> Void) extends Widget {
+    body {
+        HStack(spacing = .Medium, alignment = .Center) {
+            utilityIcon(utility.image, 40.0)
+            VStack(spacing = .Micro, alignment = .Leading) {
+                Text(copy utility.title)
+                .font(size = resolvedLength(14.0), weight = .SemiBold)
+                Text(copy utility.detail)
+                .font(size = resolvedLength(12.0))
+                .foregroundColor(selected ? .White : .Secondary)
+            }
+            Spacer()
+        }
+        .edgePadding(EdgeSet.horizontal, resolvedLength(12.0))
+        .edgePadding(EdgeSet.vertical, resolvedLength(9.0))
+        .fillWidth()
+        .background(fill = BackgroundFill(style = selected ? .Accent : .Clear, radius = .Medium))
+        .onClick(choose)
+    }
+}
+
+construct UtilitiesPane(pane: Binding<Number>) extends Widget {
+    @State var chosen: Number = 1
+
+    body {
+        var rows: [Any Widget] = []
+        for utility in utilities() {
+            let target = utility.pane
+            rows.append(
+                UtilityRow(
+                    utility = copy utility,
+                    selected = chosen == target,
+                    choose = { in
+                        chosen = target
+                        return
+                    }
+                )
+            )
+        }
+        VStack(spacing = .Medium, alignment = .Leading) {
+            HStack(spacing = .Medium, alignment = .Center) {
+                TesseraIcon(size = 30.0)
+                Text("Tessera Recovery")
+                .font(size = resolvedLength(20.0), weight = .Bold)
+            }
+            VStack(spacing = .ExtraSmall, children = rows)
+            .edgePadding(EdgeSet.all, resolvedLength(6.0))
+            .background(fill = BackgroundFill(style = .Surface, radius = .Large))
+            Spacer()
+            HStack(alignment = .Center) {
+                Spacer()
+                Button(
+                    action = { in
+                        pane.set(chosen)
+                        return
+                    }
+                ) {
+                    Text("Continue")
+                }
+                .buttonStyle(.BorderedProminent)
+            }
+        }
+        .fillWidth()
+        .fillHeight()
+        .scenePadding()
+    }
+}

@@ -1,0 +1,41 @@
+import KiraUI
+
+// The window: the panes in a sidebar, the one chosen beside them in a stack
+// of its own, as an iPad's Settings lays them out. It opens on General; a
+// pane opened from another has the bar's back button beside its title.
+construct SettingsView(release: Release, choices: SettingsChoices) extends Widget {
+    body {
+        NavigationSplitView(path = NavigationPath {}) {
+            SettingsSidebar(release = release, choices = choices)
+        } detail: {
+            NavigationStack(path = NavigationPath {}) {
+                GeneralPane(release = copy release, choices = choices)
+            }
+        }
+    }
+}
+
+// A pane's glyph as Settings draws it: white on a rounded square of the
+// pane's own color.
+construct SettingsIcon(symbol: Symbol, tint: PrimaryColor) extends Widget {
+    body {
+        ZStack(alignment = .Center) {
+            RoundedRectangle(cornerRadius = 7.0, style = .Continuous)
+            .foregroundColor(tint)
+            .frame(width = 28.0, height = 28.0)
+
+            Icon(symbol = symbol)
+            .foregroundColor(.White)
+        }
+    }
+}
+
+// A sidebar row: the pane's tile, then its name.
+construct PaneLabel(title: String, symbol: Symbol, tint: PrimaryColor) extends Widget {
+    body {
+        HStack(spacing = .Medium, alignment = .Center) {
+            SettingsIcon(symbol = symbol, tint = tint)
+            Text(title)
+        }
+    }
+}

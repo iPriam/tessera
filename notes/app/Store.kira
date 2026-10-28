@@ -1,0 +1,232 @@
+//! The notes store: the notes and folders kept on the data volume, and how they are loaded and saved.
+import Foundation
+import LibTessera
+
+// The notes are kept in the application's own data folder, which PID 1 makes
+// when it opens an application (roadmap/05-storage-and-state.md). Each folder
+// of notes is a directory there, and each note a text file in it named for
+// the second it was last saved: its first line is its title, the rest its
+// body. A machine without a data volume has no such folder, and the window
+// says its notes will not be kept.
+
+/// Where the notes are kept on the data volume; the folder the notes live in, and why they may not be kept.
+namespace NotesStore {
+    let folder: String = "/" + SystemDirectory.applicationData + "/Notes"
+    // The folder a first note goes in, as Notes on iPad starts with one.
+    let firstFolder: String = "Notes"
+    // The file every line went in before notes had folders.
+    let oldFile: String = "/" + SystemDirectory.applicationData + "/Notes/Notes.txt"
+    let suffix: String = ".txt"
+}
+
+/// The milliseconds in a second.
+namespace Millis {
+    let second: UNumber = 1000
+}
+
+/// One note: the folder it is in, the second it was last saved, its title and the lines under it.
+struct Note {
+    let folder: String
+    let saved: UN32
+    let title: String
+    let lines: [String]
+
+    function file(borrow self) -> String {
+        return NotesStore.folder + "/" + self.folder + "/" + String(self.saved) + NotesStore.suffix
+    }
+
+    // What names the note in the navigation path.
+    function key(borrow self) -> String { return self.folder + "/" + String(self.saved) }
+
+    // The title a note without one is shown under.
+    function shownTitle(borrow self) -> String {
+        return self.title.count > 0 ? copy self.title : "New Note"
+    }
+
+    // The first line of the body, as the note list shows under the title.
+    function preview(borrow self) -> String {
+        for line in self.lines {
+            if line.trim().count > 0 { return line.trim() }
+        }
+        return "No additional text"
+    }
+
+    // Whether the title or a line holds `query`.
+    function holds(borrow self, query: borrow String) -> Bool {
+        if self.title.contains(query) { return true }
+        for line in self.lines {
+            if line.contains(query) { return true }
+        }
+        return false
+    }
+}
+
+/// One folder and its notes, newest first.
+struct NotesFolder {
+    let name: String
+    let notes: [Note]
+}
+
+/// Whole seconds since 1970.
+function secondsNow() -> UN32 { return UN32(trunc(unixMillis() / Millis.second)) }
+
+/// Whether the notes can be kept: the data folder is there.
+function notesKept() -> Bool { return isDirectory(NotesStore.folder) }
+
+/// The note in `file`, saved at `saved`, or none when it cannot be read.
+function readNote(folder: borrow String, file: borrow String, saved: UN32) -> Note? {
+    match readFile(file) {
+        Ok(contents) -> {
+            let all = contents.text.split("\n")
+            // The text ends in a line break, which leaves an empty last line.
+            var last = all.count
+            while last > 1 && all[last - 1].count == 0 { last = last - 1 }
+            var lines: [String] = []
+            for index in 1..last { lines.append(copy all[index]) }
+            let title = all.count > 0 ? copy all[0] : ""
+            return .Some(Note { folder: copy folder, saved: saved, title: title, lines: lines })
+        }
+        Error(failure) -> {
+            log warn("could not read a note", file: copy file, failure)
+            return .None
+        }
+    }
+}
+
+/// The notes in one folder, newest first.
+function loadNotes(folder: borrow String) -> [Note] {
+    var notes: [Note] = []
+    match listDirectory(NotesStore.folder + "/" + folder) {
+        Ok(listing) -> {
+            for entry in listing.entries {
+                if !entry.endsWith(NotesStore.suffix) { continue }
+                match entry.before(NotesStore.suffix).toNumber() {
+                    Some(saved) -> {
+                        let file = NotesStore.folder + "/" + folder + "/" + entry
+                        match readNote(folder, file, UN32(saved)) {
+                            Some(note) -> notes.append(note)
+                            None -> {}
+                        }
+                    }
+                    None -> log warn("a file in the notes is not a note", file: copy entry)
+                }
+            }
+        }
+        Error(failure) -> log warn("could not list a folder of notes", folder: copy folder, failure)
+    }
+    return notes.sorted({ a, b in return a.saved > b.saved })
+}
+
+/// Every folder of notes, by name; a first folder when there is none.
+function loadFolders() -> [NotesFolder] {
+    adoptOldLines()
+    var folders: [NotesFolder] = []
+    match listDirectory(NotesStore.folder) {
+        Ok(listing) -> {
+            for entry in listing.entries {
+                if isDirectory(NotesStore.folder + "/" + entry) {
+                    folders.append(NotesFolder { name: copy entry, notes: loadNotes(entry) })
+                }
+            }
+        }
+        Error(failure) -> match failure {
+            Missing -> {}
+            else -> log warn("could not list the notes", folder: NotesStore.folder, failure)
+        }
+    }
+    if folders.count == 0 {
+        folders.append(NotesFolder { name: NotesStore.firstFolder, notes: [] })
+    }
+    return folders.sorted({ a, b in return nameBefore(a.name, b.name) })
+}
+
+/// The lines kept before notes had folders become one note in the first folder, so an update loses none of them.
+function adoptOldLines() {
+    if !fileExists(NotesStore.oldFile) { return }
+    match readFile(NotesStore.oldFile) {
+        Ok(contents) -> {
+            var lines: [String] = []
+            for line in contents.text.split("\n") {
+                if line.count > 0 { lines.append(line) }
+            }
+            let note = Note {
+                folder: NotesStore.firstFolder,
+                saved: secondsNow(),
+                title: "Notes",
+                lines: lines
+            }
+            if saveNote(note, .None).isSome() {
+                match removePath(NotesStore.oldFile) {
+                    Ok -> {}
+                    Error(failure) -> log warn(
+                        "could not remove the old notes",
+                        file: NotesStore.oldFile,
+                        failure
+                    )
+                }
+            }
+        }
+        Error(failure) -> log warn(
+            "could not read the old notes",
+            file: NotesStore.oldFile,
+            failure
+        )
+    }
+}
+
+/// Makes the folder `name` when it is not there yet.
+function makeFolder(name: borrow String) -> Result<Void, FileFailure> {
+    let path = NotesStore.folder + "/" + name
+    if isDirectory(path) { return .Ok }
+    return makeDirectory(path)
+}
+
+/// Saves `note` as saved now, and removes the file it was saved in before, `previous`; the note as saved, or none when it could not be.
+function saveNote(note: borrow Note, previous: Note?) -> Note? {
+    if !notesKept() { return .None }
+    match makeFolder(note.folder) {
+        Ok -> {}
+        Error(failure) -> {
+            log warn("could not make a folder of notes", folder: copy note.folder, failure)
+            return .None
+        }
+    }
+    let saved = Note {
+        folder: copy note.folder,
+        saved: secondsNow(),
+        title: copy note.title,
+        lines: copy note.lines
+    }
+    var text = saved.title + "\n"
+    for line in saved.lines { text = text + line + "\n" }
+    match writeFile(saved.file(), text) {
+        Ok -> {}
+        Error(failure) -> {
+            log warn("could not save a note", file: saved.file(), failure)
+            return .None
+        }
+    }
+    match previous {
+        Some(old) -> if old.file() != saved.file() { removeNote(old) }
+        None -> {}
+    }
+    return .Some(saved)
+}
+
+/// Removes the note's file.
+function removeNote(note: borrow Note) {
+    match removePath(note.file()) {
+        Ok -> {}
+        Error(failure) -> log warn("could not remove a note", file: note.file(), failure)
+    }
+}
+
+/// Whether `first` comes before `second` by their characters' code points, as the folders are listed.
+function nameBefore(first: borrow String, second: borrow String) -> Bool {
+    for index in 0..min(first.count, second.count) {
+        let a = first.charAt(index)
+        let b = second.charAt(index)
+        if a != b { return a < b }
+    }
+    return first.count < second.count
+}

@@ -1,0 +1,64 @@
+import Foundation
+
+// How a burst of pictures went: how many, how long each took to make and how
+// long each flip took to land. A burst ends when no picture follows the last
+// for `FramePacing.gap` milliseconds; it is printed then, beside the boot
+// log's lines, as a dev machine reads its frame rate from it.
+
+namespace FramePacing {
+    let gap: Number = 250
+    // Shorter bursts, a click or a key, say nothing about pacing.
+    let shortest: Number = 8
+}
+
+struct Pacing {
+    var began: Number = 0
+    var last: Number = 0
+    var frames: Number = 0
+    var showing: Number = 0
+    var showingMost: Number = 0
+    var landing: Number = 0
+    var landingMost: Number = 0
+    var landed: Number = 0
+    var committed: Number = 0
+}
+
+// A picture is about to be made at `now`: the burst before it ends when it
+// is far enough behind.
+function pacingBegins(pacing: borrow mut Pacing, now: Number) {
+    if pacing.frames > 0 && now - pacing.last > FramePacing.gap {
+        printPacing(pacing)
+        pacing = Pacing {}
+    }
+    if pacing.frames == 0 { pacing.began = now }
+}
+
+// The picture took `took` milliseconds to make and commit; `flipping` when
+// a flip is now in flight.
+function pacingShown(pacing: borrow mut Pacing, now: Number, took: Number, flipping: Bool) {
+    pacing.frames += 1
+    pacing.last = now
+    pacing.showing += took
+    pacing.showingMost = max(pacing.showingMost, took)
+    if flipping { pacing.committed = now }
+}
+
+function pacingLanded(pacing: borrow mut Pacing, now: Number) {
+    if pacing.committed <= 0 { return }
+    let took = now - pacing.committed
+    pacing.committed = 0
+    pacing.landed += 1
+    pacing.landing += took
+    pacing.landingMost = max(pacing.landingMost, took)
+}
+
+function printPacing(pacing: borrow Pacing) {
+    if pacing.frames < FramePacing.shortest { return }
+    let length = max(pacing.last - pacing.began, 1)
+    let rate = trunc(pacing.frames * 10000 / length) / 10
+    let showing = trunc(pacing.showing / pacing.frames)
+    let landing = pacing.landed > 0 ? trunc(pacing.landing / pacing.landed) : 0
+    print(
+        "mosaicdisplay pacing: \(pacing.frames) frames in \(length) ms, \(rate) fps; " + "make \(showing) ms (most \(pacing.showingMost)); " + "flip lands \(landing) ms (most \(pacing.landingMost))"
+    )
+}

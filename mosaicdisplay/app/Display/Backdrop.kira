@@ -1,0 +1,171 @@
+import Foundation
+import LibTessera
+import Ember
+import TesseraDisplayClient
+
+// How bright the picture is under the platform's bar, which the platform
+// reads its bar's ink by (roadmap/08-display-server.md, "Surfaces"), and
+// under the band along the bottom, which its home indicator's ink follows as
+// an iPad's does. Each is measured from the composed picture, along two rows
+// of its band that the platform's text and icons never reach, so their own
+// ink does not count, and told to the platform when either has moved.
+
+namespace BackdropSampling {
+    let interval: Number = 250
+    // How soon a timer that found the screen moving looks again.
+    let retry: Number = 50
+    // How far in from the band's top and bottom edges the rows are, in
+    // points: the bar's 14-point text and its icons stand in the middle of
+    // its band.
+    let edge: Number = 3
+    // Every this many pixels along a row is read.
+    let stride: Number = 8
+    // A change smaller than this, in thousandths, is not told.
+    let step: Number = 20
+    let scale: Number = 1000
+}
+
+// A picture was composed: its bands are measured once pictures have stopped
+// coming for `interval`. A measurement waits for the GPU, which would hold up
+// every picture of a moving screen, and the bar's ink only has to be right
+// once the screen is still.
+function noteComposedBackdrop(server: borrow mut Server) -> Result<Void, TesseraError> {
+    if server.bar <= 0 || server.idleState == .Blanked { return .Ok }
+    let now = try nowMillis()
+    server.backdropComposed = Number(now)
+    if !server.backdropOwed {
+        server.backdropOwed = true
+        armBackdrop(server, BackdropSampling.interval)
+    }
+    return .Ok
+}
+
+// The backdrop timer fired: the last composed picture is measured, unless
+// the screen is still moving.
+function backdropFired(server: borrow mut Server) -> Result<Void, TesseraError> {
+    if !server.backdropOwed { return .Ok }
+    let now = try nowMillis()
+    let quiet = Number(now) - server.backdropComposed
+    if quiet < BackdropSampling.interval || server.redrawOwed || server.display.flipping.isSome() {
+        armBackdrop(server, max(BackdropSampling.interval - quiet, BackdropSampling.retry))
+        return .Ok
+    }
+    let texture = match server.composer {
+        Some(composer) -> {
+            // `composed` counts pictures shown; the last went into the first
+            // image when the count before it was even.
+            let last = server.composed - 1
+            last % 2 == 0 ? composer.first.exported.texture : composer.second.exported.texture
+        }
+        None -> return .Ok
+    }
+    measureBackdrop(server, texture)
+    return .Ok
+}
+
+function measureBackdrop(server: borrow mut Server, texture: borrow GraphicsTexture) {
+    server.backdropOwed = false
+    let composer = try server.composer otherwise return
+    let height = server.display.scanout.pointHeight()
+    var rows = bandRows(server, 0, server.bar)
+    let bands = server.dock > 0 ? 2 : 1
+    if server.dock > 0 {
+        for row in bandRows(server, height - server.dock, height) { rows.append(row) }
+    }
+    let bytes = match readTextureSamples(
+        composer.device.graphics(),
+        texture,
+        rows,
+        UNumber(BackdropSampling.stride)
+    ) {
+        Ok(value) -> value
+        Error(failure) -> {
+            log warn("the backdrop of the platform's bands could not be read", failure)
+            return
+        }
+    }
+    let span = trunc(bytes.count / bands)
+    let bar = try bandLuminance(bytes, 0, span) otherwise return
+    var bottom: Number = 0
+    if server.dock > 0 {
+        bottom = match bandLuminance(bytes, span, bytes.count) {
+            Some(value) -> value
+            None -> 0
+        }
+    }
+    let barMoved = backdropChanged(server.barBackdrop, bar)
+    let bottomMoved = backdropChanged(server.bottomBackdrop, bottom)
+    if !barMoved && !bottomMoved { return }
+    server.barBackdrop = .Some(bar)
+    server.bottomBackdrop = .Some(bottom)
+    tellPlatforms(
+        server,
+        .BarBackdrop(DisplayBackdrop { bar: UNumber(bar), bottom: UNumber(bottom) })
+    )
+}
+
+function backdropChanged(previous: Number?, current: Number) -> Bool {
+    return match previous {
+        Some(value) -> abs(current - value) >= BackdropSampling.step
+        None -> true
+    }
+}
+
+// The rows `BackdropSampling.edge` points in from the top and the bottom of
+// the band from `top` to `bottom` points down.
+function bandRows(server: borrow Server, top: Number, bottom: Number) -> [UNumber] {
+    let scale = server.display.scanout.scale
+    return [
+        UNumber(trunc((top + BackdropSampling.edge) * scale)),
+        UNumber(trunc((bottom - BackdropSampling.edge) * scale))
+    ]
+}
+
+// How bright the sampled pixels from byte `from` to `to` are, in
+// thousandths; none when there are none.
+function bandLuminance(bytes: borrow [UN8], from: Number, to: Number) -> Number? {
+    var total: Number = 0
+    var samples: Number = 0
+    var at = from
+    while at + 3 < to {
+        total += 0.2126 * Number(bytes[at]) + 0.7152 * Number(bytes[at + 1])
+            + 0.0722 * Number(bytes[at + 2])
+        samples += 1
+        at += 4
+    }
+    if samples == 0 { return .None }
+    return .Some(trunc(total / samples / 255.0 * BackdropSampling.scale))
+}
+
+// Arms the backdrop timer `after` milliseconds from now.
+function armBackdrop(server: borrow mut Server, after: Number) {
+    if server.backdropTimer.isNone() {
+        match timerCreate(.Monotonic) {
+            Ok(timer) -> server.backdropTimer = .Some(timer)
+            Error(reason) -> noBackdropTimer(reason)
+        }
+    }
+    let timer = try server.backdropTimer otherwise return
+    let armed = match monotonic() {
+        Ok(now) -> timerSet(
+            timer,
+            UNumber(now + after * KeyRepeat.nanosecondsPerMillisecond),
+            0,
+            TimerOptions.none,
+            server.port,
+            PortKey.backdrop
+        )
+        Error(failed) -> .Error(failed)
+    }
+    match armed {
+        Ok -> {}
+        Error(failed) -> log warn(
+            "the bar's backdrop timer could not be armed",
+            error: errorName(failed)
+        )
+    }
+}
+
+function noBackdropTimer(reason: borrow TesseraError) {
+    log warn("the bar's backdrop has no timer", error: errorName(reason))
+}

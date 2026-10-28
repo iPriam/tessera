@@ -1,0 +1,88 @@
+//! A key from MosaicDisplay, delivered to the toolkit as a window would deliver
+//! it: the key going down, then the character it types, through Kira UI's own
+//! keyboard dispatch. The modifiers and the character come with the key,
+//! resolved by the display server's keymap (roadmap/08-display-server.md).
+
+import Foundation
+import KiraUI
+import Ember
+import LibTessera
+import TesseraDisplayClient
+
+/// Whether a key state from the display is a key going down.
+function isDown(state: borrow DisplayKeyState) -> Bool {
+    return match state {
+        Pressed, Repeated -> true
+        Released -> false
+    }
+}
+
+/// The modifiers a key from the display carries, as the toolkit reads them.
+function modifierState(modifiers: borrow DisplayModifiers) -> ModifierState {
+    return ModifierState {
+        shift: modifiers.shift,
+        control: modifiers.control,
+        alt: modifiers.option,
+        superKey: modifiers.command
+    }
+}
+
+/// Delivers `key` to `host`'s interface: the key going down, then the
+/// character MosaicDisplay's keymap resolved it to, which it types unless
+/// Control or Command is held and makes it a shortcut. A modifier going down
+/// is no key of its own; it arrives as the modifiers of the keys after it.
+function deliverKey(key: borrow DisplayKey, host: borrow mut Host) {
+    if !isDown(key.state) { return }
+    let usage = fromCode<Usage>(UN32(key.key))
+    if isModifier(usage) { return }
+    interactionDispatch(interactionTokenOf(key.token, key.surface, key.time))
+    var typed: UN32? = .None
+    if !key.modifiers.commanding() && key.text.count > 0 {
+        typed = .Some(UN32(scalarAt(key.text, 0, scalarWidthAt(key.text, 0))))
+    }
+    let repeated = match key.state {
+        Repeated -> true
+        Pressed, Released -> false
+    }
+    let modifiers = modifierState(key.modifiers)
+    let pressed = AppEvent {
+        kind: .KeyDown,
+        key: keyFor(copy usage),
+        keyRepeat: repeated,
+        modifiers: modifiers,
+        timestamp: Number(key.time)
+    }
+    kiraLayerDispatchKeyboard(host.state, pressed)
+    match typed {
+        Some(codepoint) -> kiraLayerDispatchKeyboard(
+            host.state,
+            AppEvent {
+                kind: .TextInput,
+                textCodepoint: codepoint,
+                modifiers: modifiers,
+                timestamp: Number(key.time)
+            }
+        )
+        // The key types nothing.
+        None -> {}
+    }
+    interactionDispatch(.None)
+}
+
+/// The token of an input event as an application reads it: none for an event
+/// that software sent, since such an event carries no token.
+function interactionTokenOf(
+    token: borrow DisplayInteractionToken,
+    surface: DisplaySurfaceId,
+    time: UNumber
+) -> InteractionToken? {
+    if token.idLow == 0 && token.idHigh == 0 { return .None }
+    return .Some(
+        InteractionToken {
+            idLow: token.idLow,
+            idHigh: token.idHigh,
+            surfaceId: surface.raw,
+            issued: time,
+        }
+    )
+}

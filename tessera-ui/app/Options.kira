@@ -1,0 +1,86 @@
+//! What an application asks of the session that hosts it.
+
+import Foundation
+import Ember
+import KiraUI
+import LibTessera
+
+/// What an application watches beside the keyboard and PID 1's answers, and
+/// redraws when it changes.
+public enum ApplicationWatch {
+    /// Watches /Volumes, where disk images appear and go.
+    Volumes
+    /// Watches /Applications, where applications are installed and uninstalled.
+    Applications
+    /// Wakes the application every minute, for one that shows the time.
+    Minute
+}
+
+/// What an application's surface is. A window has the window's chrome and
+/// its canvas. The desktop is drawn edge to edge over the whole output, under
+/// the system's bar and every window, as Finder's desktop is on a Mac and the
+/// home screen is on an iPad; it has no chrome, and the bar holds its menus
+/// while it is in front.
+public enum ApplicationSurface {
+    /// A window: it has the window's chrome and its canvas.
+    Window
+    /// The desktop: drawn edge to edge over the whole output, with no chrome.
+    Desktop
+}
+
+/// Content another engine draws that the application shows inside its interface,
+/// as a web engine's pages are.
+///
+/// The engine's frames arrive as memory another component exported, so the
+/// application imports them with the graphics it draws with and hands the
+/// interface the texture. Only the session owns that device, hence a hook rather
+/// than a device of the application's own.
+public struct EmbeddedContent {
+    /// Runs once on every turn of the session, before the interface is built; answers whether what the interface shows changed.
+    let tick: (Graphics) -> Bool
+    /// The longest the session waits between ticks, in milliseconds.
+    let interval: Number
+}
+
+/// The options an application starts with: the watches it keeps, the surface it is shown on, and any embedded content.
+public struct ApplicationOptions {
+    /// The watches the application keeps.
+    let watches: [ApplicationWatch] = []
+    /// The surface the application is shown on.
+    let surface: ApplicationSurface = .Window
+    /// The content another engine draws inside the interface, if any.
+    let embedded: EmbeddedContent? = .None
+}
+
+/// A minute in milliseconds, the period of the minute watch.
+namespace Minute {
+    let millis: Number = 60000
+}
+
+extend ApplicationOptions {
+    /// Whether the application asked to be woken every minute.
+    function watchesMinute(borrow self) -> Bool {
+        for watch in watches {
+            match watch {
+                Minute -> return true
+                Volumes, Applications -> continue
+            }
+        }
+        return false
+    }
+
+    /// How long the session may wait before the application has to redraw on
+    /// its own: until the minute turns, when it watches the minute.
+    function waitLimit(borrow self) -> Number? {
+        var limit: Number? = .None
+        if watchesMinute() { limit = .Some(Minute.millis - unixMillis() % Minute.millis) }
+        match embedded {
+            Some(content) -> limit = match limit {
+                Some(value) -> .Some(min(value, content.interval))
+                None -> .Some(content.interval)
+            }
+            None -> {}
+        }
+        return limit
+    }
+}

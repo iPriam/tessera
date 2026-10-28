@@ -1,0 +1,165 @@
+import Foundation
+import LibTessera
+import TesseraDisplayClient
+
+// Display clients that arrive while the server runs: an application the
+// desktop opened, or the desktop restarted. PID 1 hands each one's link over
+// the service channel as it handed the first ones at boot, with the client's
+// number, which becomes its surface, where the boot links carry their count.
+
+// Asks the port for one completion when PID 1 has sent something on the
+// service channel. Readable only: a PID 1 that has gone sends nothing more,
+// and the loop is not woken for it.
+function armLinks(server: borrow Server) {
+    match serviceChannel() {
+        Ok(channel) -> armLinkChannel(server, channel)
+        Error(reason) -> noLinkChannel(reason)
+    }
+}
+
+function armLinkChannel(server: borrow Server, channel: Handle) {
+    match objectWaitAsync(channel, Signals.readable, .Once, server.port, PortKey.link) {
+        Ok -> {}
+        Error(failed) -> log warn(
+            "cannot listen for display clients that arrive later",
+            error: errorName(failed)
+        )
+    }
+}
+
+function noLinkChannel(reason: borrow TesseraError) {
+    log warn("cannot listen for display clients that arrive later", error: errorName(reason))
+}
+
+// Why a client was not admitted: the client refused to begin, or it did not
+// acknowledge its configure or could not be armed.
+enum AdmitFailure {
+    Refused(SessionFailure)
+    ConfigureFailed(SessionFailure)
+    // The client was configured but its channel cannot be listened to.
+    ListenFailed(TesseraError)
+}
+
+// Admits the client on the link PID 1 sent: hello, welcome, its geometry in
+// the current mode and a configure it acknowledges, then listens to it. It
+// goes on top of every surface there is. The index it was given, or why it
+// was not admitted.
+function admitClient(
+    server: borrow mut Server,
+    link: borrow ClientLink
+) -> Result<Number, AdmitFailure> {
+    match beginClient(link.channel, link.number, server.display.scanout) {
+        Ok -> {}
+        Error(reason) -> return refusedClient(link.channel, reason)
+    }
+    let index = server.clients.count
+    var top = 0
+    for client in server.clients { top = max(top, client.zOrder + 1) }
+    server.clients.append(
+        Client {
+            channel: link.channel,
+            role: link.role,
+            surface: DisplaySurfaceId(link.number),
+            frame: Geometry { x: 0, y: 0, width: 0, height: 0 },
+            zOrder: top,
+            alive: true,
+            content: .None,
+        }
+    )
+    server.clients[index].frame = geometryFor(server, index)
+    match configureClient(server, index, 1) {
+        Ok -> {}
+        Error(reason) -> return unconfiguredClient(server, index, reason)
+    }
+    match armClient(server, index) {
+        Ok -> {}
+        Error(failed) -> return unlistenedClient(server, index, failed)
+    }
+    if link.role == .Application { relayoutStack(server) }
+    tellInsetsTo(server, index)
+    log info(
+        "admitted a display client",
+        surface: server.clients[index].surface.raw,
+        role: link.role
+    )
+    return .Ok(index)
+}
+
+function unlistenedClient(
+    server: borrow mut Server,
+    index: Number,
+    reason: borrow TesseraError
+) -> Result<Number, AdmitFailure> {
+    server.clients[index].alive = false
+    return .Error(.ListenFailed(reason))
+}
+
+function refusedClient(
+    channel: Handle,
+    reason: borrow SessionFailure
+) -> Result<Number, AdmitFailure> {
+    closeHandle(channel)
+    return .Error(.Refused(reason))
+}
+
+function unconfiguredClient(
+    server: borrow mut Server,
+    index: Number,
+    reason: borrow SessionFailure
+) -> Result<Number, AdmitFailure> {
+    server.clients[index].alive = false
+    return .Error(.ConfigureFailed(reason))
+}
+
+// PID 1 sent something on the service channel: a client to admit, which is
+// focused, or one to bring forward, which the platform decides.
+function arrived(server: borrow mut Server) {
+    match takeArrival(server.reader) {
+        Link(link) -> arriveLink(server, link)
+        BringForward(surface) -> tellPlatformActivate(server, surface)
+        Nothing -> {}
+    }
+    armLinks(server)
+}
+
+// Admits a link PID 1 sent, or refuses it and says why in the log.
+function arriveLink(server: borrow mut Server, link: borrow ClientLink) {
+    // The Presence service's link is no client: it is kept for token checks.
+    if link.role == .Presence {
+        adoptPresence(server, link.channel)
+        return
+    }
+    match admitClient(server, link) {
+        Ok(index) -> {
+            // A platform started again is the platform session from now on; it is
+            // told of every surface, as the first was, and focus stays where
+            // it is. Its session waits for its focus state first.
+            if server.clients[index].role == .Platform {
+                tellFocusOut(server.clients[index])
+                server.platform = .Some(server.clients[index].channel)
+                tellPresentInput(server, server.clients[index])
+                tellPlatformSurfaces(server)
+                tellMode(server, server.clients[index])
+            } else {
+                moveFocus(server, index)
+                tellPresentInput(server, server.clients[index])
+                tellPlatformSurface(server, index)
+                // After its focus, which its session waits for first.
+                tellMode(server, server.clients[index])
+            }
+        }
+        Error(reason) -> {
+            match reason {
+                Refused(cause) -> log warn("refused a display client that did not begin", cause)
+                ConfigureFailed(cause) -> log warn(
+                    "a display client did not acknowledge its configure",
+                    cause
+                )
+                ListenFailed(failed) -> log warn(
+                    "a display client cannot be listened to",
+                    error: errorName(failed)
+                )
+            }
+        }
+    }
+}

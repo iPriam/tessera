@@ -1,0 +1,566 @@
+import Foundation
+import LibTessera
+import PlatformKit
+import TesseraDisplayClient
+import KiraUI
+import TesseraUI
+import PlatformUI
+import AppKit
+
+// Adaptive Desktop: the Dynamic Platform a Mac's desktop is
+// (roadmap/11-adaptive-desktop.md). Kira UI runs its session with MosaicDisplay
+// and draws its interface over every application; what only a platform does
+// -- the mode it asks for, the keys it grabs, placing and focusing what is
+// open -- it does in the hooks below.
+//
+// It starts on its lock screen (roadmap/13-security-and-updates.md), which
+// covers everything and holds the keyboard until a key opens it. What came to
+// the front meanwhile is given the keyboard as the lock screen leaves.
+
+// The pointer navigates Adaptive Desktop, as it does a Mac
+// (`DynamicPlatform.presentationPolicy`).
+function navigation() -> NavigationModel {
+    return DynamicPlatform.AdaptiveDesktop.presentationPolicy().navigation
+}
+
+// Sends a display request; one that did not go out is said, as `what`.
+function request(asked: borrow Result<Void, TesseraError>, what: borrow String) {
+    match asked {
+        Ok -> {}
+        Error(failed) -> log warn(
+            "a display request failed",
+            request: what,
+            error: errorName(failed)
+        )
+    }
+}
+
+// Whether a display request went out, or why it did not.
+function sent(asked: borrow Result<Void, TesseraError>) -> Result<Bool, TesseraError> {
+    return match asked {
+        Ok -> .Ok(true)
+        Error(failed) -> .Error(failed)
+    }
+}
+
+function requestFailed(what: borrow String, failed: borrow TesseraError) {
+    log warn("a display request failed", request: what, error: errorName(failed))
+}
+
+// A session began on `opened`: the platform registers its own surface, asks
+// the compositor for the mode its window policy needs, grabs its keys and
+// presents a system prompt for the trusted path.
+function began(desktop: borrow mut Desktop, opened: borrow DynamicPlatformSession) {
+    log info("configured", x: 0, y: 0, width: opened.size.width, height: opened.size.height)
+    let channel = copy opened.channel
+    desktop.channel = .Some(copy channel)
+    desktop.desktop = .None
+    desktop.own = .Some(copy opened.surface)
+    desktop.bar = SystemBarSelection {}
+    // A new display server holds no glass for the platform: ask for all of it again.
+    desktop.glass = PlatformGlassClaim {}
+    desktop.output = SurfaceFrame {
+        x: 0,
+        y: 0,
+        width: opened.size.width,
+        height: opened.size.height
+    }
+    desktop.state = emptyPlatformState(.AdaptiveDesktop)
+    log info("arranged", arrangement: desktop.state.platform.arrangement().name())
+    let ownApplication = PlatformApplicationId(1)
+    let frame = SurfaceFrame { x: 0, y: 0, width: opened.size.width, height: opened.size.height, }
+    desktop.state.registerApplication(ownApplication, "Adaptive Desktop", .Platform)
+    desktop.state.registerSurface(
+        PlatformSurfaceId(opened.surface.raw),
+        ownApplication,
+        move frame,
+        0
+    )
+    desktop.state.bringForward(opened.surface)
+    let windows = desktop.state.platform.presentationPolicy().windows
+    log info("window policy", policy: windows.name())
+    let mode = match windows.arrangement() {
+        Freeform -> CompositorMode.Freeform
+        Stage -> CompositorMode.Stage
+        Stack -> CompositorMode.Stack
+        Exclusive -> CompositorMode.Exclusive
+    }
+    match sent(sendSetMode(copy channel, copy mode, false)) {
+        Ok(sent) -> if sent { log info("asked the compositor for its mode", mode: mode) }
+        Error(failed) -> requestFailed("set the mode", failed)
+    }
+    desktop.mode = mode
+    for key in platformKeys {
+        match sent(sendInstallGrab(copy channel, code(key))) {
+            Ok(sent) -> if sent { log info("grabbed a key", key: key) }
+            Error(failed) -> requestFailed("grab a key", failed)
+        }
+    }
+    // Present a system prompt and ask the compositor to verify it. Before any
+    // hardware input the answer is no, which is the trusted path refusing a
+    // prompt that no real keypress stands behind.
+    match sent(sendPresentSystem(copy channel)) {
+        Ok(sent) -> if sent { log info("presented a system prompt") }
+        Error(failed) -> requestFailed("present a system prompt", failed)
+    }
+    request(sendVerify(copy channel), "verify the prompt")
+    // The bar takes the top of the output, and every application is
+    // configured below it.
+    match sent(sendSetBar(copy channel, systemBarHeight())) {
+        Ok(sent) -> if sent {
+            log info("the bar takes the top of the output", height: systemBarHeight())
+        }
+        Error(failed) -> requestFailed("keep the bar's band", failed)
+    }
+    // The Dock takes the bottom of the output, as the bar takes the top.
+    keepInstalled(desktop)
+    desktop.unnamed = []
+    keepDockBand(desktop, copy channel)
+    keepIdleTimes(copy channel)
+    // A locked machine starts with the lock screen holding the keyboard, so
+    // the first click or key unlocks rather than reaching an application.
+    if desktop.lock.locked { holdForLockScreen(desktop) }
+    log info("running", locked: desktop.lock.locked)
+}
+
+// Gives `surface` the keyboard and brings it forward; whether it went out.
+function focus(
+    desktop: borrow mut Desktop,
+    surface: DisplaySurfaceId,
+    what: borrow String
+) -> Result<Bool, TesseraError> {
+    let channel = match desktop.channel {
+        Some(value) -> value
+        None -> return .Ok(false)
+    }
+    try sent(sendGrantFocus(channel, surface))
+    desktop.state.bringForward(surface)
+    // The strip holds what is not in front, so it changes with the front.
+    if desktop.mode == .Stage { redrawAfter(0) }
+    return .Ok(true)
+}
+
+// An application surface appeared: the platform tracks it, notes the desktop,
+// and focuses it -- once the lock screen has opened.
+function surfaceCreated(desktop: borrow mut Desktop, announced: borrow DisplaySurface) {
+    let surface = announced.surface
+    log info("an application surface appeared", surface: surface.raw)
+    match announced.role {
+        Desktop -> {
+            desktop.desktop = .Some(surface)
+            log info("the desktop is a surface", surface: surface.raw)
+        }
+        // Any other role is an application like the rest.
+        None, Application, Platform, Presence -> {}
+    }
+    if trackWindow(desktop.bridge, desktop.state, announced) {
+        restoreWindowFrame(desktop, surface)
+    } else {
+        desktop.unnamed.append(surface)
+    }
+    desktop.front = .Some(surface)
+    if desktop.lock.locked {
+        holdForLockScreen(desktop)
+        return
+    }
+    match focus(desktop, surface, "grant focus") {
+        Ok(sent) -> if sent { log info("granting focus", surface: surface.raw) }
+        Error(failed) -> requestFailed("grant focus", failed)
+    }
+}
+
+// While the lock screen is up the platform's own surface has the keyboard and
+// the pointer, whatever the server gave them to: a click or a key on it opens
+// it, and nothing behind it hears either.
+function holdForLockScreen(desktop: borrow mut Desktop) {
+    match holdInput(desktop, "hold the input for the lock screen") {
+        Ok(sent) -> if !sent { return }
+        Error(failed) -> {
+            requestFailed("hold the input for the lock screen", failed)
+            return
+        }
+    }
+    match takeKeyboard(desktop, "hold the keyboard for the lock screen") {
+        Ok(sent) -> if sent { log info("the lock screen holds the keyboard") }
+        Error(failed) -> requestFailed("hold the keyboard for the lock screen", failed)
+    }
+}
+
+// Closes the lock screen over the output at once, as the lock key does. What
+// the platform had out goes away first, then it holds the input as at start.
+// The application in front stays in front behind the lock screen, and takes
+// the keyboard back when it opens.
+function lockScreen(desktop: borrow mut Desktop) {
+    if desktop.lock.locked { return }
+    if desktop.state.switcherOpen { cancelSwitcher(desktop) }
+    closeControlCenter(desktop)
+    if desktop.bar.menu.isSome() {
+        let _ = systemBarKey(frontMenus(desktop), desktop.bar, .Dismiss)
+    }
+    desktop.lock.lock()
+    holdForLockScreen(desktop)
+    redrawAfter(0)
+    log info("the lock screen closed")
+}
+
+// Holds the keyboard and the pointer for the platform while it shows
+// something over the applications, a menu or the switcher, and leaves focus on
+// the window in front, which stays active as a Mac's does while a menu is
+// out; whether it went out.
+function holdInput(desktop: borrow Desktop, what: borrow String) -> Result<Bool, TesseraError> {
+    let channel = match desktop.channel {
+        Some(value) -> value
+        None -> return .Ok(false)
+    }
+    return sent(sendHoldInput(channel, true))
+}
+
+// Gives the platform's own surface the keyboard; whether it went out.
+function takeKeyboard(desktop: borrow Desktop, what: borrow String) -> Result<Bool, TesseraError> {
+    let own = match desktop.own {
+        Some(value) -> value
+        None -> return .Ok(false)
+    }
+    let channel = match desktop.channel {
+        Some(value) -> value
+        None -> return .Ok(false)
+    }
+    return sent(sendGrantFocus(channel, own))
+}
+
+// A key the platform grabbed was pressed, released or repeated. Only a press
+// acts, and none while the lock screen is up.
+function grabFired(desktop: borrow mut Desktop, fired: borrow DisplayKey) {
+    log info("a grab fired", key: fired.key)
+    // The switcher hears F3 come up as well as go down.
+    if !desktop.lock.locked && fired.key == code(PlatformKey.SwitchApplication) {
+        switcherKey(desktop, copy fired.state)
+        return
+    }
+    if fired.state != .Pressed { return }
+    // The lock key opens nothing: pressed on the lock screen it leaves it
+    // where it is, as a Mac's lock key does.
+    if desktop.lock.locked {
+        if fired.key != code(PlatformKey.LockScreen) { unlock(desktop) }
+        return
+    }
+    match caseWithCode(platformKeys, fired.key) {
+        Some(key) -> match key {
+            ShowDesktop -> match desktop.desktop {
+                Some(surface) -> {
+                    match focus(desktop, surface, "show the desktop") {
+                        Ok(sent) -> if sent { log info("showing the desktop", surface: surface.raw) }
+                        Error(failed) -> requestFailed("show the desktop", failed)
+                    }
+                }
+                // No desktop surface yet; there is nothing to show.
+                None -> {}
+            }
+            // Taken above, before the press alone.
+            SwitchApplication -> {}
+            MenuBar -> focusBar(desktop)
+            StageManager -> toggleStage(desktop)
+            LockScreen -> lockScreen(desktop)
+            Global -> probeTrustedPath(desktop)
+        }
+        None -> log warn("a key the platform did not grab fired", key: fired.key)
+    }
+}
+
+// A key came to the platform's own surface. While the lock screen is up it
+// takes every key, and a press opens it. While the keyboard is on the system
+// bar the arrows move through its menus and rows, Return chooses and Escape
+// puts the menu away, as on a Mac.
+function key(desktop: borrow mut Desktop, pressed: borrow DisplayKey) -> Bool {
+    if desktop.lock.locked {
+        if pressed.state == .Pressed { unlock(desktop) }
+        return true
+    }
+    if desktop.state.switcherOpen {
+        switcherArrow(desktop, pressed)
+        return true
+    }
+    // While Control Center is out it holds the keyboard; Escape puts it away.
+    if desktop.controls.open {
+        if pressed.state == .Pressed && Number(pressed.key) == 41 {
+            controlCenterAct(desktop, .Close)
+        }
+        return true
+    }
+    if desktop.bar.menu.isNone() { return false }
+    if pressed.state == .Released { return true }
+    let step: SystemBarKey? = match Number(pressed.key) {
+        // Left, Right, Up and Down, Return and Escape, on the keyboard page.
+        80 -> .Some(.Previous)
+        79 -> .Some(.Next)
+        82 -> .Some(.Up)
+        81 -> .Some(.Down)
+        40 -> .Some(.Choose)
+        41 -> .Some(.Dismiss)
+        else -> .None
+    }
+    match step {
+        Some(taken) -> {
+            match systemBarKey(frontMenus(desktop), desktop.bar, move taken) {
+                Some(number) -> chooseOnBar(desktop.bridge, copy desktop.front, number)
+                None -> {}
+            }
+            if desktop.bar.menu.isNone() { giveBackKeyboard(desktop) }
+        }
+        // Any other key does nothing while a menu is down.
+        None -> {}
+    }
+    return true
+}
+
+// A click on the lock screen opens it, as a key does. Anywhere else the
+// press is the interface's.
+function press(desktop: borrow mut Desktop, button: borrow DisplayPointerButton) -> Bool {
+    if !desktop.lock.locked { return false }
+    if button.state == .Pressed { unlock(desktop) }
+    return true
+}
+
+// Opens the lock screen: it leaves on its transition, and what is in front
+// takes the keyboard.
+function unlock(desktop: borrow mut Desktop) {
+    let seconds = lockScreenOpeningSeconds(navigation())
+    desktop.lock.open(unixMillis(), seconds)
+    // The lock screen is taken away once it has opened.
+    redrawAfter(seconds)
+    log info("the lock screen opened")
+    match desktop.channel {
+        Some(channel) -> {
+            match sent(sendHoldInput(channel, false)) {
+                Ok(sent) -> if sent { log info("the lock screen let the input go") }
+                Error(failed) -> requestFailed("let the input go from the lock screen", failed)
+            }
+        }
+        None -> {}
+    }
+    match desktop.front {
+        Some(surface) -> {
+            match focus(desktop, surface, "give the front the keyboard") {
+                Ok(sent) -> if sent { log info("granting focus", surface: surface.raw) }
+                Error(failed) -> requestFailed("give the front the keyboard", failed)
+            }
+        }
+        // Nothing is open; the platform keeps the keyboard.
+        None -> {}
+    }
+}
+
+// A real hardware key just arrived, so a verify now passes. Then inject a
+// synthetic key and verify again: the injected input cannot make the prompt
+// answer yes. Done once.
+function probeTrustedPath(desktop: borrow mut Desktop) {
+    if desktop.probed { return }
+    let channel = match desktop.channel {
+        Some(value) -> value
+        None -> return
+    }
+    request(sendVerify(copy channel), "verify the prompt")
+    request(sendInjectInput(copy channel, ProbeKey.usage, .Pressed), "inject a key")
+    request(sendVerify(copy channel), "verify the prompt")
+    desktop.probed = true
+}
+
+// The menus of the application in front, as it last said them through
+// AppKit; none while nothing is in front.
+function frontMenus(desktop: borrow Desktop) -> [ExportedMenu] {
+    return match desktop.front {
+        Some(surface) -> exportedMenusOf(menusOf(copy desktop.bridge, surface.raw))
+        None -> []
+    }
+}
+
+// Hands the application in front the number of the item chosen on the bar.
+function chooseOnBar(bridge: borrow BridgeHandle, front: DisplaySurfaceId?, number: Number) {
+    let surface = match front {
+        Some(value) -> value
+        None -> return
+    }
+    match chooseItem(copy bridge, surface.raw, number) {
+        Ok -> log info("chose a menu item", surface: surface.raw, item: number)
+        Error(failed) -> log warn("a menu item could not be chosen", item: number)
+    }
+}
+
+// The platform's interface over the whole output: the system bar along the
+// top, holding the menus of the application in front and the status area
+// with Control Center's symbol, the strip's icons down the leading edge while
+// Stage Manager is on, the Dock along the bottom, the switcher in the middle
+// while it is open, notification banners at the top trailing corner, Control
+// Center under the bar while it is out, and the lock screen over everything
+// while it covers it. Between them nothing is drawn, so every
+// application shows through.
+function platformRoot(
+    desktop: borrow Desktop,
+    choose: (String) -> Void,
+    open: (Number) -> Void,
+    act: (ControlCenterAction) -> Void
+) -> Any Widget {
+    let now = unixMillis()
+    let local = desktop.zone.local(now)
+    let toggle = copy act
+    let close = copy act
+    let phase: LockScreenPhase = desktop.lock.opening(now) ? .Opening : .Shown
+    let front = copy desktop.front
+    let bridge = copy desktop.bridge
+    let status = statusItems(desktop.controls.focus)
+    return ZStack(alignment = .Top) {
+        SystemBar(
+            menus = frontMenus(desktop),
+            selection = copy desktop.bar,
+            choose = { number in
+                chooseOnBar(bridge, copy front, number)
+                return
+            }
+        ) {
+            if !status.isEmpty() {
+                StatusIcons(items = copy status, spacing = systemBarStatusSpacing())
+            }
+            ControlCenterButton(toggle = { in toggle(.Toggle) })
+            StatusClock(realtime = local)
+        }
+        .fillWidth()
+        Dock(
+            items = dockItems(desktop.state, move choose, desktop.output.width),
+            ownGlass = false
+        )
+        ApplicationSwitcher(items = switcherItems(desktop.state), ownGlass = false)
+        NotificationBanners(
+            items = desktop.controls.open ? [] : notificationBannerItems(
+                desktop.banners,
+                now,
+                move open
+            ),
+            top = systemBarHeight(),
+            ownGlass = false
+        )
+        ControlCenter(
+            controls = controlCenterControls(
+                desktop.controls,
+                ControlCenterArrangement { staged: desktop.mode == .Stage },
+                move act
+            ),
+            open = desktop.controls.open,
+            top = systemBarHeight(),
+            ownGlass = false,
+            dismiss = { in close(.Close) }
+        )
+        if desktop.lock.covers(now) {
+            LockScreen(
+                time = clockTime(local),
+                date = clockDate(local),
+                navigation = navigation(),
+                phase = phase,
+                status = copy status
+            )
+            .transition(lockScreenTransition(navigation()), lockScreenAnimation(navigation()))
+        }
+    }
+    .fillWidth()
+    .fillHeight()
+}
+
+// The platform's glass: the Dock's, which is always drawn, and each
+// banner's.
+function glassOf(desktop: borrow Desktop) -> [PlatformGlass] {
+    let dock = dockGlass(
+        dockItems(desktop.state, { name in }, desktop.output.width),
+        desktop.output.width,
+        desktop.output.height
+    )
+    return platformGlass(
+        PlatformGlassAreas {
+            dock: move dock,
+            switcher: switcherGlass(
+                switcherItems(desktop.state),
+                desktop.output.width,
+                desktop.output.height
+            ),
+            banners: notificationBannerFrames(
+                bannersShown(desktop),
+                unixMillis(),
+                systemBarHeight(),
+                desktop.output.width
+            ),
+        }
+    )
+}
+
+// The banners drawn: none while Control Center is out, where they stand, as a
+// Mac's are put away under its panel.
+function bannersShown(desktop: borrow Desktop) -> [ShownNotification] {
+    if desktop.controls.open { return [] }
+    return copy desktop.banners
+}
+
+@Main
+function main() {
+    log info("starting", desktop: "Adaptive Desktop")
+    // Devices and volumes are watched before anything slow is done, so an
+    // event posted while the platform reads the power state and plays its
+    // chime waits on the System channel rather than being missed.
+    let watch = watchDevices()
+    reportStartup()
+    let bridge = makeBridgeHandle()
+    var desktop = Desktop(state: emptyPlatformState(.AdaptiveDesktop), watch: watch)
+    desktop.bridge = copy bridge
+    // Switched in by a person at the machine: they are past the lock screen.
+    if startsUnlocked() { desktop.lock.locked = false }
+    desktop.zone = currentTimeZone()
+    RunDynamicPlatform(
+        "Adaptive Desktop",
+        { in
+            // A link PID 1 handed over marks the interface stale, so a window
+            // named since the last frame is named before this one.
+            nameWaitingWindows(desktop)
+            // An application installed or uninstalled joins or leaves the
+            // Dock as it happens.
+            if takeApplicationsChange() { keepInstalled(desktop) }
+            followBarMenu(desktop)
+            let moment = focusMoment(desktop.zone, unixMillis())
+            let focus = focusChoice()
+            desktop.controls.focus = focus.active(moment)
+            desktop.banners = followFocusedNotifications(desktop.bridge, desktop.banners, unixMillis(), focus, moment)
+            match desktop.channel {
+                Some(channel) -> {
+                    claimOverlay(
+                        desktop.overlay,
+                        copy channel,
+                        notificationBannerArea(
+                            bannersShown(desktop),
+                            unixMillis(),
+                            systemBarHeight(),
+                            desktop.output.width
+                        )
+                    )
+                    match desktop.own {
+                        Some(own) -> claimGlass(desktop.glass, channel, own, glassOf(desktop))
+                        None -> {}
+                    }
+                }
+                None -> {}
+            }
+            return platformRoot(
+                desktop,
+                { name in dockChose(desktop, name) },
+                { client in bannerChose(desktop, client) },
+                { action in controlCenterAct(desktop, move action) }
+            )
+        },
+        ApplicationOptions { watches: [.Minute, .Applications] },
+        DynamicPlatformHooks {
+            badges: { in return stageBadgesOf(desktop) },
+            began: { opened in began(desktop, opened) },
+            message: { arrived in desktop.deliver(arrived) },
+            key: { pressed in return key(desktop, pressed) },
+            press: { button in return press(desktop, button) },
+            arm: { port in armSystem(desktop.watch, port) },
+            woke: { waited in platformWoke(desktop, waited) },
+        },
+        move bridge
+    )
+}

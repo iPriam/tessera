@@ -1,0 +1,36 @@
+//! The home screen's edit mode: whether the person is rearranging its icons.
+import Foundation
+
+// Whether the home screen is being edited, which the home screen says each
+// time it is built and the window tells the platform with `SetChannel`
+// (`HomeEditing`), so the platform gives the top of the screen to the home
+// screen's own edit bar, as an iPad's does.
+
+/// The persistent slot that holds the home screen's editing state for the application's life.
+namespace HomeEditingSlot {
+    let key: PersistentStateKey = PersistentStateKey { name: "tesseraui.home.editing" }
+}
+
+/// Whether the home screen is in edit mode.
+struct HomeEditingState {
+    var editing: Bool = false
+}
+
+/// The home screen's editing state, created in the ambient state on first use.
+function homeEditingState() -> RawPtr {
+    if !ambientStateHas(HomeEditingSlot.key) {
+        ambientStatePut(HomeEditingSlot.key, nativeUserData(nativeState(HomeEditingState {})))
+    }
+    return ambientStateGet(HomeEditingSlot.key)
+}
+
+/// Says whether the home screen is being edited.
+public function setHomeEditing(editing: Bool) {
+    var state = nativeRecover<HomeEditingState>(homeEditingState())
+    state.editing = editing
+}
+
+/// Whether the home screen is in edit mode now.
+function homeEditing() -> Bool {
+    return nativeRecover<HomeEditingState>(homeEditingState()).editing
+}

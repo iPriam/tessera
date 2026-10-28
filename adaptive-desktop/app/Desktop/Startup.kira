@@ -1,0 +1,266 @@
+import Foundation
+import Heap
+import LibTessera
+
+// What the desktop does once as it comes up: it reads the power state and
+// plays the startup chime, as a Mac does, through LibTessera's Power and
+// Devices calls, which the Power and Devices services answer.
+//
+// The services are started before the display server and the platform, but a
+// service is reachable only once it listens, so the first request is
+// retried for a short while before the platform gives up on it. Nothing here
+// holds the desktop back: each step that fails is reported and skipped.
+
+// How long the Power service is given to start listening, and how often it
+// is asked meanwhile: nothing announces that a service listens, so the
+// platform asks again.
+namespace PowerRetry {
+    // An emulated machine can take this long to start it.
+    let within: Number = 10000000000
+    let every: Number = 100000000
+}
+
+// The startup chime: a tenth of a second of a 440 Hz triangle, quiet,
+// 16-bit stereo at 48 kHz.
+namespace Chime {
+    let sampleRate: Number = 48000
+    let channels: Number = 2
+    let frames: Number = 4800
+    let bufferCount: Number = 2
+    // 48 kHz over 440 Hz, whole.
+    let period: Number = 109
+    let peak: Number = 4096
+    // The last fifth fades out, so the chime ends without a click.
+    let fadeParts: Number = 5
+    let wait: Number = 2000000000
+}
+
+// The keys of the requests made on the startup port.
+namespace StartupKey {
+    let list: Number = 1
+    let open: Number = 2
+    let enqueue: Number = 3
+    let start: Number = 4
+}
+
+// The most services the startup report lists.
+namespace ServiceListing {
+    let most: Number = 32
+}
+
+function now() -> Number {
+    return match timeRead(.Monotonic) {
+        Ok(value) -> value
+        Error(failed) -> {
+            // The monotonic clock exists on every kernel Tessera runs on; a
+            // reading that fails reads as the start of time.
+            absorb failed
+            return 0
+        }
+    }
+}
+
+// Closes `handle`; a close that fails is said.
+function release(handle: Handle) {
+    match handleClose(handle) {
+        Ok -> {}
+        Error(failed) -> log warn("could not close a handle", error: errorName(failed))
+    }
+}
+
+// The completion for `key` on `port`, waiting at most `nanoseconds`.
+function completion(
+    port: Handle,
+    key: Number,
+    nanoseconds: Number
+) -> Result<Completion, TesseraError> {
+    let deadline = now() + nanoseconds
+    while now() < deadline {
+        let completions = try portWait(port, 1, deadline)
+        for done in completions {
+            if done.key == key {
+                if done.error.code != .Ok { return .Error(done.error) }
+                return .Ok(done)
+            }
+        }
+    }
+    return .Error(
+        TesseraError { code: .Timeout, subsystem: .Devices, flags: ErrorFlags.none, detail: 0 }
+    )
+}
+
+// Power, retried until the service answers or `PowerRetry.within` passes.
+function logPower(port: Handle) {
+    let deadline = now() + PowerRetry.within
+    while true {
+        match powerRead() {
+            Ok(info) -> {
+                let battery = info.batteryPercent == PowerInfo.noBattery ? "none" : "\(info.batteryPercent)%"
+                log info(
+                    "read the power state",
+                    externalPower: info.externalPower,
+                    battery,
+                    thermalLevel: info.thermalLevel.rawValue()
+                )
+                return
+            }
+            Error(failed) -> {
+                if now() >= deadline {
+                    log warn("the power state is unavailable", error: errorName(failed))
+                    return
+                }
+                match portWait(port, 1, now() + PowerRetry.every) {
+                    Ok -> {}
+                    Error(waited) -> {
+                        if waited.code != .Timeout {
+                            log warn("could not wait for the power state", error: errorName(waited))
+                            return
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// How many audio outputs the Devices service lists.
+function audioOutputCount(port: Handle) -> Result<Number, TesseraError> {
+    let block = zeroedBlock(count: DeviceList.bytes, alignment: 16)
+    try deviceList(
+        .AudioOutput,
+        Buffer { address: block.pointer(), length: DeviceList.bytes },
+        port,
+        StartupKey.list
+    )
+    try completion(port, StartupKey.list, DeviceList.wait)
+    return .Ok(listedCount(block.pointer()))
+}
+
+// The chime's level at `frame`, a triangle that fades out at the end.
+function chimeLevel(frame: Number) -> Number {
+    let half = trunc(Chime.period / 2)
+    let phase = frame % Chime.period
+    let rising = phase < half
+    let level = trunc(
+        rising ? phase * 4 * Chime.peak / Chime.period - Chime.peak : Chime.peak - (
+            phase - half
+        ) * 4 * Chime.peak / Chime.period
+    )
+    let fade = trunc(Chime.frames / Chime.fadeParts)
+    if frame <= Chime.frames - fade { return level }
+    return trunc(level * (Chime.frames - frame) / fade)
+}
+
+function playChime(port: Handle) {
+    let descriptor = StreamDescriptor {
+        streamClass: .AudioOutput,
+        deviceId: 0,
+        bufferCount: Chime.bufferCount,
+        bufferSize: 0,
+        flags: StreamFlags.none,
+        format: StreamFormat {
+            sampleRate: Chime.sampleRate,
+            channels: Chime.channels,
+            sampleFormat: .I16,
+            framesPerBuffer: Chime.frames,
+            channelMask: 0,
+            pixelFormat: 0,
+            width: 0,
+            height: 0,
+            framesPerSecondQ16: 0,
+            colorSpace: 0,
+            hdrMode: 0,
+            rateHz: 0,
+            maxReportLatency: 0,
+            sensorFormat: .Vector3F32,
+            patternFormat: .AmplitudeF32AtHz,
+        },
+    }
+    let opened = match streamOpen(descriptor, port, StartupKey.open) {
+        Ok -> completion(port, StartupKey.open, Chime.wait)
+        Error(failed) -> .Error(failed)
+    }
+    let stream = match opened {
+        Ok(done) -> done
+        Error(failed) -> {
+            log warn("no startup chime", error: errorName(failed))
+            return
+        }
+    }
+    let size = stream.result1
+    match play(Handle(stream.result0), size, port) {
+        Ok -> log info("played the startup chime", bytes: size)
+        Error(failed) -> log warn("the startup chime failed", error: errorName(failed))
+    }
+    release(Handle(stream.result0))
+}
+
+// Writes the chime into the stream's first slot, `size` bytes, and plays it.
+function play(stream: Handle, size: Number, port: Handle) -> Result<Void, TesseraError> {
+    let memory = try streamBuffer(stream, 0)
+    // A mapping is whole pages; the slot's memory is rounded up to them.
+    let mapped = memoryPageRound(size)
+    let address = match memoryMap(
+        memory,
+        0,
+        mapped,
+        Protection.read | Protection.write,
+        MapOptions.none,
+        RawPtr(0)
+    ) {
+        Ok(value) -> value
+        Error(failed) -> {
+            release(memory)
+            return .Error(failed)
+        }
+    }
+    writeStereo(address, min(Chime.frames, trunc(size / StereoFrame.bytes)), chimeLevel)
+    match memoryUnmap(address, mapped) {
+        Ok -> {}
+        Error(failed) -> log warn("could not unmap the chime's buffer", error: errorName(failed))
+    }
+    release(memory)
+    let packet = StreamPacket {
+        timestamp: 0,
+        length: size,
+        flags: PacketFlags.endOfStream,
+        sequence: 0
+    }
+    try streamEnqueue(stream, 0, move packet, port, StartupKey.enqueue)
+    try streamStart(stream, port, StartupKey.start)
+    try completion(port, StartupKey.enqueue, Chime.wait)
+    return .Ok
+}
+
+// The services the broker offers, as `System.listServices` reports them.
+function logServices() {
+    let size = ServiceRecord.bytes * ServiceListing.most
+    let block = zeroedBlock(count: size, alignment: 16)
+    match serviceList(Buffer { address: block.pointer(), length: size }) {
+        Ok(count) -> {
+            let names = serviceNamesOf(block.pointer(), count)
+            log info("listed the services", count, names: joined(names, ", "))
+        }
+        Error(failed) -> log warn("cannot list services", error: errorName(failed))
+    }
+}
+
+function reportStartup() {
+    let port = match portCreate(.None) {
+        Ok(value) -> value
+        Error(failed) -> {
+            log warn("no port for the startup report", error: errorName(failed))
+            return
+        }
+    }
+    logServices()
+    logPower(port)
+    match audioOutputCount(port) {
+        Ok(count) -> {
+            log info("listed the audio outputs", count)
+            if count > 0 { playChime(port) }
+        }
+        Error(failed) -> log warn("cannot list audio outputs", error: errorName(failed))
+    }
+    release(port)
+}

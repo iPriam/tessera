@@ -1,0 +1,283 @@
+import Foundation
+import ArgumentParser
+import LibTessera
+
+// diskutil: lists, mounts, unmounts and ejects volumes through the Volume
+// service, as macOS's diskutil does through diskarbitrationd. It never
+// mounts anything itself; the service holds every mount under `/Volumes`.
+//
+// What it says follows macOS's: "Volume scratch on vda unmounted", "Disk vda
+// ejected", and `activity` prints the service's changes as they happen
+// (`Activity.kira`). It exits 0 when the service did what was asked, 1 when the
+// service refused, and 2 when the command was wrong or the service could not
+// be reached. The verbs are ArgumentParser subcommands, which also answer
+// `--help`.
+
+@Derive(Copy)
+enum DiskutilExit: Number {
+    Done = 0
+    Refused = 1
+    Unreachable = 2
+}
+
+// Each column's width in `diskutil list`.
+namespace ListColumn {
+    let number: Number = 2
+    let type: Number = 26
+    let name: Number = 23
+    let size: Number = 10
+}
+
+// The volume `name` means.
+function volumeNamed(volumes: borrow [Volume], name: borrow String) -> Volume? {
+    for volume in volumes {
+        if volume.isNamed(name) { return .Some(volume) }
+    }
+    return .None
+}
+
+// `text` padded with spaces on the left, or on the right, to `width`.
+function rightAligned(text: borrow String, width: Number) -> String {
+    var padded = ""
+    for _ in text.count..width { padded += " " }
+    return padded + text
+}
+
+function leftAligned(text: borrow String, width: Number) -> String {
+    var padded = text
+    for _ in text.count..width { padded += " " }
+    return padded
+}
+
+function listRow(number: Number, volume: borrow Volume, whole: Bool) -> String {
+    let name = match volume.mountPoint {
+        Some(path) -> lastPart(path)
+        None -> ""
+    }
+    let size = (whole ? "*" : "") + byteCountText(volume.size)
+    let kind = match volume.content.typeName() {
+        Some(value) -> value
+        None -> ""
+    }
+    return "   \(rightAligned("\(number):", ListColumn.number)) \(rightAligned(kind, ListColumn.type)) \(leftAligned(name, ListColumn.name)) \(rightAligned(size, ListColumn.size))   \(volume.name)"
+}
+
+function printDisk(disk: borrow Volume, volumes: borrow [Volume]) {
+    print("/dev/\(disk.name) (\(disk.removable ? "external" : "internal")):")
+    print(
+        "   #:\(rightAligned("TYPE", ListColumn.type + 1)) \(leftAligned("NAME", ListColumn.name)) \(rightAligned("SIZE", ListColumn.size))   IDENTIFIER"
+    )
+    print(listRow(0, disk, true))
+    var number = 1
+    for part in volumes {
+        if part.partition && part.name.count > disk.name.count && part.name.startsWith(disk.name) {
+            print(listRow(number, part, false))
+            number += 1
+        }
+    }
+}
+
+// Each disk, then its partitions, in the layout of macOS's `diskutil list`,
+// or only the disk `only` names, or holds a partition `only` names.
+function printList(volumes: borrow [Volume], only: borrow String?) -> DiskutilExit {
+    var wanted = ""
+    match only {
+        Some(name) -> {
+            match volumeNamed(volumes, name) {
+                Some(volume) -> wanted = volume.name
+                None -> {
+                    print("Could not find disk: \(name)")
+                    return DiskutilExit.Refused
+                }
+            }
+        }
+        // Every disk.
+        None -> {}
+    }
+    var first = true
+    for disk in volumes {
+        if disk.partition || !(wanted.isEmpty() || wanted.startsWith(disk.name)) { continue }
+        if !first { print("") }
+        first = false
+        printDisk(disk, volumes)
+    }
+    return DiskutilExit.Done
+}
+
+// What the service knows of one volume, in the shape of macOS's `diskutil
+// info`.
+function printInfo(volume: borrow Volume) -> DiskutilExit {
+    print("   Device Identifier:         \(volume.name)")
+    print("   Device Node:               /dev/\(volume.name)")
+    print("   Whole:                     \(volume.partition ? "No" : "Yes")")
+    print("   File System Personality:   \(volume.content.name())")
+    match volume.mountPoint {
+        Some(path) -> {
+            print("   Mounted:                   Yes")
+            print("   Mount Point:               \(path)")
+            print("   Volume Name:               \(lastPart(path))")
+        }
+        None -> print("   Mounted:                   No")
+    }
+    print("   Disk Size:                 \(volume.size) Bytes")
+    print("   Volume Read-Only:          \(volume.readOnly ? "Yes" : "No")")
+    return DiskutilExit.Done
+}
+
+// Mount, unmount or eject `volume`, and say how it went in macOS's words.
+function act(
+    service: borrow VolumeService,
+    operation: borrow VolumeOperation,
+    volume: borrow Volume
+) -> DiskutilExit {
+    match service.ask(operation, volume.entry) {
+        Ok(answer) -> {
+            match operation {
+                Mount -> print("Volume \(lastPart(answer.text())) on \(volume.name) mounted")
+                Unmount -> print("Volume \(volume.shownName()) on \(volume.name) unmounted")
+                List, Eject, Watch -> print("Disk \(volume.name) ejected")
+            }
+            return DiskutilExit.Done
+        }
+        Error(failure) -> {
+            match failure {
+                Unreachable(failed) -> {
+                    log warn("cannot reach the Volume service", failed)
+                    return DiskutilExit.Unreachable
+                }
+                Refused(code) -> log warn(
+                    "the Volume service refused",
+                    operation,
+                    volume: volume.name,
+                    code
+                )
+            }
+            match operation {
+                Mount -> print("Volume on \(volume.name) failed to mount")
+                Unmount -> print("Volume \(volume.shownName()) on \(volume.name) failed to unmount")
+                List, Eject, Watch -> print("Disk \(volume.name) failed to eject")
+            }
+            return DiskutilExit.Refused
+        }
+    }
+}
+
+// The verbs, each an ArgumentParser subcommand naming its operand.
+function diskutilCommands() -> CommandRouter {
+    let root = Command {
+        configuration: CommandConfiguration {
+            name: "diskutil",
+            abstract: "Lists, mounts, unmounts and ejects volumes through the Volume service",
+            subcommands: ["list", "info", "activity", "mount", "unmount", "eject"]
+        },
+        arguments: []
+    }
+    let named = argument(name: "volume", help: "A node name, /dev/ path or mount point")
+    return CommandRouter {
+        root: root,
+        commands: [Command {
+            configuration: CommandConfiguration {
+                name: "list",
+                abstract: "Each disk and its partitions, or only one disk"
+            },
+            arguments: [argument(
+                name: "disk",
+                help: "A disk, a partition or a mount point"
+            ).optional()]
+        }, Command {
+            configuration: CommandConfiguration {
+                name: "info",
+                abstract: "What the service knows of one volume"
+            },
+            arguments: [named]
+        }, Command {
+            configuration: CommandConfiguration {
+                name: "activity",
+                abstract: "The service's changes as they happen"
+            },
+            arguments: []
+        }, Command {
+            configuration: CommandConfiguration {
+                name: "mount",
+                abstract: "Mounts a volume under /Volumes"
+            },
+            arguments: [argument(name: "volume", help: "A node name or /dev/ path")]
+        }, Command {
+            configuration: CommandConfiguration { name: "unmount", abstract: "Unmounts a volume" },
+            arguments: [named]
+        }, Command {
+            configuration: CommandConfiguration {
+                name: "eject",
+                abstract: "Unmounts every volume on a disk and lets its medium go"
+            },
+            arguments: [named]
+        },]
+    }
+}
+
+// The verb on the volume the command line names.
+function onVolume(
+    service: borrow VolumeService,
+    volumes: borrow [Volume],
+    verb: borrow String,
+    name: borrow String
+) -> DiskutilExit {
+    let volume = match volumeNamed(volumes, name) {
+        Some(found) -> found
+        None -> {
+            print("Could not find disk: \(name)")
+            return DiskutilExit.Refused
+        }
+    }
+    match verb {
+        "info" -> return printInfo(volume)
+        "mount" -> return act(service, .Mount, volume)
+        "unmount" -> return act(service, .Unmount, volume)
+        else -> return act(service, .Eject, volume)
+    }
+}
+
+function diskutil(service: borrow VolumeService) -> DiskutilExit {
+    let router = diskutilCommands()
+    let tokens = commandLineArguments()
+    let parsed = match router.parse(tokens) {
+        Ok(value) -> value
+        Error(error) -> {
+            router.explain(error, tokens)
+            return error.isCleanExit() ? DiskutilExit.Done : DiskutilExit.Unreachable
+        }
+    }
+    if parsed.command == "activity" { return activity(service) }
+    let volumes = match service.list() {
+        Ok(value) -> value
+        Error(failure) -> {
+            log warn("cannot list the volumes", failure)
+            return DiskutilExit.Unreachable
+        }
+    }
+    match parsed.command {
+        "list" -> return printList(volumes, parsed.text("disk"))
+        "info", "mount", "unmount", "eject" -> return onVolume(
+            service,
+            volumes,
+            parsed.command,
+            parsed.requiredText("volume")
+        )
+        else -> {
+            printError(router.help())
+            return DiskutilExit.Unreachable
+        }
+    }
+}
+
+@Main
+function main() -> Number {
+    let port = match portCreate(.None) {
+        Ok(value) -> value
+        Error(failed) -> {
+            log fault("no port", failed)
+            return code(DiskutilExit.Unreachable)
+        }
+    }
+    return code(diskutil(VolumeService { port: port }))
+}

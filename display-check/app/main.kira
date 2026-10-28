@@ -1,0 +1,76 @@
+//! The display check's entry point: draws two frames and logs the keys that arrive, for the boot tests.
+import Foundation
+import KiraUI
+import LibTessera
+import TesseraUI
+
+/// Runs the display check: draws its two frames and then serves the display links PID 1 hands over.
+@Main
+function main() {
+    checkView()
+    RunDisplayCheck()
+}
+
+/// Checks what the application can name and write, and logs the result for the boot tests.
+function checkView() {
+    let data = "/data/appdata/Display Check"
+    let wroteData = match writeFile("\(data)/view", "checked\n") {
+        Ok -> true
+        Error(failure) -> {
+            absorb failure
+            false
+        }
+    }
+    let wroteRuntime = match writeFile("/System/Library/view", "checked\n") {
+        Ok -> true
+        Error(failure) -> {
+            absorb failure
+            false
+        }
+    }
+    log info(
+        "checked the application's view",
+        applications: pathExists("/System/Applications"),
+        systemState: pathExists("/data/system"),
+        settings: pathExists("/etc"),
+        frameworks: pathExists("/System/Library/Frameworks"),
+        wroteData: wroteData,
+        wroteRuntime: wroteRuntime,
+        disk: pathExists("/dev/vda"),
+        initRoot: pathExists("/proc/1/root/data/system"),
+        capabilities: holdsCapabilities(),
+        rootGiven: startupHandle(StartupTag.systemRoot).isSome(),
+        everyEntitlement: entitlementHas("tessera.driver"),
+        defaultEntitlements: entitlementHas("tessera.trace")
+    )
+}
+
+/// Whether the process holds any effective capability, read from its status file; true when the status cannot be read.
+function holdsCapabilities() -> Bool {
+    let bytes = match readFileRange("/proc/self/status", 0, 16384) {
+        Ok(read) -> read
+        Error(failure) -> {
+            absorb failure
+            return true
+        }
+    }
+    let key = "CapEff:\t".utf8()
+    var start = 0
+    while start + key.count + 16 <= bytes.count {
+        var matched = true
+        for index in 0..key.count {
+            if UN8(bytes[start + index]) != key[index] {
+                matched = false
+                break
+            }
+        }
+        if matched {
+            for index in 0..16 {
+                if bytes[start + key.count + index] != U8(48) { return true }
+            }
+            return false
+        }
+        start = start + 1
+    }
+    return true
+}

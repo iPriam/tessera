@@ -1,0 +1,343 @@
+import Foundation
+import LibTessera
+
+// The process's DeviceKit objects and the Refs that name them (17 §4).
+//
+// The table is separate from LibTessera's handle table, as §4.1 says. An
+// object is one slot in `library.objects`; a Ref is one slot in
+// `library.refs` naming it with a set of rights. The object keeps its kernel
+// descriptor; what a family keeps besides is in that family's own table,
+// found by the object's index. A descriptor never leaves the object except
+// through a `nativeHandle` call.
+
+struct Object {
+    var live: Bool
+    var kind: DeviceObject
+    var family: Family
+    var state: ObjectState
+    var device: Descriptor?
+    var refs: Number
+    var id: U64
+    var entry: EntryId
+    var name: String
+    // The sysfs directory of the entry, for families that act through sysfs
+    // files rather than a node.
+    var path: String?
+}
+
+struct RefSlot {
+    var live: Bool
+    var object: Number
+    var rights: RefRights
+    var generation: U64
+}
+
+// Every right a type supports, before the caller's options add Master or
+// Grab.
+function defaultRights(kind: borrow DeviceObject) -> RefRights {
+    let common = RefRights.duplicate | RefRights.inspect | RefRights.setProperty | RefRights.wait
+    return match kind {
+        Connection -> common | RefRights.read | RefRights.write | RefRights.manage
+        Surface -> common | RefRights.export | RefRights.read | RefRights.write | RefRights.map | RefRights.native
+        Fence -> common | RefRights.export | RefRights.read | RefRights.write | RefRights.native
+        Framebuffer -> common | RefRights.read
+        RegistryWatch -> common | RefRights.read
+        WakeSource -> common | RefRights.write
+        Mapper -> common | RefRights.read | RefRights.write | RefRights.manage
+        Driver -> common | RefRights.read | RefRights.write
+        None -> common
+    }
+}
+
+// A new object of `kind`, holding `device` when it has one.
+function createObject(
+    kind: borrow DeviceObject,
+    family: borrow Family,
+    device: borrow Descriptor?
+) -> Number {
+    let object = Object {
+        live: true,
+        kind: kind,
+        family: family,
+        state: .Ok,
+        device: device,
+        refs: 0,
+        id: deviceLibrary.nextObjectId,
+        entry: EntryId(0),
+        name: "",
+        path: .None,
+    }
+    deviceLibrary.nextObjectId += U64(1)
+    for index in 0..deviceLibrary.objects.count {
+        if !deviceLibrary.objects[index].live {
+            deviceLibrary.objects[index] = object
+            return index
+        }
+    }
+    deviceLibrary.objects.append(object)
+    return deviceLibrary.objects.count - 1
+}
+
+// The object's descriptor. Every object a family hands a descriptor-backed
+// call was made with one.
+function deviceOf(object: Number) -> Result<Descriptor, TesseraError> {
+    return match deviceLibrary.objects[object].device {
+        Some(device) -> .Ok(device)
+        None -> .Error(failure(.Unsupported))
+    }
+}
+
+// The sysfs directory behind a connection.
+function sysfsPath(object: Number) -> Result<String, TesseraError> {
+    return match deviceLibrary.objects[object].path {
+        Some(path) -> .Ok(path)
+        None -> .Error(failure(.NotFound))
+    }
+}
+
+// The slot `ref` names: its low half is the slot plus one, its high half the
+// slot's generation, so a closed Ref never names the slot's next use.
+function slotOf(ref: Ref) -> Number? {
+    let low = ref.raw & U64(0xFFFFFFFF)
+    if low == U64(0) { return .None }
+    let slot = low - 1
+    if slot >= deviceLibrary.refs.count { return .None }
+    if !deviceLibrary.refs[slot].live { return .None }
+    if deviceLibrary.refs[slot].generation != (ref.raw >> U64(32)) { return .None }
+    return .Some(slot)
+}
+
+function refOfSlot(slot: Number) -> Ref {
+    return Ref((deviceLibrary.refs[slot].generation << U64(32)) | U64(slot + 1))
+}
+
+// A new Ref to `object` with `rights`.
+function mintRef(object: Number, rights: RefRights) -> Ref {
+    deviceLibrary.objects[object].refs += 1
+    for index in 0..deviceLibrary.refs.count {
+        if !deviceLibrary.refs[index].live {
+            deviceLibrary.refs[index].live = true
+            deviceLibrary.refs[index].object = object
+            deviceLibrary.refs[index].rights = rights
+            return refOfSlot(index)
+        }
+    }
+    deviceLibrary.refs.append(RefSlot { live: true, object: object, rights: rights, generation: U64(1) })
+    return refOfSlot(deviceLibrary.refs.count - 1)
+}
+
+function liveSlot(ref: Ref) -> Result<Number, TesseraError> {
+    return match slotOf(ref) {
+        Some(slot) -> .Ok(slot)
+        None -> .Error(failure(.InvalidHandle))
+    }
+}
+
+// The object behind `ref` when it carries every right in `rights`.
+function resolveAny(ref: Ref, rights: RefRights) -> Result<Number, TesseraError> {
+    let slot = try liveSlot(ref)
+    if !deviceLibrary.refs[slot].rights.has(rights) { return .Error(failure(.AccessDenied)) }
+    return .Ok(deviceLibrary.refs[slot].object)
+}
+
+// The object behind `ref` when it is of `kind` and carries every right in
+// `rights`.
+function resolve(
+    ref: Ref,
+    kind: borrow DeviceObject,
+    rights: RefRights
+) -> Result<Number, TesseraError> {
+    let object = try resolveAny(ref, rights)
+    if deviceLibrary.objects[object].kind != kind { return .Error(failure(.WrongType)) }
+    return .Ok(object)
+}
+
+// A connection of `family` behind `ref`, still usable.
+function resolveConnection(
+    ref: Ref,
+    family: borrow Family,
+    rights: RefRights
+) -> Result<Number, TesseraError> {
+    let object = try resolve(ref, .Connection, rights)
+    if deviceLibrary.objects[object].family != family { return .Error(failure(.WrongType)) }
+    if deviceLibrary.objects[object].state == .Lost { return .Error(failure(.DeviceLost)) }
+    return .Ok(object)
+}
+
+function rightsOf(ref: Ref) -> RefRights {
+    return match slotOf(ref) {
+        Some(slot) -> deviceLibrary.refs[slot].rights
+        None -> RefRights.none
+    }
+}
+
+// Ends an object once its last Ref is gone: the family gives back what it
+// holds in the kernel, then the descriptor closes.
+function destroyObject(object: Number) {
+    if !deviceLibrary.objects[object].live { return }
+    match deviceLibrary.objects[object].kind {
+        Surface -> surfaceRelease(object)
+        Fence -> fenceRelease(object)
+        Framebuffer -> framebufferRelease(object)
+        Connection -> connectionRelease(object)
+        WakeSource -> wakeSourceRelease(object)
+        Mapper -> mapperRelease(object)
+        RegistryWatch -> watchRelease(object)
+        Driver -> {}
+        None -> {}
+    }
+    match deviceLibrary.objects[object].device {
+        Some(device) -> device.close()
+        None -> {}
+    }
+    deviceLibrary.objects[object].live = false
+    deviceLibrary.objects[object].device = .None
+    deviceLibrary.objects[object].path = .None
+}
+
+// ─── Generic calls (§4.5) ───────────────────────────────────────────────────
+
+public function refClose(ref: Ref) -> Result<Void, TesseraError> {
+    let slot = try liveSlot(ref)
+    let object = deviceLibrary.refs[slot].object
+    deviceLibrary.refs[slot].live = false
+    deviceLibrary.refs[slot].generation += U64(1)
+    deviceLibrary.objects[object].refs -= 1
+    if deviceLibrary.objects[object].refs <= 0 { destroyObject(object) }
+    return .Ok
+}
+
+public function refDuplicate(ref: Ref, rights: RefRights) -> Result<Ref, TesseraError> {
+    let slot = try liveSlot(ref)
+    let held = deviceLibrary.refs[slot].rights
+    if !held.has(RefRights.duplicate) { return .Error(failure(.AccessDenied)) }
+    var wanted = rights
+    if wanted == RefRights.same { wanted = held }
+    if !held.has(wanted) { return .Error(failure(.AccessDenied)) }
+    return .Ok(mintRef(deviceLibrary.refs[slot].object, wanted))
+}
+
+public function refInfo(ref: Ref) -> Result<RefInfo, TesseraError> {
+    let slot = try liveSlot(ref)
+    let object = deviceLibrary.objects[deviceLibrary.refs[slot].object]
+    return .Ok(
+        RefInfo {
+            objectType: object.kind,
+            state: object.state,
+            rights: deviceLibrary.refs[slot].rights,
+            entry: object.entry,
+            objectId: object.id,
+        }
+    )
+}
+
+namespace RefLimit {
+    let name: Number = 64
+}
+
+public function refSetName(ref: Ref, name: borrow String) -> Result<Void, TesseraError> {
+    let object = try resolveAny(ref, RefRights.setProperty)
+    if name.count > RefLimit.name { return .Error(failure(.NameTooLong)) }
+    deviceLibrary.objects[object].name = name
+    return .Ok
+}
+
+// The events each type can assert (§4.4).
+function eventsFor(kind: borrow DeviceObject) -> DeviceEvents {
+    return match kind {
+        Connection -> DeviceEvents.readable | DeviceEvents.writable | DeviceEvents.lost | DeviceEvents.error | DeviceEvents.changed | DeviceEvents.suspending | DeviceEvents.resumed | DeviceEvents.reset
+        Surface -> DeviceEvents.idle | DeviceEvents.lost
+        Fence -> DeviceEvents.signaled
+        RegistryWatch -> DeviceEvents.readable
+        WakeSource -> DeviceEvents.lost
+        Framebuffer -> DeviceEvents.none
+        Mapper -> DeviceEvents.none
+        Driver -> DeviceEvents.none
+        None -> DeviceEvents.none
+    }
+}
+
+// The events a connection's descriptor shows directly, and the port's
+// readiness events they are: Readable, Writable, Lost (a hang-up) and Error.
+namespace DescriptorEvents {
+    let device: DeviceEvents = DeviceEvents.readable | DeviceEvents.writable | DeviceEvents.lost | DeviceEvents.error
+}
+
+function sourceEvents(events: DeviceEvents) -> SourceEvents {
+    var source = SourceEvents.none
+    if events.has(DeviceEvents.readable) { source = source | SourceEvents.readable }
+    if events.has(DeviceEvents.writable) { source = source | SourceEvents.writable }
+    if events.has(DeviceEvents.lost) { source = source | SourceEvents.hangUp }
+    if events.has(DeviceEvents.error) { source = source | SourceEvents.error }
+    return source
+}
+
+public function refWaitAsync(
+    ref: Ref,
+    events: DeviceEvents,
+    options: borrow WaitOptions,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    let object = try resolveAny(ref, RefRights.wait)
+    let kind = deviceLibrary.objects[object].kind
+    let supported = eventsFor(kind)
+    if events == DeviceEvents.none || !supported.has(events) {
+        return .Error(failure(.InvalidArgument))
+    }
+    let reply = Reply { port: port, key: key }
+    let mode = SourceOptions { mode: options, fillEvents: false }
+    return match kind {
+        Fence -> fenceArmNext(object, reply)
+        RegistryWatch -> watchArm(object, reply, mode)
+        // A dma-buf polls writable once every fence on it has signalled.
+        Surface -> {
+            let completion = packet(
+                key,
+                successOutcome,
+                Answer { result0: U64(DeviceEvents.idle.raw), result1: U64(0) },
+                .Event
+            )
+            let buffer = try deviceOf(object)
+            return reply.attach(buffer, SourceEvents.writable, completion, mode)
+        }
+        Connection -> connectionWait(object, events, options, reply)
+        // `eventsFor` gives these no events, so the check above refused
+        // every wait on them.
+        WakeSource -> .Error(failure(.Unsupported))
+        Framebuffer -> .Error(failure(.Unsupported))
+        Mapper -> .Error(failure(.Unsupported))
+        Driver -> .Error(failure(.Unsupported))
+        None -> .Error(failure(.Unsupported))
+    }
+}
+
+// A connection's descriptor shows Readable, Writable, Lost and Error itself,
+// and the port fills in which; Changed, Reset, Suspending and Resumed arrive
+// as kernel uevents. One wait does not mix the two.
+function connectionWait(
+    object: Number,
+    events: DeviceEvents,
+    options: borrow WaitOptions,
+    reply: borrow Reply
+) -> Result<Void, TesseraError> {
+    if DescriptorEvents.device.has(events) {
+        let completion = packet(reply.key, successOutcome, Answer.none, .Event)
+        let device = try deviceOf(object)
+        return reply.attach(
+            device,
+            sourceEvents(events),
+            completion,
+            SourceOptions { mode: options, fillEvents: true }
+        )
+    }
+    if (events & DescriptorEvents.device) == DeviceEvents.none {
+        return connectionArmUevent(
+            object,
+            events,
+            SourceOptions { mode: options, fillEvents: false },
+            reply
+        )
+    }
+    return .Error(failure(.InvalidArgument))
+}

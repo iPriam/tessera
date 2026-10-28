@@ -1,0 +1,254 @@
+import Foundation
+import KiraUI
+
+// Disk Utility, as a Mac's: the disks down the side, and for the one chosen
+// its map, what its partitions hold, and Partition and Erase.
+
+namespace DiskMode {
+    let info: Number = 0
+    let partition: Number = 1
+    let erase: Number = 2
+}
+
+let partitionColors: [RGBAColor] = [
+    RGBAColor { r: 0.04, g: 0.52, b: 1.0, a: 1.0 },
+    RGBAColor { r: 0.19, g: 0.82, b: 0.35, a: 1.0 },
+    RGBAColor { r: 1.0, g: 0.62, b: 0.04, a: 1.0 },
+    RGBAColor { r: 0.75, g: 0.35, b: 0.95, a: 1.0 },
+]
+let freeColor: RGBAColor = RGBAColor { r: 0.5, g: 0.5, b: 0.55, a: 0.35 }
+
+function partitionColor(index: Number) -> RGBAColor {
+    return copy partitionColors[index - floor(
+        index / partitionColors.count
+    ) * partitionColors.count]
+}
+
+// One disk in the sidebar, with its volumes under it.
+function diskRows(
+    disks: borrow [RecoveryDisk],
+    external: Bool,
+    chosen: Number,
+    choice: Binding<Number>
+) -> [Any Widget] {
+    var rows: [Any Widget] = []
+    for index in 0..disks.count {
+        if disks[index].external != external { continue }
+        let at = index
+        rows.append(
+            ListRow(selected = chosen == index) {
+                DriveIcon(size = 18.0, external = external)
+                Text(copy disks[index].model)
+            }.onClick(
+                { in
+                    choice.set(at)
+                    return
+                }
+            )
+        )
+        for partition in disks[index].partitions {
+            rows.append(
+                ListRow(level = 1.0) {
+                    DriveIcon(size = 18.0, external = external)
+                    Text(copy partition.name)
+                }
+            )
+        }
+    }
+    return rows
+}
+
+// The source list down the window's leading column, a section per kind of disk.
+function diskSidebar(
+    disks: borrow [RecoveryDisk],
+    chosen: Number,
+    choice: Binding<Number>
+) -> Any Widget {
+    return List(
+        children: [
+            Section(
+                children: diskRows(disks, false, chosen, copy choice),
+                header: Text("Internal")
+            ),
+            Section(children: diskRows(disks, true, chosen, copy choice), header: Text("External")),
+        ]
+    )
+    .listStyle(.Sidebar)
+}
+
+function usedBytes(partitions: borrow [RecoveryPartition]) -> Number {
+    var used = 0.0
+    for partition in partitions {
+        used = used + partition.bytes
+    }
+    return used
+}
+
+// The disk's map: one band per partition, as wide as its share of the disk,
+// and what is left free after them.
+function mapBar(disk: borrow RecoveryDisk, span: Number) -> Any Widget {
+    // The bands sit 1pt apart, so the gaps between them come out of the span.
+    let used = usedBytes(disk.partitions)
+    let free = disk.bytes - used
+    let hasFree = free > disk.bytes / 200.0
+    let bandCount = disk.partitions.count + (hasFree ? 1 : 0)
+    let width = span - max(bandCount - 1, 0)
+    var bands: [Any Widget] = []
+    for index in 0..disk.partitions.count {
+        let share = disk.partitions[index].bytes / disk.bytes
+        bands.append(
+            Rectangle().fill(partitionColor(index)).frame(
+                width = max(share * width, 3.0),
+                height = 22.0
+            )
+        )
+    }
+    if hasFree {
+        bands.append(
+            Rectangle().fill(freeColor).frame(width = free / disk.bytes * width, height = 22.0)
+        )
+    }
+    return HStack(spacing = .Length(1.0), alignment = .Center, children = bands)
+    .cornerRadius(resolvedLength(6.0))
+}
+
+function mapLegend(disk: borrow RecoveryDisk) -> Any Widget {
+    var keys: [Any Widget] = []
+    for index in 0..disk.partitions.count {
+        let partition = disk.partitions[index]
+        keys.append(
+            HStack(spacing = .ExtraSmall, alignment = .FirstTextBaseline) {
+                Circle().fill(partitionColor(index)).frame(width = 10.0, height = 10.0)
+                VStack(spacing = .Micro, alignment = .Leading) {
+                    Text(copy partition.name).font(size = resolvedLength(12.0), weight = .SemiBold)
+                    Text(byteText(partition.bytes) + " · " + partition.format)
+                    .font(size = resolvedLength(11.0))
+                    .foregroundColor(.Secondary)
+                }
+            }
+        )
+    }
+    if disk.partitions.count == 0 {
+        keys.append(Text("This disk has no partition map.").foregroundColor(.Secondary))
+    }
+    return HStack(spacing = .ExtraLarge, alignment = .Top, children = keys)
+}
+
+function diskInfo(disk: borrow RecoveryDisk) -> Any Widget {
+    return List(
+        children: [
+            Section(
+                children: [
+                    LabeledContent(label: "Location") {
+                        Text(disk.external ? "External" : "Internal")
+                    },
+                    LabeledContent(label: "Connection") { Text("VirtIO") },
+                    LabeledContent(label: "Partition Map") { Text(copy disk.scheme) },
+                    LabeledContent(label: "Capacity") { Text(byteText(disk.bytes)) },
+                    LabeledContent(label: "Child count") { Text(String(disk.partitions.count)) },
+                    LabeledContent(label: "Device") { Text("/dev/" + disk.name) },
+                ]
+            ),
+        ]
+    )
+}
+
+function toolbarButton(image: String, title: String, action: () -> Void) -> Any Widget {
+    return Button(action = action) {
+        VStack(spacing = .Micro, alignment = .Center) {
+            Picture(name = copy image, points = 22.0)
+            Text(copy title).font(size = resolvedLength(10.0))
+        }
+    }
+    .buttonStyle(.Plain)
+}
+
+// The chosen disk's name and size, with the actions that open its modes.
+function deviceHeader(disk: borrow RecoveryDisk, mode: Binding<Number>) -> Any Widget {
+    let toInfo = copy mode
+    let toPartition = copy mode
+    let toErase = copy mode
+    return HStack(spacing = .Medium, alignment = .Center) {
+        DriveIcon(size = 48.0, external = disk.external)
+        VStack(spacing = .Micro, alignment = .Leading) {
+            Text(copy disk.model).font(size = resolvedLength(17.0), weight = .Bold)
+            Text(byteText(disk.bytes) + " · " + disk.scheme)
+            .font(size = resolvedLength(12.0))
+            .foregroundColor(.Secondary)
+        }
+        Spacer()
+        toolbarButton(
+            "disk-utility",
+            "First Aid",
+            { in
+                toInfo.set(DiskMode.info)
+                return
+            }
+        )
+        toolbarButton(
+            "tessera",
+            "Partition",
+            { in
+                toPartition.set(DiskMode.partition)
+                return
+            }
+        )
+        toolbarButton(
+            "internal-drive",
+            "Erase",
+            { in
+                toErase.set(DiskMode.erase)
+                return
+            }
+        )
+    }
+}
+
+// The info: the header, the map and its legend in the column's margins, and
+// the disk's details as a list under them running to the bottom of the pane.
+function diskOverview(disk: borrow RecoveryDisk, mode: Binding<Number>) -> Any Widget {
+    return VStack(spacing = .None, alignment = .Leading) {
+        VStack(spacing = .Large, alignment = .Leading) {
+            deviceHeader(disk, copy mode)
+            mapBar(disk, 640.0)
+            mapLegend(disk)
+        }
+        .scenePadding()
+        diskInfo(disk)
+    }
+}
+
+public construct DiskUtilityPane(model: RecoveryModel) extends Widget {
+    @State var chosen: Number = 0
+    @State var mode: Number = 0
+
+    body {
+        let disk = copy model.disks[chosen]
+        let show: () -> Void = { in
+            mode = DiskMode.info
+            return
+        }
+        HStack(spacing = .None, alignment = .Top) {
+            diskSidebar(model.disks, chosen, $chosen)
+            .width(resolvedLength(220.0))
+            .background(fill = BackgroundFill(style = .Surface))
+            Divider()
+            VStack(spacing = .None, alignment = .Leading) {
+                if mode == DiskMode.info {
+                    diskOverview(disk, $mode)
+                }
+                if mode == DiskMode.partition {
+                    PartitionEditor(
+                        head = deviceHeader(disk, $mode),
+                        disk = copy disk,
+                        done = copy show
+                    )
+                }
+                if mode == DiskMode.erase {
+                    EraseForm(head = deviceHeader(disk, $mode), disk = copy disk, done = copy show)
+                }
+            }
+        }
+        .fillHeight()
+    }
+}

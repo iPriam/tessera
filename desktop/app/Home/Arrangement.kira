@@ -1,0 +1,79 @@
+import Foundation
+import HomeLayout
+import LibTessera
+import PlatformUI
+
+// Home's arrangement on Adaptive Mobile (roadmap/24-home-and-personalisation.md,
+// "Pages and editing"): its pages in order, each a run of applications and
+// folders, and the applications taken off Home, which App Library still
+// lists. It is kept by application name in Desktop's data folder, one line
+// an entry, and read again each time Home is drawn:
+//
+//     version 2
+//     reset 1792414882134
+//     page
+//     app Notes
+//     folder Utilities
+//     member Clock
+//     page hidden
+//     widget Clock medium
+//     removed Welcome
+//
+// What is installed decides what is on it: an application that is gone
+// leaves every page and folder, and one newly installed goes on the last page
+// with room, or a new page after it.
+
+namespace HomeStore {
+    let folder: String = "/" + SystemDirectory.applicationData + "/Desktop"
+    let file: String = "/" + SystemDirectory.applicationData + "/Desktop/Home.txt"
+    // The arrangement from before the edit under way, which cancelling puts
+    // back.
+    let before: String = "/" + SystemDirectory.applicationData + "/Desktop/Home-before.txt"
+}
+
+// The arrangement saved, or none yet.
+function loadArrangement() -> HomeArrangement {
+    return match readFile(HomeStore.file) {
+        Ok(contents) -> parsedArrangement(contents.text)
+        // Home is arranged for the first time.
+        Error(failure) -> {
+            log info("no Home arrangement saved yet", failure)
+            HomeArrangement {}
+        }
+    }
+}
+
+// Saves `arrangement`; Home keeps working from memory when it cannot.
+function saveArrangement(arrangement: borrow HomeArrangement) {
+    if !isDirectory(HomeStore.folder) {
+        match makeDirectory(HomeStore.folder) {
+            Ok -> {}
+            Error(failure) -> {
+                log warn("could not make Home's folder", failure)
+                return
+            }
+        }
+    }
+    match writeFile(HomeStore.file, arrangementText(arrangement)) {
+        Ok -> {}
+        Error(failure) -> log warn("could not save Home", failure)
+    }
+}
+
+// The saved arrangement brought up to what is installed, `installed`, in
+// pages that hold `space`; saved again when that changed it.
+function arrangedHome(installed: borrow [Application], space: borrow HomeSpace) -> HomeArrangement {
+    var saved = loadArrangement()
+    // Settings asked for Home's layout as it first was: only the
+    // arrangement goes, every application staying installed.
+    let reset = homeResetAsked()
+    if reset.count > 0 && reset != saved.reset {
+        log info("Home's layout is reset", reset: copy reset)
+        saved = HomeArrangement { reset: copy reset }
+    }
+    var names: [String] = []
+    for application in installed { names.append(copy application.name) }
+    let arrangement = withInstalled(saved, names, newApplicationsToLibrary(), space)
+    if arrangementText(arrangement) != arrangementText(saved) { saveArrangement(arrangement) }
+    return arrangement
+}

@@ -1,0 +1,209 @@
+//! Running a utility under the wake lock, as `caffeinate -i make` does: the utility runs as a child and the lock is held until it exits.
+import Foundation
+import Heap
+import LibTessera
+
+// Running a utility under the lock, as `caffeinate -i make` does on macOS:
+// the utility is launched as a child, and the lock is held until it exits.
+
+/// How a utility ended: it exited with a status, it was killed or crashed, or it could not be run.
+enum UtilityEnd {
+    // It exited with this status.
+    Exited(Number)
+    // It was killed or crashed; the number of what ended it.
+    Ended(Number)
+    // It could not be run.
+    NotRun
+}
+
+/// The status a shell reports for `end`: the utility's own, 128 and the number of what ended it, or 127 when it could not be run.
+function utilityStatus(end: borrow UtilityEnd) -> Number {
+    return match end {
+        Exited(status) -> status
+        Ended(reason) -> 128 + reason
+        NotRun -> 127
+    }
+}
+
+/// The layout of the kernel's process record that caffeinate reads a utility's end from.
+namespace ProcessRecord {
+    let version: Number = 1
+    let size: Number = 96
+    let alignment: Number = 16
+}
+
+/// The longest launch name a utility is given.
+namespace LaunchName {
+    // A launch name is diagnostic and at most this long.
+    let limit: Number = 64
+}
+
+/// The utility's path: as written when it names a directory, otherwise in the system programs directory.
+function utilityPath(utility: borrow String) -> String {
+    if utility.contains("/") { return utility }
+    return "/" + SystemDirectory.programs + "/" + utility
+}
+
+/// The completion of the call just made on `port`, or why there is none.
+function answer(port: Handle) -> Result<Completion, TesseraError> {
+    let waited = match portWait(port, 1, Deadline.infinite) {
+        Ok(value) -> value
+        Error(failed) -> return .Error(failed)
+    }
+    if waited.count == 0 {
+        return .Error(
+            TesseraError {
+                code: .Internal,
+                subsystem: .Launcher,
+                flags: ErrorFlags.none,
+                detail: 0
+            }
+        )
+    }
+    if waited[0].error.code != .Ok { return .Error(waited[0].error) }
+    return .Ok(waited[0])
+}
+
+/// The completion of `call`, which starts its work on `port`.
+function answered(
+    call: Result<Void, TesseraError>,
+    port: Handle
+) -> Result<Completion, TesseraError> {
+    match call {
+        Ok -> return answer(port)
+        Error(failed) -> return .Error(failed)
+    }
+}
+
+/// Closes a handle, logging a warning naming `what` when it cannot.
+function close(handle: Handle, what: String) {
+    match handleClose(handle) {
+        Ok -> {}
+        Error(failed) -> log warn("cannot close a handle", what, failed)
+    }
+}
+
+/// This process's standard streams, each a copy for the utility; a stream this process was not given is not given either.
+function standardStreams() -> [StartupEntry] {
+    var entries: [StartupEntry] = []
+    for tag in [StartupTag.stdIn, StartupTag.stdOut, StartupTag.stdErr] {
+        let own = match startupHandle(tag) {
+            Some(value) -> value
+            None -> continue
+        }
+        match handleDuplicate(own, Rights.same) {
+            Ok(copied) -> entries.append(StartupEntry { tag: tag, rights: .None, handle: copied })
+            Error(failed) -> log warn("cannot hand a stream to the utility", tag, failed)
+        }
+    }
+    return entries
+}
+
+/// The executable at `path`, looked up from the root this process was given.
+function executable(path: borrow String, port: Handle) -> Result<Handle, TesseraError> {
+    var beneath = copy path
+    while beneath.startsWith("/") { beneath = beneath.substring(1, beneath.count) }
+    let rights = Rights.read | Rights.execute | Rights.inspect
+    let root = match startupHandle(StartupTag.systemRoot) {
+        Some(value) -> value
+        None -> return .Error(
+            TesseraError {
+                code: .NotFound,
+                subsystem: .Launcher,
+                flags: ErrorFlags.none,
+                detail: 0
+            }
+        )
+    }
+    match answered(nodeLookup(root, beneath, rights, port, CompletionKey.utility), port) {
+        Ok(found) -> return .Ok(Handle(found.result0))
+        Error(failed) -> return .Error(failed)
+    }
+}
+
+/// The utility's own name, for its launch name: its path's last part.
+function launchName(path: borrow String) -> String {
+    let parts = path.split("/")
+    let name = parts[parts.count - 1]
+    if name.count > LaunchName.limit { return name.substring(0, LaunchName.limit) }
+    return name
+}
+
+/// Runs `arguments[0]` with `arguments` and answers how it ended.
+function runUtility(arguments: borrow [String], port: Handle) -> UtilityEnd {
+    let utility = arguments[0]
+    let found = match executable(utilityPath(utility), port) {
+        Ok(value) -> value
+        Error(failed) -> {
+            log warn("cannot find the utility", utility, failed)
+            return .NotRun
+        }
+    }
+    let info = match launchInfoCreate(.Helper, arguments) {
+        Ok(value) -> value
+        Error(failed) -> {
+            log warn("cannot start the utility", utility, failed)
+            close(found, "the utility's executable")
+            return .NotRun
+        }
+    }
+    let options = LaunchOptions {
+        name: launchName(utility),
+        arguments: .Some(info),
+        initialHandles: standardStreams(),
+        flags: LaunchFlags.none,
+        job: .None,
+        stackSize: 0,
+    }
+    let launched = answered(processLaunch(found, options, port, CompletionKey.utility), port)
+    close(found, "the utility's executable")
+    close(info, "the utility's launch information")
+    let process = match launched {
+        Ok(done) -> {
+            if done.result1 != 0 { close(Handle(done.result1), "the utility's main thread") }
+            Handle(done.result0)
+        }
+        Error(failed) -> {
+            log warn("cannot start the utility", utility, failed)
+            return .NotRun
+        }
+    }
+    let status = endOf(process, port)
+    close(process, "the utility")
+    return status
+}
+
+/// How `process` ended, once it has.
+function endOf(process: Handle, port: Handle) -> UtilityEnd {
+    match answered(
+        objectWaitAsync(process, Signals.terminated, .Once, port, CompletionKey.utility),
+        port
+    ) {
+        Ok -> {}
+        Error(failed) -> {
+            log warn("cannot wait for the utility", failed)
+            return .NotRun
+        }
+    }
+    let record = zeroedBlock(count: ProcessRecord.size, alignment: ProcessRecord.alignment)
+    let block = record.pointer()
+    match objectInfo(
+        process,
+        .Process,
+        ProcessRecord.version,
+        Buffer { address: block, length: ProcessRecord.size }
+    ) {
+        Ok -> {}
+        Error(failed) -> {
+            log warn("cannot read how the utility ended", failed)
+            return .NotRun
+        }
+    }
+    let info: ProcessInfoRecord = heapLoad(block)
+    let code = Number(info.exitCode) & 0xFF
+    // `Exited` is 0; killed or crashed is what ended it.
+    match info.terminationReason {
+        0 -> return .Exited(code)
+        else -> return .Ended(code)
+    }
+}

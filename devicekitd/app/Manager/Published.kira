@@ -1,0 +1,274 @@
+import Foundation
+import Heap
+import LibTessera
+import DeviceKit
+
+// Published entries (17 §18.3): what drivers make of the entries they
+// claimed.
+//
+// The list lives here and nowhere else. Every change bumps a generation,
+// encodes the list once, and hands it to this process's own DeviceKit
+// (`registryAdoptPublished`), which merges it into the registry the
+// manager's lookups read. A client asks for the list with op 7 and the
+// generation it holds; it gets the list, in a memfd, only when that is
+// stale. The encoding is DeviceKit's `Device/Driver.kira`:
+//
+//     @0 count U32  @8 generation U64  @16 records, each 8-aligned:
+//     @0 id  @8 parent  @16 class U32  @20 size U32  @24 properties
+
+struct Published {
+    var id: U64
+    var parent: U64
+    var entryClass: U32
+    // The connection that published it, which takes it along when it goes.
+    var owner: Descriptor
+    var properties: [U8]
+}
+
+namespace PublishedList {
+    let headerBytes: Number = 16
+    let generationAt: Number = 8
+    let recordBytes: Number = 24
+    let parentAt: Number = 8
+    let classAt: Number = 16
+    let sizeAt: Number = 20
+    // The most properties one entry carries.
+    let propertyLimit: U64 = U64(65536)
+    let memoryName: String = "devicekit-published"
+}
+
+// Op 5's request reads the class from `kind` @4, the entry from `entry` @8
+// (0 for a new one), the properties' size from `options` @16 and the
+// claimed entry from `rights` @24. Op 7's carries the generation the client
+// holds in `entry` @8; its reply the current one @8 and the list's size @64.
+namespace ListAt {
+    let generation: Number = 8
+    let size: Number = 64
+}
+
+function aligned8(value: Number) -> Number { return trunc((value + 7) / 8) * 8 }
+
+function encodedSize(manager: borrow Manager) -> Number {
+    var size = PublishedList.headerBytes
+    for entry in manager.published {
+        size = aligned8(size + PublishedList.recordBytes + Number(entry.properties.count))
+    }
+    return size
+}
+
+// The list as DeviceKit reads it.
+function encodePublished(manager: borrow Manager) -> ByteBlock {
+    let block = zeroedBlock(count: encodedSize(manager), alignment: 16)
+    blockStore<U32>(block, 0, U32(manager.published.count))
+    blockStore<U64>(block, PublishedList.generationAt, manager.generation)
+    var recordAt = PublishedList.headerBytes
+    for entry in manager.published {
+        blockStore<U64>(block, recordAt, entry.id)
+        blockStore<U64>(block, recordAt + PublishedList.parentAt, entry.parent)
+        blockStore<U32>(block, recordAt + PublishedList.classAt, entry.entryClass)
+        blockStore<U32>(block, recordAt + PublishedList.sizeAt, U32(entry.properties.count))
+        let start = recordAt + PublishedList.recordBytes
+        for (index, property) in entry.properties.enumerated() {
+            blockStore<U8>(block, start + index, property)
+        }
+        recordAt = aligned8(start + entry.properties.count)
+    }
+    return move block
+}
+
+// Gives the list to DeviceKit.
+function publishedChanged(manager: borrow Manager) {
+    let block = encodePublished(manager)
+    match registryAdoptPublished(Buffer { address: block.pointer(), length: Number(block.count) }) {
+        // DeviceKit has the list, so nothing more is needed here.
+        Ok -> {}
+        Error(failed) -> log warn(
+            "the published list could not be adopted",
+            error: errorName(failed)
+        )
+    }
+}
+
+// A change: a new generation, then the list given to DeviceKit.
+function bumpPublished(manager: borrow mut Manager) {
+    manager.generation += U64(1)
+    publishedChanged(manager)
+}
+
+// An id no walk makes: the parent's with a serial in its top bits, and the
+// top bit set. Shifts, not a multiply, which would overflow and trap.
+function publishedId(manager: borrow mut Manager, parent: U64) -> U64 {
+    manager.serial += U64(1)
+    return (parent ^ ((manager.serial & U64(0x7FFF)) << U64(48))) | (U64(1) << U64(63))
+}
+
+function publishedIndex(manager: borrow Manager, id: U64, owner: borrow Descriptor) -> Number? {
+    for (index, entry) in manager.published.enumerated() {
+        if entry.id == id && entry.owner.number == owner.number { return .Some(index) }
+    }
+    return .None
+}
+
+// The properties in `memory`, all `size` bytes of them.
+function readProperties(memory: borrow Descriptor, size: U64) -> Result<[U8], TesseraError> {
+    let block = zeroedBlock(count: size + 8, alignment: 16)
+    let got = try backendReadAt(memory.number, block.pointer(), Number(size), 0)
+    if got != Number(size) { return .Error(failure(.InvalidArgument)) }
+    var properties: [U8] = []
+    for index in 0..size { properties.append(blockLoad<U8>(block, index)) }
+    return .Ok(properties)
+}
+
+// Makes a new entry of `kind` under `parent`, owned by `client`, and answers
+// its id.
+function addPublished(
+    manager: borrow mut Manager,
+    client: borrow Client,
+    parent: U64,
+    kind: U32,
+    properties: [U8]
+) -> U64 {
+    let id = publishedId(manager, parent)
+    manager.published.append(
+        Published {
+            id: id,
+            parent: parent,
+            entryClass: kind,
+            owner: client.socket,
+            properties: properties
+        }
+    )
+    log info(
+        "a driver published an entry",
+        program: client.programName(),
+        id: id,
+        entryClass: kind,
+        parent: parent
+    )
+    return id
+}
+
+// Op 5, `Registry.publish` (entry 0) and `Registry.update`: the properties
+// come in the memfd the request carries.
+function publish(
+    manager: borrow mut Manager,
+    client: borrow Client,
+    request: borrow Request,
+    passed: Descriptor?
+) -> Answer {
+    let memory = try passed otherwise return refuse(.InvalidArgument, U64(0))
+    let size = request.options
+    let parent = request.rights
+    if size > PublishedList.propertyLimit {
+        closeDescriptor(memory)
+        return refuse(.InvalidArgument, size)
+    }
+    if !holds(manager, client.socket, parent) {
+        closeDescriptor(memory)
+        return refuse(.NotEntitled, parent)
+    }
+    let readResult = readProperties(memory, size)
+    closeDescriptor(memory)
+    let properties = match readResult {
+        Ok(value) -> value
+        Error(failed) -> return refuse(.InvalidArgument, failed.detail)
+    }
+    var id = request.entry
+    if id != U64(0) {
+        let index = try publishedIndex(manager, id, client.socket) otherwise return refuse(
+            .NotFound,
+            id
+        )
+        manager.published[index].properties = properties
+    } else {
+        id = addPublished(manager, client, parent, request.kind, move properties)
+    }
+    bumpPublished(manager)
+    let reply = replyBlock()
+    blockStore<U64>(reply, ReplyAt.entry, id)
+    return answered(move reply)
+}
+
+function removePublished(manager: borrow mut Manager, index: Number) {
+    var kept: [Published] = []
+    for (position, entry) in manager.published.enumerated() {
+        if position != index { kept.append(entry) }
+    }
+    manager.published = kept
+}
+
+// Op 6, `Registry.unpublish`: the entry @8.
+function unpublish(
+    manager: borrow mut Manager,
+    client: borrow Client,
+    request: borrow Request
+) -> Answer {
+    let index = try publishedIndex(manager, request.entry, client.socket) otherwise return refuse(
+        .NotFound,
+        request.entry
+    )
+    removePublished(manager, index)
+    bumpPublished(manager)
+    return answered(replyBlock())
+}
+
+// Writes `block` into `memory` whole.
+function writeWhole(memory: borrow Descriptor, block: borrow ByteBlock) -> Result<Void, TesseraError> {
+    var written = 0
+    while written < block.count {
+        let wrote = try backendWrite(
+            memory.number,
+            heapOffset(block.pointer(), written),
+            Number(block.count - written)
+        )
+        if wrote == 0 { return .Error(failure(.Internal)) }
+        written += wrote
+    }
+    return .Ok
+}
+
+// The memory is closed, and the failure that ended the write is answered.
+function closedMemory(memory: borrow Descriptor, failed: borrow TesseraError) -> Result<Descriptor, TesseraError> {
+    closeDescriptor(memory)
+    return .Error(failed)
+}
+
+// The list in a new memfd, for a client to map or read.
+function publishedMemory(manager: borrow Manager) -> Result<Descriptor, TesseraError> {
+    let block = encodePublished(manager)
+    let memory = Descriptor {
+        number: try backendMemoryObject(PublishedList.memoryName, LinuxOpen.memoryCloseOnExec.raw)
+    }
+    match writeWhole(memory, block) {
+        Ok -> return .Ok(memory)
+        Error(failed) -> return closedMemory(memory, failed)
+    }
+}
+
+// Op 7: the list, when the generation the client holds is not the current
+// one.
+function publishedList(manager: borrow Manager, request: borrow Request) -> Answer {
+    let reply = replyBlock()
+    blockStore<U64>(reply, ListAt.generation, manager.generation)
+    blockStore<U64>(reply, ListAt.size, U64(encodedSize(manager)))
+    if request.entry == manager.generation { return answered(move reply) }
+    return match publishedMemory(manager) {
+        Ok(memory) -> Answer { reply: move reply, passing: .Some(memory) }
+        Error(failed) -> refuse(.Internal, failed.detail)
+    }
+}
+
+// A client that closed takes what it published with it.
+function dropPublished(manager: borrow mut Manager, socket: borrow Descriptor) {
+    var kept: [Published] = []
+    for entry in manager.published {
+        if entry.owner.number == socket.number {
+            log info("an entry was unpublished; its driver went", id: entry.id)
+        } else {
+            kept.append(entry)
+        }
+    }
+    let dropped = kept.count != manager.published.count
+    manager.published = kept
+    if dropped { bumpPublished(manager) }
+}

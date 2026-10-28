@@ -1,0 +1,137 @@
+import KiraUI
+
+// The recovery's icons: Tessera's and its utilities' are pictures CoreIcon
+// drew when the system was built. A drive is built from shapes in its own
+// colours, with a one-colour glyph from `Glyphs` over them, as Kira UI draws
+// an SVG in one colour; every measure is on a 64-point canvas, scaled to
+// `size`.
+
+namespace IconColors {
+    let green: RGBAColor = RGBAColor { r: 0.19, g: 0.82, b: 0.35, a: 1.0 }
+    let silver: RGBAColor = RGBAColor { r: 0.83, g: 0.83, b: 0.86, a: 1.0 }
+    let steel: RGBAColor = RGBAColor { r: 0.56, g: 0.56, b: 0.59, a: 1.0 }
+    let ink: RGBAColor = RGBAColor { r: 0.23, g: 0.23, b: 0.24, a: 1.0 }
+    let orange: RGBAColor = RGBAColor { r: 1.0, g: 0.62, b: 0.04, a: 1.0 }
+    let amber: RGBAColor = RGBAColor { r: 1.0, g: 0.72, b: 0.26, a: 1.0 }
+    let white: RGBAColor = RGBAColor { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }
+}
+
+// A rounded rectangle at (x, y) on the 64-point canvas.
+function block(
+    x: Number,
+    y: Number,
+    width: Number,
+    height: Number,
+    radius: Number,
+    color: borrow RGBAColor,
+    scale: Number
+) -> Any Widget {
+    return RoundedRectangle(cornerRadius = radius * scale, style = .Continuous)
+    .fill(copy color)
+    .frame(width = width * scale, height = height * scale)
+    .offset(x = resolvedLength(x * scale), y = resolvedLength(y * scale))
+}
+
+function dot(
+    x: Number,
+    y: Number,
+    radius: Number,
+    color: borrow RGBAColor,
+    scale: Number
+) -> Any Widget {
+    return Circle()
+    .fill(copy color)
+    .frame(width = radius * 2.0 * scale, height = radius * 2.0 * scale)
+    .offset(x = resolvedLength((x - radius) * scale), y = resolvedLength((y - radius) * scale))
+}
+
+// A glyph from `Glyphs` centred in the box at (x, y).
+function glyph(
+    name: String,
+    x: Number,
+    y: Number,
+    box: Number,
+    color: borrow RGBAColor,
+    scale: Number
+) -> Any Widget {
+    return ZStack(alignment = .Center) {
+        Artwork(svg = glyphNamed(name), points = box * scale)
+        .textColor(copy color)
+    }
+    .frame(width = box * scale, height = box * scale)
+    .offset(x = resolvedLength(x * scale), y = resolvedLength(y * scale))
+}
+
+function canvas(size: Number, layers: [Any Widget]) -> Any Widget {
+    return ZStack(alignment = .TopLeading, children = layers)
+    .frame(width = size, height = size)
+}
+
+// A drive: silver for one inside the machine, orange for one plugged in.
+public construct DriveIcon(size: Number, external: Bool) extends Widget {
+    body {
+        let s = size / 64.0
+        let body = external ? IconColors.orange : IconColors.steel
+        let face = external ? IconColors.amber : IconColors.silver
+        var layers: [Any Widget] = []
+        if external {
+            // On the same 6pt margin as the internal drive, so the two line up
+            // in a list.
+            layers.append(block(6.0, 10.0, 52.0, 44.0, 9.0, body, s))
+            layers.append(block(6.0, 10.0, 52.0, 36.0, 9.0, face, s))
+            layers.append(glyph("external-drive", 22.0, 14.0, 20.0, IconColors.white, s))
+            layers.append(dot(51.0, 50.0, 1.8, IconColors.white, s))
+        } else {
+            layers.append(block(6.0, 18.0, 52.0, 30.0, 5.0, body, s))
+            layers.append(block(6.0, 18.0, 52.0, 21.0, 5.0, face, s))
+            layers.append(block(12.0, 42.0, 18.0, 2.0, 1.0, IconColors.ink, s))
+            layers.append(dot(50.0, 43.0, 1.8, IconColors.green, s))
+        }
+        canvas(size, move layers)
+    }
+}
+
+// Where the pictures CoreIcon drew are: the recovery's own, and the Disk
+// Utility application's on the system it runs from.
+namespace IconFiles {
+    let own: String = "/usr/share/recovery/Resources/"
+    let diskUtility: String = "/System/Applications/Disk Utility.app/Contents/Resources/AppIcon"
+    // Apple's corner, as a share of an icon's side.
+    let corner: Number = 0.2237
+}
+
+// The picture `file` names, `size` points square: framed as a Mac shows it on
+// a desktop, edge to edge and clipped to the icon's corners on a touch screen,
+// in its dark version, as the recovery is drawn dark.
+public construct RecoveryIcon(file: String, size: Number) extends Widget {
+    body {
+        recoveryIcon(file, size)
+    }
+}
+
+function recoveryIcon(file: borrow String, size: Number) -> Any Widget {
+    let framed = interfaceMode() == .AdaptiveDesktop
+    let picture = ImageFile(path = "\(file)\(framed ? "" : "Edge")Dark.png")
+    .width(resolvedLength(size))
+    .height(resolvedLength(size))
+    if framed { return picture }
+    return picture.clipShape(.Squircle(size * IconFiles.corner))
+}
+
+// Tessera's own icon, which the installer shows too.
+public construct TesseraIcon(size: Number) extends Widget {
+    body {
+        recoveryIcon(IconFiles.own + "Tessera", size)
+    }
+}
+
+// The icon a utility is drawn with, by its image name.
+public function utilityIcon(name: borrow String, size: Number) -> Any Widget {
+    let file = match name {
+        "disk-utility" -> IconFiles.diskUtility
+        "startup-disk" -> IconFiles.own + "StartupDisk"
+        "terminal" -> IconFiles.own + "Terminal"
+        else -> IconFiles.own + "Tessera"
+    }
+    return recoveryIcon(file, size)
+}

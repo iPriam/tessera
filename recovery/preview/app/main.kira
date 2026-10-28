@@ -1,0 +1,17 @@
+import KiraUI
+import Foundation
+
+@Main
+function main() {
+    RunKiraWindowApp(
+        "Tessera Recovery",
+        1280,
+        800,
+        { in
+            return RecoveryView(model = sampleRecoveryModel(), clock = "Fri 16 Oct  20:30")
+        },
+        noopEngineFrame,
+        false,
+        "org.tessera.recovery.preview"
+    )
+}

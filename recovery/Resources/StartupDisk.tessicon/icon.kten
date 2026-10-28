@@ -1,0 +1,15 @@
+TessIcon {
+    fill: .AutomaticGradient(Color { space: .Srgb, red: 0.556863, green: 0.556863, blue: 0.576471, alpha: 1 }),
+    groups: [
+        Group {
+            name: "Symbol",
+            layers: [
+                Layer { name: "internaldrive.fill", image: "internaldrive.fill.png", position: Position { scale: 0.660156, x: 0, y: 0.25 } }
+            ],
+            lighting: .Combined,
+            specular: .Inside,
+            translucency: Translucency { enabled: true, amount: 0.3 },
+            shadow: Shadow { kind: .Neutral, opacity: 0.5 }
+        }
+    ]
+}

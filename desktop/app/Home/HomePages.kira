@@ -1,0 +1,101 @@
+import Foundation
+import HomeLayout
+import LibTessera
+import KiraUI
+import TesseraUI
+import PlatformUI
+
+// The pages of Home side by side, opened from the page dots while Home is
+// edited, as an iPad's are: each page small, with a check that shows or hides
+// it and its moves along the row. A hidden page keeps its arrangement and its
+// applications stay in App Library.
+
+namespace HomePagesLook {
+    let scale: Number = 0.18
+    let icon: Number = 14
+    let spacing: Number = 24
+    let corner: Number = 18
+}
+
+// What the pages overview asks of Home.
+public struct HomePagesActions {
+    var toggle: (Number) -> Void
+    var shift: (Number, Number) -> Void
+    var done: () -> Void
+}
+
+function homePagesOverview(
+    arrangement: borrow HomeArrangement,
+    actions: borrow HomePagesActions
+) -> Any Widget {
+    var cards: [Any Widget] = []
+    for page in 0..arrangement.pages.count {
+        cards.append(pageCard(arrangement.pages[page], page, arrangement.pages.count, actions))
+    }
+    let done = copy actions.done
+    return ZStack(alignment = .Center) {
+        Rectangle()
+        .fill(folderDim)
+        .fillWidth()
+        .fillHeight()
+        VStack(spacing = .Large, alignment = .Center) {
+            HStack(spacing = .Length(HomePagesLook.spacing), alignment = .Top, children = cards)
+            Button(action = move done) {
+                Text("Done").font(size: resolvedLength(17), weight: .SemiBold).padding(
+                    resolvedLength(10)
+                )
+            }
+            .buttonStyle(.Plain)
+            .glassEffect()
+        }
+    }
+    .fillWidth()
+    .fillHeight()
+}
+
+// One page small: its icons as they stand, a check under it, and its moves.
+function pageCard(
+    page: borrow HomePage,
+    at: Number,
+    count: Number,
+    actions: borrow HomePagesActions
+) -> Any Widget {
+    let width = viewportWidth() * HomePagesLook.scale
+    let height = viewportHeight() * HomePagesLook.scale
+    var icons: [Any Widget] = []
+    for item in page.items {
+        icons.append(ApplicationIcon(name = item.name(), side = HomePagesLook.icon))
+    }
+    let toggle = copy actions.toggle
+    let earlier = copy actions.shift
+    let later = copy actions.shift
+    return VStack(spacing = .Small, alignment = .Center) {
+        LazyVGrid(
+            columns = [GridItem {
+                size: .Adaptive(GridItemRange { minimum: resolvedLength(HomePagesLook.icon + 8) })
+            }],
+            alignment = .Top,
+            spacing = .Some(resolvedLength(8)),
+            children = icons
+        )
+        .padding(resolvedLength(10))
+        .width(resolvedLength(width))
+        .height(resolvedLength(height))
+        .background(
+            RoundedRectangle(cornerRadius = HomePagesLook.corner, style = .Continuous).fill(
+                folderGlass
+            )
+        )
+        .opacity(page.hidden ? 0.5 : 1)
+        HStack(spacing = .Small, alignment = .Center) {
+            folderMove(.ChevronLeft, at > 0, { in earlier(at, -1) })
+            Button(action = { in toggle(at) }) {
+                Icon(symbol = page.hidden ? .Circle : .CheckmarkCircleFill)
+                .font(size: resolvedLength(24))
+                .textColor(tileInk)
+            }
+            .buttonStyle(.Plain)
+            folderMove(.ChevronRight, at < count - 1, { in later(at, 1) })
+        }
+    }
+}

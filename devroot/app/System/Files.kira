@@ -1,0 +1,509 @@
+import Foundation
+import Heap
+import LibTessera
+
+// Paths, and whole files read and written as byte blocks.
+//
+// The dev root is a system service, so LibTessera gives it the root as its
+// SystemRoot handle, with every right on it; each path is looked up beneath
+// it. A file is replaced, never written in place: the new bytes go to a
+// temporary beside it that is renamed over it, so a process still running the
+// old file keeps the copy it mapped until PID 1 restarts it.
+//
+// LibTessera answers on a port. The dev root's calls are answered on a port
+// of its own, one at a time, so every call here is made and then waited for.
+
+namespace FileCall {
+    // The key every call is made under.
+    let key: Number = 1
+    // The most read or written in one call.
+    let chunkBytes: Number = 1048576
+}
+
+namespace FileRights {
+    // Everything a directory the dev root writes in needs. A node made in one
+    // carries no right its directory lacks, so these are a file's rights too.
+    let directory: Rights = Rights.read | Rights.write | Rights.enumerate | Rights.create
+        | Rights.delete | Rights.traverse | Rights.inspect | Rights.setProperty
+        | Rights.duplicate | Rights.transfer
+    let file: Rights = Rights.read | Rights.write | Rights.inspect | Rights.setProperty
+        | Rights.duplicate | Rights.transfer
+}
+
+// `NodeInfo` (16 §Node): the kind @0 and the attributes @100, whose bit 2
+// says a file may be run.
+namespace NodeInfoLayout {
+    let bytes: Number = 128
+    let executable: UN32 = 4
+}
+
+// roadmap/16-libtessera.md §13's `NodeInfo`.
+@FFI.Struct { layout: c }
+struct NodeInfoRecord {
+    var kind: U32
+    var flags: U32
+    var size: U64
+    var nodeId: U64
+    var volumeId: U64
+    var created: U64
+    var modified: U64
+    var accessed: U64
+    var changed: U64
+    var rights: U64
+    var grantId: GrantWords
+    var grantExpiry: U64
+    var lifetime: U32
+    var attributes: U32
+    var blockSize: U32
+    var reserved0: U32
+    var allocated: U64
+    var reserved1: U64
+}
+
+// A `u128`, as two words.
+@FFI.Array { element: U64, count: 2 }
+struct GrantWords {}
+
+// What `Node.info` says of a node, as far as the dev root asks.
+struct NodeSummary {
+    let kind: NodeKind
+    let executable: Bool
+}
+
+function decodedNodeKind(raw: UN32) -> Result<NodeKind, TesseraError> {
+    match raw {
+        0 -> return .Ok(.File)
+        1 -> return .Ok(.Directory)
+        2 -> return .Ok(.Link)
+        3 -> return .Ok(.Selection)
+        4 -> return .Ok(.Special)
+        else -> return .Error(storageFailure(.Internal))
+    }
+}
+
+function storageFailure(code: ErrorCode) -> TesseraError {
+    return TesseraError {
+        code: code,
+        subsystem: .LibTessera,
+        flags: ErrorFlags.none,
+        detail: UNumber(0)
+    }
+}
+
+// A failure to find what was to be removed: it is gone, which was the point.
+function absent(failed: TesseraError) -> Result<Void, TesseraError> {
+    if failed.code == .NotFound { return .Ok }
+    return .Error(failed)
+}
+
+// `path` without its leading slashes, as a lookup beneath the root takes it.
+function beneathRoot(path: borrow String) -> String {
+    var relative = copy path
+    while relative.startsWith("/") { relative = relative.substring(1, relative.count) }
+    return relative
+}
+
+// The directory part of `path` and its last name: `/bin/date` is `/bin` and
+// `date`.
+function directoryOf(path: borrow String) -> String {
+    match path.lastIndexOf("/") {
+        Some(slash) -> return slash == 0 ? "/" : path.substring(0, slash)
+        None -> return "/"
+    }
+}
+
+function nameOf(path: borrow String) -> String {
+    match path.lastIndexOf("/") {
+        Some(slash) -> return path.substring(slash + 1, path.count)
+        None -> return copy path
+    }
+}
+
+function filesAtRoot() -> Result<Files, TesseraError> {
+    // No root handle at startup is absence, which is a NotFound.
+    let root = try startupHandle(StartupTag.systemRoot) otherwise return .Error(
+        storageFailure(.NotFound)
+    )
+    match portCreate(.None) {
+        Ok(port) -> return .Ok(Files { root: root, port: port })
+        Error(failed) -> return .Error(failed)
+    }
+}
+
+// Closes `handle`; a close that fails is said, since nothing else can be done
+// about it.
+function release(handle: Handle) {
+    match handleClose(handle) {
+        Ok -> {}
+        Error(failed) -> log warn("could not close a handle", error: errorName(failed))
+    }
+}
+
+// What a stored file holds: bytes in this process, or another file's.
+enum StoredContents {
+    Bytes(Buffer)
+    SharedWith(String)
+}
+
+struct Files {
+    let root: Handle
+    let port: Handle
+
+    // The completion of a call that was just made, or why there is none.
+    function answer(
+        borrow self,
+        asked: borrow Result<Void, TesseraError>
+    ) -> Result<Completion, TesseraError> {
+        try asked
+        let waited = try portWait(self.port, 1, Deadline.infinite)
+        if waited.count == 0 { return .Error(storageFailure(.Internal)) }
+        if waited[0].error.code != .Ok { return .Error(waited[0].error) }
+        return .Ok(waited[0])
+    }
+
+    // The outcome of a call that answers with nothing else.
+    function answered(
+        borrow self,
+        asked: borrow Result<Void, TesseraError>
+    ) -> Result<Void, TesseraError> {
+        match self.answer(asked) {
+            Ok -> return .Ok
+            Error(failed) -> return .Error(failed)
+        }
+    }
+
+    // The handle a call answered with in `result0`.
+    function answeredHandle(
+        borrow self,
+        asked: borrow Result<Void, TesseraError>
+    ) -> Result<Handle, TesseraError> {
+        match self.answer(asked) {
+            Ok(done) -> return .Ok(Handle(done.result0))
+            Error(failed) -> return .Error(failed)
+        }
+    }
+
+    // The node at `path`, with `rights`. The root itself is a duplicate.
+    function lookup(
+        borrow self,
+        path: borrow String,
+        rights: Rights
+    ) -> Result<Handle, TesseraError> {
+        let relative = beneathRoot(path)
+        if relative.isEmpty() { return handleDuplicate(self.root, rights) }
+        return self.answeredHandle(nodeLookup(self.root, relative, rights, self.port, FileCall.key))
+    }
+
+    function summarize(borrow self, path: borrow String) -> Result<NodeSummary, TesseraError> {
+        let node = try self.lookup(path, Rights.inspect)
+        let infoBytes = zeroedBlock(count: NodeInfoLayout.bytes, alignment: 16)
+        let info = infoBytes.pointer()
+        let asked = self.answered(
+            nodeInfo(
+                node,
+                Buffer { address: info, length: NodeInfoLayout.bytes },
+                self.port,
+                FileCall.key
+            )
+        )
+        release(node)
+        try asked
+        let record: NodeInfoRecord = heapLoad(info)
+        let kind = try decodedNodeKind(record.kind)
+        return .Ok(
+            NodeSummary {
+                kind: kind,
+                executable: (record.attributes & NodeInfoLayout.executable) != 0
+            }
+        )
+    }
+
+    // The kind of node at `path`, or none when nothing is there.
+    function kindAt(borrow self, path: borrow String) -> Result<NodeKind?, TesseraError> {
+        match self.summarize(path) {
+            Ok(summary) -> return .Ok(.Some(summary.kind))
+            Error(failed) -> {
+                if failed.code == .NotFound { return .Ok(.None) }
+                return .Error(failed)
+            }
+        }
+    }
+
+    function isDirectory(borrow self, path: borrow String) -> Result<Bool, TesseraError> {
+        match self.kindAt(path) {
+            Ok(found) -> return .Ok(found == .Some(.Directory))
+            Error(failed) -> return .Error(failed)
+        }
+    }
+
+    // The file at `path`, whole.
+    function load(borrow self, path: borrow String) -> Result<ByteBlock, TesseraError> {
+        let node = try self.lookup(path, Rights.read | Rights.inspect)
+        let opened = self.answeredHandle(fileOpen(node, OpenMode.read, self.port, FileCall.key))
+        release(node)
+        let file = try opened
+        let contents = self.readAll(file)
+        release(file)
+        return move contents
+    }
+
+    function readAll(borrow self, file: Handle) -> Result<ByteBlock, TesseraError> {
+        let info = try fileInfo(file)
+        let block = zeroedBlock(count: info.size, alignment: 16)
+        var consumed: Number = 0
+        while consumed < info.size {
+            let amount = min(info.size - consumed, FileCall.chunkBytes)
+            let buffers = [Buffer {
+                address: heapOffset(block.pointer(), consumed),
+                length: amount
+            }]
+            let read = try self.answer(fileReadAt(file, consumed, buffers, self.port, FileCall.key))
+            // The file shrank while it was read.
+            if read.result0 == 0 { return .Error(storageFailure(.Internal)) }
+            consumed += Number(read.result0)
+        }
+        return .Ok(move block)
+    }
+
+    // The text of the file at `path`, or none when there is no file there.
+    function readTextIfPresent(borrow self, path: borrow String) -> Result<String?, TesseraError> {
+        match self.load(path) {
+            Ok(block) -> return .Ok(.Some(stringFromCBytes(block.pointer(), block.count)))
+            Error(failed) -> {
+                if failed.code == .NotFound { return .Ok(.None) }
+                return .Error(failed)
+            }
+        }
+    }
+
+    // Removes `name` from `directory`; nothing by that name is already removed.
+    function removeIn(
+        borrow self,
+        directory: Handle,
+        name: borrow String,
+        options: DeleteOptions
+    ) -> Result<Void, TesseraError> {
+        match self.answered(nodeDelete(directory, name, options, self.port, FileCall.key)) {
+            Ok -> return .Ok
+            Error(failed) -> return absent(move failed)
+        }
+    }
+
+    // Removes what is at `path`; nothing there is already removed.
+    function remove(
+        borrow self,
+        path: borrow String,
+        options: DeleteOptions
+    ) -> Result<Void, TesseraError> {
+        let directory = match self.lookup(directoryOf(path), FileRights.directory) {
+            Ok(value) -> value
+            Error(failed) -> return absent(move failed)
+        }
+        let removed = self.removeIn(directory, nameOf(path), options)
+        release(directory)
+        return removed
+    }
+
+    // Replaces the file at `path` with `contents`, runnable or not. Its
+    // directory must exist.
+    function store(
+        borrow self,
+        path: borrow String,
+        contents: borrow Buffer,
+        executable: Bool
+    ) -> Result<Void, TesseraError> {
+        return self.place(path, .Bytes(contents), executable)
+    }
+
+    // Replaces the file at `path` with the one at `source`, sharing its
+    // blocks where the volume can, with its executable bit.
+    function storeShared(
+        borrow self,
+        path: borrow String,
+        source: borrow String
+    ) -> Result<Void, TesseraError> {
+        let summary = try self.summarize(source)
+        return self.place(path, .SharedWith(copy source), summary.executable)
+    }
+
+    // Replaces the file at `path` with `contents`: written beside it, then
+    // renamed over it.
+    function place(
+        borrow self,
+        path: borrow String,
+        contents: borrow StoredContents,
+        executable: Bool
+    ) -> Result<Void, TesseraError> {
+        let directory = try self.lookup(directoryOf(path), FileRights.directory)
+        let name = nameOf(path)
+        let temporary = ".\(name).devroot"
+        let outcome = match self.storeIn(directory, temporary, contents, executable) {
+            Ok -> self.answered(
+                nodeRename(
+                    directory,
+                    temporary,
+                    directory,
+                    name,
+                    RenameOptions.replace,
+                    self.port,
+                    FileCall.key
+                )
+            )
+            Error(failed) -> .Error(failed)
+        }
+        match outcome {
+            Ok -> {
+                release(directory)
+                return .Ok
+            }
+            Error(failed) -> {
+                match self.removeIn(directory, temporary, DeleteOptions.permanent) {
+                    Ok -> {}
+                    Error(left) -> log warn(
+                        "could not remove a temporary file",
+                        path: temporary,
+                        error: errorName(left)
+                    )
+                }
+                release(directory)
+                return .Error(failed)
+            }
+        }
+    }
+
+    // Writes `contents` to a new file `name` in `directory`.
+    function storeIn(
+        borrow self,
+        directory: Handle,
+        name: borrow String,
+        contents: borrow StoredContents,
+        executable: Bool
+    ) -> Result<Void, TesseraError> {
+        // A temporary an earlier attempt left behind.
+        try self.removeIn(directory, name, DeleteOptions.permanent)
+        let made = nodeCreate(
+            directory,
+            name,
+            .File,
+            CreateOptions.exclusive,
+            FileRights.file,
+            self.port,
+            FileCall.key
+        )
+        let node = try self.answeredHandle(made)
+        let runnable = executable ? AttributeMask.executable : AttributeMask.none
+        let attributes = NodeAttributes {
+            mask: AttributeMask.executable,
+            attributes: runnable,
+            modified: 0,
+            accessed: 0
+        }
+        let outcome = match self.writeAll(node, contents) {
+            Ok -> self.answered(nodeSetAttributes(node, move attributes, self.port, FileCall.key))
+            Error(failed) -> .Error(failed)
+        }
+        release(node)
+        return outcome
+    }
+
+    function writeAll(
+        borrow self,
+        node: Handle,
+        contents: borrow StoredContents
+    ) -> Result<Void, TesseraError> {
+        let file = try self.answeredHandle(
+            fileOpen(node, OpenMode.write | OpenMode.truncate, self.port, FileCall.key)
+        )
+        let outcome = match contents {
+            Bytes(buffer) -> self.writeChunks(file, buffer)
+            SharedWith(source) -> self.writeShared(file, source)
+        }
+        release(file)
+        return outcome
+    }
+
+    // The file at `source` into `file`: its blocks shared, or copied where the
+    // volume cannot share them.
+    function writeShared(
+        borrow self,
+        file: Handle,
+        source: borrow String
+    ) -> Result<Void, TesseraError> {
+        let node = try self.lookup(source, Rights.read | Rights.inspect)
+        let opened = self.answeredHandle(fileOpen(node, OpenMode.read, self.port, FileCall.key))
+        release(node)
+        let from = try opened
+        let cloned = self.answered(fileClone(file, from, self.port, FileCall.key))
+        release(from)
+        match cloned {
+            Ok -> return .Ok
+            Error(failed) -> {
+                if failed.code != .Unsupported { return .Error(failed) }
+            }
+        }
+        let block = try self.load(source)
+        return self.writeChunks(file, Buffer { address: block.pointer(), length: block.count })
+    }
+
+    function writeChunks(
+        borrow self,
+        file: Handle,
+        contents: borrow Buffer
+    ) -> Result<Void, TesseraError> {
+        var written: Number = 0
+        while written < contents.length {
+            let amount = min(contents.length - written, FileCall.chunkBytes)
+            let buffers = [Buffer {
+                address: heapOffset(contents.address, written),
+                length: amount
+            }]
+            let wrote = try self.answer(
+                fileWriteAt(file, written, buffers, self.port, FileCall.key)
+            )
+            if wrote.result0 == 0 { return .Error(storageFailure(.NoSpace)) }
+            written += Number(wrote.result0)
+        }
+        return .Ok
+    }
+
+    // Replaces the file at `path` with `text`.
+    function writeText(
+        borrow self,
+        path: borrow String,
+        text: borrow String
+    ) -> Result<Void, TesseraError> {
+        let bytes = text.utf8()
+        let block = zeroedBlock(count: bytes.count + 1, alignment: 16)
+        for (index, byte) in bytes.enumerated() { heapStore<U8>(block.pointer(), index, byte) }
+        return self.store(path, Buffer { address: block.pointer(), length: bytes.count }, false)
+    }
+
+    // Makes the directory at `path` and every one above it that is missing.
+    function ensureDirectories(borrow self, path: borrow String) -> Result<Void, TesseraError> {
+        if path == "/" || path.isEmpty() { return .Ok }
+        match self.isDirectory(path) {
+            Ok(present) -> { if present { return .Ok } }
+            Error(failed) -> return .Error(failed)
+        }
+        let above = directoryOf(path)
+        try self.ensureDirectories(above)
+        let parent = try self.lookup(above, FileRights.directory)
+        let made = self.answeredHandle(
+            nodeCreate(
+                parent,
+                nameOf(path),
+                .Directory,
+                CreateOptions.openExisting,
+                FileRights.directory,
+                self.port,
+                FileCall.key
+            )
+        )
+        release(parent)
+        match made {
+            Ok(directory) -> release(directory)
+            Error(failed) -> return .Error(failed)
+        }
+        return .Ok
+    }
+}

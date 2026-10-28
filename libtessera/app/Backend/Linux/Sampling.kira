@@ -1,0 +1,295 @@
+import Foundation
+import Heap
+
+// Sampling the machine: a `cpu-clock` perf event on every CPU, which needs no
+// performance counters, records where each CPU is `hz` times a second, with
+// the kernel and user call chain beneath it, into a ring buffer this process
+// maps and drains.
+
+namespace PerfEvent {
+    // `struct perf_event_attr` at PERF_ATTR_SIZE_VER7.
+    let attributeBytes: Number = 128
+    let typeSoftware: Number = 1
+    // PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN.
+    let sampleType: Number = 2 + 32
+    // `disabled` and `freq`.
+    let flags: Number = 1 + 1024
+    // Any process, as a 32-bit -1.
+    let anyone: Number = 0xFFFFFFFF
+    let closeOnExec: Number = 8
+    let enable: Number = 0x2400
+    let disable: Number = 0x2401
+    let recordLost: Number = 2
+    let recordSample: Number = 9
+    // The ring's metadata: where the kernel has written to, and where this
+    // process has read to.
+    let head: Number = 1024
+    let tail: Number = 1032
+    // Data pages behind the metadata page, a power of two.
+    let dataPages: Number = 16
+    let drainInterval: Number = 20000000
+    // The context-switch event: every switch away from a thread, with the
+    // call chain it blocked in, and a record each time one comes back.
+    let contextSwitches: Number = 3
+    // PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_CALLCHAIN.
+    let switchSampleType: Number = 2 + 4 + 32
+    // `disabled`, `sample_id_all`, `use_clockid` and `context_switch`.
+    let switchFlags: Number = 1 + 262144 + 33554432 + 67108864
+    let monotonicClock: Number = 1
+    // PERF_RECORD_SWITCH_CPU_WIDE: the other thread's pid and tid, then the
+    // sample id of the thread switched to or from.
+    let recordSwitch: Number = 15
+    let switchedOut: Number = 0x2000
+    let switchPages: Number = 64
+    // Frames kept of a blocked thread's call chain.
+    let switchMaxStack: Number = 32
+}
+
+enum PerfRingKind {
+    Clock
+    Switches
+}
+
+// One CPU's event and the ring it writes.
+struct PerfRing {
+    let fd: Number
+    let base: RawPtr
+    let length: U64
+    let dataBytes: Number
+    let kind: PerfRingKind
+}
+
+// Samples every CPU for `seconds` at `hz`.
+function kernelSampleMachine(seconds: Number, hz: Number) -> Result<MachineSamples, TesseraError> {
+    let cpus = Number(try kernelCpuCount())
+    let page = kernelPageSize()
+    var rings: [PerfRing] = []
+    for cpu in 0..cpus {
+        for kind in [PerfRingKind.Clock, PerfRingKind.Switches] {
+            match openPerfRing(cpu, hz, page, kind) {
+                Ok(ring) -> rings.append(ring)
+                Error(failed) -> {
+                    closePerfRings(rings)
+                    return .Error(failed)
+                }
+            }
+        }
+    }
+    var samples = MachineSamples {}
+    var tracer = traceStart()
+    for ring in rings { ioctlValue(ring.fd, U64(PerfEvent.enable), 0) }
+    let began = try kernelClockRead(.Monotonic)
+    samples.began = began
+    let length = U64(trunc(seconds * 1000000000))
+    var now = began
+    var described: Map<Number, SampledMaps> = Map {}
+    var checked = 0
+    while now - began < length {
+        kernelSleep(U64(PerfEvent.drainInterval))
+        for ring in rings { drainPerfRing(ring, samples) }
+        traceDrain(tracer)
+        checked = try describeNewProcesses(samples, described, checked)
+        now = match kernelClockRead(.Monotonic) {
+            Ok(value) -> value
+            Error(failed) -> {
+                absorb failed
+                began + length
+            }
+        }
+    }
+    samples.ended = now
+    log info(
+        "sampled; draining",
+        stacks: samples.stacks.count,
+        blocks: samples.blocks.count,
+        resumes: samples.resumes.count
+    )
+    for ring in rings { ioctlValue(ring.fd, U64(PerfEvent.disable), 0) }
+    for ring in rings { drainPerfRing(ring, samples) }
+    closePerfRings(rings)
+    samples.counters = traceStop(tracer)
+    log info("sampled; naming", counters: samples.counters.count)
+    checked = try describeNewProcesses(samples, described, checked)
+    try rereadAllMaps(samples, described, checked + 1)
+    samples.kernelSymbols = try kernelTextSymbols()
+    log info("sampled; named", symbols: samples.kernelSymbols.count)
+    return .Ok(samples)
+}
+
+function openPerfRing(
+    cpu: Number,
+    hz: Number,
+    page: U64,
+    kind: PerfRingKind
+) -> Result<PerfRing, TesseraError> {
+    let attributeBytes = zeroedBlock(count: PerfEvent.attributeBytes, alignment: 16)
+    let attributes = attributeBytes.pointer()
+    heapStore<U32>(attributes, 0, U32(PerfEvent.typeSoftware))
+    heapStore<U32>(attributes, 4, U32(PerfEvent.attributeBytes))
+    var pages = PerfEvent.dataPages
+    match kind {
+        Clock -> {
+            heapStore<U64>(attributes, 16, U64(hz))
+            heapStore<U64>(attributes, 24, U64(PerfEvent.sampleType))
+            heapStore<U64>(attributes, 40, U64(PerfEvent.flags))
+        }
+        Switches -> {
+            heapStore<U64>(attributes, 8, U64(PerfEvent.contextSwitches))
+            heapStore<U64>(attributes, 16, U64(1))
+            heapStore<U64>(attributes, 24, U64(PerfEvent.switchSampleType))
+            heapStore<U64>(attributes, 40, U64(PerfEvent.switchFlags))
+            heapStore<U32>(attributes, 92, U32(PerfEvent.monotonicClock))
+            heapStore<U16>(attributes, 96, U16(PerfEvent.switchMaxStack))
+            pages = PerfEvent.switchPages
+        }
+    }
+    let fd = perfEventOpen(
+        attributes,
+        U32(PerfEvent.anyone),
+        U32(cpu),
+        U32(PerfEvent.anyone),
+        U64(PerfEvent.closeOnExec)
+    )
+    if answerFailed(fd) { return .Error(errnoFailure(answerErrno(fd))) }
+    let dataBytes = Number(page) * pages
+    let length = page + U64(dataBytes)
+    let mapped = mmap(
+        nullPointer(),
+        length,
+        ProtectionFlag.read | ProtectionFlag.write,
+        MapFlag.shared,
+        fd,
+        U64(0)
+    )
+    if answerFailed(mapped) {
+        closeBacking(fd)
+        return .Error(errnoFailure(answerErrno(mapped)))
+    }
+    return .Ok(
+        PerfRing { fd: fd, base: RawPtr(mapped), length: length, dataBytes: dataBytes, kind: kind }
+    )
+}
+
+function closePerfRings(rings: borrow [PerfRing]) {
+    for ring in rings {
+        munmap(ring.base, ring.length)
+        closeBacking(ring.fd)
+    }
+}
+
+// Takes every record the kernel wrote since the last drain. Records are
+// 8-byte aligned and the ring a multiple of 8, so no field straddles its end.
+function drainPerfRing(ring: borrow PerfRing, samples: borrow mut MachineSamples) {
+    let head = heapLoad<U64>(ring.base, PerfEvent.head)
+    var at = heapLoad<U64>(ring.base, PerfEvent.tail)
+    let data = heapOffset(ring.base, ring.length - U64(ring.dataBytes))
+    let mask = U64(ring.dataBytes) - U64(1)
+    while at < head {
+        let header = ringWord(data, mask, at)
+        let kind = Number(header & U64(0xFFFFFFFF))
+        let size = (header >> U64(48)) & U64(0xFFFF)
+        if size == U64(0) { break }
+        // The idle task's switches are most of them, and wait for nothing.
+        let idsAt = kind == PerfEvent.recordSwitch ? at + U64(16) : at + U64(8)
+        let idle = (ringWord(data, mask, idsAt) & U64(0xFFFFFFFF)) == U64(0)
+        if kind == PerfEvent.recordSample && !(idle && ring.kind == .Switches) {
+            match ringStack(data, mask, at + U64(8), at + size, ring.kind == .Switches) {
+                Some(stack) -> match ring.kind {
+                    Clock -> samples.stacks.append(stack)
+                    Switches -> samples.blocks.append(stack)
+                }
+                None -> {}
+            }
+        }
+        if kind == PerfEvent.recordSwitch && !idle && (
+            Number(header >> U64(32)) & PerfEvent.switchedOut
+        ) == 0 {
+            let ids = ringWord(data, mask, idsAt)
+            samples.resumes.append(
+                SampledResume {
+                    pid: Number(ids & U64(0xFFFFFFFF)),
+                    tid: Number(ids >> U64(32)),
+                    time: ringWord(data, mask, idsAt + U64(8))
+                }
+            )
+        }
+        if kind == PerfEvent.recordLost {
+            samples.lost += Number(ringWord(data, mask, at + U64(16)))
+        }
+        at += size
+    }
+    heapStore<U64>(ring.base, PerfEvent.tail, head)
+}
+
+// A sample's thread, its time when it has one, and its call chain; none when
+// the chain would run past the record's `end`. Offsets are words, masked into
+// the ring, so a drain does no decimal arithmetic per frame.
+function ringStack(data: RawPtr, mask: U64, at: U64, end: U64, timed: Bool) -> SampledStack? {
+    let ids = ringWord(data, mask, at)
+    var next = at + U64(8)
+    var time = U64(0)
+    if timed {
+        time = ringWord(data, mask, next)
+        next += U64(8)
+    }
+    let count = ringWord(data, mask, next)
+    if next + U64(8) + count * U64(8) > end { return .None }
+    var frames: [U64] = []
+    for index in 0..Number(count) {
+        frames.append(ringWord(data, mask, next + U64(8) + U64(index * 8)))
+    }
+    return .Some(
+        SampledStack {
+            pid: Number(ids & U64(0xFFFFFFFF)),
+            tid: Number(ids >> U64(32)),
+            time: time,
+            frames: frames
+        }
+    )
+}
+
+function ringWord(data: RawPtr, mask: U64, at: U64) -> U64 {
+    return heapLoad<U64>(data, at & mask)
+}
+
+// A /proc file's text; empty when the process has exited, which a process
+// seen in one drain can have done before it is looked up.
+// The kernel's text symbols, `<address> <name>` a line, from /proc/kallsyms.
+function kernelTextSymbols() -> Result<String, TesseraError> {
+    let text = try kernelReadText("/proc/kallsyms")
+    var kept = ""
+    for line in text.split("\n") {
+        let words = line.split(" ")
+        if words.count >= 3 && (words[1] == "t" || words[1] == "T") {
+            kept.append(words[0] + " " + words[2] + "\n")
+        }
+    }
+    return .Ok(kept)
+}
+
+// The whole of a file the kernel makes up as it is read, such as one under
+// /proc, whatever its length.
+function kernelReadText(path: borrow String) -> Result<String, TesseraError> {
+    let fd = openat(
+        AtDirectory.current,
+        cStringFrom(path),
+        LinuxOpen.readOnly | LinuxOpen.closeOnExec,
+        0
+    )
+    if answerFailed(fd) { return .Error(errnoFailure(answerErrno(fd))) }
+    let chunk = 65536
+    let blockBytes = zeroedBlock(count: chunk + 1, alignment: 16)
+    let block = blockBytes.pointer()
+    var text = ""
+    while true {
+        let got = read(fd, block, U64(chunk))
+        if answerFailed(got) {
+            closeBacking(fd)
+            return .Error(errnoFailure(answerErrno(got)))
+        }
+        if got == 0 { break }
+        text.append(stringFromCBytes(block, got))
+    }
+    closeBacking(fd)
+    return .Ok(text)
+}

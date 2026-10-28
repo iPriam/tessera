@@ -1,0 +1,371 @@
+import Foundation
+import Heap
+import LibTessera
+import DeviceKit
+
+// The wire (LibTessera `app/Device/Wire.kira`): a 32-byte header, `op` @0,
+// `code` @4 (an `ErrorCode` value), `a` @8, `b` @16, `c` @24, then the
+// operation's bytes, with Memory handles beside them. A request is decoded
+// here, once, into a `Request`.
+//
+// A `StreamDescriptor` travels as 96 bytes: class @0, device id @8, buffer
+// count @16, buffer size @20, flags @24, then the format @32: sample rate,
+// channels, sample format and frames per buffer (`u32` @0..@12), channel
+// mask (`u64` @16), pixel format, width, height, frames per second (Q16),
+// color space and HDR mode (`u32` @24..@44), sensor rate (`u32` @48),
+// sensor format and pattern format (`u16` @52, @54), and the report latency
+// (`u64` @56).
+
+@Derive(Copy)
+enum Operation: UN32 {
+    List = 1
+    Open = 2
+    Enqueue = 3
+    Start = 4
+    Stop = 5
+    Flush = 6
+    Reconfigure = 7
+    Control = 8
+    Info = 9
+    Done = 16
+}
+
+namespace DeviceWire {
+    let headerBytes: Number = 32
+    let descriptorBytes: Number = 96
+    // The biggest message a client sends: a header and a control's input.
+    let messageBytes: Number = 4096
+    // The most handles a client's message carries; a request needs none.
+    let handleCapacity: Number = 4
+    // A control's value: one `u32`.
+    let controlBytes: Number = 4
+}
+
+let operations: [Operation] = [Operation.List, Operation.Open, Operation.Enqueue, Operation.Start, Operation.Stop, Operation.Flush, Operation.Reconfigure, Operation.Control, Operation.Info, Operation.Done,]
+let deviceClasses: [DeviceClass] = [DeviceClass.Sensor, DeviceClass.AudioInput, DeviceClass.AudioOutput, DeviceClass.Camera, DeviceClass.Haptic]
+let audioSampleFormats: [AudioSampleFormat] = [AudioSampleFormat.I16, AudioSampleFormat.I24, AudioSampleFormat.I32, AudioSampleFormat.F32]
+let sensorSampleFormats: [SensorSampleFormat] = [SensorSampleFormat.Vector3F32, SensorSampleFormat.ScalarF32, SensorSampleFormat.QuaternionF32, SensorSampleFormat.U64Count,]
+let hapticPatternFormats: [HapticPatternFormat] = [HapticPatternFormat.AmplitudeF32AtHz]
+
+// `Enqueue`: `a` the slot, `b` its length and, above it, its flags.
+struct EnqueueRequest {
+    var slot: Number
+    var length: Number
+    var flags: PacketFlags
+}
+
+// `Control`: `a` the control; a 4-byte input sets a value, none reads it.
+struct ControlRequest {
+    var control: Number
+    var value: Number?
+}
+
+enum Request {
+    List(DeviceClass)
+    Open(StreamDescriptor)
+    Enqueue(EnqueueRequest)
+    Start
+    Stop
+    Flush
+    Reconfigure(StreamDescriptor)
+    Control(ControlRequest)
+    Info
+}
+
+// A request refused as it was sent, answered with the reason.
+struct Refusal {
+    var op: Operation
+    var reason: ErrorCode
+}
+
+// Why nothing could be taken off a channel as a request.
+enum ReceiveFailure {
+    // The channel had nothing (`ShouldWait`) or failed.
+    Channel(TesseraError)
+    // An operation a client does not send; there is nothing to answer.
+    UnknownOperation(UN32)
+    Refused(Refusal)
+}
+
+function refused(op: borrow Operation, reason: borrow ErrorCode) -> ReceiveFailure {
+    return .Refused(Refusal { op: op, reason: reason })
+}
+
+// The low and high 32 bits of a header word.
+function low(word: UNumber) -> Number { return Number(word & UNumber(0xFFFFFFFF)) }
+function high(word: UNumber) -> UN32 { return UN32(word >> UNumber(32)) }
+
+// A `u32` field holding `value`, which may be below zero.
+function wordOf(value: Number) -> UN32 {
+    if value < 0 { return UN32(value + 4294967296) }
+    return UN32(value)
+}
+
+// The next request on `channel`. Handles a client sends are closed: no
+// request carries any.
+function receive(channel: Handle) -> Result<Request, ReceiveFailure> {
+    let block = zeroedBlock(count: DeviceWire.messageBytes, alignment: 16)
+    let bytes = Buffer { address: block.pointer(), length: DeviceWire.messageBytes }
+    let received = match channelRead(channel, bytes, DeviceWire.handleCapacity) {
+        Ok(value) -> value
+        Error(failed) -> return .Error(.Channel(failed))
+    }
+    closeHandles(received.handles)
+    if received.bytes < DeviceWire.headerBytes {
+        return .Error(.Channel(failure(.InvalidArgument)))
+    }
+    let raw = blockLoad<U32>(block, 0)
+    let op = try caseWithCode(operations, raw) otherwise return .Error(.UnknownOperation(raw))
+    let a = blockLoad<U64>(block, 8)
+    let b = blockLoad<U64>(block, 16)
+    let payload = Buffer {
+        address: heapOffset(block.pointer(), DeviceWire.headerBytes),
+        length: received.bytes - DeviceWire.headerBytes
+    }
+    return match op {
+        List -> match caseWithCode(deviceClasses, low(a)) {
+            Some(deviceClass) -> .Ok(.List(deviceClass))
+            None -> .Error(refused(op, .InvalidArgument))
+        }
+        Open -> match descriptorIn(op, payload) {
+            Ok(descriptor) -> .Ok(.Open(descriptor))
+            Error(fault) -> .Error(fault)
+        }
+        Reconfigure -> match descriptorIn(op, payload) {
+            Ok(descriptor) -> .Ok(.Reconfigure(descriptor))
+            Error(fault) -> .Error(fault)
+        }
+        Enqueue -> .Ok(
+            .Enqueue(EnqueueRequest { slot: low(a), length: low(b), flags: PacketFlags(high(b)) })
+        )
+        Start -> .Ok(.Start)
+        Stop -> .Ok(.Stop)
+        Flush -> .Ok(.Flush)
+        Info -> .Ok(.Info)
+        Control -> .Ok(.Control(ControlRequest { control: low(a), value: controlValue(payload) }))
+        Done -> .Error(.UnknownOperation(raw))
+    }
+}
+
+function controlValue(payload: borrow Buffer) -> Number? {
+    if payload.length < DeviceWire.controlBytes { return .None }
+    return .Some(Number(heapLoad<U32>(payload.address, 0)))
+}
+
+// `Open` and `Reconfigure`: the descriptor.
+function descriptorIn(
+    op: borrow Operation,
+    payload: borrow Buffer
+) -> Result<StreamDescriptor, ReceiveFailure> {
+    if payload.length < DeviceWire.descriptorBytes { return .Error(refused(op, .InvalidArgument)) }
+    return match descriptorRead(payload.address) {
+        Ok(descriptor) -> .Ok(descriptor)
+        Error(failed) -> .Error(refused(op, failed.code))
+    }
+}
+
+function noBytes() -> Buffer { return Buffer { address: nullPointer(), length: 0 } }
+
+// Sends one message; `handles` leave this process. A client that cannot be
+// sent to has gone, and its channel's wait closes it.
+function send(
+    channel: Handle,
+    op: borrow Operation,
+    outcome: borrow ErrorCode,
+    a: UNumber,
+    b: UNumber,
+    c: UNumber,
+    payload: borrow Buffer,
+    handles: borrow [Handle]
+) {
+    let size = DeviceWire.headerBytes + payload.length
+    let block = zeroedBlock(count: size, alignment: 16)
+    blockStore<U32>(block, 0, code(op))
+    blockStore<U32>(block, 4, outcome.rawValue())
+    blockStore<U64>(block, 8, a)
+    blockStore<U64>(block, 16, b)
+    blockStore<U64>(block, 24, c)
+    if payload.length > 0 {
+        copyBytes(
+            heapOffset(block.pointer(), DeviceWire.headerBytes),
+            payload.address,
+            payload.length
+        )
+    }
+    match channelWrite(channel, Buffer { address: block.pointer(), length: size }, handles) {
+        Ok -> {}
+        Error(failed) -> log warn("a client could not be answered", error: errorName(failed))
+    }
+}
+
+// An answer with only a header.
+function answer(channel: Handle, op: borrow Operation, outcome: borrow ErrorCode) {
+    let none: [Handle] = []
+    send(channel, op, outcome, UNumber(0), UNumber(0), UNumber(0), noBytes(), none)
+}
+
+// The descriptor at `block`; a format the wire does not have is
+// `FormatUnsupported`.
+function descriptorRead(block: RawPtr) -> Result<StreamDescriptor, TesseraError> {
+    let streamClass = try caseWithCode(
+        deviceClasses,
+        heapLoad<U32>(block, 0)
+    ) otherwise return .Error(failure(.InvalidArgument))
+    let sampleFormat = try caseWithCode(
+        audioSampleFormats,
+        heapLoad<U32>(block, 40)
+    ) otherwise return .Error(failure(.FormatUnsupported))
+    let sensorFormat = try caseWithCode(
+        sensorSampleFormats,
+        heapLoad<U16>(block, 84)
+    ) otherwise return .Error(failure(.FormatUnsupported))
+    let patternFormat = try caseWithCode(
+        hapticPatternFormats,
+        heapLoad<U16>(block, 86)
+    ) otherwise return .Error(failure(.FormatUnsupported))
+    return .Ok(
+        StreamDescriptor {
+            streamClass: streamClass,
+            deviceId: Number(heapLoad<U64>(block, 8)),
+            bufferCount: Number(heapLoad<U32>(block, 16)),
+            bufferSize: Number(heapLoad<U32>(block, 20)),
+            flags: StreamFlags(heapLoad<U32>(block, 24)),
+            format: StreamFormat {
+                sampleRate: Number(heapLoad<U32>(block, 32)),
+                channels: Number(heapLoad<U32>(block, 36)),
+                sampleFormat: sampleFormat,
+                framesPerBuffer: Number(heapLoad<U32>(block, 44)),
+                channelMask: heapLoad<U64>(block, 48),
+                pixelFormat: heapLoad<U32>(block, 56),
+                width: Number(heapLoad<U32>(block, 60)),
+                height: Number(heapLoad<U32>(block, 64)),
+                framesPerSecondQ16: Number(heapLoad<U32>(block, 68)),
+                colorSpace: heapLoad<U32>(block, 72),
+                hdrMode: heapLoad<U32>(block, 76),
+                rateHz: Number(heapLoad<U32>(block, 80)),
+                maxReportLatency: Number(heapLoad<U64>(block, 88)),
+                sensorFormat: sensorFormat,
+                patternFormat: patternFormat,
+            },
+        }
+    )
+}
+
+function descriptorWrite(block: RawPtr, descriptor: borrow StreamDescriptor) {
+    heapStore<U32>(block, 0, descriptor.streamClass.rawValue())
+    heapStore<U64>(block, 8, UNumber(descriptor.deviceId))
+    heapStore<U32>(block, 16, UN32(descriptor.bufferCount))
+    heapStore<U32>(block, 20, UN32(descriptor.bufferSize))
+    heapStore<U32>(block, 24, descriptor.flags.raw)
+    let format = descriptor.format
+    heapStore<U32>(block, 32, UN32(format.sampleRate))
+    heapStore<U32>(block, 36, UN32(format.channels))
+    heapStore<U32>(block, 40, format.sampleFormat.rawValue())
+    heapStore<U32>(block, 44, UN32(format.framesPerBuffer))
+    heapStore<U64>(block, 48, format.channelMask)
+    heapStore<U32>(block, 56, format.pixelFormat)
+    heapStore<U32>(block, 60, UN32(format.width))
+    heapStore<U32>(block, 64, UN32(format.height))
+    heapStore<U32>(block, 68, UN32(format.framesPerSecondQ16))
+    heapStore<U32>(block, 72, format.colorSpace)
+    heapStore<U32>(block, 76, format.hdrMode)
+    heapStore<U32>(block, 80, UN32(format.rateHz))
+    heapStore<U16>(block, 84, UN16(format.sensorFormat.rawValue()))
+    heapStore<U16>(block, 86, UN16(format.patternFormat.rawValue()))
+    heapStore<U64>(block, 88, UNumber(format.maxReportLatency))
+}
+
+// roadmap/17-devicekit.md §7.4's `MatchSpec`, without property constraints.
+@FFI.Struct { layout: c }
+struct MatchSpecRecord {
+    var entryClass: EntryClass
+    var family: Family
+    var flags: U32
+    var count: U32
+}
+
+// §7's `EntryInfo`, one record of `Registry.match`'s list.
+@FFI.Struct { layout: c }
+struct EntryInfoRecord {
+    var id: U64
+    var entryClass: EntryClass
+    var family: Family
+    var parent: U64
+    var generation: U64
+    var flags: U32
+    var childCount: U32
+    var name: U64
+}
+
+// §7.3's `Property` before its key; the value follows the key at the next
+// 8-byte boundary.
+@FFI.Struct { layout: c }
+struct PropertyHeader {
+    var kind: U32
+    var keyLength: U32
+    var valueLength: U32
+    var reserved: U32
+}
+
+// A sensor channel as `Sensor.channels` writes it.
+@FFI.Struct { layout: c }
+struct SensorChannelRecord {
+    var kind: U32
+    var index: U32
+    var exponent: U32
+    var format: U32
+}
+
+// The head of a `DeviceInfo`; the name and the capabilities follow.
+@FFI.Struct { layout: c }
+struct DeviceInfoHead {
+    var id: U64
+    var deviceClass: U32
+    var kind: U32
+    var flags: U32
+    var capabilityCount: U32
+}
+
+// A `deviceChanged` body.
+@FFI.Struct { layout: c }
+struct DeviceChangedRecord {
+    var deviceClass: U32
+    var deviceId: U64
+    var added: U8
+}
+
+// roadmap/16-libtessera.md §16's `StreamInfo`.
+@FFI.Struct { layout: c }
+struct StreamInfoRecord {
+    var state: U32
+    var latency: U64
+    var dropped: U64
+    var delivered: U64
+    var underruns: U64
+    var streamClass: U32
+    var deviceId: U64
+    var bufferCount: U32
+    var bufferSize: U32
+}
+
+// A `MatchSpec` for every entry of `entryClass`.
+function classSpec(entryClass: borrow EntryClass) -> ByteBlock {
+    let spec = zeroedBlock(count: RegistryRecord.specBytes, alignment: 16)
+    heapStore(
+        spec.pointer(),
+        MatchSpecRecord {
+            entryClass: entryClass,
+            family: Family.None,
+            flags: UN32(0),
+            count: UN32(0)
+        }
+    )
+    return move spec
+}
+
+// Writes `text` into a fixed field of `field` bytes, NUL-padded.
+function storeText(base: RawPtr, at: Number, text: borrow String, field: Number) {
+    var count = text.count
+    if count > field - 1 { count = field - 1 }
+    copyBytes(heapOffset(base, at), text.data, count)
+}

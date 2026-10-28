@@ -1,0 +1,117 @@
+import Foundation
+
+// The protocol writes numbers, memory and names as lower-case hex: a number
+// with its most significant digit first, a register as its bytes in memory
+// order, which on both of Tessera's architectures is little-endian.
+
+namespace Hex {
+    let digits: String = "0123456789abcdef"
+}
+
+function hexDigit(value: Number) -> String {
+    return Hex.digits.substring(value, value + 1)
+}
+
+// Two digits.
+function hexByte(value: Number) -> String {
+    return hexDigit(trunc(value / 16) % 16) + hexDigit(value % 16)
+}
+
+// As few digits as the value needs, at least one.
+function hexNumber(value: U64) -> String {
+    var parts: [String] = []
+    var rest = value
+    while true {
+        parts.append(hexDigit(Number(rest & U64(15))))
+        rest = rest >> U64(4)
+        if rest == U64(0) { break }
+    }
+    var text: [String] = []
+    for index in 0..parts.count { text.append(parts[parts.count - 1 - index]) }
+    return joined(text, "")
+}
+
+// `count` bytes of `value`, the lowest first.
+function hexLittleEndian(value: U64, count: Number) -> String {
+    var parts: [String] = []
+    for index in 0..count { parts.append(hexByte(Number((value >> U64(index * 8)) & U64(255)))) }
+    return joined(parts, "")
+}
+
+function hexBytes(bytes: borrow [UN8]) -> String {
+    var parts: [String] = []
+    for byte in bytes { parts.append(hexByte(Number(byte))) }
+    return joined(parts, "")
+}
+
+// Text as the hex of its bytes, as names and triples are sent.
+function hexText(text: borrow String) -> String {
+    var parts: [String] = []
+    for byte in text.utf8() { parts.append(hexByte(Number(byte))) }
+    return joined(parts, "")
+}
+
+// Why hex text is not the value asked for.
+enum HexFailure {
+    Empty
+    TooLong
+    NotHex
+    OddLength
+    InvalidText
+}
+
+function digitValue(byte: UN8) -> Result<Number, HexFailure> {
+    return match hexDigitValue(byte) {
+        Some(value) -> .Ok(Number(value))
+        None -> .Error(HexFailure.NotHex)
+    }
+}
+
+// A number written most significant digit first; a failure says why the text
+// is not one.
+function parseHex(text: borrow String) -> Result<U64, HexFailure> {
+    if text.isEmpty() { return .Error(HexFailure.Empty) }
+    if text.count > 16 { return .Error(HexFailure.TooLong) }
+    var value = U64(0)
+    for byte in text.utf8() {
+        let digit = try digitValue(byte)
+        value = (value << U64(4)) | U64(digit)
+    }
+    return .Ok(value)
+}
+
+function parseHexNumber(text: borrow String) -> Result<Number, HexFailure> {
+    let value = try parseHex(text)
+    return .Ok(Number(value))
+}
+
+// Bytes written two digits each.
+function parseHexBytes(text: borrow String) -> Result<[UN8], HexFailure> {
+    if text.count % 2 != 0 { return .Error(HexFailure.OddLength) }
+    let digits = text.utf8()
+    var bytes: [UN8] = []
+    for index in 0..trunc(text.count / 2) {
+        let high = try digitValue(digits[index * 2])
+        let low = try digitValue(digits[index * 2 + 1])
+        bytes.append(UN8(high * 16 + low))
+    }
+    return .Ok(bytes)
+}
+
+// A register written as its bytes, the lowest first.
+function parseLittleEndian(text: borrow String) -> Result<U64, HexFailure> {
+    let bytes = try parseHexBytes(text)
+    if bytes.count > 8 { return .Error(HexFailure.TooLong) }
+    var value = U64(0)
+    for (index, byte) in bytes.enumerated() { value = value | (U64(byte) << U64(index * 8)) }
+    return .Ok(value)
+}
+
+function textOfHex(text: borrow String) -> Result<String, HexFailure> {
+    let bytes = try parseHexBytes(text)
+    return match textFromBytes(bytes) {
+        Some(value) -> .Ok(value)
+        // The bytes are hex, but not text.
+        None -> .Error(HexFailure.InvalidText)
+    }
+}

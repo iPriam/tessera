@@ -1,0 +1,238 @@
+import Foundation
+import Heap
+import LibTessera
+
+// The registry's entries and their properties (17 §7.1–§7.3).
+//
+// The specification has the manager publish a shared snapshot. Here each
+// process walks sysfs itself (17 §25). An entry's id is FNV-1a 64 over its
+// canonical sysfs path, so it is stable for one boot and the same in every
+// process. Its Service-plane parent is the nearest entry above it in that
+// path.
+
+enum PropertyValue {
+    Flag(Bool)
+    Signed(Number)
+    Unsigned(U64)
+    Text(String)
+}
+
+// A property: a key and a typed value (§7.3).
+struct Property {
+    var key: String
+    var value: PropertyValue
+
+    function propertyType(borrow self) -> PropertyType {
+        return match self.value {
+            Flag(on) -> .Bool
+            Signed(number) -> .I64
+            Unsigned(number) -> .U64
+            Text(text) -> .String
+        }
+    }
+
+    function text(borrow self) -> String? {
+        return match self.value {
+            Text(text) -> .Some(text)
+            Flag(on) -> .None
+            Signed(number) -> .None
+            Unsigned(number) -> .None
+        }
+    }
+
+    // The value's eight bytes, as a record carries a number.
+    function word(borrow self) -> U64? {
+        return match self.value {
+            Flag(on) -> .Some(on ? U64(1) : U64(0))
+            Signed(number) -> .Some(twosComplement(number))
+            Unsigned(number) -> .Some(number)
+            Text(text) -> .None
+        }
+    }
+
+    // Whether this property satisfies `wanted`, a match constraint with the
+    // same key: equal, or for text, a prefix when `wanted` ends in `*`.
+    function satisfies(borrow self, wanted: borrow Property) -> Bool {
+        if self.key != wanted.key { return false }
+        match wanted.text() {
+            Some(pattern) -> {
+                return match self.text() {
+                    Some(have) -> pattern.endsWith("*") ? have.startsWith(
+                        pattern.substring(0, pattern.count - 1)
+                    ) : have == pattern
+                    None -> false
+                }
+            }
+            None -> return self.word() == wanted.word()
+        }
+    }
+
+    function valueLength(borrow self) -> Number {
+        return match self.text() {
+            Some(text) -> text.count
+            None -> 8
+        }
+    }
+
+    // The size of its `Property` record.
+    function recordSize(borrow self) -> Number {
+        return alignRecord(alignRecord(16 + self.key.count) + self.valueLength())
+    }
+
+    // Its `Property` record at `at`: type, key length, value length, the key
+    // @16 and the value at the next 8-byte boundary.
+    function write(borrow self, out: RawPtr, at: Number) {
+        heapStore<U32>(out, at, code(self.propertyType()))
+        heapStore<U32>(out, at + 4, U32(self.key.count))
+        heapStore<U32>(out, at + 8, U32(self.valueLength()))
+        heapStore<U32>(out, at + 12, U32(0))
+        copyBytes(heapOffset(out, at + 16), self.key.data, self.key.count)
+        let valueAt = alignRecord(at + 16 + self.key.count)
+        match self.value {
+            Text(text) -> copyBytes(heapOffset(out, valueAt), text.data, text.count)
+            Flag(on) -> heapStore<U64>(out, valueAt, on ? U64(1) : U64(0))
+            Signed(number) -> heapStore<U64>(out, valueAt, twosComplement(number))
+            Unsigned(number) -> heapStore<U64>(out, valueAt, number)
+        }
+    }
+}
+
+// Property records as a match spec and a publish carry them: `count` records
+// from `start`, ending at `length`.
+function readProperties(
+    base: RawPtr,
+    start: Number,
+    length: Number,
+    count: Number
+) -> Result<[Property], TesseraError> {
+    var properties: [Property] = []
+    var at = start
+    for index in 0..count {
+        if at + 16 > length { return .Error(failure(.InvalidArgument, at)) }
+        let kind = heapLoad<U32>(base, at)
+        let keyLength = heapLoad<U32>(base, at + 4)
+        let valueLength = heapLoad<U32>(base, at + 8)
+        let valueAt = alignRecord(at + 16 + keyLength)
+        if valueAt + valueLength > length { return .Error(failure(.InvalidArgument, at)) }
+        let key = stringFromCBytes(heapOffset(base, at + 16), keyLength)
+        let value = try readValue(base, valueAt, valueLength, kind, at)
+        properties.append(Property { key: key, value: value })
+        at = alignRecord(valueAt + valueLength)
+    }
+    return .Ok(properties)
+}
+
+let propertyTypes: [PropertyType] = [PropertyType.Bool, PropertyType.I64, PropertyType.U64, PropertyType.String, PropertyType.Bytes, PropertyType.List]
+
+// One property value of `kind`, a `PropertyType` raw value from the caller.
+// A registry property holds a flag, a number or text; bytes, lists and a
+// type no case names are refused.
+function readValue(
+    base: RawPtr,
+    at: Number,
+    length: Number,
+    kind: U32,
+    record: Number
+) -> Result<PropertyValue, TesseraError> {
+    let propertyType = try caseWithCode(propertyTypes, kind) otherwise return .Error(
+        failure(.InvalidArgument, record)
+    )
+    if propertyType == .String { return .Ok(.Text(stringFromCBytes(heapOffset(base, at), length))) }
+    if length < 8 { return .Error(failure(.InvalidArgument, record)) }
+    let word = heapLoad<U64>(base, at)
+    return match propertyType {
+        Bool -> .Ok(.Flag(word != U64(0)))
+        I64 -> .Ok(.Signed(signedOf(word)))
+        U64 -> .Ok(.Unsigned(word))
+        String -> .Ok(.Text(stringFromCBytes(heapOffset(base, at), length)))
+        Bytes -> .Error(failure(.InvalidArgument, record))
+        List -> .Error(failure(.InvalidArgument, record))
+    }
+}
+
+function textProperty(key: borrow String, value: borrow String) -> Property {
+    return Property { key: key, value: .Text(value) }
+}
+
+function numberProperty(key: borrow String, value: U64) -> Property {
+    return Property { key: key, value: .Unsigned(value) }
+}
+
+function flagProperty(key: borrow String, value: Bool) -> Property {
+    return Property { key: key, value: .Flag(value) }
+}
+
+struct Entry {
+    var id: EntryId
+    var entryClass: EntryClass
+    var family: Family
+    var parent: EntryId?
+    var flags: EntryFlags
+    var path: String
+    var node: String?
+    var name: String
+    var properties: [Property]
+
+    function property(borrow self, key: borrow String) -> Property? {
+        for property in self.properties {
+            if property.key == key { return .Some(property) }
+        }
+        return .None
+    }
+
+    function text(borrow self, key: borrow String) -> String? {
+        return match self.property(key) {
+            Some(property) -> property.text()
+            None -> .None
+        }
+    }
+
+    function word(borrow self, key: borrow String) -> U64? {
+        return match self.property(key) {
+            Some(property) -> property.word()
+            None -> .None
+        }
+    }
+}
+
+// FNV-1a 64 over a sysfs path; never 0, which names no entry.
+function entryIdOf(path: borrow String) -> EntryId {
+    var hash = U64(0xcbf29ce484222325)
+    for byte in path.utf8() {
+        hash = hash ^ U64(byte)
+        hash = wrappingMul(hash, U64(0x100000001b3))
+    }
+    if hash == U64(0) { return EntryId(1) }
+    return EntryId(hash)
+}
+
+// Records in a caller's buffer start on 8-byte boundaries.
+function alignRecord(offset: Number) -> Number { return (offset + 7) & ~7 }
+
+// A list header: the count, then the record size (§3.1).
+function writeListHeader(out: RawPtr, count: Number, size: Number) {
+    heapStore<U32>(out, 0, U32(count))
+    heapStore<U32>(out, 4, U32(size))
+}
+
+// Two's-complement words, without a conversion that traps on a negative
+// value.
+function twosComplement(value: Number) -> U64 {
+    if value < 0 { return U64(0xFFFFFFFFFFFFFFFF) - U64(-(value + 1)) }
+    return U64(value)
+}
+
+function signedOf(word: U64) -> Number {
+    if word >= U64(0x8000000000000000) { return -Number(U64(0xFFFFFFFFFFFFFFFF) - word) - 1 }
+    return word
+}
+
+function signedOf32(word: U32) -> Number {
+    if word >= U32(0x80000000) { return Number(word) - 4294967296 }
+    return word
+}
+
+function word32Of(value: Number) -> U32 {
+    if value < 0 { return U32(4294967296 + value) }
+    return U32(value)
+}

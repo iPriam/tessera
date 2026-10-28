@@ -1,0 +1,211 @@
+import Foundation
+
+// A debugger's control of another process (§20.2), for the debug server a
+// development image runs: its threads stopped and resumed, stepped one
+// instruction, their registers and its memory read and written. Each call
+// takes the entitlement `tessera.debug.attach`, which only a debug image
+// grants; a production image refuses every one.
+
+// Why a thread stopped, as ptrace's event names it.
+@Open public enum DebugStopCause: U8 {
+    // A signal, a breakpoint or the end of a step.
+    Signal = 0
+    // The thread started another, which is held stopped too.
+    Clone = 3
+    // The thread is about to end.
+    Exit = 6
+    // The debugger interrupted it.
+    Interrupt = 128
+}
+
+public struct DebugStop {
+    let signal: Number
+    let cause: DebugStopCause
+}
+
+public enum DebugChange {
+    Stopped(DebugStop)
+    // The thread ended, with this exit status.
+    Exited(Number)
+    // This signal ended the thread.
+    Killed(Number)
+}
+
+public struct DebugEvent {
+    let thread: Number
+    let change: DebugChange
+}
+
+public struct DebugSignal {
+    let signal: Number
+    // The kernel's `si_code`: how it was raised.
+    let code: Number
+    // For a fault, the address that faulted; 0 otherwise.
+    let address: U64
+}
+
+function debugAllowed() -> Result<Void, TesseraError> {
+    // The system's own programs hold the entitlement, as they do
+    // `tessera.driver`, and an application is never given it; init starts
+    // the debug server among them only when the boot line has `tessera.dev`.
+    if !entitlementHeld("tessera.debug.attach") { return .Error(failure(.NotEntitled)) }
+    return .Ok
+}
+
+// Stops every thread of `pid` and holds it; its threads, its first one first.
+public function debugAttach(pid: Number) -> Result<[Number], TesseraError> {
+    try debugAllowed()
+    return kernelDebugAttach(pid)
+}
+
+// The threads `pid` now has.
+public function debugThreads(pid: Number) -> Result<[Number], TesseraError> {
+    try debugAllowed()
+    return .Ok(kernelDebugThreads(pid))
+}
+
+// Lets the thread go, delivering `signal` to it when not 0.
+public function debugDetach(thread: Number, signal: Number) -> Result<Void, TesseraError> {
+    try debugAllowed()
+    return kernelDebugDetach(thread, signal)
+}
+
+public function debugContinue(thread: Number, signal: Number) -> Result<Void, TesseraError> {
+    try debugAllowed()
+    return kernelDebugContinue(thread, signal)
+}
+
+// Runs one instruction of the thread, which then stops with SIGTRAP.
+public function debugStep(thread: Number, signal: Number) -> Result<Void, TesseraError> {
+    try debugAllowed()
+    return kernelDebugStep(thread, signal)
+}
+
+// Stops a running thread; its stop is waited for as any other.
+public function debugInterrupt(thread: Number) -> Result<Void, TesseraError> {
+    try debugAllowed()
+    return kernelDebugInterrupt(thread)
+}
+
+public function debugKill(thread: Number) -> Result<Void, TesseraError> {
+    try debugAllowed()
+    return kernelDebugKill(thread)
+}
+
+// The next change of any thread held, waiting for one.
+public function debugWait() -> Result<DebugEvent, TesseraError> {
+    try debugAllowed()
+    return kernelDebugWait()
+}
+
+// A change of a thread held that has happened already, if any has; the
+// debug server polls between reads of its port.
+public function debugPoll() -> Result<DebugEvent?, TesseraError> {
+    try debugAllowed()
+    return kernelDebugPoll()
+}
+
+// A stopped thread's registers, laid out as `CrashedThread.registers`.
+public function debugRegisters(thread: Number) -> Result<[U64], TesseraError> {
+    try debugAllowed()
+    return kernelDebugRegisters(thread)
+}
+
+public function debugSetRegisters(
+    thread: Number,
+    registers: borrow [U64]
+) -> Result<Void, TesseraError> {
+    try debugAllowed()
+    return kernelDebugSetRegisters(thread, registers)
+}
+
+// The signal a stopped thread stopped for.
+public function debugSignal(thread: Number) -> Result<DebugSignal, TesseraError> {
+    try debugAllowed()
+    return kernelDebugSignal(thread)
+}
+
+// Up to `count` bytes of the process's memory at `address`; fewer where its
+// mapping ends.
+public function debugReadMemory(
+    pid: Number,
+    address: U64,
+    count: Number
+) -> Result<[UN8], TesseraError> {
+    try debugAllowed()
+    return kernelDebugRead(pid, address, count)
+}
+
+// Writes the bytes at `address`, read-only code included.
+public function debugWriteMemory(
+    pid: Number,
+    address: U64,
+    bytes: borrow [UN8]
+) -> Result<Void, TesseraError> {
+    try debugAllowed()
+    return kernelDebugWrite(pid, address, bytes)
+}
+
+// The debug port's connection to the host, where the debugger is.
+@Derive(Copy)
+public distinct DebugPort = Number
+
+// The ports the development image's machine gives its debuggers, by the
+// names QEMU gives them: debugserver's, and LLVM's lldb-server's.
+public namespace DebugPortName {
+    let debugServer: String = "tessera.debug"
+    let lldbServer: String = "tessera.lldb"
+}
+
+// The port the development image's machine gives its debugger; `NotFound`
+// on a machine without one.
+public function debugPortOpen() -> Result<DebugPort, TesseraError> {
+    return debugPortNamed(DebugPortName.debugServer)
+}
+
+// The port QEMU named `name`; `NotFound` on a machine without it.
+public function debugPortNamed(name: borrow String) -> Result<DebugPort, TesseraError> {
+    try debugAllowed()
+    let fd = try kernelDebugPortOpen(name)
+    return .Ok(DebugPort(fd))
+}
+
+// Hands `port` on to the program the process becomes next: it stays open
+// across `processReplace`, its reads wait, and what the host has already
+// sent stays in it, as it would not if the program opened the port again.
+// Answers the descriptor the program is told to use.
+public function debugPortHandedOn(port: DebugPort) -> Result<Number, TesseraError> {
+    try kernelDebugPortKeptAcrossExec(port.raw)
+    return .Ok(port.raw)
+}
+
+// Whether a debugger on the host is connected to `port` now.
+public function debugPortHostAttached(port: DebugPort) -> Bool {
+    return kernelDebugPortHostAttached(port.raw)
+}
+
+// What the host sent, after waiting up to `wait` nanoseconds for anything;
+// empty when nothing came, and nothing at all while no debugger is connected.
+public function debugPortRead(port: DebugPort, wait: U64) -> Result<[UN8]?, TesseraError> {
+    return kernelDebugPortRead(port.raw, wait)
+}
+
+public function debugPortWrite(port: DebugPort, bytes: borrow [UN8]) -> Result<Void, TesseraError> {
+    return kernelDebugPortWrite(port.raw, bytes)
+}
+
+// The process's mappings, lowest first.
+public function debugRegions(pid: Number) -> Result<[CrashedRegion], TesseraError> {
+    try debugAllowed()
+    return kernelDebugRegions(pid)
+}
+
+public function debugAuxiliaryVector(pid: Number) -> Result<[UN8], TesseraError> {
+    try debugAllowed()
+    return kernelDebugAuxiliaryVector(pid)
+}
+
+// The machine's architecture, which the debugger's register layout follows.
+public function debugArchitecture() -> Architecture {
+    return kernelArchitecture()
+}

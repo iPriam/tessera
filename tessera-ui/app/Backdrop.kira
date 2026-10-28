@@ -1,0 +1,260 @@
+//! The window's backdrop: what is behind the window, blurred and tinted as a
+//! Mac's sidebar is, which MosaicDisplay draws under the hole the window
+//! leaves for its sidebar (kira-ui's WindowBackdrop.kira), and the glass the
+//! window's chrome lays over the hole, which MosaicDisplay draws over it, and
+//! the platform's glass, which it draws under the platform's surface.
+
+import Foundation
+import KiraUI
+import KCoreAnimation
+import TesseraDisplayClient
+
+/// The backdrop MosaicDisplay was last asked for: none when it is zero wide.
+struct HostBackdrop {
+    var width: Number = 0
+    var height: Number = 0
+    var margin: Number = 0
+    var dark: Bool = false
+    var active: Bool = true
+    // The glass lifted off the hole, drawn over the backdrop.
+    var pieces: [WindowBackdropPiece] = []
+}
+
+/// Asks for the backdrop the last build left a hole for, when it is not the
+/// one last asked for. Sent before the frame is committed, so the glass
+/// changes with the picture that holds the hole.
+function sendBackdrop(
+    session: borrow Session,
+    hosting: borrow mut Hosting
+) -> Result<Void, SessionEnd> {
+    let strip = windowBackdropStrip()
+    let wanted = HostBackdrop {
+        width: strip.width,
+        height: strip.height,
+        margin: hosting.host.margin,
+        dark: windowBackdropDark(),
+        active: windowActive(),
+        pieces: windowBackdropPieces()
+    }
+    let last = hosting.host.backdrop
+    if wanted.width == last.width && wanted.height == last.height && wanted.margin == last.margin
+        && wanted.dark == last.dark && wanted.active == last.active && wanted.pieces == last.pieces {
+        return .Ok
+    }
+    // The strip meets the window's leading corners and runs on under the
+    // detail by a corner's length, so only its leading corners are rounded
+    // where they show. The glass is placed from the buffer's top left, which
+    // is the margin out from the window's.
+    let corner = windowChromeMetrics().cornerRadius * interfaceScale()
+    let shown = wanted.width > 0
+    try session.sendMessage(
+        .SetGlass(
+            DisplayGlass {
+                surface: session.surface,
+                piece: 0,
+                x: shown ? wanted.margin : 0,
+                y: shown ? wanted.margin : 0,
+                width: shown ? wanted.width + corner : 0,
+                height: shown ? wanted.height : 0,
+                corner: corner,
+                shape: .Continuous,
+                interface: .Desktop,
+                recipe: .WindowBackdrop,
+                dark: wanted.dark,
+                active: wanted.active,
+            }
+        )
+    )
+    // The glass over the hole, placed from the strip's corner as the
+    // backdrop is; pieces the last frame had and this one has not are taken
+    // away.
+    let through = UNumber(max(wanted.pieces.count, last.pieces.count) + 1)
+    for i in 1..through {
+        let index = i - 1
+        let has = shown && index < wanted.pieces.count
+        let gone = index < last.pieces.count
+        if has || gone {
+            let piece = has ? glassShown(wanted.pieces[index]) : WindowBackdropPiece {}
+            try session.sendMessage(
+                .SetGlass(
+                    DisplayGlass {
+                        surface: session.surface,
+                        piece: i,
+                        x: has ? wanted.margin + piece.x : 0,
+                        y: has ? wanted.margin + piece.y : 0,
+                        width: piece.width,
+                        height: piece.height,
+                        corner: piece.corner,
+                        shape: piece.capsule ? .Capsule : piece.continuous ? .Continuous : .Arc,
+                        interface: .Desktop,
+                        recipe: .Regular,
+                        dark: wanted.dark,
+                        active: wanted.active,
+                    }
+                )
+            )
+        }
+    }
+    hosting.host.backdrop = move wanted
+    return .Ok
+}
+
+/// The platform's glass starts at this piece, past the pieces the platform
+/// asks for itself (the Dock's, Control Center's modules, the banners').
+namespace PlatformLiftedGlass {
+    let firstPiece: Number = 1000
+}
+
+/// Asks for the glass the platform's last build lifted out of its frame, each
+/// piece that moved or appeared, and takes away the pieces it no longer has.
+/// Sent before the frame is committed, so the glass changes with the picture
+/// cut for it.
+function sendPlatformGlass(
+    session: borrow Session,
+    hosting: borrow mut Hosting
+) -> Result<Void, SessionEnd> {
+    let wanted = copy hosting.host.platformGlass
+    let last = copy hosting.host.platformGlassSent
+    let dark = interfaceDrawnDark()
+    let interface: DisplayGlassInterface = interfaceMode() == .AdaptiveDesktop ? .Desktop : .Touch
+    for index in 0..max(wanted.count, last.count) {
+        let has = index < wanted.count
+        let piece = has ? glassShown(wanted[index]) : WindowBackdropPiece {}
+        let before = index < last.count ? glassShown(last[index]) : WindowBackdropPiece {}
+        let same = has && index < last.count && piece.x == before.x && piece.y == before.y
+            && piece.width == before.width && piece.height == before.height && piece.corner == before.corner
+            && displayRecipe(piece.recipe) == displayRecipe(before.recipe)
+        if !same {
+            try session.sendMessage(
+                .SetGlass(
+                    DisplayGlass {
+                        surface: session.surface,
+                        piece: UNumber(PlatformLiftedGlass.firstPiece + index),
+                        x: piece.x,
+                        y: piece.y,
+                        width: piece.width,
+                        height: piece.height,
+                        corner: piece.corner,
+                        shape: piece.capsule ? .Capsule : piece.continuous ? .Continuous : .Arc,
+                        interface: interface,
+                        recipe: displayRecipe(piece.recipe),
+                        dark: dark,
+                    }
+                )
+            )
+        }
+    }
+    hosting.host.platformGlassSent = move wanted
+    return .Ok
+}
+
+/// The part of `piece` at or after the surface's top left, which is where
+/// the compositor's glass is placed from, and none when nothing of it is: a
+/// piece partly above or before the surface, as one coming in from the top,
+/// is cut at that edge rather than moved in. Each crosses the channel as an
+/// unsigned word, so nothing of it is ever negative.
+function glassShown(piece: borrow WindowBackdropPiece) -> WindowBackdropPiece {
+    if piece.width < 0 || piece.height < 0 || piece.corner < 0 {
+        log warn(
+            "a piece of glass was laid out with a negative size",
+            x: piece.x,
+            y: piece.y,
+            width: piece.width,
+            height: piece.height,
+            corner: piece.corner
+        )
+    }
+    let x = max(piece.x, 0)
+    let y = max(piece.y, 0)
+    let width = piece.x + piece.width - x
+    let height = piece.y + piece.height - y
+    var shown = copy piece
+    if width <= 0 || height <= 0 {
+        shown.x = 0
+        shown.y = 0
+        shown.width = 0
+        shown.height = 0
+    } else {
+        shown.x = x
+        shown.y = y
+        shown.width = width
+        shown.height = height
+    }
+    shown.corner = max(piece.corner, 0)
+    return shown
+}
+
+/// The compositor's name for the glass a piece is made of.
+function displayRecipe(recipe: CAGlassRecipe) -> DisplayGlassRecipe {
+    return match recipe {
+        Regular -> .Regular
+        Clear -> .Clear
+        Dock -> .Dock
+        DockRegular -> .DockRegular
+        ControlCenter -> .ControlCenter
+        NotificationCenter -> .NotificationCenter
+        AbuttedSidebar -> .AbuttedSidebar
+        AppIcons -> .AppIcons
+        AVPlayer -> .AVPlayer
+        Bubbles -> .Bubbles
+        Camera -> .Camera
+        CarPlayUltra -> .CarPlayUltra
+        CartouchePopover -> .CartouchePopover
+        Control -> .Control
+        FaceTime -> .FaceTime
+        Identity -> .Identity
+        Inspector -> .Inspector
+        Keyboard -> .Keyboard
+        Loupe -> .Loupe
+        Menu -> .Menu
+        Monogram -> .Monogram
+        Sidebar -> .Sidebar
+        Siri -> .Siri
+        SiriSnippet -> .SiriSnippet
+        Slider -> .Slider
+        Text -> .Text
+        Widgets -> .Widgets
+    }
+}
+
+/// Tells the platform whether the window asks for the status bar to be hidden
+/// (`.statusBarHidden`), when that has changed since it was last told.
+function sendStatusBarHidden(
+    session: borrow Session,
+    hosting: borrow mut Hosting
+) -> Result<Void, SessionEnd> {
+    let hidden = hosting.host.statusBarHidden
+    if hidden == hosting.host.statusBarHiddenSent { return .Ok }
+    try session.sendMessage(
+        .SetChannel(
+            DisplayChannelValue {
+                surface: session.surface,
+                channel: .StatusBarHidden,
+                value: hidden ? 1 : 0
+            }
+        )
+    )
+    hosting.host.statusBarHiddenSent = hidden
+    return .Ok
+}
+
+/// Tells the platform whether the home screen is being edited, when that
+/// has changed since it was last told.
+function sendHomeEditing(
+    session: borrow Session,
+    hosting: borrow mut Hosting
+) -> Result<Void, SessionEnd> {
+    let editing = homeEditing()
+    if editing == hosting.host.homeEditingSent { return .Ok }
+    try session.sendMessage(
+        .SetChannel(
+            DisplayChannelValue {
+                surface: session.surface,
+                channel: .HomeEditing,
+                value: editing ? 1 : 0
+            }
+        )
+    )
+    hosting.host.homeEditingSent = editing
+    return .Ok
+}

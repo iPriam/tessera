@@ -1,0 +1,273 @@
+//! Hotplug: the registry watches that tell the service when disks and volumes come and go.
+import Foundation
+import Heap
+import LibTessera
+import DeviceKit
+
+// Disks that come and go while the service runs, as diskarbitrationd sees
+// them through IOKit's matching notifications.
+//
+// Two DeviceKit registry watches, one on BlockDevice entries and one on
+// Partition entries, wake the service. A disk or partition that appears is
+// probed and mounted as the scan would have. One that goes is forgotten:
+// its mount is detached (`MNT_DETACH`), because the device behind it is
+// already gone and nothing it held can be written any more, and its mount
+// point is removed. A disk that was ejected and goes away is no longer
+// remembered as ejected, so attaching it again mounts it. A change to an
+// entry's properties, which is how a drive reports a medium put in or taken
+// out, is a disk that went, or one that came.
+
+/// The watches the service holds on the registry: one for each class of entry it follows.
+struct Watches {
+    var disks: Ref
+    var partitions: Ref
+}
+
+/// What a watch completion is for: the registry, or an entry class's watch.
+enum Watched {
+    Disks
+    Partitions
+}
+
+/// One registry change, as the registry records it.
+@FFI.Struct { layout: c }
+struct RegistryChangeRecord {
+    var kind: U32
+    var entryClass: EntryClass
+    var entry: U64
+    var generation: U64
+}
+
+/// The layout of a watch record in the registry's change list.
+namespace WatchRecord {
+    let headerBytes: Number = 8
+    let changeBytes: Number = 24
+    let changes: Number = 64
+}
+
+/// The kinds of registry change the service tells apart, in the order the registry numbers them.
+let registryChangeKinds: [RegistryChangeKind] = [RegistryChangeKind.Matched, RegistryChangeKind.Terminated, RegistryChangeKind.PropertiesChanged, RegistryChangeKind.Resync]
+
+/// The kind of registry change `raw` names, or none when it names none.
+function changeKindOf(raw: UN32) -> RegistryChangeKind? {
+    for kind in registryChangeKinds {
+        if kind.rawValue() == raw { return .Some(kind) }
+    }
+    return .None
+}
+
+/// A watch on the entries of `entryClass`.
+function watchClass(entryClass: borrow EntryClass) -> Result<Ref, TesseraError> {
+    let spec = classSpec(entryClass)
+    return registryWatch(Buffer { address: spec.pointer(), length: RegistryRecord.specBytes })
+}
+
+/// Arms `watch` so its next change completes under `key`.
+function armWatch(service: borrow Service, watch: Ref, key: Number) -> Result<Void, TesseraError> {
+    return refWaitAsync(watch, DeviceEvents.readable, .Once, service.port, UNumber(key))
+}
+
+/// Starts the watches on the entry classes the service follows.
+function startWatches(service: borrow mut Service) -> Result<Void, TesseraError> {
+    let disks = try watchClass(.BlockDevice)
+    let partitions = match watchClass(.Partition) {
+        Ok(value) -> value
+        Error(failed) -> {
+            // The first watch is released before the failure is returned;
+            // try would leak it.
+            closeRef(disks)
+            return .Error(failed)
+        }
+    }
+    service.watches = .Some(Watches { disks: disks, partitions: partitions })
+    match drainChanges(disks) {
+        Ok -> {}
+        Error(failed) -> log warn("could not drain the initial disk changes", error: errorName(failed))
+    }
+    match drainChanges(partitions) {
+        Ok -> {}
+        Error(failed) -> log warn("could not drain the initial partition changes", error: errorName(failed))
+    }
+    try armWatch(service, disks, PortKey.diskWatch)
+    return armWatch(service, partitions, PortKey.partitionWatch)
+}
+
+/// Forgets volume `index`, which is no longer in the registry.
+function forgetVolume(service: borrow mut Service, index: Number) {
+    let volume = service.volumes[index]
+    match volume.mountPoint {
+        Some(path) -> if ownsMount(path) {
+            // Detached: the device is gone, so the mount goes now and the
+            // kernel lets go of it once nothing on it is open.
+            match volumeUnmount(path, VolumeUnmountOptions.detach) {
+                Ok -> {}
+                Error(failed) -> log warn(
+                    "cannot detach a volume",
+                    disk: volume.name,
+                    mountPoint: path,
+                    error: errorName(failed)
+                )
+            }
+            removeMountPoint(service, path)
+            log info(
+                "a disk went away; its volume was unmounted",
+                disk: volume.name,
+                mountPoint: path
+            )
+            announce(service, path, false)
+        } else {
+            log info("a disk went away", disk: volume.name)
+        }
+        None -> log info("a disk went away", disk: volume.name)
+    }
+    notify(service, .Disappeared, index)
+    var kept: [Volume] = []
+    for position in 0..service.volumes.count {
+        if position != index { kept.append(service.volumes[position]) }
+    }
+    service.volumes = kept
+}
+
+/// Forgets an ejected disk and its volumes.
+function forgetEjected(service: borrow mut Service, entry: EntryId) {
+    var kept: [EntryId] = []
+    for ejected in service.ejected {
+        if !sameEntry(ejected, entry) { kept.append(ejected) }
+    }
+    service.ejected = kept
+}
+
+/// Handles an entry appearing: a disk or a volume is scanned and mounted when it is one to mount.
+function entryAppeared(service: borrow mut Service, entry: EntryId, kind: borrow EntryKind) {
+    if volumeIndex(service, entry).isSome() { return }
+    let before = service.volumes.count
+    add(service, entry, kind)
+    if service.volumes.count == before { return }
+    let index = service.volumes.count - 1
+    notify(service, .Appeared, index)
+    // A volume that does not mount is said; the entry is still listed.
+    let table = match mountTable() {
+        Ok(value) -> value
+        Error(failed) -> {
+            log warn("cannot read what is mounted", error: errorName(failed))
+            return
+        }
+    }
+    match mount(service, index, table) {
+        Ok -> {}
+        Error(failed) -> log warn(
+            "cannot mount a volume that appeared",
+            disk: service.volumes[index].name,
+            error: errorName(failed)
+        )
+    }
+    if service.volumes[index].mountPoint.isSome() { notify(service, .DescriptionChanged, index) }
+}
+
+/// Handles an entry going: its volume is forgotten.
+function entryDisappeared(service: borrow mut Service, entry: EntryId) {
+    forgetEjected(service, entry)
+    match volumeIndex(service, entry) {
+        Some(index) -> forgetVolume(service, index)
+        // Not listed, so there is no volume to forget.
+        None -> {}
+    }
+}
+
+/// Handles a disk's medium changing: its volumes are rescanned.
+function mediumChanged(service: borrow mut Service, entry: EntryId, kind: borrow EntryKind) {
+    let holds = match numberProperty(entry, "size") {
+        Some(size) -> size > 0
+        None -> false
+    }
+    let listed = volumeIndex(service, entry).isSome()
+    if listed && !holds { entryDisappeared(service, entry) }
+    if !listed && holds { entryAppeared(service, entry, kind) }
+}
+
+/// Applies one registry change to the volumes the service knows.
+function applyChange(
+    service: borrow mut Service,
+    change: borrow RegistryChangeKind,
+    entry: EntryId,
+    kind: borrow EntryKind
+) {
+    match change {
+        Matched -> entryAppeared(service, entry, kind)
+        Terminated -> entryDisappeared(service, entry)
+        PropertiesChanged -> mediumChanged(service, entry, kind)
+        Resync -> log warn(
+            "the registry overran; disks that came or went meanwhile are seen when the service starts again"
+        )
+    }
+}
+
+/// Reads a batch of registry changes into `block`, answering how many were read.
+function readBatch(watch: Ref, block: RawPtr, size: Number) -> Result<Number, TesseraError> {
+    return match registryWatchRead(watch, Buffer { address: block, length: size }) {
+        Ok(value) -> .Ok(value)
+        Error(failed) -> match failed.code {
+            ShouldWait -> .Ok(0)
+            else -> .Error(failed)
+        }
+    }
+}
+
+/// Reads the registry changes waiting on `watch` and applies each one.
+function readChanges(
+    service: borrow mut Service,
+    watch: Ref,
+    kind: borrow EntryKind
+) -> Result<Void, TesseraError> {
+    let size = WatchRecord.headerBytes + WatchRecord.changes * WatchRecord.changeBytes
+    let block = zeroedBlock(count: size, alignment: 16)
+    while true {
+        let count = try readBatch(watch, block.pointer(), size)
+        if count == 0 { return .Ok }
+        for item in 0..count {
+            let offset = WatchRecord.headerBytes + item * WatchRecord.changeBytes
+            let change: RegistryChangeRecord = heapLoad(block.pointer(), offset)
+            match changeKindOf(change.kind) {
+                Some(changeKind) -> applyChange(service, changeKind, EntryId(change.entry), kind)
+                None -> log warn(
+                    "a registry change of a kind this service does not know",
+                    kind: change.kind
+                )
+            }
+        }
+    }
+}
+
+/// Reads every change waiting on `watch`, until none is left.
+function drainChanges(watch: Ref) -> Result<Void, TesseraError> {
+    let size = WatchRecord.headerBytes + WatchRecord.changes * WatchRecord.changeBytes
+    let block = zeroedBlock(count: size, alignment: 16)
+    while true {
+        let count = try readBatch(watch, block.pointer(), size)
+        if count == 0 { return .Ok }
+    }
+}
+
+/// Handles a watch completion: its changes are read and applied, and the watch is armed again.
+function watchWoke(service: borrow mut Service, watched: Watched) {
+    let watches = try service.watches otherwise return
+    match watched {
+        Disks -> rearm(service, watches.disks, PortKey.diskWatch, .WholeDisk)
+        Partitions -> rearm(service, watches.partitions, PortKey.partitionWatch, .Partition)
+    }
+}
+
+/// Arms the watch `watch` again, after its changes were read.
+function rearm(service: borrow mut Service, watch: Ref, key: Number, kind: borrow EntryKind) {
+    match readChanges(service, watch, kind) {
+        Ok -> {}
+        Error(failed) -> log warn("cannot read a registry watch", error: errorName(failed))
+    }
+    match armWatch(service, watch, key) {
+        Ok -> {}
+        Error(failed) -> log warn(
+            "a registry watch cannot be armed again; disks that come or go are not seen",
+            error: errorName(failed)
+        )
+    }
+}

@@ -1,0 +1,273 @@
+import Foundation
+import Kten
+
+// The values a `.tessicon` document is made of, in Kten's text form: each a
+// Kira value literal, a colour `Color { space: .Srgb, red: 0, … }`, a fill
+// `.Solid(Color { … })`, a blend mode `.Multiply`. A field a document leaves
+// out takes its default, so a document only spells what it changes.
+
+// Why a document's text is not a document.
+public enum IconReadFailure {
+    // A value of the wrong kind, or a field or element that is not there.
+    Shape(KtenReadFailure)
+    // A case this version does not know, in the property it was found in.
+    UnknownCase(String)
+}
+
+function readFailure(failure: KtenReadFailure) -> IconReadFailure {
+    return .Shape(failure)
+}
+
+function numberIn(value: borrow Kten) -> Result<Number, IconReadFailure> {
+    return match value.number() {
+        Ok(number) -> .Ok(number)
+        Error(failure) -> .Error(readFailure(move failure))
+    }
+}
+
+function boolIn(value: borrow Kten) -> Result<Bool, IconReadFailure> {
+    return match value.boolean() {
+        Ok(flag) -> .Ok(flag)
+        Error(failure) -> .Error(readFailure(move failure))
+    }
+}
+
+function textIn(value: borrow Kten) -> Result<String, IconReadFailure> {
+    return match value.text() {
+        Ok(text) -> .Ok(text)
+        Error(failure) -> .Error(readFailure(move failure))
+    }
+}
+
+// The case `value` names. Kten reads `.None` as its null, so a null is the
+// case `None`.
+function caseIn(value: borrow Kten) -> Result<KtenCase, IconReadFailure> {
+    match value {
+        Null -> return .Ok(KtenCase { name: "None" })
+        Bool, Number, Text, Bytes, List, Object, Case -> {}
+    }
+    return match value.variant() {
+        Ok(variant) -> .Ok(variant)
+        Error(failure) -> .Error(readFailure(move failure))
+    }
+}
+
+function itemsIn(value: borrow Kten) -> Result<[Kten], IconReadFailure> {
+    return match value.items() {
+        Ok(items) -> .Ok(items)
+        Error(failure) -> .Error(readFailure(move failure))
+    }
+}
+
+// The field `name` of `object`; none when the document leaves it out. The
+// fields are searched here rather than through `Kten.field`, whose answer for a
+// field left out is a failure, and leaving one out is no failure.
+function fieldIn(object: borrow Kten, name: borrow String) -> Result<Kten?, IconReadFailure> {
+    let fields = match object.object() {
+        Ok(read) -> read.fields
+        Error(failure) -> return .Error(readFailure(move failure))
+    }
+    for field in fields {
+        if field.name == name { return .Ok(.Some(copy field.value)) }
+    }
+    return .Ok(.None)
+}
+
+function numberField(
+    object: borrow Kten,
+    name: borrow String,
+    fallback: Number
+) -> Result<Number, IconReadFailure> {
+    return match try fieldIn(object, name) {
+        Some(value) -> numberIn(value)
+        None -> .Ok(fallback)
+    }
+}
+
+function boolField(
+    object: borrow Kten,
+    name: borrow String,
+    fallback: Bool
+) -> Result<Bool, IconReadFailure> {
+    return match try fieldIn(object, name) {
+        Some(value) -> boolIn(value)
+        None -> .Ok(fallback)
+    }
+}
+
+function textField(
+    object: borrow Kten,
+    name: borrow String,
+    fallback: borrow String
+) -> Result<String, IconReadFailure> {
+    return match try fieldIn(object, name) {
+        Some(value) -> textIn(value)
+        None -> .Ok(copy fallback)
+    }
+}
+
+function caseKten(name: borrow String) -> Kten {
+    return ktenCase(name, [])
+}
+
+// ─── Colours ────────────────────────────────────────────────────────────────
+
+function colorSpaceIn(value: borrow Kten) -> Result<IconColorSpace, IconReadFailure> {
+    let variant = try caseIn(value)
+    return match variant.name {
+        "Srgb" -> .Ok(.Srgb)
+        "ExtendedSrgb" -> .Ok(.ExtendedSrgb)
+        "DisplayP3" -> .Ok(.DisplayP3)
+        "Gray" -> .Ok(.Gray)
+        "ExtendedGray" -> .Ok(.ExtendedGray)
+        else -> .Error(.UnknownCase(variant.name))
+    }
+}
+
+function colorSpaceKten(space: IconColorSpace) -> Kten {
+    return caseKten(
+        match space {
+            Srgb -> "Srgb"
+            ExtendedSrgb -> "ExtendedSrgb"
+            DisplayP3 -> "DisplayP3"
+            Gray -> "Gray"
+            ExtendedGray -> "ExtendedGray"
+        }
+    )
+}
+
+function colorIn(value: borrow Kten) -> Result<IconColor, IconReadFailure> {
+    let space = match try fieldIn(value, "space") {
+        Some(named) -> try colorSpaceIn(named)
+        None -> IconColorSpace.Srgb
+    }
+    return .Ok(
+        IconColor {
+            space: space,
+            red: try numberField(value, "red", 0),
+            green: try numberField(value, "green", 0),
+            blue: try numberField(value, "blue", 0),
+            alpha: try numberField(value, "alpha", 1)
+        }
+    )
+}
+
+function colorKten(color: borrow IconColor) -> Kten {
+    return ktenObject(
+        "Color",
+        [
+            ktenField("space", colorSpaceKten(color.space)),
+            ktenField("red", .Number(color.red)),
+            ktenField("green", .Number(color.green)),
+            ktenField("blue", .Number(color.blue)),
+            ktenField("alpha", .Number(color.alpha))
+        ]
+    )
+}
+
+// ─── Fills ──────────────────────────────────────────────────────────────────
+
+function pointIn(
+    value: borrow Kten,
+    fallback: borrow IconPoint
+) -> Result<IconPoint, IconReadFailure> {
+    return .Ok(
+        IconPoint {
+            x: try numberField(value, "x", fallback.x),
+            y: try numberField(value, "y", fallback.y)
+        }
+    )
+}
+
+function pointKten(point: borrow IconPoint) -> Kten {
+    return ktenObject("Point", [ktenField("x", .Number(point.x)), ktenField("y", .Number(point.y))])
+}
+
+function gradientIn(value: borrow Kten) -> Result<IconGradient, IconReadFailure> {
+    let defaults = IconGradient {}
+    var gradient = IconGradient {}
+    let fromValue = try fieldIn(value, "from")
+    match fromValue {
+        Some(color) -> gradient.from = try colorIn(color)
+        // A gradient without its colours runs between the defaults.
+        None -> {}
+    }
+    let toValue = try fieldIn(value, "to")
+    match toValue {
+        Some(color) -> gradient.to = try colorIn(color)
+        // As above.
+        None -> {}
+    }
+    let startValue = try fieldIn(value, "start")
+    match startValue {
+        Some(point) -> gradient.start = try pointIn(point, defaults.start)
+        // The gradient starts at the default point.
+        None -> {}
+    }
+    let stopValue = try fieldIn(value, "stop")
+    match stopValue {
+        Some(point) -> gradient.stop = try pointIn(point, defaults.stop)
+        // The gradient stops at the default point.
+        None -> {}
+    }
+    return .Ok(gradient)
+}
+
+function gradientKten(gradient: borrow IconGradient) -> Kten {
+    return ktenObject(
+        "Gradient",
+        [
+            ktenField("from", colorKten(gradient.from)),
+            ktenField("to", colorKten(gradient.to)),
+            ktenField("start", pointKten(gradient.start)),
+            ktenField("stop", pointKten(gradient.stop))
+        ]
+    )
+}
+
+// The one value a case carries.
+function payloadIn(variant: borrow KtenCase) -> Result<Kten, IconReadFailure> {
+    if variant.payload.count != 1 { return .Error(.Shape(.OutOfRange(0))) }
+    return .Ok(copy variant.payload[0])
+}
+
+function fillIn(value: borrow Kten) -> Result<IconFill, IconReadFailure> {
+    let variant = try caseIn(value)
+    return match variant.name {
+        "Automatic" -> .Ok(.Automatic)
+        "SystemLight" -> .Ok(.SystemLight)
+        "SystemDark" -> .Ok(.SystemDark)
+        "None" -> .Ok(.None)
+        "Solid" -> solidFillIn(variant)
+        "AutomaticGradient" -> automaticGradientIn(variant)
+        "LinearGradient" -> linearGradientIn(variant)
+        else -> .Error(.UnknownCase(variant.name))
+    }
+}
+
+function solidFillIn(variant: borrow KtenCase) -> Result<IconFill, IconReadFailure> {
+    let payload = try payloadIn(variant)
+    return .Ok(.Solid(try colorIn(payload)))
+}
+
+function automaticGradientIn(variant: borrow KtenCase) -> Result<IconFill, IconReadFailure> {
+    let payload = try payloadIn(variant)
+    return .Ok(.AutomaticGradient(try colorIn(payload)))
+}
+
+function linearGradientIn(variant: borrow KtenCase) -> Result<IconFill, IconReadFailure> {
+    let payload = try payloadIn(variant)
+    return .Ok(.LinearGradient(try gradientIn(payload)))
+}
+
+function fillKten(fill: borrow IconFill) -> Kten {
+    return match fill {
+        Automatic -> caseKten("Automatic")
+        SystemLight -> caseKten("SystemLight")
+        SystemDark -> caseKten("SystemDark")
+        None -> caseKten("None")
+        Solid(color) -> ktenCase("Solid", [colorKten(color)])
+        AutomaticGradient(color) -> ktenCase("AutomaticGradient", [colorKten(color)])
+        LinearGradient(gradient) -> ktenCase("LinearGradient", [gradientKten(gradient)])
+    }
+}

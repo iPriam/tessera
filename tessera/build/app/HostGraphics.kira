@@ -1,0 +1,248 @@
+import Foundation
+import Build
+
+// The host half of Tessera's GPU stack: virglrenderer with venus, and a QEMU
+// that talks to it. Nothing here runs inside Tessera. venus forwards a
+// guest's Vulkan calls to a Vulkan driver on the host: virglrenderer decodes
+// the venus protocol, and QEMU's virtio-gpu is what the guest's driver emits
+// it to.
+//
+// Both are pinned to the versions the patches under patches/ were written
+// against. Upstream virglrenderer requires libdrm for venus, sleeps through a
+// call Darwin lacks and runs venus in a second process built on signalfd;
+// the patches change that one at a time, and QEMU's let it map venus blobs
+// and give Hypervisor.framework the memory slots they need. The build is one
+// command in a workspace, whose prefix holds the emulator, its firmware and
+// data, and virglrenderer. Both trees are unpacked and patched in that
+// workspace and kept there (UpstreamSource.kira), so a change rebuilds what
+// ninja finds touched by it, and an edit to the build itself rebuilds
+// nothing.
+//
+// On a Mac, KosmicKrisp is Mesa's Vulkan over Metal, the driver venus
+// forwards to; MoltenVK is what a Mac without it falls back to.
+
+namespace HostGraphicsSources {
+    let virgl: Upstream = Upstream {
+        top: "virglrenderer-virglrenderer-1.1.1",
+        url: "https://gitlab.freedesktop.org/virgl/virglrenderer/-/archive/virglrenderer-1.1.1/virglrenderer-virglrenderer-1.1.1.tar.gz",
+        sha256: "d7c30699f8dcd4b2fef17332fd5c2ae64fdae8585f64f14363a94799a34e74f4"
+    }
+    let qemu: Upstream = Upstream {
+        top: "qemu-10.0.2",
+        url: "https://download.qemu.org/qemu-10.0.2.tar.xz",
+        sha256: "ef786f2398cb5184600f69aef4d5d691efd44576a3cff4126d38d4c6fec87759"
+    }
+    let inprocHeader: String = "patches/virglrenderer-1.1.1-inproc-venus/vkr_inproc.h"
+    let inprocPatch: String = "patches/virglrenderer-1.1.1-inproc-venus/virglrenderer.c.patch"
+    let darwinPatch: String = "patches/virglrenderer-1.1.1-darwin/darwin.patch"
+    let virglPatches: [String] = [
+        "patches/virglrenderer-1.1.1-venus-host-pointer/venus-host-pointer.patch",
+        "patches/virglrenderer-1.1.1-venus-shm-import/venus-shm-import.patch"
+    ]
+    let qemuPatches: [String] = [
+        "patches/qemu-10.0.2-darwin-venus/darwin-venus.patch",
+        "patches/qemu-10.0.2-blob-mapping/blob-mapping.patch",
+        "patches/qemu-10.0.2-hvf-slots/hvf-slots.patch",
+        "patches/qemu-10.0.2-highmem-mmio-size/highmem-mmio-size.patch",
+        "patches/qemu-10.0.2-no-app-nap/no-app-nap.patch",
+        "patches/qemu-10.0.2-hidpi/hidpi.patch"
+    ]
+    // KosmicKrisp is newer than any Mesa release: the commit it was built
+    // from, as GitLab archives it.
+    let kosmicKrisp: Upstream = Upstream {
+        top: "mesa-0ba4b08edc65075e9346d20d5310261939aaaf48",
+        url: "https://gitlab.freedesktop.org/mesa/mesa/-/archive/0ba4b08edc65075e9346d20d5310261939aaaf48/mesa-0ba4b08edc65075e9346d20d5310261939aaaf48.tar.gz",
+        sha256: "5863c4dbcee957734589f19d61ec567947356cc45fdd21dce10cb82dbfba964b"
+    }
+    let kosmicKrispPatches: [String] = [
+        "patches/mesa-kosmickrisp/buffer-backed-optimal-textures.patch",
+        "patches/mesa-kosmickrisp/linear-color-attachment.patch",
+        "patches/mesa-kosmickrisp/disk-shader-cache.patch",
+        "patches/mesa-kosmickrisp/device-local-memory-type.patch"
+    ]
+}
+
+// The emulator a venus boot runs: a prefix whose bin/ holds
+// qemu-system-<arch> for each architecture the host boots.
+function hostGraphics(graph: borrow mut Graph, host: borrow Host) -> Artifact {
+    // In-process venus first: it replaces the render server the others
+    // patch around.
+    var virglChanges = [
+        UpstreamChange.Place(
+            TreePlace {
+                path: "src/venus/vkr_inproc.h",
+                artifact: graph.source(HostGraphicsSources.inprocHeader)
+            }
+        ),
+        UpstreamChange.Patch(graph.source(HostGraphicsSources.inprocPatch))
+    ]
+    if host.darwin { virglChanges.append(.Patch(graph.source(HostGraphicsSources.darwinPatch))) }
+    for path in HostGraphicsSources.virglPatches { virglChanges.append(.Patch(graph.source(path))) }
+    var qemuChanges: [UpstreamChange] = []
+    for path in HostGraphicsSources.qemuPatches { qemuChanges.append(.Patch(graph.source(path))) }
+    let installed: Argument = .Joined([.Workspace, .Text("/prefix")])
+    let virglBuild: Argument = .Joined([.Workspace, .Text("/virglrenderer")])
+    let qemuBuild: Argument = .Joined([.Workspace, .Text("/qemu")])
+    // Hypervisor.framework runs an aarch64 guest on a Mac, and the
+    // paravirtualised graphics QEMU offers there is Apple's, which venus
+    // replaces. Elsewhere KVM, and OpenGL for the egl-headless display.
+    let targets = host.darwin ? "aarch64-softmmu" : "aarch64-softmmu,x86_64-softmmu"
+    let acceleration = host.darwin ? ["--enable-hvf", "--disable-pvg"] : ["--enable-kvm", "--enable-opengl"]
+    var configure: [Argument] = [
+        .Joined([.Text("PKG_CONFIG_PATH="), copy installed, .Text("/lib/pkgconfig")]),
+        .Text("sh"),
+        .Joined([upstreamSource("qemu"), .Text("/configure")]),
+        .Text("--target-list=\(targets)"),
+        .Text("--enable-virglrenderer"),
+        .Text("--disable-docs"),
+        .Text("--disable-guest-agent"),
+        .Text("--disable-tools"),
+        .Joined([.Text("--prefix="), copy installed])
+    ]
+    for flag in acceleration { configure.append(.Text(copy flag)) }
+    // The prefix is copied into the store and run from there, so QEMU finds
+    // virglrenderer beside it rather than where it was installed.
+    let origin = host.darwin ? "@executable_path" : "$ORIGIN"
+    configure.append(.Text("--extra-ldflags=-Wl,-rpath,\(origin)/../lib"))
+    var stages: [CommandStage] = [
+        upstreamStage(graph, "virglrenderer", HostGraphicsSources.virgl, virglChanges),
+        upstreamStage(graph, "qemu", HostGraphicsSources.qemu, qemuChanges),
+        CommandStage {
+            tool: "\(host.pythonBin())/meson",
+            arguments: [
+                .Text("setup"),
+                .Text("--reconfigure"),
+                copy virglBuild,
+                upstreamSource("virglrenderer"),
+                .Text("--buildtype=release"),
+                .Text("--libdir=lib"),
+                .Joined([.Text("--prefix="), copy installed]),
+                .Text("-Dplatforms="),
+                .Text("-Dvenus=true")
+            ]
+        },
+        CommandStage { tool: "ninja", arguments: [.Text("-C"), copy virglBuild, .Text("install")] }
+    ]
+    // meson names a Mach-O library by the absolute path it installs it at.
+    if host.darwin {
+        stages.append(
+            CommandStage {
+                tool: "install_name_tool",
+                arguments: [
+                    .Text("-id"),
+                    .Text("@rpath/libvirglrenderer.1.dylib"),
+                    .Joined([copy installed, .Text("/lib/libvirglrenderer.1.dylib")])
+                ]
+            }
+        )
+    }
+    // QEMU's configure finds virglrenderer through pkg-config and builds
+    // outside its tree.
+    stages.append(CommandStage { tool: "env", arguments: configure, directory: copy qemuBuild })
+    stages.append(
+        CommandStage { tool: "ninja", arguments: [.Text("-C"), copy qemuBuild, .Text("install")] }
+    )
+    stages.append(
+        CommandStage {
+            tool: "cp",
+            arguments: [.Text("-R"), .Joined([copy installed, .Text("/.")]), .Output("emulator")]
+        }
+    )
+    let built = graph.command(
+        CommandAction {
+            label: "host GPU stack",
+            tool: "rm",
+            arguments: [.Text("-rf"), copy installed],
+            environment: [
+                EnvironmentEntry { name: "PATH", value: "\(host.pythonBin()):\(host.path)" },
+                EnvironmentEntry { name: "HOME", value: copy host.home }
+            ],
+            outputs: [Output { name: "emulator", kind: .Tree }],
+            workspace: "gpu-host",
+            followedBy: stages
+        }
+    )
+    return built[0]
+}
+
+// KosmicKrisp, installed under a prefix whose share/vulkan/icd.d names it.
+// It needs Homebrew's libclc and SPIRV-LLVM-Translator, which `kira build
+// setup` installs, and Homebrew's LLVM to compile its shaders' CL.
+function kosmicKrisp(graph: borrow mut Graph, host: borrow Host) -> Artifact {
+    var patches: [UpstreamChange] = []
+    for path in HostGraphicsSources.kosmicKrispPatches {
+        patches.append(.Patch(graph.source(path)))
+    }
+    let installed: Argument = .Joined([.Workspace, .Text("/prefix")])
+    let build: Argument = .Joined([.Workspace, .Text("/mesa")])
+    let homebrew = "/opt/homebrew"
+    let built = graph.command(
+        CommandAction {
+            label: "KosmicKrisp",
+            tool: "rm",
+            arguments: [.Text("-rf"), copy installed],
+            environment: [
+                EnvironmentEntry {
+                    name: "PATH",
+                    value: "\(host.pythonBin()):\(homebrew)/opt/llvm/bin:\(host.path)"
+                },
+                EnvironmentEntry { name: "HOME", value: copy host.home },
+                EnvironmentEntry {
+                    name: "PKG_CONFIG_PATH",
+                    value: "\(homebrew)/opt/spirv-llvm-translator/lib/pkgconfig:\(homebrew)/lib/pkgconfig"
+                }
+            ],
+            outputs: [Output { name: "kosmickrisp", kind: .Tree }],
+            workspace: "kosmickrisp",
+            followedBy: [
+                upstreamStage(graph, "mesa", HostGraphicsSources.kosmicKrisp, patches),
+                CommandStage {
+                    tool: "\(host.pythonBin())/meson",
+                    arguments: [
+                        .Text("setup"),
+                        .Text("--reconfigure"),
+                        copy build,
+                        upstreamSource("mesa"),
+                        .Text("--buildtype=release"),
+                        .Joined([.Text("--prefix="), copy installed]),
+                        .Text("-Dplatforms=macos"),
+                        .Text("-Dvulkan-drivers=kosmickrisp"),
+                        .Text("-Dgallium-drivers="),
+                        .Text("-Dopengl=false"),
+                        .Text("-Dzstd=disabled"),
+                        .Joined(
+                            [.Text("-Dvulkan-icd-dir="), copy installed, .Text(
+                                "/share/vulkan/icd.d"
+                            )]
+                        )
+                    ]
+                },
+                CommandStage {
+                    tool: "ninja",
+                    arguments: [.Text("-C"), copy build, .Text("install")]
+                },
+                // The ICD names the driver by the absolute path it was
+                // installed at; the loader reads a relative one against the
+                // ICD's own directory, which is what survives the copy into
+                // the store.
+                CommandStage {
+                    tool: "sed",
+                    arguments: [
+                        .Text("-i"),
+                        .Text(""),
+                        .Text("-e"),
+                        .Text("s|\"library_path\": \".*/lib/|\"library_path\": \"../../../lib/|"),
+                        .Joined([copy installed, .Text("/\(MachineLayout.kosmicKrisp)")])
+                    ]
+                },
+                CommandStage {
+                    tool: "cp",
+                    arguments: [.Text("-R"), .Joined([copy installed, .Text("/.")]), .Output(
+                        "kosmickrisp"
+                    )]
+                }
+            ]
+        }
+    )
+    return built[0]
+}

@@ -1,0 +1,237 @@
+import Foundation
+
+// Linux's own numbers for the calls this backend makes, named once. Those
+// that differ between architectures are answered by `LinuxOpen` and
+// `architecture`; these are the same on both.
+
+// `AT_FDCWD`: a path is read from the working directory.
+namespace AtDirectory {
+    let current: Number = -100
+}
+
+namespace Fcntl {
+    let setDescriptorFlags: Number = 2
+    let getFlags: Number = 3
+    let setFlags: Number = 4
+    let openFileDescriptionLock: Number = 37
+    let duplicateCloseOnExec: Number = 1030
+    let addSeals: Number = 1033
+    // The lowest number `duplicateCloseOnExec` answers: above the standard
+    // streams.
+    let aboveStreams: Number = 3
+}
+
+namespace Seal {
+    let shrink: Number = 2
+    let grow: Number = 4
+}
+
+namespace SocketDomain {
+    let unix: Number = 1
+}
+
+namespace SocketKind {
+    let seqPacket: Number = 5
+    // Flags a socket kind carries: `SOCK_NONBLOCK`, `SOCK_CLOEXEC`.
+    let nonBlock: Number = 0x800
+    let closeOnExec: Number = 0x80000
+}
+
+// `SOL_SOCKET` options.
+namespace SocketOption {
+    let reuseAddress: Number = 2
+    let kind: Number = 3
+    let error: Number = 4
+    let sendBuffer: Number = 7
+    let linger: Number = 13
+    let peerCredentials: Number = 17
+    let bindToDevice: Number = 25
+}
+
+namespace IpOption {
+    let addMembership: Number = 35
+    let dropMembership: Number = 36
+}
+
+namespace Ipv6Option {
+    let joinGroup: Number = 20
+    let leaveGroup: Number = 21
+    let only: Number = 26
+}
+
+// `waitid`: whom it waits for.
+@Derive(Copy)
+enum WaitWhom: U32 {
+    // `P_PID`
+    Pid = 1
+    // `P_PIDFD`
+    Pidfd = 3
+}
+
+// How `waitid` and `wait4` wait.
+@Derive(Copy)
+distinct WaitHow = Number
+
+namespace WaitHow {
+    // `WNOHANG`: answer at once when nothing has changed.
+    let noHang: WaitHow = WaitHow(0x1)
+    // `WEXITED`
+    let exited: WaitHow = WaitHow(0x4)
+    // `WNOWAIT`: leave the child to be waited for again.
+    let noWait: WaitHow = WaitHow(0x1000000)
+    // `__WALL`: a traced thread as well as a child process.
+    let allThreads: WaitHow = WaitHow(0x40000000)
+}
+
+// `sigprocmask`'s `how`.
+namespace SignalMaskHow {
+    let block: Number = 0
+    let unblock: Number = 1
+    let set: Number = 2
+}
+
+namespace Signal {
+    let trap: Number = 5
+    let child: Number = 17
+    let stop: Number = 19
+}
+
+// Linux clock ids.
+namespace LinuxClock {
+    let monotonic: Number = 1
+}
+
+// `TIMER_ABSTIME` and `TFD_TIMER_ABSTIME`.
+namespace TimerFlag {
+    let relative: Number = 0
+    let absolute: Number = 1
+}
+
+namespace FutexOp {
+    let wake: Number = 1
+    let requeue: Number = 3
+    let waitBitset: Number = 9
+    let anyBit: U32 = U32(0xFFFFFFFF)
+}
+
+namespace FallocateMode {
+    let keepSize: Number = 1
+    let punchHole: Number = 2
+    let zeroRange: Number = 0x10
+}
+
+// `RENAME_NOREPLACE` and `RENAME_EXCHANGE`.
+namespace RenameFlag {
+    let noReplace: U32 = U32(1)
+    let exchange: U32 = U32(2)
+}
+
+// `UTIME_OMIT`: a `timespec` that leaves its time as it is.
+let timeOmit: U64 = U64(0x3FFFFFFE)
+
+// `IN_*` for an inotify watch.
+namespace Inotify {
+    let modify: U32 = U32(0x2)
+    let attributes: U32 = U32(0x4)
+    let closeWrite: U32 = U32(0x8)
+    let movedFrom: U32 = U32(0x40)
+    let movedTo: U32 = U32(0x80)
+    let create: U32 = U32(0x100)
+    let delete: U32 = U32(0x200)
+    let deleteSelf: U32 = U32(0x400)
+    let moveSelf: U32 = U32(0x800)
+    let overflow: U32 = U32(0x4000)
+    let isDirectory: U32 = U32(0x40000000)
+}
+
+// `FS_IOC_GETFLAGS` and `FS_IOC_SETFLAGS`, and the immutable flag.
+namespace FileFlags {
+    let get: U64 = U64(0x80086601)
+    let set: U64 = U64(0x40086602)
+    let immutable: U32 = U32(0x10)
+}
+
+// `CLOSE_RANGE_CLOEXEC`.
+namespace CloseRange {
+    let closeOnExec: U32 = U32(4)
+}
+
+// `AT_SYMLINK_NOFOLLOW`, and `AT_EMPTY_PATH` for a call on the descriptor
+// itself.
+namespace AtFlag {
+    let symlinkNoFollow: Number = 0x100
+    let removeDirectory: Number = 0x200
+    let emptyPath: Number = 0x1000
+}
+
+// `RESOLVE_*` for `openat2`.
+namespace Resolve {
+    let noMagicLinks: U64 = U64(0x2)
+    let noSymlinks: U64 = U64(0x4)
+    let beneath: U64 = U64(0x8)
+}
+
+// `statx` masks and attributes.
+namespace Statx {
+    // `STATX_BASIC_STATS | STATX_BTIME`.
+    let basicAndBirth: U32 = U32(0xFFF)
+    let blocks: U32 = U32(0x400)
+    let immutable: U64 = U64(0x10)
+    let encrypted: U64 = U64(0x800)
+    // `stx_blocks` counts 512-byte units.
+    let blockUnit: U64 = U64(512)
+}
+
+// `st_mode` bits.
+namespace FileMode {
+    let typeMask: U32 = U32(0xF000)
+    // `S_IXUSR | S_IXGRP | S_IXOTH`.
+    let anyExecute: U32 = U32(0x49)
+    // `rwxr-xr-x`.
+    let directoryDefault: Number = 0x1ED
+    // `rw-r--r--`.
+    let fileDefault: Number = 0x1A4
+}
+
+// The `st_mode` file types a node is told apart by: `S_IFDIR` 0x4000,
+// `S_IFREG` 0x8000, `S_IFLNK` 0xA000.
+@Derive(Copy)
+@Open enum FileType: U32 {
+    Directory = 16384
+    Regular = 32768
+    Link = 40960
+}
+
+// `MSG_*` for `sendmsg` and `recvmsg`.
+namespace MessageFlag {
+    let peek: Number = 0x2
+    let truncated: U32 = U32(0x20)
+    let dontWait: Number = 0x40
+    let noSignal: Number = 0x4000
+    let more: Number = 0x8000
+    let closeOnExecRights: Number = 0x40000000
+}
+
+// The auxiliary vector entries the backend reads.
+@Derive(Copy)
+enum Auxiliary: U64 {
+    PageSize = 6
+    HardwareCaps = 16
+    HardwareCaps2 = 26
+}
+
+// Where `struct utsname`'s fields start: 65 bytes each.
+@Derive(Copy)
+enum UnameField: U32 {
+    Release = 130
+    Version = 195
+}
+
+// `clone3` flags.
+namespace CloneFlag {
+    let vfork: U64 = U64(0x4000)
+    let newMountNamespace: U64 = U64(0x20000)
+    let newPidNamespace: U64 = U64(0x20000000)
+    let pidfd: U64 = U64(0x1000)
+    let intoCgroup: U64 = U64(0x200000000)
+}

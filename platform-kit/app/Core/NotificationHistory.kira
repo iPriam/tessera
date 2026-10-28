@@ -1,0 +1,185 @@
+//! What was posted, kept after its banner went: every notification, newest first, shown or held back by Focus.
+import Foundation
+
+// What was posted, kept after its banner went (roadmap/23-product-experience.md
+// §4): every notification, banner shown or held back by Focus, newest first,
+// grouped by the application that posted it, until the person clears it.
+// The count an application has here is its badge. The platform keeps it in a
+// file in the text form below and draws it; nothing here reads a clock.
+
+/// One notification kept in the history.
+public struct HistoryEntry {
+    /// The id that tells this notification apart from the others.
+    let id: Number
+    /// The application that sent the notification.
+    let application: String
+    /// The title the notification shows.
+    let title: String
+    /// The body the notification shows.
+    let body: String
+    /// When it arrived, in milliseconds since 1970.
+    let at: Number
+}
+
+/// The notifications kept, newest last, and the id the next one takes.
+public struct NotificationHistory {
+    /// The notifications kept, oldest first.
+    var entries: [HistoryEntry] = []
+    /// The id the next recorded notification takes.
+    var nextId: Number = 1
+}
+
+/// How many notifications the history keeps; past the limit the oldest goes.
+public namespace HistoryLimit {
+    /// The most kept; past it the oldest goes.
+    let entries: Number = 64
+}
+
+/// Every application's notifications, newest first.
+public struct HistoryGroup {
+    /// The application these notifications came from.
+    let application: String
+    /// The notifications of this application, newest first.
+    let entries: [HistoryEntry]
+}
+
+extend NotificationHistory {
+    /// Keeps a notification that arrived `at`.
+    function record(
+        borrow mut self,
+        application: borrow String,
+        title: borrow String,
+        body: borrow String,
+        at: Number
+    ) {
+        entries.append(
+            HistoryEntry {
+                id: nextId,
+                application: copy application,
+                title: copy title,
+                body: copy body,
+                at: at
+            }
+        )
+        nextId += 1
+        if entries.count > HistoryLimit.entries {
+            var kept: [HistoryEntry] = []
+            for index in entries.count - HistoryLimit.entries..entries.count {
+                kept.append(copy entries[index])
+            }
+            entries = move kept
+        }
+    }
+
+    /// Clears the notification `id`.
+    function clear(borrow mut self, id: Number) {
+        var kept: [HistoryEntry] = []
+        for entry in entries {
+            if entry.id != id { kept.append(copy entry) }
+        }
+        entries = move kept
+    }
+
+    /// Clears every notification `application` posted.
+    function clearApplication(borrow mut self, application: borrow String) {
+        var kept: [HistoryEntry] = []
+        for entry in entries {
+            if entry.application != application { kept.append(copy entry) }
+        }
+        entries = move kept
+    }
+
+    /// How many notifications `application` has kept: its badge.
+    function count(borrow self, application: borrow String) -> Number {
+        var total: Number = 0
+        for entry in entries {
+            if entry.application == application { total += 1 }
+        }
+        return total
+    }
+
+    /// The notifications by application, the one with the newest first, each
+    /// group newest first.
+    function groups(borrow self) -> [HistoryGroup] {
+        var order: [String] = []
+        for index in 0..entries.count {
+            let application = entries[entries.count - 1 - index].application
+            if !order.contains(application) { order.append(copy application) }
+        }
+        var groups: [HistoryGroup] = []
+        for application in order {
+            var mine: [HistoryEntry] = []
+            for index in 0..entries.count {
+                let entry = entries[entries.count - 1 - index]
+                if entry.application == application { mine.append(copy entry) }
+            }
+            groups.append(HistoryGroup { application: copy application, entries: mine })
+        }
+        return groups
+    }
+}
+
+/// The text format the history is stored in: its version and its field separator.
+namespace HistoryText {
+    let version: String = "version 1"
+    let field: String = "\t"
+}
+
+/// `history` as the platform keeps it: a version line, then one line for each
+/// notification, `id`, `at`, application, title and body apart by tabs. A
+/// tab or a line break in the text is written as a space.
+public function historyText(history: borrow NotificationHistory) -> String {
+    var lines: [String] = [HistoryText.version]
+    for entry in history.entries {
+        let fields = [
+            String(entry.id),
+            String(entry.at),
+            oneLine(entry.application),
+            oneLine(entry.title),
+            oneLine(entry.body)
+        ]
+        lines.append(joined(fields, HistoryText.field))
+    }
+    return joined(lines, "\n") + "\n"
+}
+
+/// The text with tabs and line breaks turned into spaces, so one record stays on one line.
+function oneLine(text: borrow String) -> String {
+    return joined(joined(text.split("\t"), " ").split("\n"), " ")
+}
+
+/// The history `text` holds; lines it cannot read are skipped, and a text in
+/// another form holds none.
+public function historyFrom(text: borrow String) -> NotificationHistory {
+    var history = NotificationHistory {}
+    let lines = text.split("\n")
+    if lines.count == 0 || lines[0] != HistoryText.version { return history }
+    for index in 1..lines.count {
+        match historyEntryFrom(lines[index]) {
+            Some(entry) -> {
+                history.nextId = max(history.nextId, entry.id + 1)
+                history.entries.append(entry)
+            }
+            // An empty or damaged line keeps nothing.
+            None -> {}
+        }
+    }
+    return history
+}
+
+/// Reads one stored record back into an entry, or none when the line is not a record.
+function historyEntryFrom(line: borrow String) -> HistoryEntry? {
+    let fields = line.split(HistoryText.field)
+    if fields.count != 5 { return .None }
+    let id = try parseNumber(fields[0]) otherwise return .None
+    let at = try parseNumber(fields[1]) otherwise return .None
+    return .Some(
+        HistoryEntry {
+            id: id,
+            application: copy fields[2],
+            title: copy fields[3],
+            body: copy fields[4],
+            at: at
+        }
+    )
+}

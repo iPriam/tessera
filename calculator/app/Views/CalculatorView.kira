@@ -1,0 +1,481 @@
+//! The calculator's view: the keypad, the display and the history list.
+import KiraUI
+import LibTessera
+import Calculation
+
+/// The sizes of the calculator's keys and text, in points.
+namespace CalculatorLayout {
+    let margin: Number = 16
+    let keyDiameter: Number = 80
+    let keyFont: Number = 36
+    let expressionFont: Number = 24
+    let displayFont: Number = 80
+    let historyWidth: Number = 340
+    let historyHeight: Number = 280
+}
+
+/// One result in history: the expression, the answer as shown, and the exact value that reusing the row puts back into the expression.
+struct HistoryRow {
+    let expression: String
+    let answer: String
+    let exact: String
+}
+
+/// The history text for one result: its expression, answer and exact value, separated by tabs and ended by a line break.
+function historyLine(
+    expression: borrow String,
+    answer: borrow String,
+    exact: borrow String
+) -> String {
+    return "\(expression)\t\(answer)\t\(exact)\n"
+}
+
+/// The history rows `text` holds, skipping any line that does not have three fields.
+function historyRows(text: borrow String) -> [HistoryRow] {
+    var rows: [HistoryRow] = []
+    for line in text.split("\n") {
+        let fields = line.split("\t")
+        if fields.count == 3 {
+            rows.append(
+                HistoryRow {
+                    expression: copy fields[0],
+                    answer: copy fields[1],
+                    exact: copy fields[2]
+                }
+            )
+        }
+    }
+    return rows
+}
+
+/// The keypad's three groups, as the calculator groups them: digits and the sign, the functions across the top, and the operators down the right side.
+enum KeyTone {
+    Digit
+    Function
+    Operator
+}
+
+/// The tint of a key of `tone`: the operators are orange, and the other keys have none.
+function keyTint(tone: KeyTone) -> PrimaryColor? {
+    match tone {
+        Digit -> { return .None }
+        Function -> { return .None }
+        Operator -> { return .Some(.Orange) }
+    }
+}
+
+/// A circular key of the keypad's size, its label on a circle of glass.
+function keyFace(label: String, tone: KeyTone) -> Any Widget {
+    return Text(label)
+    .font(size: scaledMetric(CalculatorLayout.keyFont), weight: .Regular)
+    .frame(width: CalculatorLayout.keyDiameter, height: CalculatorLayout.keyDiameter)
+    .glassEffect(glass: .Regular, shape: .Circle, interactive: true, tint: keyTint(tone))
+}
+
+/// A circular key of the keypad's size, drawing `symbol` where its label goes.
+function symbolKeyFace(symbol: Symbol, tone: KeyTone) -> Any Widget {
+    return Icon(symbol: symbol)
+    .font(size: scaledMetric(CalculatorLayout.keyFont), weight: .Regular)
+    .frame(width: CalculatorLayout.keyDiameter, height: CalculatorLayout.keyDiameter)
+    .glassEffect(glass: .Regular, shape: .Circle, interactive: true, tint: keyTint(tone))
+}
+
+/// A keypad key that says `label` and runs `action` when pressed.
+function keyButton(label: String, tone: KeyTone, action: () -> Void) -> Any Widget {
+    return Button(action: move action) {
+        keyFace(move label, tone)
+    }
+    .buttonStyle(.Plain)
+}
+
+/// A digit key: a keypad key that also answers to its digit on the keyboard.
+function digitKeyButton(digit: String, tone: KeyTone, action: () -> Void) -> Any Widget {
+    return Button(action: move action) {
+        keyFace(copy digit, tone)
+    }
+    .buttonStyle(.Plain)
+    .keyboardShortcut(move digit, modifiers: [])
+}
+
+/// A keypad key that draws `symbol` and runs `action` when pressed.
+function symbolKeyButton(symbol: Symbol, tone: KeyTone, action: () -> Void) -> Any Widget {
+    return Button(action: move action) {
+        symbolKeyFace(symbol, tone)
+    }
+    .buttonStyle(.Plain)
+}
+
+/// The history list: each row reuses its exact value, and Clear empties it.
+function historyPanel(
+    history: borrow String,
+    reuse: (String) -> Void,
+    clear: () -> Void
+) -> Any Widget {
+    return VStack(spacing = .Small, alignment = .Trailing) {
+        ScrollView {
+            VStack(spacing = .Small, alignment = .Trailing) {
+                For(item in historyRows(history)) {
+                    Button(action: { in reuse(copy item.exact) }) {
+                        HStack(spacing = .Medium, alignment = .Center) {
+                            Text(shownExpression(item.expression))
+                            .foregroundColor(.Secondary)
+                            Spacer()
+                            Text(item.answer)
+                        }
+                    }
+                    .buttonStyle(.Plain)
+                }
+            }
+        }
+        .frame(width = CalculatorLayout.historyWidth, height = CalculatorLayout.historyHeight)
+        Button(action: move clear) {
+            Text("Clear History")
+            .typography(.footnote)
+        }
+    }
+}
+
+/// The history panel while it is shown, otherwise the display.
+function topArea(showsHistory: Bool, history: Any Widget, display: Any Widget) -> Any Widget {
+    if showsHistory {
+        return history
+    }
+    return display
+}
+
+/// The value the display shows: the field while something is typed, else the last answer.
+function shownValue(entry: borrow String, answer: borrow String) -> String {
+    if entry.isEmpty() { return copy answer }
+    return copy entry
+}
+
+/// The message to show when `answer` could not be copied to the pasteboard, or none when it was copied.
+function copyMessage(answer: String) -> String? {
+    match pasteboardWrite(answer) {
+        Ok -> return .None
+        Error(failed) -> return .Some("The answer could not be copied: " + errorName(failed))
+    }
+}
+
+/// The text a Paste brings: the pasteboard's item for the key press or click that asked for it, or the reason there is none.
+function pastedText() -> Result<String, String> {
+    let token = match interactionCurrent() {
+        Some(value) -> value
+        None -> return .Error("Paste needs a key press or a click")
+    }
+    match pasteboardRead(move token) {
+        Ok(text) -> return .Ok(text)
+        Error(failed) -> return .Error("Nothing was pasted: " + errorName(failed))
+    }
+}
+
+/// The keypad and the display: the keys and the keyboard edit one expression, and history shows the past results.
+construct CalculatorView() extends Widget {
+    @State var entry: String = ""
+    @State var answer: String = "0"
+    @State var expression: String = ""
+    @State var message: String = ""
+    @State var history: String = ""
+    @State var showsHistory: Bool = false
+
+    body {
+        ZStack {
+            // The black runs under the status bar and the toolbar, as Apple's
+            // bars are clear over the content, so no gray band shows.
+            Color(palette: .Black).ignoresSafeArea(regions: .All, edges: EdgeSet.all)
+            VStack(spacing = .Medium, alignment = .Center) {
+                topArea(
+                    showsHistory,
+                    historyPanel(
+                        history,
+                        { text in
+                            entry = copy text
+                            message = ""
+                        },
+                        { in history = "" }
+                    ),
+                    VStack(spacing = .Small, alignment = .Trailing) {
+                        Spacer()
+                        Text(shownExpression(expression))
+                        .font(size: scaledMetric(CalculatorLayout.expressionFont), weight: .Regular)
+                        .foregroundColor(.Secondary)
+                        .multilineTextAlignment(.Trailing)
+                        .fillWidth()
+                        ZStack(alignment: .Trailing) {
+                            Text(answer)
+                            .font(size: scaledMetric(CalculatorLayout.displayFont), weight: .Light)
+                            .multilineTextAlignment(.Trailing)
+                            .fillWidth()
+                            .opacity(entry.isEmpty() ? 1.0 : 0.0)
+                            TextField(title = "", text = $entry)
+                            .textFieldStyle(.Plain)
+                            .font(size: scaledMetric(CalculatorLayout.displayFont), weight: .Light)
+                            .multilineTextAlignment(.Trailing)
+                            .fillWidth()
+                            .onSubmit(
+                                { in
+                                    if !entry.isEmpty() {
+                                        match calculate(entry) {
+                                            Ok(value) -> {
+                                                history = history + historyLine(
+                                                    entry,
+                                                    displayText(value),
+                                                    String(value)
+                                                )
+                                                expression = copy entry
+                                                answer = displayText(value)
+                                                entry = ""
+                                                message = ""
+                                            }
+                                            Error(failure) -> { message = failureText(failure) }
+                                        }
+                                    }
+                                }
+                            )
+                        }
+                        Text(message)
+                        .foregroundColor(.Secondary)
+                        .fillWidth()
+                    }
+                )
+                GlassEffectContainer(spacing: 8.0) {
+                    Grid(horizontalSpacing: .Medium, verticalSpacing: .Medium) {
+                        GridRow {
+                            symbolKeyButton(
+                                .DeleteLeft,
+                                .Function,
+                                { in
+                                    entry = entry.dropLastScalar()
+                                    message = ""
+                                }
+                            )
+                            keyButton(
+                                "AC",
+                                .Function,
+                                { in
+                                    entry = ""
+                                    answer = "0"
+                                    expression = ""
+                                    message = ""
+                                }
+                            )
+                            keyButton(
+                                "%",
+                                .Function,
+                                { in
+                                    entry = entry + "%"
+                                    message = ""
+                                }
+                            )
+                            keyButton(
+                                "÷",
+                                .Operator,
+                                { in
+                                    entry = entry + "/"
+                                    message = ""
+                                }
+                            )
+                        }
+                        GridRow {
+                            digitKeyButton(
+                                "7",
+                                .Digit,
+                                { in
+                                    entry = entry + "7"
+                                    message = ""
+                                }
+                            )
+                            digitKeyButton(
+                                "8",
+                                .Digit,
+                                { in
+                                    entry = entry + "8"
+                                    message = ""
+                                }
+                            )
+                            digitKeyButton(
+                                "9",
+                                .Digit,
+                                { in
+                                    entry = entry + "9"
+                                    message = ""
+                                }
+                            )
+                            keyButton(
+                                "×",
+                                .Operator,
+                                { in
+                                    entry = entry + "*"
+                                    message = ""
+                                }
+                            )
+                        }
+                        GridRow {
+                            digitKeyButton(
+                                "4",
+                                .Digit,
+                                { in
+                                    entry = entry + "4"
+                                    message = ""
+                                }
+                            )
+                            digitKeyButton(
+                                "5",
+                                .Digit,
+                                { in
+                                    entry = entry + "5"
+                                    message = ""
+                                }
+                            )
+                            digitKeyButton(
+                                "6",
+                                .Digit,
+                                { in
+                                    entry = entry + "6"
+                                    message = ""
+                                }
+                            )
+                            keyButton(
+                                "−",
+                                .Operator,
+                                { in
+                                    entry = entry + "-"
+                                    message = ""
+                                }
+                            )
+                        }
+                        GridRow {
+                            digitKeyButton(
+                                "1",
+                                .Digit,
+                                { in
+                                    entry = entry + "1"
+                                    message = ""
+                                }
+                            )
+                            digitKeyButton(
+                                "2",
+                                .Digit,
+                                { in
+                                    entry = entry + "2"
+                                    message = ""
+                                }
+                            )
+                            digitKeyButton(
+                                "3",
+                                .Digit,
+                                { in
+                                    entry = entry + "3"
+                                    message = ""
+                                }
+                            )
+                            keyButton(
+                                "+",
+                                .Operator,
+                                { in
+                                    entry = entry + "+"
+                                    message = ""
+                                }
+                            )
+                        }
+                        GridRow {
+                            keyButton(
+                                "+/−",
+                                .Digit,
+                                { in
+                                    entry = negatingLastNumber(entry)
+                                    message = ""
+                                }
+                            )
+                            digitKeyButton(
+                                "0",
+                                .Digit,
+                                { in
+                                    entry = entry + "0"
+                                    message = ""
+                                }
+                            )
+                            keyButton(
+                                ".",
+                                .Digit,
+                                { in
+                                    entry = entry + "."
+                                    message = ""
+                                }
+                            )
+                            keyButton(
+                                "=",
+                                .Operator,
+                                { in
+                                    if !entry.isEmpty() {
+                                        match calculate(entry) {
+                                            Ok(value) -> {
+                                                history = history + historyLine(
+                                                    entry,
+                                                    displayText(value),
+                                                    String(value)
+                                                )
+                                                expression = copy entry
+                                                answer = displayText(value)
+                                                entry = ""
+                                                message = ""
+                                            }
+                                            Error(failure) -> { message = failureText(failure) }
+                                        }
+                                    }
+                                }
+                            )
+                        }
+                    }
+                }
+            }
+            .padding(scaledMetric(CalculatorLayout.margin))
+            .toolbar {
+                ToolbarItem(placement = .Navigation) {
+                    Button(action: { in showsHistory = !showsHistory }) {
+                        Icon(symbol: .Clock)
+                    }
+                }
+                // Apple's icon opens Math Notes or the Converter. Neither exists yet
+                // (roadmap/29: unit conversion is later work), so the icon is shown
+                // disabled rather than wired to nothing.
+                ToolbarItem(placement = .PrimaryAction) {
+                    Button(action: { in }) {
+                        Icon(symbol: .CircleGrid3x3)
+                    }
+                    .disabled(true)
+                }
+            }
+            // Copy and Paste sit where the platform's Edit menu has them. Copy
+            // writes the value on the display. Paste reads the pasteboard with the token of the
+            // key press or click, and types the text only when it is a valid
+            // expression (roadmap/16 §14).
+            .commands(items: [
+                CommandGroup(placement: .Replacing(.Pasteboard)) {
+                                    Button(title: "Copy", action: { in
+                                        message = match copyMessage(shownValue(entry, answer)) {
+                                            Some(text) -> text
+                                            None -> ""
+                                        }
+                                    })
+                    .keyboardShortcut("C")
+                    Button(
+                        title: "Paste",
+                        action: { in
+                            match pastedText() {
+                                Ok(text) -> match calculate(text) {
+                                    Ok -> {
+                                        entry = entry + text
+                                        message = ""
+                                    }
+                                    Error(failure) -> { message = "Nothing to paste" }
+                                }
+                                Error(reason) -> { message = reason }
+                            }
+                        }
+                    ).keyboardShortcut("V")
+                }
+            ])
+        }
+    }
+}

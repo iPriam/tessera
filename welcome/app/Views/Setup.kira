@@ -1,0 +1,222 @@
+import Foundation
+import KiraUI
+import LibTessera
+import TesseraUI
+import PlatformUI
+
+// The first-run setup (roadmap/23-product-experience.md §6): Hello, then the
+// language, the keyboard, the time zone and the appearance, each kept in
+// Settings as it is chosen, then Get Started, which marks the setup done so
+// PID 1 does not open Welcome again. Nothing needs a network or an account,
+// and every page goes back to the one before.
+
+enum SetupStep {
+    Hello
+    Language
+    Keyboard
+    TimeZone
+    Appearance
+    Done
+}
+
+let setupSteps: [SetupStep] = [.Hello, .Language, .Keyboard, .TimeZone, .Appearance, .Done]
+
+namespace SetupLook {
+    let width: Number = 560
+    let title: Number = 34
+    let gap: Number = 24
+}
+
+construct SetupView() extends Widget {
+    @State var step: Number = 0
+    @State var region: String = ""
+    @State var trial: String = ""
+
+    body {
+        let current = setupSteps[min(step, setupSteps.count - 1)]
+        VStack(spacing = .Length(SetupLook.gap), alignment = .Center) {
+            Text(setupTitle(current))
+            .font(size = scaledMetric(SetupLook.title, relativeTo: .largeTitle), weight = .Bold)
+            self.page(current)
+            HStack(spacing = .Medium, alignment = .Center) {
+                if step > 0 {
+                    Button(action = { in step = step - 1 }) { Text("Back") }
+                }
+                Spacer()
+                self.forward(current)
+            }
+        }
+        .maxWidth(resolvedLength(SetupLook.width))
+        .padding(resolvedLength(SetupLook.gap))
+    }
+
+    // The page of `current`.
+    function page(current: borrow SetupStep) -> Any Widget {
+        return match current {
+            Hello -> Text(
+                "Tessera keeps everything on this device. Setup takes a minute and needs no network."
+            )
+            .foregroundColor(.Secondary)
+            Language -> languagePage()
+            Keyboard -> VStack(spacing = .Small, alignment = .Leading) {
+                keyboardPage()
+                TextField(title = "Type here to try the keyboard", text = $trial)
+            }
+            TimeZone -> self.timeZonePage()
+            Appearance -> appearancePage()
+            Done -> Text("You can change any of these in Settings.").foregroundColor(.Secondary)
+        }
+    }
+
+    // Continue, or Get Started on the last page.
+    function forward(current: borrow SetupStep) -> Any Widget {
+        return match current {
+            Done -> Button(action = { in finishSetup() }) { Text("Get Started") }
+            .buttonStyle(.BorderedProminent)
+            Hello, Language, Keyboard, TimeZone, Appearance -> Button(
+                action = { in step = step + 1 }
+            ) {
+                Text("Continue")
+            }
+            .buttonStyle(.BorderedProminent)
+        }
+    }
+
+    // Set Automatically, or a region and then one of its zones.
+    function timeZonePage() -> Any Widget {
+        let chosen = settingValue(TimeZoneSetting.key, TimeZoneSetting.automatic)
+        var rows: [Any Widget] = [
+            Toggle(
+                title = "Set Automatically",
+                isOn = chosen == TimeZoneSetting.automatic,
+                onChange = { on in
+                    keepSetting(
+                        TimeZoneSetting.key,
+                        on ? copy TimeZoneSetting.automatic : regionTimeZoneName()
+                    )
+                    return
+                }
+            )
+        ]
+        if chosen != TimeZoneSetting.automatic {
+            rows.append(Text("Time zone: \(timeZoneCity(chosen))").foregroundColor(.Secondary))
+            if region.count == 0 {
+                for name in timeZoneRegions(timeZoneNames()) {
+                    let picked = copy name
+                    rows.append(Button(action = { in region = copy picked }) { Text(copy name) })
+                }
+            } else {
+                rows.append(Button(action = { in region = "" }) { Text("All Regions") })
+                for name in timeZoneNames() {
+                    if timeZoneRegion(name) != region { continue }
+                    rows.append(
+                        choiceRow(
+                            timeZoneCity(name),
+                            name == chosen,
+                            copy TimeZoneSetting.key,
+                            copy name
+                        )
+                    )
+                }
+            }
+        }
+        return ScrollView { VStack(spacing = .Small, alignment = .Leading, children = rows) }
+    }
+}
+
+function setupTitle(step: borrow SetupStep) -> String {
+    return match step {
+        Hello -> "Hello"
+        Language -> "Language"
+        Keyboard -> "Keyboard"
+        TimeZone -> "Time Zone"
+        Appearance -> "Appearance"
+        Done -> "You're All Set"
+    }
+}
+
+// The languages; choosing one also chooses its keyboard, which the next page
+// can change.
+function languagePage() -> Any Widget {
+    let chosen = settingValue(LanguageSetting.preferred, LanguageSetting.fallback)
+    var rows: [Any Widget] = []
+    for language in languageChoices() {
+        let picked = copy language
+        rows.append(
+            Button(
+                action = { in
+                    keepSetting(LanguageSetting.preferred, picked.code)
+                    keepSetting(KeyboardSetting.layout, picked.layout)
+                }
+            ) {
+                choiceLabel(language.name, language.code == chosen)
+            }.buttonStyle(.Plain)
+        )
+    }
+    return VStack(spacing = .Small, alignment = .Leading, children = rows)
+}
+
+function keyboardPage() -> Any Widget {
+    let chosen = settingValue(KeyboardSetting.layout, KeyboardSetting.fallback)
+    var rows: [Any Widget] = []
+    for layout in layoutChoices() {
+        rows.append(
+            choiceRow(layout.name, layout.code == chosen, KeyboardSetting.layout, layout.code)
+        )
+    }
+    return VStack(spacing = .Small, alignment = .Leading, children = rows)
+}
+
+function appearancePage() -> Any Widget {
+    let chosen = settingValue(AppearanceSetting.key, "")
+    return VStack(spacing = .Small, alignment = .Leading) {
+        choiceRow(
+            "Light",
+            chosen == AppearanceSetting.light,
+            AppearanceSetting.key,
+            AppearanceSetting.light
+        )
+        choiceRow(
+            "Dark",
+            chosen == AppearanceSetting.dark,
+            AppearanceSetting.key,
+            AppearanceSetting.dark
+        )
+    }
+}
+
+// One choice, checked when it is the one kept; choosing it keeps `value`
+// under `key`.
+function choiceRow(title: String, chosen: Bool, key: String, value: String) -> Any Widget {
+    return Button(action = { in keepSetting(key, value) }) { choiceLabel(title, chosen) }
+    .buttonStyle(.Plain)
+}
+
+function choiceLabel(title: borrow String, chosen: Bool) -> Any Widget {
+    return HStack(spacing = .Medium, alignment = .Center) {
+        Text(copy title)
+        Spacer()
+        Icon(symbol = .Checkmark).foregroundColor(chosen ? .Accent : .Clear)
+    }
+    .fillWidth()
+}
+
+// Keeps `value` under `key` in Settings; the window is drawn again when
+// Settings says it changed.
+function keepSetting(key: borrow String, value: borrow String) {
+    match storeSetting(key, .Some(copy value)) {
+        Ok -> {}
+        Error(failed) -> log warn(
+            "a setup choice could not be kept",
+            key: copy key,
+            error: errorName(failed)
+        )
+    }
+}
+
+// Marks the setup done and closes Welcome.
+function finishSetup() {
+    keepSetting(SetupSetting.completed, SetupSetting.yes)
+    log info("the first-run setup is complete")
+    requestWindowClose()
+}

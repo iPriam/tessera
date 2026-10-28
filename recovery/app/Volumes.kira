@@ -1,0 +1,254 @@
+import Foundation
+import Heap
+import LibTessera
+
+// The disks the machine has, from the Volume service. No LibTessera call
+// reaches the service yet, so its `List` is decoded here, as diskutil decodes
+// it: a 32-byte header, `op` @0, `code` @4, `a` @8, then `a` records of 160
+// bytes: the registry entry @0, size @8, logical block @16, DeviceKit
+// `BlockInfo.flags` @20, content @24, partition @28, the node's name @32 and
+// the mount point @96, both NUL-padded to 64 bytes.
+
+namespace VolumeWire {
+    let list: UN32 = UN32(1)
+    let headerBytes: Number = 32
+    let recordBytes: Number = 160
+    let textBytes: Number = 64
+    let answerBytes: Number = 65536
+    let alignment: Number = 16
+    // The service scans every disk before it answers anyone, which an
+    // emulated machine can take a while to do.
+    let answerWait: Number = 30000000000
+    let readyKey: Number = 1
+}
+
+@FFI.Struct { layout: c }
+struct WireHeader {
+    var operation: U32
+    var code: U32
+    var a: U64
+    var b: U64
+    var c: U64
+}
+
+@FFI.Struct { layout: c }
+struct VolumeRecordHead {
+    var entry: U64
+    var size: U64
+    var logicalBlock: U32
+    var flags: U32
+    var content: U32
+    var partition: U32
+}
+
+namespace VolumeContent {
+    let gpt: Number = 1
+    let mbr: Number = 2
+    let ext4: Number = 3
+    let erofs: Number = 4
+    let squashfs: Number = 5
+    let fat: Number = 6
+    let btrfs: Number = 8
+}
+
+// DeviceKit's `BlockInfo.flags`.
+namespace BlockFlag {
+    let removable: UN32 = UN32(4)
+}
+
+struct ListedVolume {
+    let size: Number
+    let content: Number
+    let removable: Bool
+    let partition: Bool
+    let name: String
+    let mountPoint: String
+}
+
+function paddedText(base: RawPtr, offset: Number, field: Number) -> String {
+    for length in 0..field {
+        if heapLoad<U8>(base, offset + length) == UN8(0) {
+            return stringFromCBytes(heapOffset(base, offset), length)
+        }
+    }
+    return stringFromCBytes(heapOffset(base, offset), field)
+}
+
+function volumeAt(record: RawPtr) -> ListedVolume {
+    let head: VolumeRecordHead = heapLoad(record)
+    return ListedVolume {
+        size: Number(head.size),
+        content: Number(head.content),
+        removable: (head.flags & BlockFlag.removable) != UN32(0),
+        partition: head.partition != UN32(0),
+        name: paddedText(record, 32, VolumeWire.textBytes),
+        mountPoint: paddedText(record, 96, VolumeWire.textBytes),
+    }
+}
+
+function closeChannel(channel: Handle) {
+    match handleClose(channel) {
+        Ok -> {}
+        Error(failed) -> log warn("cannot close the Volume service's channel", failed)
+    }
+}
+
+// One `List`, on a channel of its own, answered on `port`.
+function listVolumes(port: Handle) -> Result<[ListedVolume], TesseraError> {
+    let channel = try serviceConnect("tessera.volume")
+    let request = zeroedBlock(count: VolumeWire.headerBytes, alignment: VolumeWire.alignment)
+    heapStore(
+        request.pointer(),
+        WireHeader {
+            operation: VolumeWire.list,
+            code: UN32(0),
+            a: UNumber(0),
+            b: UNumber(0),
+            c: UNumber(0)
+        }
+    )
+    let none: [Handle] = []
+    let answer = zeroedBlock(count: VolumeWire.answerBytes, alignment: VolumeWire.alignment)
+    let read = askList(channel, port, request, answer, none)
+    closeChannel(channel)
+    let bytes = try read
+    if bytes < VolumeWire.headerBytes { return .Error(refused(.InvalidArgument)) }
+    let header: WireHeader = heapLoad(answer.pointer())
+    if errorCodeFrom(header.code) != .Ok { return .Error(refused(errorCodeFrom(header.code))) }
+    let held = trunc((bytes - VolumeWire.headerBytes) / VolumeWire.recordBytes)
+    let said = Number(header.a)
+    var volumes: [ListedVolume] = []
+    for index in 0..(said < held ? said : held) {
+        volumes.append(
+            volumeAt(
+                heapOffset(
+                    answer.pointer(),
+                    VolumeWire.headerBytes + index * VolumeWire.recordBytes
+                )
+            )
+        )
+    }
+    return .Ok(volumes)
+}
+
+function askList(
+    channel: Handle,
+    port: Handle,
+    request: borrow ByteBlock,
+    answer: borrow ByteBlock,
+    none: borrow [Handle]
+) -> Result<Number, TesseraError> {
+    try channelWrite(
+        channel,
+        Buffer { address: request.pointer(), length: VolumeWire.headerBytes },
+        none
+    )
+    let now = try timeRead(.Monotonic)
+    try objectWaitAsync(
+        channel,
+        Signals.readable | Signals.peerClosed,
+        .Once,
+        port,
+        VolumeWire.readyKey
+    )
+    try portWait(port, 1, now + VolumeWire.answerWait)
+    let received = try channelRead(
+        channel,
+        Buffer { address: answer.pointer(), length: VolumeWire.answerBytes },
+        UN32(0)
+    )
+    return .Ok(received.bytes)
+}
+
+// What a volume's content is called in Disk Utility.
+function formatName(content: Number) -> String {
+    if content == VolumeContent.btrfs { return "btrfs" }
+    if content == VolumeContent.fat { return "FAT32" }
+    if content == VolumeContent.ext4 { return "ext4" }
+    if content == VolumeContent.erofs { return "EROFS" }
+    if content == VolumeContent.squashfs { return "SquashFS" }
+    return "Unknown"
+}
+
+function schemeName(content: Number) -> String {
+    if content == VolumeContent.gpt { return "GUID Partition Map" }
+    if content == VolumeContent.mbr { return "Master Boot Record" }
+    return "None"
+}
+
+function lastPart(path: borrow String) -> String {
+    let parts = path.split("/")
+    return parts.count > 0 ? copy parts[parts.count - 1] : copy path
+}
+
+// The disks, each with the partitions whose node names start with its own:
+// vda1 and vda2 are vda's.
+// A loop device is an image the system mounted, not a disk to install on,
+// and is left out.
+// The media Recovery runs from is not a disk to install on either, and is
+// left out: `running` names the disks a volume is mounted from.
+function recoveryDisks(volumes: borrow [ListedVolume], running: borrow [String]) -> [RecoveryDisk] {
+    var disks: [RecoveryDisk] = []
+    for disk in volumes {
+        if disk.partition || disk.name.startsWith("loop") { continue }
+        var runs = false
+        for name in running {
+            if name.startsWith(disk.name) { runs = true }
+        }
+        if runs { continue }
+        var partitions: [RecoveryPartition] = []
+        for volume in volumes {
+            if !volume.partition || !volume.name.startsWith(disk.name) { continue }
+            partitions.append(
+                RecoveryPartition {
+                    name: volume.mountPoint.isEmpty() ? copy volume.name : lastPart(
+                        volume.mountPoint
+                    ),
+                    format: formatName(volume.content),
+                    bytes: volume.size,
+                    usedBytes: 0.0,
+                    mountPoint: copy volume.mountPoint
+                }
+            )
+        }
+        disks.append(
+            RecoveryDisk {
+                name: copy disk.name,
+                model: disk.removable ? "External Disk" : "VirtIO Block Device",
+                bytes: disk.size,
+                external: disk.removable,
+                scheme: schemeName(disk.content),
+                partitions: partitions
+            }
+        )
+    }
+    return disks
+}
+
+// The disks the running system is mounted from, by their node names: the
+// mount table's sources under /dev mounted at / or /data. A disk the Volume
+// service mounted under /Volumes stays a disk to install on.
+function runningDisks() -> Result<[String], RecoveryModelFailure> {
+    let table = match volumeMounts() {
+        Ok(value) -> value
+        Error(failed) -> return .Error(.Volumes(failed))
+    }
+    var names: [String] = []
+    for line in table.split("\n") {
+        let fields = line.split(" ")
+        if fields.count < 2 || !fields[0].startsWith("/dev/") { continue }
+        if fields[1] != "/" && fields[1] != "/" + SystemDirectory.data { continue }
+        let name = fields[0].substring(5, fields[0].count)
+        if !name.startsWith("loop") && !names.contains(name) { names.append(name) }
+    }
+    return .Ok(names)
+}
+
+function refused(code: borrow ErrorCode) -> TesseraError {
+    return TesseraError {
+        code: code,
+        subsystem: .LibTessera,
+        flags: ErrorFlags.none,
+        detail: U64(0)
+    }
+}

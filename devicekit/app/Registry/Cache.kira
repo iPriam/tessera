@@ -1,0 +1,132 @@
+import Foundation
+import Heap
+import LibTessera
+
+// The registry, walked once and kept until the kernel says it changed.
+//
+// Walking sysfs costs hundreds of opens and reads, and every registry call
+// and every open devicekitd checks needs the whole tree. The process keeps
+// the last walk and a uevent socket of its own, opened before that walk: any
+// uevent since, or an overrun of the socket, means the walk is stale, and the
+// next call walks again. Published entries (17 §16) are merged after the
+// walk, so a publish costs no walk either; the merged tree is kept until
+// either side changes, as IOKit's registry is one tree kept up to date
+// rather than rebuilt per lookup.
+
+struct RegistryState {
+    // The cache's own uevent socket; none until the first walk, or when the
+    // kernel refused one, and then every call walks.
+    var uevents: Descriptor?
+    var walk: [Entry]
+    var walkValid: Bool
+    var tree: [Entry]
+    var treeValid: Bool
+    // `publishedGeneration` when the tree was merged.
+    var treePublished: U64
+    // `EntryInfo.generation`: bumped whenever the kernel's devices change.
+    var generation: U64
+    var published: [Published]
+    // The manager's generation of `published`.
+    var publishedKnown: U64
+    // Bumped whenever this process's view of published entries changes.
+    var publishedGeneration: U64
+    // The device manager keeps the list itself and hands it over; it never
+    // asks itself for it.
+    var managerKeepsList: Bool
+    var watches: [Watch]
+}
+
+function emptyRegistry() -> RegistryState {
+    return RegistryState {
+        uevents: .None,
+        walk: [],
+        walkValid: false,
+        tree: [],
+        treeValid: false,
+        treePublished: U64(0),
+        generation: U64(1),
+        published: [],
+        publishedKnown: U64(0),
+        publishedGeneration: U64(0),
+        managerKeepsList: false,
+        watches: []
+    }
+}
+
+namespace Uevent {
+    let bufferBytes: Number = 8192
+}
+
+// Reads every uevent waiting on `socket`. True when something arrived or the
+// socket overran (`ENOBUFS`), either of which makes the walk stale.
+function drainForStaleness(socket: borrow Descriptor) -> Bool {
+    let blockBytes = zeroedBlock(count: Uevent.bufferBytes, alignment: 16)
+    let block = blockBytes.pointer()
+    var stale = false
+    while true {
+        match socket.read(block, Uevent.bufferBytes) {
+            Ok(got) -> {
+                if got == 0 { break }
+                stale = true
+            }
+            Error(failed) -> {
+                match errnoOf(failed) {
+                    Again -> {}
+                    NoBufferSpace -> stale = true
+                    else -> {
+                        log warn(
+                            "the registry's uevent socket failed; walking again",
+                            errno: errnoOf(failed)
+                        )
+                        stale = true
+                    }
+                }
+                break
+            }
+        }
+    }
+    return stale
+}
+
+// Notes what the kernel said since the last call, opening the socket that
+// says it the first time.
+function checkUevents() {
+    match deviceLibrary.registry.uevents {
+        Some(socket) -> {
+            if drainForStaleness(socket) {
+                deviceLibrary.registry.walkValid = false
+                deviceLibrary.registry.generation += U64(1)
+            }
+        }
+        None -> {
+            match ueventSocket() {
+                Ok(socket) -> deviceLibrary.registry.uevents = .Some(socket)
+                Error(failed) -> log warn(
+                    "no uevent socket; every registry call walks sysfs",
+                    error: errorName(failed)
+                )
+            }
+            deviceLibrary.registry.walkValid = false
+        }
+    }
+}
+
+// Every entry, in tree order, with parents filled in.
+function scan() -> Result<[Entry], TesseraError> {
+    checkUevents()
+    if !deviceLibrary.registry.walkValid {
+        deviceLibrary.registry.walk = try walkSysfs()
+        // Without a socket nothing would say the walk went stale; it is kept
+        // for this call only.
+        deviceLibrary.registry.walkValid = deviceLibrary.registry.uevents.isSome()
+        deviceLibrary.registry.treeValid = false
+    }
+    refreshPublished()
+    if deviceLibrary.registry.treeValid && deviceLibrary.registry.treePublished == deviceLibrary.registry.publishedGeneration {
+        return .Ok(deviceLibrary.registry.tree)
+    }
+    deviceLibrary.registry.tree = treeOrder(try withPublished(deviceLibrary.registry.walk))
+    deviceLibrary.registry.treePublished = deviceLibrary.registry.publishedGeneration
+    deviceLibrary.registry.treeValid = true
+    return .Ok(deviceLibrary.registry.tree)
+}

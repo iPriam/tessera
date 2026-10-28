@@ -1,0 +1,12 @@
+import Foundation
+import RenderBox
+
+// A rendered icon: eight-bit RGBA pixels, alpha not premultiplied, top row
+// first, in `colorSpace`: Display P3 for an icon, as IconRendering renders
+// into a Display P3 target.
+public struct IconImage {
+    let width: Number
+    let height: Number
+    let bytes: [UN8]
+    let colorSpace: ColorSpace = .StandardRgb
+}

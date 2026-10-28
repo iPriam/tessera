@@ -1,0 +1,110 @@
+import Foundation
+import Heap
+
+// fs-verity and the sealed system's mount, on Linux
+// (roadmap/13-security-and-updates.md, "How the system is sealed").
+//
+// fs-verity is turned on with SHA-256 over 4096-byte blocks and no salt, the
+// digest the build's composefs image records for every file. The sealed
+// system is overlayfs with the composefs image's EROFS tree as its one layer
+// and the system's files as a data-only layer, under `verity=require`.
+
+namespace VerityIoctl {
+    // `FS_IOC_ENABLE_VERITY`, `_IOW('f', 133, struct fsverity_enable_arg)`.
+    let enable: U64 = U64(0x40806685)
+    // `FS_IOC_MEASURE_VERITY`, `_IOWR('f', 134, struct fsverity_digest)`.
+    let measure: U64 = U64(0xc0046686)
+    // `struct fsverity_enable_arg`: version, hash algorithm, block size and
+    // salt size, each a word from 0, then pointers and reserved room; 128
+    // bytes in all.
+    let enableBytes: Number = 128
+    let version: U32 = U32(1)
+    // `FS_VERITY_HASH_ALG_SHA256`.
+    let sha256: U32 = U32(1)
+    let blockSize: U32 = U32(4096)
+    // `struct fsverity_digest`: the algorithm at 0, the digest's size at 2,
+    // the digest from 4.
+    let digestAt: Number = 4
+    let digestRoom: U16 = U16(64)
+}
+
+// Overlayfs's options for the sealed system: data from the data-only layer
+// only through the image's redirects, and only while its fs-verity digest
+// is the one the image's metacopy attribute names.
+namespace SealedMount {
+    let options: String = "metacopy=on,redirect_dir=on,verity=require,lowerdir="
+    // Separates the layer from the data-only layer in `lowerdir`.
+    let dataLayer: String = "::"
+}
+
+// Turns fs-verity on for the file at `path`. A file that already has it on
+// is left as it is.
+function kernelEnableVerity(path: borrow String) -> Result<Void, TesseraError> {
+    let fd = openat(
+        AtDirectory.current,
+        cStringFrom(path),
+        LinuxOpen.readOnly | LinuxOpen.closeOnExec,
+        0
+    )
+    if answerFailed(fd) { return .Error(errnoFailure(answerErrno(fd))) }
+    let argumentBytes = zeroedBlock(count: VerityIoctl.enableBytes, alignment: 16)
+    let argument = argumentBytes.pointer()
+    heapStore<U32>(argument, 0, VerityIoctl.version)
+    heapStore<U32>(argument, 4, VerityIoctl.sha256)
+    heapStore<U32>(argument, 8, VerityIoctl.blockSize)
+    let answer = ioctl(fd, VerityIoctl.enable, argument)
+    closeBacking(fd)
+    if failedWith(answer, .Exists) { return .Ok }
+    return answerStatus(answer)
+}
+
+// The fs-verity digest of the file at `path`, in lowercase hexadecimal.
+function kernelVerityDigest(path: borrow String) -> Result<String, TesseraError> {
+    let fd = openat(
+        AtDirectory.current,
+        cStringFrom(path),
+        LinuxOpen.readOnly | LinuxOpen.closeOnExec,
+        0
+    )
+    if answerFailed(fd) { return .Error(errnoFailure(answerErrno(fd))) }
+    let digestBytes = zeroedBlock(
+        count: VerityIoctl.digestAt + Number(VerityIoctl.digestRoom),
+        alignment: 16
+    )
+    let digest = digestBytes.pointer()
+    heapStore<U16>(digest, 2, VerityIoctl.digestRoom)
+    let answer = ioctl(fd, VerityIoctl.measure, digest)
+    closeBacking(fd)
+    if answerFailed(answer) { return .Error(errnoFailure(answerErrno(answer))) }
+    let size = Number(heapLoad<U16>(digest, 2))
+    let digits = "0123456789abcdef"
+    var text = ""
+    for index in 0..size {
+        let byte = Number(heapLoad<U8>(digest, VerityIoctl.digestAt + index))
+        let high = floor(byte / 16)
+        let low = byte % 16
+        text.append(digits.substring(high, high + 1))
+        text.append(digits.substring(low, low + 1))
+    }
+    return .Ok(text)
+}
+
+// Mounts at `target`, read-only, the tree the EROFS image mounted at
+// `metadata` describes, its files' data from the tree at `data`.
+function kernelVolumeMountSealed(
+    metadata: borrow String,
+    data: borrow String,
+    target: borrow String,
+    options: VolumeOptions
+) -> Result<Void, TesseraError> {
+    let layers = cStringFrom(SealedMount.options + metadata + SealedMount.dataLayer + data)
+    return answerStatus(
+        mount(
+            cStringFrom("overlay"),
+            cStringFrom(target),
+            cStringFrom("overlay"),
+            mountFlags(options | VolumeOptions.readOnly),
+            layers.address
+        )
+    )
+}

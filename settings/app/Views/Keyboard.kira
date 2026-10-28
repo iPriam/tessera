@@ -1,0 +1,57 @@
+import Foundation
+import KiraUI
+import LibTessera
+import PlatformUI
+
+// Language & Keyboard: the language the person chose in setup, and the
+// layout every key is typed through, which changes from the next key.
+
+construct KeyboardPane() extends Widget {
+    body {
+        let language = storedSetting(LanguageSetting.preferred, LanguageSetting.fallback)
+        let layout = storedSetting(KeyboardSetting.layout, KeyboardSetting.fallback)
+        var languages: [Any Widget] = []
+        for choice in languageChoices() {
+            languages.append(
+                checkedRow(
+                    choice.name,
+                    choice.code == language,
+                    LanguageSetting.preferred,
+                    choice.code
+                )
+            )
+        }
+        var layouts: [Any Widget] = []
+        for choice in layoutChoices() {
+            layouts.append(
+                checkedRow(choice.name, choice.code == layout, KeyboardSetting.layout, choice.code)
+            )
+        }
+        Form(
+            children: [
+                Section(children: languages, header: Text("Language")),
+                Section(
+                    children: layouts,
+                    header: Text("Keyboard"),
+                    footer: Text(
+                        "Every key is typed through this layout, from the next one you press."
+                    )
+                )
+            ]
+        )
+        .navigationTitle("Language & Keyboard")
+    }
+}
+
+// One choice, checked when it is the one kept; choosing it keeps `value`
+// under `key`.
+function checkedRow(title: String, chosen: Bool, key: String, value: String) -> Any Widget {
+    return Button(action = { in changeSetting(key, .Some(copy value)) }) {
+        HStack(spacing = .Medium, alignment = .Center) {
+            Text(title)
+            Spacer()
+            Icon(symbol = .Checkmark).foregroundColor(chosen ? .Accent : .Clear)
+        }
+    }
+    .buttonStyle(.Plain)
+}

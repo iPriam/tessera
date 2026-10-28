@@ -1,0 +1,222 @@
+import Foundation
+import Heap
+
+// The Install service (`tessera.install`), which only the recovery media
+// runs, as only a Mac's recovery carries its installer: it lays a disk out,
+// puts a Tessera volume on a partition and installs the system the media
+// carries onto one. A running system has no such service, and nothing on it
+// answers these calls (roadmap/05-storage-and-state.md).
+//
+// The wire: a 32-byte header, `op` @0, `code` @4 (an `ErrorCode` value), `a`
+// @8, `b` @16, `c` @24, then the operation's text. A request's text is the
+// disk or partition it is about. An answer carries the request's `op`; a
+// failed one says why in its text, and `Partition`'s says the partition it
+// made.
+//
+//   1 `Partition`: one GUID partition table holding one Tessera partition
+//     over the whole disk.
+//   2 `Erase`: a new, empty Tessera volume on the partition, named the
+//     request's `a` bytes of text after the partition's name.
+//   3 `Install`: the system onto the partition's volume. Until it is done,
+//     the service sends answers with the code `ShouldWait`, `a` the files
+//     written and `b` all of them.
+
+namespace InstallWire {
+    let service: String = "tessera.install"
+    let headerBytes: Number = 32
+    let messageBytes: Number = 4096
+    let alignment: Number = 16
+    // Making a table or a volume takes a second or two; an emulated disk
+    // can take longer.
+    let answerWait: Number = 60000000000
+    let readyKey: Number = 1
+}
+
+@Derive(Copy)
+enum InstallOperation: U32 {
+    Partition = 1
+    Erase = 2
+    Install = 3
+}
+
+// Where an install is: the files written of all of them, and once it ends,
+// whether it installed and why not.
+public struct InstallProgress {
+    let done: Number
+    let total: Number
+    let finished: Bool
+    let installed: Bool
+    let problem: String
+}
+
+// An answer as it came off the channel.
+struct InstallAnswer {
+    let operation: U32
+    let code: ErrorCode
+    // An install's progress: bytes written of the total.
+    let done: Number
+    let total: Number
+    let text: String
+}
+
+// A connection to the Install service, for one caller's requests.
+public function installConnect() -> Result<Handle, TesseraError> {
+    return serviceConnect(InstallWire.service)
+}
+
+// Lays the disk `disk` out as one Tessera partition and answers that
+// partition's name, `vdb1` for `vdb`. Everything the disk held is lost.
+public function installPartition(
+    channel: Handle,
+    disk: borrow String
+) -> Result<String, TesseraError> {
+    try installSend(channel, .Partition, 0, disk)
+    let answer = try installAwait(channel, .Partition)
+    return .Ok(answer.text)
+}
+
+// Puts a new, empty Tessera volume called `name` on the partition
+// `partition`. Everything the partition held is lost.
+public function installErase(
+    channel: Handle,
+    partition: borrow String,
+    name: borrow String
+) -> Result<Void, TesseraError> {
+    if name.count == 0 || name.count > 255 || name.contains("/") {
+        return .Error(failure(.InvalidArgument))
+    }
+    try installSend(channel, .Erase, partition.count, partition + name)
+    try installAwait(channel, .Erase)
+    return .Ok
+}
+
+// Asks for the system to be installed onto the volume on `partition`. Its
+// progress arrives on `channel`, read with `installRead` once it is
+// readable.
+public function installBegin(
+    channel: Handle,
+    partition: borrow String
+) -> Result<Void, TesseraError> {
+    return installSend(channel, .Install, 0, partition)
+}
+
+// The newest progress waiting on `channel`, or `ShouldWait` when none has
+// arrived since the last read.
+public function installRead(channel: Handle) -> Result<InstallProgress, TesseraError> {
+    var latest = try installTake(channel)
+    while latest.code == .ShouldWait {
+        match installTake(channel) {
+            Ok(next) -> latest = next
+            Error(failed) -> {
+                absorb failed
+                break
+            }
+        }
+    }
+    let finished = latest.code != .ShouldWait
+    return .Ok(
+        InstallProgress {
+            done: latest.done,
+            total: latest.total,
+            finished: finished,
+            installed: latest.code == .Ok,
+            problem: finished && latest.code != .Ok ? copy latest.text : ""
+        }
+    )
+}
+
+function installSend(
+    channel: Handle,
+    operation: InstallOperation,
+    // Where the first of two names packed into `text` ends; 0 for one name.
+    firstLength: Number,
+    text: borrow String
+) -> Result<Void, TesseraError> {
+    if InstallWire.headerBytes + text.count > InstallWire.messageBytes {
+        return .Error(failure(.InvalidArgument))
+    }
+    let block = zeroedBlock(
+        count: InstallWire.headerBytes + text.count,
+        alignment: InstallWire.alignment
+    )
+    heapStore<U32>(block.pointer(), 0, code(operation))
+    heapStore<U64>(block.pointer(), 8, U64(firstLength))
+    copyBytes(heapOffset(block.pointer(), InstallWire.headerBytes), text.data, text.count)
+    let none: [Handle] = []
+    return channelWrite(
+        channel,
+        Buffer { address: block.pointer(), length: InstallWire.headerBytes + text.count },
+        none
+    )
+}
+
+// One answer off `channel`, `ShouldWait` when there is none.
+function installTake(channel: Handle) -> Result<InstallAnswer, TesseraError> {
+    let block = zeroedBlock(count: InstallWire.messageBytes, alignment: InstallWire.alignment)
+    let received = try channelRead(
+        channel,
+        Buffer { address: block.pointer(), length: InstallWire.messageBytes },
+        UNumber(0)
+    )
+    if received.bytes < InstallWire.headerBytes { return .Error(failure(.InvalidArgument)) }
+    return .Ok(
+        InstallAnswer {
+            operation: heapLoad<U32>(block.pointer(), 0),
+            code: errorCodeFrom(heapLoad<U32>(block.pointer(), 4)),
+            done: Number(heapLoad<U64>(block.pointer(), 8)),
+            total: Number(heapLoad<U64>(block.pointer(), 16)),
+            text: stringFromCBytes(
+                heapOffset(block.pointer(), InstallWire.headerBytes),
+                received.bytes - InstallWire.headerBytes
+            )
+        }
+    )
+}
+
+// Waits for the answer to `operation`, its failure the error.
+function installAwait(
+    channel: Handle,
+    operation: InstallOperation
+) -> Result<InstallAnswer, TesseraError> {
+    let port = try portCreate(.None)
+    let answer = installAwaitOn(channel, port, operation)
+    match handleClose(port) {
+        Ok -> {}
+        Error(failed) -> absorb failed
+    }
+    let taken = try answer
+    if taken.code != .Ok {
+        log warn("the Install service refused", problem: taken.text)
+        return .Error(failure(taken.code))
+    }
+    return .Ok(taken)
+}
+
+function installAwaitOn(
+    channel: Handle,
+    port: Handle,
+    operation: InstallOperation
+) -> Result<InstallAnswer, TesseraError> {
+    let deadline = try timeRead(.Monotonic) + InstallWire.answerWait
+    while true {
+        match installTake(channel) {
+            Ok(answer) -> {
+                if answer.operation == code(operation) && answer.code != .ShouldWait {
+                    return .Ok(answer)
+                }
+            }
+            Error(failed) -> {
+                if failed.code != .ShouldWait { return .Error(failed) }
+                try objectWaitAsync(
+                    channel,
+                    Signals.readable | Signals.peerClosed,
+                    .Once,
+                    port,
+                    InstallWire.readyKey
+                )
+                try portWait(port, 1, deadline)
+            }
+        }
+    }
+    return .Error(failure(.Internal))
+}

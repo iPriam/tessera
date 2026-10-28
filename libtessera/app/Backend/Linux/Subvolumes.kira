@@ -1,0 +1,130 @@
+import Foundation
+import Heap
+
+// A btrfs volume's subvolumes: mounting one by its path in the volume, and
+// creating, snapshotting and deleting them through btrfs's ioctls
+// (linux/btrfs.h), each called on the directory that holds the subvolume.
+
+namespace BtrfsIoctl {
+    // `_IOW(0x94, 14, struct btrfs_ioctl_vol_args)`.
+    let subvolumeCreate: U64 = U64(0x5000940e)
+    // `_IOW(0x94, 15, struct btrfs_ioctl_vol_args)`.
+    let snapshotDestroy: U64 = U64(0x5000940f)
+    // `_IOW(0x94, 23, struct btrfs_ioctl_vol_args_v2)`.
+    let snapshotCreate: U64 = U64(0x50009417)
+    // Both argument structs are 4096 bytes.
+    let argumentBytes: Number = 4096
+    // `btrfs_ioctl_vol_args.name` follows its `fd`.
+    let nameAt: Number = 8
+    // `btrfs_ioctl_vol_args_v2.flags`, after `fd` and `transid`.
+    let flagsAt: Number = 16
+    // `btrfs_ioctl_vol_args_v2.name`, after `fd`, `transid`, `flags` and a
+    // union of four words.
+    let nameAtV2: Number = 56
+    // `BTRFS_SUBVOL_NAME_MAX`.
+    let nameMost: Number = 4039
+    // `BTRFS_SUBVOL_RDONLY`.
+    let readOnly: U64 = U64(2)
+}
+
+// The directory holding `path` and the last name in it.
+struct PathSplit {
+    let directory: String
+    let name: String
+}
+
+function splitPath(path: borrow String) -> Result<PathSplit, TesseraError> {
+    match path.lastIndexOf("/") {
+        Some(slash) -> {
+            let name = path.substring(slash + 1, path.count)
+            if name.count == 0 || name.count > BtrfsIoctl.nameMost {
+                return .Error(failure(.InvalidArgument))
+            }
+            let directory = slash == 0 ? "/" : path.substring(0, slash)
+            return .Ok(PathSplit { directory: directory, name: name })
+        }
+        None -> return .Error(failure(.InvalidArgument))
+    }
+}
+
+// A descriptor for the directory at `path`, which the caller closes.
+function openDirectoryAt(path: borrow String) -> Result<Number, TesseraError> {
+    let directory = openat(
+        AtDirectory.current,
+        cStringFrom(path),
+        LinuxOpen.readOnly | openDirectoryFlag() | LinuxOpen.closeOnExec,
+        0
+    )
+    if answerFailed(directory) { return .Error(errnoFailure(answerErrno(directory))) }
+    return .Ok(directory)
+}
+
+// Runs the btrfs ioctl `request` on the directory holding `path`, with a
+// 4096-byte argument whose name, at `nameAt`, is `path`'s last name, and
+// whose first word is `source` when there is one. `flags` goes at the v2
+// argument's flags.
+function subvolumeCall(
+    path: borrow String,
+    request: U64,
+    nameAt: Number,
+    source: Number?,
+    flags: U64
+) -> Result<Void, TesseraError> {
+    let split = try splitPath(path)
+    let argumentBytes = zeroedBlock(count: BtrfsIoctl.argumentBytes, alignment: 8)
+    let argument = argumentBytes.pointer()
+    match source {
+        Some(descriptor) -> heapStore<I32>(argument, 0, I32(descriptor))
+        None -> {}
+    }
+    if flags != U64(0) { heapStore<U64>(argument, BtrfsIoctl.flagsAt, flags) }
+    copyBytes(heapOffset(argument, nameAt), split.name.data, split.name.count)
+    let directory = try openDirectoryAt(split.directory)
+    let answer = ioctl(directory, request, argument)
+    closeBacking(directory)
+    return answerStatus(answer)
+}
+
+function kernelVolumeMountSubvolume(
+    source: borrow String,
+    target: borrow String,
+    subvolume: borrow String,
+    options: VolumeOptions
+) -> Result<Void, TesseraError> {
+    let data = cStringFrom("subvol=" + subvolume)
+    return answerStatus(
+        mount(
+            cStringFrom(diskNode(source)),
+            cStringFrom(target),
+            cStringFrom("btrfs"),
+            mountFlags(options),
+            data.address
+        )
+    )
+}
+
+function kernelVolumeCreateSubvolume(path: borrow String) -> Result<Void, TesseraError> {
+    return subvolumeCall(path, BtrfsIoctl.subvolumeCreate, BtrfsIoctl.nameAt, .None, U64(0))
+}
+
+function kernelVolumeSnapshot(
+    source: borrow String,
+    target: borrow String,
+    readOnly: Bool
+) -> Result<Void, TesseraError> {
+    let from = try openDirectoryAt(source)
+    let flags = readOnly ? BtrfsIoctl.readOnly : U64(0)
+    let made = subvolumeCall(
+        target,
+        BtrfsIoctl.snapshotCreate,
+        BtrfsIoctl.nameAtV2,
+        .Some(from),
+        flags
+    )
+    closeBacking(from)
+    return made
+}
+
+function kernelVolumeDeleteSubvolume(path: borrow String) -> Result<Void, TesseraError> {
+    return subvolumeCall(path, BtrfsIoctl.snapshotDestroy, BtrfsIoctl.nameAt, .None, U64(0))
+}

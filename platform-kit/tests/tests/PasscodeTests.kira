@@ -1,0 +1,73 @@
+import Foundation
+import PlatformKit
+
+function hex(bytes: borrow [UN8]) -> String {
+    let digits = "0123456789abcdef"
+    var text = ""
+    for byte in bytes {
+        let high = trunc(Number(byte) / 16)
+        let low = Number(byte) % 16
+        text += digits.substring(high, high + 1) + digits.substring(low, low + 1)
+    }
+    return text
+}
+
+function derivedHex(rounds: Number) -> String {
+    return match pbkdf2("password".utf8(), "salt".utf8(), rounds, 32) {
+        Ok(bytes) -> hex(bytes)
+        Error(failure) -> traceText(failure)
+    }
+}
+
+// PBKDF2-HMAC-SHA256's published vectors for "password" and "salt".
+@Test
+function pbkdf2MatchesItsVectors() {
+    expect!(derivedHex(1) == "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b")
+    expect!(derivedHex(2) == "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43")
+    expect!(derivedHex(4096) == "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a")
+}
+
+@Test
+function aRecordMatchesOnlyItsPasscode() {
+    let record = match passcodeRecord("2468") {
+        Ok(value) -> value
+        Error(failure) -> {
+            absorb failure
+            PasscodeRecord { salt: [], rounds: 1, derived: [] }
+        }
+    }
+    expect!(record.matches("2468"))
+    expect!(!record.matches("2469"))
+    let again = match passcodeRecordFrom(passcodeRecordText(record)) {
+        Some(read) -> read.matches("2468")
+        None -> false
+    }
+    expect!(again)
+    expect!(passcodeRecordFrom("md5 1 aa bb").isNone())
+}
+
+@Test
+function aShortPasscodeIsRefused() {
+    let refused = match passcodeRecord("12") {
+        Ok -> false
+        Error(failure) -> match failure {
+            TooShort -> true
+            Crypto -> false
+        }
+    }
+    expect!(refused)
+}
+
+@Test
+function wrongPasscodesWaitLongerEachTime() {
+    var attempts = UnlockAttempts {}
+    for _ in 0..UnlockPatience.free - 1 {
+        attempts = attempts.failed(0)
+    }
+    expect!(attempts.allowed(0))
+    attempts = attempts.failed(0)
+    expect!(!attempts.allowed(UnlockPatience.firstWait - 1))
+    expect!(attempts.allowed(UnlockPatience.firstWait))
+    attempts = attempts.failed(0)
+    expect!(attempts.waitUntil == UnlockPatience.firstWait * 2)
+}

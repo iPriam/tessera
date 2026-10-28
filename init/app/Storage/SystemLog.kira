@@ -1,0 +1,149 @@
+import Foundation
+import Heap
+import LibTessera
+
+// The system log (roadmap/14-tooling-and-ports.md, "Debugging"): every line a
+// service writes, after the time and the service's name, kept on the data
+// volume so the machine can be asked what happened the last time it ran.
+// Each boot writes `system.log`, and the one before it is kept as
+// `system.log.0`, as a Mac's newsyslog keeps the last. A boot says how long
+// the last boot's log was and how it ended.
+
+namespace SystemLogFile {
+    let directory: String = "/" + SystemDirectory.systemLogs
+    let current: String = "system.log"
+    let previous: String = "system.log.0"
+}
+
+// The log this boot writes to; no file before the data volume is mounted.
+struct SystemLog {
+    var calls: Handle = Handle.invalid
+    var file: Handle = Handle.invalid
+}
+
+// Keeps the last boot's log as `system.log.0`, says how it ended, and opens
+// a new `system.log` for this boot. A machine with no data volume keeps no
+// log, and says nothing of it.
+function openSystemLog(calls: Handle) -> Result<SystemLog, TesseraError> {
+    try ensureDirectory(calls, SystemLogFile.directory)
+    let directory = try lookup(calls, SystemLogFile.directory, directoryRights())
+    match answer(
+        calls,
+        nodeRename(
+            directory,
+            SystemLogFile.current,
+            directory,
+            SystemLogFile.previous,
+            RenameOptions.replace,
+            calls,
+            PortKey.call
+        )
+    ) {
+        Ok(_) -> announcePreviousLog(calls)
+        // The first boot on a new data volume has no log before it.
+        Error(failed) -> {
+            if failed.code != .NotFound {
+                log warn("could not keep the last boot's log", error: errorName(failed))
+            }
+        }
+    }
+    let node = answeredHandle(
+        calls,
+        nodeCreate(
+            directory,
+            SystemLogFile.current,
+            .File,
+            CreateOptions.none,
+            fileRights,
+            calls,
+            PortKey.call
+        )
+    )
+    release(directory)
+    let created = try node
+    let file = openNode(calls, created, OpenMode.write | OpenMode.append | OpenMode.truncate)
+    release(created)
+    return .Ok(SystemLog { calls: calls, file: try file })
+}
+
+// Says how many lines the last boot's log has and what its last one was.
+function announcePreviousLog(calls: Handle) {
+    let path = SystemLogFile.directory + "/" + SystemLogFile.previous
+    let bytes = match readWholeFile(calls, path) {
+        Ok(value) -> value
+        Error(failed) -> {
+            if failed.code != .NotFound {
+                log warn("could not read the previous system log", error: errorName(failed))
+            }
+            return
+        }
+    }
+    var lines: Number = 0
+    var lastStart: Number = 0
+    var lastEnd: Number = 0
+    var start: Number = 0
+    for index in 0..bytes.count {
+        if bytes[index] == UN8(10) {
+            lines += 1
+            lastStart = start
+            lastEnd = index
+            start = index + 1
+        }
+    }
+    var last: [UN8] = []
+    for index in lastStart..lastEnd { last.append(bytes[index]) }
+    let text = match textFromBytes(last) {
+        Some(value) -> value
+        None -> ""
+    }
+    log info("read the last boot's log", path, lines, last: text)
+}
+
+// Writes `line`, from `source`, to the log after the time it was written.
+function writeSystemLog(systemLog: borrow SystemLog, source: borrow String, line: borrow String) {
+    if systemLog.file == Handle.invalid { return }
+    let bytes = "\(logStamp(unixMillis())) \(source): \(line)\n".utf8()
+    let block = zeroedBlock(count: bytes.count, alignment: 16)
+    for index in 0..bytes.count { heapStore<U8>(block.pointer(), index, bytes[index]) }
+    let buffers = [Buffer { address: block.pointer(), length: bytes.count }]
+    match answer(
+        systemLog.calls,
+        fileWriteAt(systemLog.file, FileOffset.append, buffers, systemLog.calls, PortKey.call)
+    ) {
+        Ok(_) -> {}
+        Error(failed) -> log warn("could not write the system log", error: errorName(failed))
+    }
+}
+
+// Puts what the log holds on stable storage and closes it, before the
+// machine stops.
+function closeSystemLog(systemLog: borrow mut SystemLog) {
+    if systemLog.file == Handle.invalid { return }
+    match answer(systemLog.calls, fileSync(systemLog.file, .All, systemLog.calls, PortKey.call)) {
+        Ok(_) -> {}
+        Error(failed) -> log warn("could not sync the system log", error: errorName(failed))
+    }
+    release(systemLog.file)
+    systemLog.file = Handle.invalid
+    // The rename that kept the last boot's log is the volume's, not the file's.
+    match machineFlush() {
+        Ok -> {}
+        Error(failed) -> log warn("could not flush the volume", error: errorName(failed))
+    }
+}
+
+// `2026-10-14 16:32:01.250`: the wall clock `realtime`, in milliseconds since
+// 1970, as UTC, which is the only time zone Tessera has.
+function logStamp(realtime: Number) -> String {
+    let seconds = floor(realtime / 1000)
+    let millis = realtime - seconds * 1000
+    let days = floor(seconds / CivilTime.secondsPerDay)
+    let date = civilDate(days)
+    let rest = seconds - days * CivilTime.secondsPerDay
+    let hour = floor(rest / CivilTime.secondsPerHour)
+    let minute = floor(rest % CivilTime.secondsPerHour / CivilTime.secondsPerMinute)
+    let second = rest % CivilTime.secondsPerMinute
+    let day = "\(date.year)-\(zeroPadded(date.month, 2))-\(zeroPadded(date.day, 2))"
+    let time = "\(zeroPadded(hour, 2)):\(zeroPadded(minute, 2)):\(zeroPadded(second, 2))"
+    return "\(day) \(time).\(zeroPadded(floor(millis), 3))"
+}

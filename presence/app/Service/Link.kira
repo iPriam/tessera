@@ -1,0 +1,67 @@
+//! The display link PID 1 gives Presence: the channel to MosaicDisplay on which the token checks go.
+import Foundation
+import Heap
+import LibTessera
+
+// The display link PID 1 gives this service: the channel to MosaicDisplay, on
+// which token checks go. PID 1 sends it on the parent channel as a display
+// link. The role (Presence) is on MosaicDisplay's end, not this one, so the
+// detail word here is only the link count.
+//
+// The header is a service message's: opcode @0, size @4, serial @8, detail @12.
+
+/// Waits on `reader`, a port of this service's own, until `channel` has a message or has gone.
+function awaitReadable(channel: Handle, reader: Handle) -> Result<Void, TesseraError> {
+    try objectWaitAsync(channel, Signals.readable | Signals.peerClosed, .Once, reader, 1)
+    return match portWait(reader, 1, Deadline.infinite) {
+        Ok(completions) -> .Ok
+        Error(failed) -> .Error(failed)
+    }
+}
+
+/// The display link, or none when PID 1 sends none; messages that are not a display link are closed and skipped.
+function takeLink() -> Handle? {
+    let channel = match startupHandle(StartupTag.parentChannel) {
+        Some(value) -> value
+        None -> {
+            log warn("no parent channel")
+            return .None
+        }
+    }
+    let reader = match portCreate(.None) {
+        Ok(value) -> value
+        Error(failed) -> {
+            log warn("no port to read the link on", error: errorName(failed))
+            return .None
+        }
+    }
+    while true {
+        let body = zeroedBlock(count: Number(ServiceMessage.headerBytes), alignment: 16)
+        let buffer = Buffer { address: body.pointer(), length: Number(ServiceMessage.headerBytes) }
+        let received = match channelRead(channel, buffer, 1) {
+            Ok(value) -> value
+            Error(failed) -> {
+                if failed.code != .ShouldWait {
+                    log warn("the display link did not arrive", error: errorName(failed))
+                    return .None
+                }
+                match awaitReadable(channel, reader) {
+                    Ok -> {}
+                    Error(failedWait) -> {
+                        log warn("the display link did not arrive", error: errorName(failedWait))
+                        return .None
+                    }
+                }
+                continue
+            }
+        }
+        let opcode = UN32(blockLoad<U32>(body, 0))
+        if received.bytes >= Number(ServiceMessage.headerBytes) && opcode == ServiceOpcode.DisplayLink.rawValue() && received.handles.count == 1 {
+            log info("the display link arrived")
+            return .Some(received.handles[0])
+        }
+        closeHandles(received.handles)
+        log warn("a message on the parent channel is not the display link", opcode: opcode)
+    }
+    return .None
+}

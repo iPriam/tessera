@@ -1,0 +1,169 @@
+import Foundation
+import LibTessera
+import KiraUI
+import TesseraUI
+import PlatformUI
+import FileOperations
+
+// What the person keeps on Adaptive Desktop's desktop
+// (roadmap/28-desktop-and-displays.md, "Desktop items"): the entries of
+// `/Documents/Desktop`, each an icon down the trailing edge under the bar,
+// as a Mac's are. A click chooses one; a click on the chosen one opens it, a
+// folder in Inlay. With one chosen, Return renames it and Command-Delete
+// moves it to the Trash; Command-Shift-N makes a folder. Inlay lists the
+// same folder, so a change in either shows in the other.
+
+namespace DeskLook {
+    let icon: Number = 64
+    let tile: Number = 100
+    let label: Number = 12
+    let edge: Number = 16
+    let top: Number = 40
+    let chosen: RGBAColor = RGBAColor { r: 1.0, g: 1.0, b: 1.0, a: 0.25 }
+}
+
+construct DeskItems() extends Widget {
+    @State var chosen: String = ""
+    @State var renaming: Bool = false
+    @State var newName: String = ""
+
+    body {
+        let folder = deskFolder()
+        let entries = match entriesIn(folder) {
+            Ok(found) -> found
+            Error(failure) -> {
+                log info("the desktop's folder is not there yet", failure: traceText(failure))
+                []
+            }
+        }
+        var tiles: [Any Widget] = []
+        for entry in entries {
+            if entry.name.startsWith(".") { continue }
+            tiles.append(self.tile(entry))
+        }
+        HStack(spacing = .None, alignment = .Top) {
+            Spacer()
+            VStack(spacing = .Small, alignment = .Center, children = tiles)
+            .edgePadding(EdgeSet.top, resolvedLength(DeskLook.top))
+            .edgePadding(EdgeSet.trailing, resolvedLength(DeskLook.edge))
+        }
+        .fillWidth()
+        .fillHeight()
+        .onKeyPress(KeyEquivalent.returnKey, action = { in self.beginRename() })
+        .onKeyPress(
+            KeyEquivalent.delete,
+            modifiers = [.Command],
+            action = { in self.moveToTrash() }
+        )
+        .onKeyPress("N", modifiers = [.Command, .Shift], action = { in self.makeFolder() })
+    }
+
+    // One item: its icon and name, lit when chosen; a field while renamed.
+    function tile(entry: borrow Entry) -> Any Widget {
+        let path = copy entry.path
+        let isChosen = chosen == entry.path
+        let symbol: Symbol = match entry.kind {
+            Folder -> .FolderFill
+            File -> .DocText
+            Other -> .Doc
+        }
+        let name: Any Widget = isChosen && renaming
+        ? TextField(title = "Name", text = $newName).onSubmit({ in self.rename() })
+        : Text(copy entry.name)
+        .font(size: resolvedLength(DeskLook.label), weight: .Medium)
+        .foregroundColor(.White)
+        return Button(action = { in self.pressed(path) }) {
+            VStack(spacing = .Small, alignment = .Center) {
+                Icon(symbol = symbol).font(
+                    size: resolvedLength(DeskLook.icon * 0.7)
+                ).foregroundColor(.White)
+                name
+            }
+            .width(resolvedLength(DeskLook.tile))
+            .background(
+                RoundedRectangle(cornerRadius = 8, style = .Continuous).fill(
+                    isChosen ? DeskLook.chosen : RGBAColor { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }
+                )
+            )
+        }
+        .buttonStyle(.Plain)
+    }
+
+    // A click chooses an item; a click on the chosen one opens it.
+    function pressed(path: borrow String) {
+        if chosen != path {
+            chosen = copy path
+            renaming = false
+            return
+        }
+        if isDirectory(path) { openInInlay(path) }
+    }
+
+    function beginRename() {
+        if chosen.count == 0 { return }
+        newName = lastPathPart(chosen)
+        renaming = true
+    }
+
+    function rename() {
+        renaming = false
+        match renameEntry(chosen, newName) {
+            Ok(path) -> chosen = path
+            Error(failure) -> log warn(
+                "a desktop item could not be renamed",
+                failure: traceText(failure)
+            )
+        }
+    }
+
+    function moveToTrash() {
+        let onData = try trashPathFor(chosen) otherwise return
+        match trashMove(onData) {
+            Ok(id) -> {
+                log info("moved a desktop item to the Trash", id: id)
+                chosen = ""
+            }
+            Error(failed) -> log warn(
+                "a desktop item could not be moved to the Trash",
+                error: errorName(failed)
+            )
+        }
+    }
+
+    function makeFolder() {
+        match makeNewFolder(deskFolder()) {
+            Ok(path) -> {
+                chosen = path
+                newName = lastPathPart(path)
+                renaming = true
+            }
+            Error(failure) -> log warn(
+                "a folder could not be made on the desktop",
+                failure: traceText(failure)
+            )
+        }
+    }
+}
+
+// The desktop's folder, made the first time it is asked for.
+function deskFolder() -> String {
+    let folder = "/" + SystemDirectory.desktopItems
+    if !isDirectory(folder) {
+        match makeDirectory(folder) {
+            Ok -> log info("made the desktop's folder", path: copy folder)
+            Error(failure) -> log warn("the desktop's folder could not be made", failure)
+        }
+    }
+    return folder
+}
+
+// Opens Inlay showing the folder at `path`.
+function openInInlay(path: borrow String) {
+    for application in installedApplications() {
+        if application.name == InlayApplication.name {
+            openApplicationAt(application, path)
+            return
+        }
+    }
+    log warn("Inlay is not installed to open a folder")
+}

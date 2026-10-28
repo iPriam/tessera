@@ -1,0 +1,59 @@
+import Foundation
+
+// Buffers, bands and handles: the checks a surface's data makes on itself.
+
+@Test
+function bufferIsValidWithPositiveSizeAndFullRows() {
+    let good = Buffer { fd: 3, width: 10, height: 10, stride: 40 }
+    expect!(good.isValid())
+}
+
+@Test
+function bufferWithShortRowsIsInvalid() {
+    let short = Buffer { fd: 3, width: 10, height: 10, stride: 39 }
+    expect!(!short.isValid())
+}
+
+@Test
+function bufferWithoutAreaIsInvalid() {
+    let flat = Buffer { fd: 3, width: 0, height: 10, stride: 0 }
+    expect!(!flat.isValid())
+}
+
+@Test
+function bufferDefaultsToLinearXrgb() {
+    let buffer = Buffer { fd: 3, width: 4, height: 4, stride: 16 }
+    expect!(buffer.modifier == 0)
+    let format = match buffer.format {
+        Xrgb8888 -> true
+        Argb8888 -> false
+        Xbgr8888 -> false
+        Abgr8888 -> false
+    }
+    expect!(format)
+}
+
+@Test
+function channelTableStartsWithEverySlotEmpty() {
+    let table = ChannelTable {}
+    expect!(!table.navigationTitle.isSome())
+    expect!(!table.badge.isSome())
+    expect!(!table.focusGraph.isSome())
+    expect!(!table.safeAreaNeeds.isSome())
+    expect!(!table.nowPlayingHint.isSome())
+    expect!(!table.supportsPosture.isSome())
+}
+
+@Test
+function nowPlayingHintDefaultsToPaused() {
+    let hint = NowPlayingHint { title: "track" }
+    expect!(!hint.playing)
+    expect!(hint.artist == "")
+}
+
+@Test
+function surfaceHandleCarriesIdAndGeneration() {
+    let handle = SurfaceHandle { id: SurfaceId(5), generation: SurfaceGeneration(2) }
+    expect!(handle.id.raw == 5)
+    expect!(handle.generation.raw == 2)
+}

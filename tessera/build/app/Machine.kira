@@ -1,0 +1,209 @@
+import Foundation
+
+// The machine QEMU emulates: which emulator, its board and processor, the
+// console and the GPU. A boot and an install both start one.
+
+// The emulator a boot runs, and what the guest's Vulkan reaches through it.
+struct Emulator {
+    let program: String
+    // Whether it is the venus-capable QEMU the host GPU stack built
+    // (HostGraphics.kira).
+    let venus: Bool
+    // The host Vulkan driver venus forwards to, named to the loader through
+    // VK_ICD_FILENAMES; empty for the loader's own choice.
+    let icd: String
+}
+
+namespace MachineLayout {
+    // The port on the host's loopback that reaches a dev machine's debug
+    // server, `debugserver`, through a virtio-serial port it reads as
+    // `/dev/vport0p1`: `lldb` connects with `gdb-remote 7331`.
+    let debugPort: Number = 7331
+    // The port that reaches LLVM's own `lldb-server`, through the third port
+    // of the virtio-serial device, `/dev/vport0p2`: stock `lldb` connects
+    // with `gdb-remote 7332`.
+    let lldbPort: Number = 7332
+    // MoltenVK as Homebrew installs it: Vulkan over Metal, the portability
+    // subset, for a boot without KosmicKrisp.
+    let moltenVk: String = "/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json"
+    // KosmicKrisp's manifest, from its prefix.
+    let kosmicKrisp: String = "share/vulkan/icd.d/kosmickrisp_mesa_icd.aarch64.json"
+    // The host-visible window is a PCI BAR, and every window's buffers and
+    // uploads are mapped through it: 256M ran out with three applications
+    // open, and 1G with two at 4480 by 2520. It grows with the output, a
+    // gigabyte for every 2560 by 1600 of it, to the power of two a BAR is. A
+    // BAR this size needs the high PCI window, which a Mac's board only has
+    // with `highmem-mmio-size` (machineArguments).
+    let venusDevice: String = "virtio-gpu-gl-pci,venus=on,blob=on"
+    let pixelsAGigabyte: Number = 2560 * 1600
+    // The 2D device: what a window shows dumb buffers on.
+    let plainDevice: String = "virtio-gpu-pci"
+}
+
+extend Architecture {
+    // The emulator the host's package manager installs.
+    function qemu(borrow self) -> String {
+        return match self {
+            X86_64 -> "qemu-system-x86_64"
+            Aarch64 -> "qemu-system-aarch64"
+        }
+    }
+
+    // The kernel's console words. /dev/console is hvc0, the virtio console:
+    // the emulated UART traps into QEMU for every byte. The UART still shows
+    // the boot until the virtio console is up, which is where a kernel that
+    // dies early says why.
+    function console(borrow self) -> String {
+        return match self {
+            X86_64 -> "earlyprintk=serial console=hvc0"
+            Aarch64 -> "earlycon console=hvc0"
+        }
+    }
+}
+
+// The emulator for a boot of `architecture`: the venus QEMU the graph built,
+// the host's when it built none. `icd` overrides the Vulkan driver.
+function bootEmulator(
+    host: borrow Host,
+    architecture: Architecture,
+    icd: borrow String,
+    images: borrow BootImages
+) -> Emulator {
+    if images.emulator.count > 0 {
+        return Emulator {
+            program: "\(images.emulator)/bin/\(architecture.qemu())",
+            venus: true,
+            icd: hostVulkanDriver(host, icd, images.vulkan)
+        }
+    }
+    return Emulator { program: host.find(architecture.qemu()), venus: false, icd: "" }
+}
+
+// The Vulkan driver venus forwards a guest's Vulkan to: `named` when it is
+// given, and on a Mac KosmicKrisp, else MoltenVK. A Linux host's loader
+// finds its own driver.
+function hostVulkanDriver(
+    host: borrow Host,
+    named: borrow String,
+    kosmicKrisp: borrow String
+) -> String {
+    if named.count > 0 { return copy named }
+    if !host.darwin { return "" }
+    if kosmicKrisp.count > 0 { return "\(kosmicKrisp)/\(MachineLayout.kosmicKrisp)" }
+    if fileExists(MachineLayout.moltenVk) { return MachineLayout.moltenVk }
+    return ""
+}
+
+// QEMU's side of the console: the UART and the virtio console on stdio
+// through one multiplexer, so Ctrl-A X still quits, copied to `logfile`
+// when one is named.
+function consoleArguments(logfile: borrow String) -> [String] {
+    var chardev = "stdio,id=console,mux=on,signal=on"
+    if logfile.count > 0 { chardev = chardev + ",logfile=" + logfile }
+    return [
+        "-chardev", chardev, "-serial", "chardev:console",
+        "-device", "virtio-serial-pci", "-device", "virtconsole,chardev=console"
+    ]
+}
+
+// A dev machine's debug ports: the second and third ports of the
+// virtio-serial device, each a TCP socket on the host's loopback that lldb
+// connects to, the first served by `debugserver` and the second by
+// `lldb-server`.
+function debugPortArguments() -> [String] {
+    return [
+        "-chardev", "socket,id=debugport,host=127.0.0.1,port=\(MachineLayout.debugPort),server=on,wait=off",
+        "-device", "virtserialport,chardev=debugport,name=tessera.debug",
+        "-chardev", "socket,id=lldbport,host=127.0.0.1,port=\(MachineLayout.lldbPort),server=on,wait=off",
+        "-device", "virtserialport,chardev=lldbport,name=tessera.lldb"
+    ]
+}
+
+// The board and processor. x86_64 takes KVM when the host exposes it and
+// TCG otherwise. On Apple silicon Hypervisor.framework runs an aarch64 guest
+// untranslated; elsewhere TCG emulates `max`, since the kernel's 16K pages
+// are more than a Cortex-A72 maps, with the cheap pointer authentication.
+// `emulate` takes TCG on every host. Hypervisor.framework on an M1 gives the
+// guest 36 address bits, too few for the board's 512G high PCI window, so a
+// 16G one is asked for (patches/qemu-10.0.2-highmem-mmio-size): without it
+// every BAR shares the 32-bit window, where the GPU's is held to 256M.
+//
+// The CPU is described without a PMU: Hypervisor.framework gives the guest
+// no performance counters on more than one CPU, and a board that lists one
+// has the kernel fail to probe it at every boot.
+function machineArguments(
+    host: borrow Host,
+    architecture: Architecture,
+    emulate: Bool
+) -> [String] {
+    return match architecture {
+        X86_64 -> emulate ? ["-machine", "q35,accel=tcg", "-cpu", "max"] : ["-machine", "q35,accel=kvm:tcg", "-cpu", "max"]
+        Aarch64 -> !emulate && host.darwin && host.architecture == .Aarch64
+        ? ["-machine", "virt,accel=hvf,highmem-mmio-size=16G", "-cpu", "host,pmu=off"]
+        : ["-machine", "virt", "-cpu", "max,pauth-impdef=on"]
+    }
+}
+
+// What the kernel prints to the console: errors and worse, since it waits
+// on the serial line for each byte, unless `all` asks for everything. Init
+// lowers the console's level once it runs, which `ignore_loglevel` outlasts,
+// and a program a signal kills prints its registers and code.
+function kernelLogWords(level: borrow String) -> String {
+    if level == "all" { return " ignore_loglevel print-fatal-signals=1" }
+    return " loglevel=4"
+}
+
+// The exit status of `exit`, a signal as a shell reports one.
+function exitStatus(exit: borrow ChildExit) -> Number {
+    return match exit {
+        Status(status) -> status
+        Signalled(signal) -> 128 + signal
+    }
+}
+
+// The host's time zone, by its IANA name, for the guest to read its clocks
+// in until Settings names another: `TZ` when it names one, else the zone file
+// `/etc/localtime` links to. None when the host says neither.
+function hostTimeZone() -> String {
+    var named = environmentValue("TZ")
+    if named.startsWith(":") { named = named.substring(1, named.count) }
+    if named.count > 0 && !named.startsWith("/") { return named }
+    let linked = match readSymbolicLink(named.count > 0 ? named : "/etc/localtime") {
+        Ok(target) -> target
+        Error(failure) -> return ""
+    }
+    return match linked.indexOf("zoneinfo/") {
+        Some(at) -> linked.substring(at + 9, linked.count)
+        None -> ""
+    }
+}
+
+// The boot word that hands the guest the host's zone, or nothing.
+function timeZoneWord() -> String {
+    let zone = hostTimeZone()
+    if zone.count == 0 || zone.contains(" ") { return "" }
+    return " tessera.zone=" + zone
+}
+
+// The host-visible window for an output `width` by `height`, in gigabytes.
+function venusHostMemory(width: Number, height: Number) -> Number {
+    let wanted = width * height / MachineLayout.pixelsAGigabyte
+    var gigabytes: Number = 1
+    while gigabytes < wanted { gigabytes = gigabytes * 2 }
+    return gigabytes
+}
+
+// The host-visible window for a boot whose output starts `width` by `height`.
+// The window cannot grow once the guest has mapped it, but the output can, as
+// the Mac's window is resized or made full screen: on a Mac it is made for the
+// largest of its screens too.
+function bootHostMemory(host: borrow Host, width: Number, height: Number) -> Number {
+    var pixels = width * height
+    if host.darwin {
+        match hostLargestScreen() {
+            Some(screen) -> pixels = max(pixels, screen.0 * screen.1)
+            None -> {}
+        }
+    }
+    return venusHostMemory(pixels, 1)
+}

@@ -1,0 +1,57 @@
+import Foundation
+
+// The §10.3 body encoding, for the variable-length records calls write to
+// caller buffers (`DeviceInfo`, `SystemInfo`): little-endian,
+// each field at its natural alignment, `String`/`Bytes`/`Vector` as a `u64`
+// count followed by the elements padded to 8.
+//
+// One record is built at a time, in `encodingBytes`.
+
+function encodeReset() {
+    library.encoding = []
+}
+
+function encodeAlign(alignment: Number) {
+    while library.encoding.count % alignment != 0 { library.encoding.append(U8(0)) }
+}
+
+function encodeU32(value: U32) {
+    encodeAlign(4)
+    for index in 0..4 { library.encoding.append(U8((value >> U32(index * 8)) & U32(0xFF))) }
+}
+
+function encodeU64(value: U64) {
+    encodeAlign(8)
+    for index in 0..8 { library.encoding.append(U8((value >> U64(index * 8)) & U64(0xFF))) }
+}
+
+function encodeBool(value: Bool) {
+    library.encoding.append(value ? U8(1) : U8(0))
+}
+
+function encodeString(text: borrow String) {
+    encodeU64(U64(text.count))
+    for index in 0..text.count { library.encoding.append(U8(text.charAt(index))) }
+    encodeAlign(8)
+}
+
+// `Bytes` from memory.
+function encodeBytes(source: RawPtr, count: U64) {
+    encodeU64(count)
+    for index in 0..Number(count) {
+        library.encoding.append(heapLoad<U8>(source, index))
+    }
+    encodeAlign(8)
+}
+
+// The encoding so far, copied to `out`; its size, or `BufferTooSmall` with
+// the size needed.
+function encodeDeliver(out: borrow Buffer) -> Result<U64, TesseraError> {
+    encodeAlign(8)
+    let size = U64(library.encoding.count)
+    if out.length < size { return .Error(failureDetail(.BufferTooSmall, size)) }
+    for index in 0..library.encoding.count {
+        heapStore<U8>(out.address, index, library.encoding[index])
+    }
+    return .Ok(size)
+}

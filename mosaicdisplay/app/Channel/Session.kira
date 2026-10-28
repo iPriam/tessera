@@ -1,0 +1,212 @@
+import Foundation
+import LibTessera
+import DeviceKit
+import TesseraDisplayClient
+
+// One client's session: its hello, and the frames it commits.
+
+// The DeviceKit token an `Attach` names its surface by.
+function tokenOf(token: borrow DisplayToken) -> Token {
+    return Token { high: UNumber(token.high), low: UNumber(token.low) }
+}
+
+function hasToken(token: borrow DisplayToken) -> Bool {
+    return token.high != 0 || token.low != 0
+}
+
+// The next message, or the reason the session cannot continue.
+function nextMessage(channel: Handle) -> Result<DisplayMessage, SessionFailure> {
+    return match receive(channel) {
+        Message(message) -> .Ok(message)
+        Closed -> .Error(.Closed)
+        Invalid -> .Error(.InvalidMessage)
+    }
+}
+
+// A client may declare a channel value, post a notification or ask for a
+// window action around its frames. Each is taken here and the next message
+// read, which is what keeps the frame path from being desynced by a client
+// that speaks about its surface between frames. False when `message` is
+// none of these.
+function takeAside(
+    server: borrow mut Server,
+    index: Number,
+    message: borrow DisplayMessage
+) -> Result<Bool, SessionFailure> {
+    // Only the platform controls the compositor. An application that sends a
+    // control message, focus for itself above all, is refused and keeps its
+    // session; nothing changes.
+    if isPlatformControl(message) {
+        refuseApplicationControl(server.clients[index].surface.raw, message)
+        return .Ok(true)
+    }
+    let forwarded: DisplayMessage = match message {
+        SetChannel(value) -> .ChannelChanged(
+            DisplayChannelValue {
+                surface: value.surface,
+                channel: value.channel,
+                value: value.value
+            }
+        )
+        Notify(notification) -> .Notification(
+            DisplayNotification {
+                surface: notification.surface,
+                id: notification.id,
+                priority: notification.priority
+            }
+        )
+        RequestWindow(request) -> {
+            requestWindow(server, index, request)
+            return .Ok(true)
+        }
+        SetMargin(asked) -> {
+            setMargin(server, index, asked)
+            return .Ok(true)
+        }
+        SetGlass(asked) -> {
+            setGlass(server, index, asked)
+            return .Ok(true)
+        }
+        SetLaunchOrigin(asked) -> {
+            match setLaunchOrigin(server, index, asked) {
+                Ok -> return .Ok(true)
+                Error(reason) -> return .Error(.ClockFailure(reason))
+            }
+        }
+        // A configure the client acknowledged in its own time.
+        AckConfigure(frame) -> {
+            log info(
+                "a surface acknowledged a configure",
+                surface: frame.surface.raw,
+                serial: frame.serial
+            )
+            resizeAcknowledged(server, index)
+            return .Ok(true)
+        }
+        // Anything else is not taken aside.
+        Hello, Welcome, Attach, Commit, Key, FrameDone, FrameRequest, FrameReady, FocusIn, FocusOut,
+            Configure, SetStageBadge, SetMode, ModeChanged, InputCapability, SurfaceCreated,
+            SurfaceDestroyed, GrantFocus, InstallGrab, GrabFired, ChannelChanged, PresentSystem, Verify,
+            VerifyResult, InjectInput, Notification, ActivateRequested, SetBar, PointerMotion,
+            PointerButton, PointerAxis, PointerEnter, PointerLeave, SetDock, SurfacePressed,
+            WindowRequested, GrantMove, GrantResize, HoldInput, SetOverlay, SetIdle, IdleChanged, BarBackdrop, PlaceSurface, SurfacePlaced, SetHidden, Insets, Output -> return .Ok(false)
+    }
+    match server.platform {
+        Some(channel) -> tell(channel, forwarded)
+        // No platform to tell; the message is still taken.
+        None -> {}
+    }
+    return .Ok(true)
+}
+
+function refuseApplicationControl(surface: UNumber, message: borrow DisplayMessage) {
+    if asksForFocus(message) {
+        log warn("refused focus to an application that asked for it", surface: surface)
+    } else {
+        log warn("refused a control message from an application", surface: surface)
+    }
+}
+
+namespace ImportKey {
+    let surface: UNumber = UNumber(4)
+}
+
+// The surface behind a token, once DeviceKit's manager has handed it over.
+function importSurface(display: borrow Display, token: borrow Token) -> Result<Ref, TesseraError> {
+    try surfaceImport(token, display.flips, ImportKey.surface)
+    let imported = try awaitAnswer(display.flips)
+    return .Ok(Ref(imported.result0))
+}
+
+// One message from the application at `index`: something it says about its
+// surface, taken aside, or a step of its frame exchange. False when the
+// client has gone, sent something that is not a message, or broke the
+// exchange.
+function serveApplication(server: borrow mut Server, index: Number) -> Result<Void, SessionFailure> {
+    let message = try nextMessage(server.clients[index].channel)
+    let aside = try takeAside(server, index, message)
+    if aside { return .Ok }
+    return exchangeStep(server, index, move message)
+}
+
+namespace OutputId {
+    // The one output MosaicDisplay drives.
+    let first: UNumber = 1
+}
+
+// A client's hello, answered with its welcome, which hands it `surface`, the
+// one surface number it may name, and the output it is on
+// (roadmap/08-display-server.md, "Connection").
+function beginClient(channel: Handle, surface: UNumber, scanout: borrow Scanout) -> Result<Void, SessionFailure> {
+    let hello = try nextMessage(channel)
+    match hello {
+        Hello -> {}
+        Welcome, Attach, Commit, Key, FrameDone, FrameRequest, FrameReady, FocusIn, FocusOut, Configure,
+            AckConfigure, SetMode, ModeChanged, InputCapability, SurfaceCreated, SurfaceDestroyed,
+            GrantFocus, InstallGrab, GrabFired, SetChannel, ChannelChanged, PresentSystem, Verify,
+            VerifyResult, InjectInput, Notify, Notification, ActivateRequested, SetBar, PointerMotion, PointerButton, PointerAxis, PointerEnter, PointerLeave, SetDock, SurfacePressed, RequestWindow, WindowRequested, GrantMove, GrantResize, HoldInput, SetOverlay, SetIdle, IdleChanged, BarBackdrop, SetGlass, SetLaunchOrigin, SetStageBadge, PlaceSurface, SurfacePlaced, SetHidden, SetMargin, Insets, Output -> {
+            return .Error(.ExpectedHello)
+        }
+    }
+    let welcome: DisplayMessage = .Welcome(DisplayIdRange { base: surface, count: 1 })
+    let output: DisplayMessage = .Output(
+        DisplayOutput {
+            id: OutputId.first,
+            width: scanout.width,
+            height: scanout.height,
+            refresh: scanout.refresh,
+            scale: scanout.scale,
+        }
+    )
+    for message in [welcome, output] {
+        match sendDisplayMessage(channel, message) {
+            Ok -> {}
+            Error(reason) -> return .Error(.Send(reason))
+        }
+    }
+    log info(
+        "told the UI its output",
+        width: scanout.width,
+        height: scanout.height,
+        refresh: scanout.refresh,
+        scale: scanout.scale
+    )
+    return .Ok
+}
+
+// Keeps `replaced`, the frame the one just flipped to replaced, and lets go of
+// the frame it replaced in turn (roadmap/08-display-server.md, "Buffer
+// lifetime"). The server holds a frame until the flip after the one that
+// replaced it: until then the display may still be reading it. The client
+// draws into it again only after the `FrameDone` for the frame after it, so
+// holding it costs nothing, and a buffer the client alternates is never let
+// go of by the time it is taken in again.
+function keepReplaced(server: borrow mut Server, index: Number, replaced: Content?) {
+    let retired = server.clients[index].replaced
+    server.clients[index].replaced = replaced
+    match retired {
+        Some(frame) -> letGo(server.composer, frame)
+        None -> {}
+    }
+}
+
+// Takes the frames of the client at `index` off the screen, and lets them go
+// once the screen no longer shows them.
+function dropContent(server: borrow mut Server, index: Number) {
+    let left = server.clients[index].content
+    let replaced = server.clients[index].replaced
+    server.clients[index].content = .None
+    server.clients[index].replaced = .None
+    match left {
+        Some(content) -> {
+            if content.slot == 0 { server.releasing.append(content) }
+            redraw(server, "a surface left the screen")
+        }
+        None -> {}
+    }
+    match replaced {
+        Some(frame) -> if frame.slot == 0 { server.releasing.append(frame) }
+        None -> {}
+    }
+    dropSlots(server, index)
+}

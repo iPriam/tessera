@@ -1,0 +1,66 @@
+import Foundation
+import Heap
+
+// Wait and wake on an address (§7.4). A word in shared memory works across
+// processes.
+
+function addressWait(address: RawPtr, expected: U32, deadline: U64) -> Result<Void, TesseraError> {
+    if deadline == U64(0) { return .Error(failure(.Timeout)) }
+    return kernelAddressWait(address, expected, deadline)
+}
+
+// Blocks while `*address == expected`, until woken or the deadline.
+// `BadState` when the value already differs.
+public function syncWait32(
+    address: RawPtr,
+    expected: UNumber,
+    deadline: UNumber
+) -> Result<Void, TesseraError> {
+    if (U64(pointerAddress(address)) & U64(3)) != U64(0) || isNull(address) {
+        return .Error(failure(.InvalidArgument))
+    }
+    if heapLoad<U32>(address, 0) != expected { return .Error(failure(.BadState)) }
+    return addressWait(address, expected, deadline)
+}
+
+// The 64-bit form checks the whole word and sleeps on its low half.
+public function syncWait64(
+    address: RawPtr,
+    expected: UNumber,
+    deadline: UNumber
+) -> Result<Void, TesseraError> {
+    if (U64(pointerAddress(address)) & U64(7)) != U64(0) || isNull(address) {
+        return .Error(failure(.InvalidArgument))
+    }
+    if heapLoad<U64>(address, 0) != expected { return .Error(failure(.BadState)) }
+    return addressWait(address, U32(expected & U64(0xFFFFFFFF)), deadline)
+}
+
+function waiterCount(count: U32) -> U32 {
+    if count > U32(0x7FFFFFFF) { return U32(0x7FFFFFFF) }
+    return count
+}
+
+// Wakes up to `count` waiters; `UInt32.max` wakes all. Answers how many woke.
+public function syncWake(address: RawPtr, count: UNumber) -> Result<UNumber, TesseraError> {
+    if (U64(pointerAddress(address)) & U64(3)) != U64(0) || isNull(address) {
+        return .Error(failure(.InvalidArgument))
+    }
+    return .Ok(try kernelAddressWake(address, waiterCount(count)))
+}
+
+// Wakes `wakeCount` waiters and moves up to `requeueCount` others to wait
+// on `target`. Answers how many were woken or moved.
+public function syncRequeue(
+    address: RawPtr,
+    wakeCount: UNumber,
+    target: RawPtr,
+    requeueCount: UNumber
+) -> Result<UNumber, TesseraError> {
+    if (U64(pointerAddress(address)) & U64(3)) != U64(0) || (
+        U64(pointerAddress(target)) & U64(3)
+    ) != U64(0) { return .Error(failure(.InvalidArgument)) }
+    return .Ok(
+        try kernelAddressRequeue(address, waiterCount(wakeCount), target, waiterCount(requeueCount))
+    )
+}

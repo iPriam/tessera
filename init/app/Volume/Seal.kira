@@ -1,0 +1,101 @@
+import Foundation
+import Heap
+import LibTessera
+
+// The system's seal (roadmap/13-security-and-updates.md, "How the system is
+// sealed"): the build signs the fs-verity digest of the system's composefs
+// image with Ed25519, and the public half of its key lies in the initramfs
+// beside PID 1, at `VolumeLayout.sealKey`. A system is mounted only when the
+// signature beside its image checks over the digest the kernel answers for
+// that image.
+
+// The seal key's and a signature's sizes, and how many bytes a digest is.
+namespace SealSize {
+    let key: Number = 32
+    let signature: Number = 64
+    let digest: Number = 32
+}
+
+// Checks the seal of the system `subvolume`, whose image the kernel answers
+// `digest` for, in hexadecimal, and whose signature is at `signaturePath`.
+// The error says which part failed.
+function checkSeal(
+    calls: Handle,
+    subvolume: borrow String,
+    digest: borrow String,
+    signaturePath: borrow String
+) -> Result<Void, String> {
+    match cryptoKnownAnswers() {
+        Some(check) -> return .Error(
+            "the seal's cryptography gave a wrong answer to \(check), so \(subvolume) cannot be checked"
+        )
+        None -> {}
+    }
+    let key = match readWholeFile(calls, "/" + VolumeLayout.sealKey) {
+        Ok(value) -> value
+        Error(failed) -> return .Error(
+            "the initramfs seal key could not be read: \(errorName(failed))"
+        )
+    }
+    if key.count != SealSize.key {
+        return .Error("the initramfs holds no seal key, so \(subvolume) cannot be checked")
+    }
+    let signature = match readWholeFile(calls, signaturePath) {
+        Ok(value) -> value
+        Error(failed) -> return .Error(
+            "the system signature could not be read: \(errorName(failed))"
+        )
+    }
+    if signature.count != SealSize.signature {
+        return .Error("\(subvolume) is not signed: its image has no signature beside it")
+    }
+    let message = try bytesOfHex(digest) otherwise return .Error(
+        "\(subvolume)'s image digest \(digest) is not one the seal covers"
+    )
+    if message.count != SealSize.digest {
+        return .Error("\(subvolume)'s image digest \(digest) is not one the seal covers")
+    }
+    let messageBlock = heapBlockOf(message)
+    let keyBlock = heapBlockOf(key)
+    let signatureBlock = heapBlockOf(signature)
+    let valid = signatureVerifyEd25519(
+        Buffer { address: messageBlock.pointer(), length: message.count },
+        Buffer { address: keyBlock.pointer(), length: key.count },
+        Buffer { address: signatureBlock.pointer(), length: signature.count },
+    )
+    if !valid {
+        return .Error(
+            "\(subvolume)'s image is not the one signed: the signature does not check over its digest \(digest)"
+        )
+    }
+    return .Ok
+}
+
+// `bytes` copied into a block of their own, for a call that takes a buffer.
+function heapBlockOf(bytes: borrow [UN8]) -> ByteBlock {
+    let block = zeroedBlock(count: bytes.count + 1, alignment: 16)
+    for index in 0..bytes.count { heapStore<U8>(block.pointer(), index, bytes[index]) }
+    return move block
+}
+
+// The bytes lowercase hexadecimal `text` spells, or none when it spells none.
+function bytesOfHex(text: borrow String) -> [UN8]? {
+    let digits = text.utf8()
+    if digits.count % 2 != 0 { return .None }
+    var bytes: [UN8] = []
+    var at = 0
+    while at < digits.count {
+        let high = try hexDigit(digits[at]) otherwise return .None
+        let low = try hexDigit(digits[at + 1]) otherwise return .None
+        bytes.append(UN8(high * 16 + low))
+        at += 2
+    }
+    return .Some(bytes)
+}
+
+function hexDigit(byte: UN8) -> Number? {
+    let value = Number(byte)
+    if value >= 48 && value <= 57 { return .Some(value - 48) }
+    if value >= 97 && value <= 102 { return .Some(value - 87) }
+    return .None
+}

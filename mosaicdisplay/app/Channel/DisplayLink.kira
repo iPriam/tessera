@@ -1,0 +1,111 @@
+import Foundation
+import Heap
+import LibTessera
+import TesseraDisplayClient
+
+// The links PID 1 hands this process: one Channel per display client.
+
+// One client's link: its channel, and its number, which is the count of
+// clients for the links handed at boot and the client's own number, which
+// becomes its surface, for one that arrives later.
+struct ClientLink {
+    var channel: Handle
+    var number: UNumber
+    var role: DisplayRole
+}
+
+// What PID 1 sent on the service channel.
+enum Arrival {
+    Link(ClientLink)
+    // PID 1 asked for the client with this surface to come to the front.
+    BringForward(DisplaySurfaceId)
+    Nothing
+}
+
+let displayRoles: [DisplayRole] = [DisplayRole.None, DisplayRole.Application, DisplayRole.Platform, DisplayRole.Desktop, DisplayRole.Presence]
+
+function roleOf(raw: UN32) -> DisplayRole? {
+    for role in displayRoles {
+        if role.rawValue() == raw { return .Some(role) }
+    }
+    return .None
+}
+
+// The header's detail word @12: the client's number in its low half and its
+// role in its high half.
+namespace LinkDetail {
+    let numberMask: UN32 = UN32(0xFFFF)
+    let roleShift: UN32 = UN32(16)
+}
+
+// Reads the next message off the service channel.
+function takeArrival(reader: Handle) -> Arrival {
+    let body = zeroedBlock(count: ServiceMessage.headerBytes, alignment: 16)
+    let channel = match serviceChannel() {
+        Ok(value) -> value
+        Error(reason) -> return missingDisplayLink(reason)
+    }
+    let received = match readMessage(reader, channel, body, 1) {
+        Ok(value) -> value
+        Error(reason) -> return missingDisplayLink(reason)
+    }
+    let header: ServiceHeader = heapLoad(body.pointer())
+    let opcode = header.opcode
+    let detail = header.detail
+    let number = UNumber(detail & LinkDetail.numberMask)
+    let whole = received.bytes >= Number(ServiceMessage.headerBytes) && number > 0
+    if whole && opcode == ServiceOpcode.BringForward.rawValue() && received.handles.count == 0 {
+        return .BringForward(DisplaySurfaceId(number))
+    }
+    let linked = whole && opcode == ServiceOpcode.DisplayLink.rawValue() && received.handles.count == 1
+    let role: DisplayRole? = linked ? roleOf(detail >> LinkDetail.roleShift) : .None
+    return match role {
+        Some(given) -> {
+            log info("a UI channel connected", role: given)
+            .Link(ClientLink { channel: received.handles[0], number: number, role: given })
+        }
+        None -> {
+            closeHandles(received.handles)
+            log warn("a message on the service channel is not a display link", opcode: opcode)
+            .Nothing
+        }
+    }
+}
+
+function missingDisplayLink(reason: borrow TesseraError) -> Arrival {
+    log warn("the display link did not arrive", error: errorName(reason))
+    return .Nothing
+}
+
+// The links handed at boot: the first says how many there are.
+function takeDisplayLinks(reader: Handle) -> [ClientLink] {
+    let first = match takeArrival(reader) {
+        Link(link) -> link
+        BringForward(surface) -> return []
+        Nothing -> return []
+    }
+    var links: [ClientLink] = [first]
+    for index in 1..first.number {
+        match takeArrival(reader) {
+            Link(link) -> links.append(link)
+            BringForward(surface) -> {
+                log warn(
+                    "a client was brought forward before every link arrived",
+                    surface: surface.raw,
+                    links: index
+                )
+                closeLinks(links)
+                return []
+            }
+            Nothing -> {
+                closeLinks(links)
+                return []
+            }
+        }
+    }
+    return links
+}
+
+function closeLinks(links: borrow [ClientLink]) {
+    for link in links { closeHandle(link.channel) }
+}

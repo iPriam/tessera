@@ -1,0 +1,309 @@
+import Foundation
+import RenderBox
+
+// The three images IconRendering renders for each group before it composites
+// the icon: the group's contents, the distance field of its layers' shapes,
+// and the shadow it casts. Each is a display list rendered on its own.
+
+// IconRendering's stitchable functions, as the KSL ports CoreIcon carries.
+namespace IconFunctions {
+    let clampToEdges: String = "clampToEdges"
+    let glassHighlight: String = "glassHighlight"
+}
+
+function iconLibrary() -> ShaderLibrary {
+    return ShaderLibrary {
+        name: "IconRendering",
+        functions: [
+            ShaderFunction {
+                name: IconFunctions.clampToEdges,
+                artifact: ksl!("Shaders/IconRendering/ClampToEdges.ksl")
+            },
+            ShaderFunction {
+                name: IconFunctions.glassHighlight,
+                artifact: ksl!("Shaders/IconRendering/GlassHighlight.ksl")
+            }
+        ]
+    }
+}
+
+// The group's contents, the pixels `box` covers on the content image `side`
+// across: each layer in a layer of its own, in a mask its luminance alone.
+function contentsList(
+    group: borrow PreparedGroup,
+    box: borrow Rect,
+    side: Number,
+    masked: Bool
+) -> Result<LayerContents, IconRenderFailure> {
+    let list = DisplayList()
+    list.translateBy(-box.x, -box.y)
+    let scale = side / IconGeometry.canvas
+    list.scaleBy(scale, scale)
+    if masked { addMonochrome(list) }
+    try drawGroupLayers(list, group.layers)
+    return .Ok(list.moveContents())
+}
+
+// How the distance field is drawn for a content image `side` across, with
+// the highlights reaching `outset` pixels outside the shapes.
+struct FieldSizing {
+    let side: Number
+    let outset: Number
+}
+
+extend FieldSizing {
+    // How far the field reaches either way, a fifth of the side.
+    function reach(borrow self) -> Number {
+        return DistanceDefaults.reach * side
+    }
+
+    function smoothing(borrow self) -> Number {
+        return min(DistanceDefaults.maxRelativeSmoothing * side, DistanceDefaults.maxSmoothing)
+    }
+
+    // The layer's box in pixels, grown by the outset and the margin, its
+    // edges cut to whole pixels toward zero.
+    function clipRect(borrow self, bounds: borrow Rect) -> Rect {
+        let scale = side / IconGeometry.canvas
+        let grow = outset + DistanceDefaults.margin
+        let left = trunc(bounds.x * scale - grow)
+        let top = trunc(bounds.y * scale - grow)
+        let right = trunc(ceil((bounds.x + bounds.width) * scale) + grow)
+        let bottom = trunc(ceil((bounds.y + bounds.height) * scale) + grow)
+        return Rect { x: left, y: top, width: right - left, height: bottom - top }
+    }
+}
+
+// `clampToEdges` keeping the field off the image's outermost pixels.
+function edgeClamp(side: Number) -> Shader {
+    let inset = DistanceDefaults.clampThreshold * side
+    var shader = Shader { library: iconLibrary(), functionName: IconFunctions.clampToEdges }
+    shader.setArgument(
+        .Float4(Vector4 { x: inset, y: inset, z: side - 2 * inset, w: side - 2 * inset }),
+        0
+    )
+    return shader
+}
+
+// One layer's distance field: its shape, black where the layer covers,
+// through the distance transform.
+function drawLayerField(
+    list: borrow DisplayList,
+    layer: borrow PlacedLayer,
+    sizing: borrow FieldSizing
+) -> Result<Void, IconRenderFailure> {
+    list.save()
+    var clip = Shape()
+    clip.setRect(sizing.clipRect(layer.bounds))
+    list.clipShape(clip, 1, .Normal)
+    let reach = sizing.reach()
+    list.addDistanceFilter(reach, -reach, 1, sizing.smoothing(), .Gradient, .Default, .Exact)
+    list.addShaderFilter(edgeClamp(sizing.side), .Unbounded, ShaderFilterFlags.layer)
+    let scale = sizing.side / IconGeometry.canvas
+    list.save()
+    list.scaleBy(scale, scale)
+    list.beginLayer(LayerFlags.none)
+    try drawLayerArt(list, layer)
+    try listDrawn(list.clipLayer(1, .Normal))
+    var shape = Shape()
+    shape.setRect(copy layer.bounds)
+    list.drawShape(shape, colorFill(black(), .DisplayP3), 1, .Normal)
+    try listDrawn(list.restore())
+    return listDrawn(list.restore())
+}
+
+// The smallest half-precision float above `value`, for `value` above zero.
+function halfAbove(value: Number) -> Number {
+    var low: Number = 1
+    var spacing: Number = 1 / 1024
+    while value < low {
+        low = low / 2
+        spacing = spacing / 2
+    }
+    while value >= low * 2 {
+        low = low * 2
+        spacing = spacing * 2
+    }
+    return (floor(value / spacing) + 1) * spacing
+}
+
+// `FUN_1ccaee16c`, `sdfGeneration.useAdvancedStacking`: where a later layer's
+// shape, grown by the outset and a pixel, covers the field, its own field
+// replaces the larger of the two.
+function coverStops(sizing: borrow FieldSizing) -> [GradientStop] {
+    let threshold = 0.5 - 0.5 * (sizing.outset + 1) / sizing.reach()
+    return [
+        GradientStop { color: clear(), location: threshold },
+        GradientStop { color: black(), location: halfAbove(threshold) }
+    ]
+}
+
+function stackLayerField(
+    list: borrow DisplayList,
+    layer: borrow PlacedLayer,
+    sizing: borrow FieldSizing
+) -> Result<Void, IconRenderFailure> {
+    list.beginLayer(LayerFlags.none)
+    try drawLayerField(list, layer, sizing)
+    try listDrawn(list.drawLayer(1, .DistanceFieldMaximum))
+    list.save()
+    list.beginLayer(LayerFlags.none)
+    list.addGradientMap(.Red, 0, 1, coverStops(sizing), .Device, .Clamp, .Linear, .Device)
+    try drawLayerField(list, layer, sizing)
+    try listDrawn(list.clipLayer(1, .Normal))
+    try drawLayerField(list, layer, sizing)
+    return listDrawn(list.restore())
+}
+
+// `lighting` combined: one distance field of all the group's shapes,
+// each black where it covers, together in one layer.
+function drawCombinedField(
+    list: borrow DisplayList,
+    group: borrow PreparedGroup,
+    sizing: borrow FieldSizing
+) -> Result<Void, IconRenderFailure> {
+    list.save()
+    var clip = Shape()
+    clip.setRect(sizing.clipRect(group.bounds))
+    list.clipShape(clip, 1, .Normal)
+    let reach = sizing.reach()
+    list.addDistanceFilter(reach, -reach, 1, sizing.smoothing(), .Gradient, .Default, .Exact)
+    list.addShaderFilter(edgeClamp(sizing.side), .Unbounded, ShaderFilterFlags.layer)
+    let scale = sizing.side / IconGeometry.canvas
+    list.save()
+    list.scaleBy(scale, scale)
+    list.beginLayer(LayerFlags.none)
+    for layer in group.layers {
+        if !layer.glass { continue }
+        list.save()
+        list.beginLayer(LayerFlags.none)
+        try drawLayerArt(list, layer)
+        try listDrawn(list.clipLayer(1, .Normal))
+        var shape = Shape()
+        shape.setRect(copy layer.bounds)
+        list.drawShape(shape, colorFill(black(), .DisplayP3), 1, .Normal)
+        try listDrawn(list.restore())
+    }
+    try listDrawn(list.drawLayer(1, .Normal))
+    try listDrawn(list.restore())
+    return listDrawn(list.restore())
+}
+
+// The group's distance field, on an image a pixel wider than the content
+// image on every side: its layers' fields, back to front, stacked, or under
+// combined lighting all at once.
+function fieldList(
+    group: borrow PreparedGroup,
+    sizing: borrow FieldSizing
+) -> Result<LayerContents, IconRenderFailure> {
+    let list = DisplayList()
+    list.translateBy(1, 1)
+    list.beginLayer(LayerFlags.none)
+    if group.combined {
+        try drawCombinedField(list, group, sizing)
+        try listDrawn(list.drawLayer(1, .Normal))
+        return .Ok(list.moveContents())
+    }
+    // Only the layers that take part in the glass shape the field.
+    var first = true
+    for back in 0..group.layers.count {
+        let index = group.layers.count - 1 - back
+        let layer = group.layers[index]
+        if !layer.glass { continue }
+        if first {
+            list.save()
+            try drawLayerField(list, layer, sizing)
+            try listDrawn(list.restore())
+            first = false
+        } else {
+            try stackLayerField(list, layer, sizing)
+        }
+    }
+    try listDrawn(list.drawLayer(1, .Normal))
+    return .Ok(list.moveContents())
+}
+
+// The distance field `field`, its image's border pixel outside the content
+// image, drawn over the content image's pixels.
+function drawField(
+    list: borrow DisplayList,
+    field: borrow TextureImage,
+    side: Number
+) -> Result<Void, IconRenderFailure> {
+    list.save()
+    let scale = IconGeometry.canvas / side
+    list.scaleBy(scale, scale)
+    list.translateBy(-1, -1)
+    var shape = Shape()
+    shape.setRect(Rect { x: 1, y: 1, width: side, height: side })
+    var fill = Fill()
+    fill.setImage(
+        ImageFill {
+            image: .Texture(copy field),
+            transform: AffineTransform { a: side + 2, d: side + 2 },
+            interpolation: .Linear,
+            tint: .None,
+            colorSpace: .Device
+        }
+    )
+    list.drawShape(shape, fill, 1, .Normal)
+    return listDrawn(list.restore())
+}
+
+// What a mask draws its contents as: their luminance, in white.
+function addMonochrome(list: borrow DisplayList) {
+    list.addColorMonochromeFilter(1, white(), 0, ColorFilterFlags.none)
+}
+
+// The matrix moving red into alpha, the field's distance as coverage.
+function redAsAlpha() -> [Number] {
+    return [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0]
+}
+
+// How a group's shadow is cast: in its contents' colours or black, and
+// whether the contents are a mask's.
+struct ShadowCast {
+    let neutral: Bool
+    let masked: Bool
+}
+
+// The shadow a group casts: its contents dimmed, or black when neutral,
+// moved down and blurred, kept where the field says its shapes, drawn in by
+// the deepest highlight, cover.
+function shadowList(
+    group: borrow PreparedGroup,
+    field: borrow TextureImage,
+    sizing: borrow FieldSizing,
+    reachIn: Number,
+    size: IconSizeClass,
+    cast: borrow ShadowCast
+) -> Result<LayerContents, IconRenderFailure> {
+    let list = DisplayList()
+    let scale = sizing.side / IconGeometry.canvas
+    list.scaleBy(scale, scale)
+    if cast.neutral {
+        list.addAlphaMultiplyFilter(black(), ColorFilterFlags.none)
+    } else {
+        let level = GroupShadowDefaults.vibrantBrightness
+        list.addColorMultiplyFilter(
+            RGBAColor { r: level, g: level, b: level, a: 1 },
+            ColorFilterFlags.none
+        )
+    }
+    list.translateBy(GroupShadowDefaults.offsetX, GroupShadowDefaults.offsetY)
+    list.addBlurFilter(
+        GroupShadowDefaults.radius.at(size) * GroupShadowDefaults.blurStrengthMax,
+        BlurFlags.none
+    )
+    list.beginLayer(LayerFlags.none)
+    list.save()
+    let span = -2 * sizing.reach()
+    list.addColorThreshold(.Alpha, 0.5, .Some(-reachIn / span + 0.5), white())
+    list.addColorMatrixFilter(redAsAlpha(), ColorFilterFlags.none)
+    try drawField(list, field, sizing.side)
+    try listDrawn(list.restore())
+    try listDrawn(list.clipLayer(1, .Normal))
+    if cast.masked { addMonochrome(list) }
+    try drawShadowLayers(list, group.layers)
+    return .Ok(list.moveContents())
+}

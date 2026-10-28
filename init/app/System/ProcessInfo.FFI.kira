@@ -1,0 +1,23 @@
+// roadmap/16-libtessera.md §11's ProcessInfo C layout.
+@FFI.Struct { layout: c }
+struct ProcessInfoRecord {
+    var processId: U64
+    var jobId: U64
+    var appId: U64
+    var state: U32
+    var isMain: U8
+    var reserved0: Reserved3
+    var exitCode: Int
+    var startTime: U64
+    var cpuTime: U64
+    var threadCount: U32
+    var handleCount: U32
+    var residentBytes: U64
+    var mappedBytes: U64
+    var terminationReason: U32
+    var reserved1: U32
+    var reserved2: U64
+}
+
+@FFI.Array { element: U8, count: 3 }
+struct Reserved3 {}

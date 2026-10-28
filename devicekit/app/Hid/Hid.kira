@@ -1,0 +1,100 @@
+import Foundation
+import Heap
+import LibTessera
+
+// Hid (17 §17.1) over hidraw.
+//
+// The connection's descriptor is the `/dev/hidrawN` node the manager opened,
+// non-blocking. A report is one `read` or `write`; the report descriptor and
+// feature reports are hidraw's ioctls, as IOHIDDevice's `getReport` and
+// `setReport` are on a Mac.
+
+namespace Hidraw {
+    let ioctlType: U64 = U64(0x48)
+    // `HIDIOCGRDESCSIZE`, `HIDIOCGRDESC` (`struct hidraw_report_descriptor`:
+    // a `u32` size, then up to 4096 bytes).
+    let descriptorSize: U64 = U64(0x80044801) // _IOR(0x48, 0x01, 4)
+    let descriptor: U64 = U64(0x90044802) // _IOR(0x48, 0x02, 4100)
+    let descriptorBytes: Number = 4100
+    let reportIdLimit: Number = 255
+}
+
+// `HIDIOCSFEATURE(len)`, `HIDIOCGFEATURE(len)`.
+function hidSetFeatureRequest(length: Number) -> U64 {
+    return ioctlRequest(.ReadWrite, Hidraw.ioctlType, U64(0x06), U64(length))
+}
+function hidGetFeatureRequest(length: Number) -> U64 {
+    return ioctlRequest(.ReadWrite, Hidraw.ioctlType, U64(0x07), U64(length))
+}
+
+function usable(buffer: borrow Buffer) -> Bool {
+    return buffer.length > 0 && !isNull(buffer.address)
+}
+
+// A report call's answer: `ShouldWait` when the device has nothing queued
+// or no room.
+function reportAnswer(answer: borrow Result<Number, TesseraError>) -> Result<Number, TesseraError> {
+    return match answer {
+        Ok(count) -> .Ok(count)
+        Error(failed) -> {
+            match errnoOf(failed) {
+                Again -> return .Error(failure(.ShouldWait))
+                else -> return .Error(failed)
+            }
+        }
+    }
+}
+
+public function hidDescriptor(hid: Ref, out: borrow Buffer) -> Result<Number, TesseraError> {
+    let object = try resolveConnection(hid, .Hid, RefRights.read)
+    let device = try deviceOf(object)
+    let blockBytes = zeroedBlock(count: Hidraw.descriptorBytes, alignment: 16)
+    let block = blockBytes.pointer()
+    let sized = try device.control(Hidraw.descriptorSize, block)
+    let size = Number(heapLoad<U32>(block, 0))
+    try requireRoom(out, size)
+    let read = try device.control(Hidraw.descriptor, block)
+    copyBytes(out.address, heapOffset(block, 4), size)
+    return .Ok(size)
+}
+
+// One input report, or `ShouldWait` when none is queued; wait for READABLE.
+public function hidReadReport(hid: Ref, out: borrow Buffer) -> Result<Number, TesseraError> {
+    let object = try resolveConnection(hid, .Hid, RefRights.read)
+    if !usable(out) { return .Error(failure(.BufferTooSmall, 1)) }
+    let device = try deviceOf(object)
+    return reportAnswer(device.read(out.address, out.length))
+}
+
+// One output report; its first byte is the report id, or 0 for a device
+// with one report.
+public function hidWriteReport(hid: Ref, report: borrow Buffer) -> Result<Number, TesseraError> {
+    let object = try resolveConnection(hid, .Hid, RefRights.write)
+    if !usable(report) { return .Error(failure(.InvalidArgument)) }
+    let device = try deviceOf(object)
+    return reportAnswer(device.write(report.address, report.length))
+}
+
+// Feature report `reportId` into `out`, whose first byte the kernel reads as
+// the id and answers with the report after it.
+public function hidGetFeature(
+    hid: Ref,
+    reportId: Number,
+    out: borrow Buffer
+) -> Result<Number, TesseraError> {
+    let object = try resolveConnection(hid, .Hid, RefRights.read)
+    if !usable(out) || reportId < 0 || reportId > Hidraw.reportIdLimit {
+        return .Error(failure(.InvalidArgument))
+    }
+    let device = try deviceOf(object)
+    heapStore<U8>(out.address, 0, U8(reportId))
+    return device.control(hidGetFeatureRequest(out.length), out.address)
+}
+
+public function hidSetFeature(hid: Ref, report: borrow Buffer) -> Result<Void, TesseraError> {
+    let object = try resolveConnection(hid, .Hid, RefRights.write)
+    if !usable(report) { return .Error(failure(.InvalidArgument)) }
+    let device = try deviceOf(object)
+    let set = try device.control(hidSetFeatureRequest(report.length), report.address)
+    return .Ok
+}

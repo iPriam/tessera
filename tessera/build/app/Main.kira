@@ -1,0 +1,293 @@
+import Foundation
+import Build
+
+// Tessera's build graph. `kira build` lists its steps; `kira build initramfs
+// -arch aarch64` builds one; `kira build boot -desktop` builds the
+// initramfs and boots it.
+
+@Main
+function main() -> Number {
+    var graph = buildGraph("Tessera")
+    let baseTrain = trainOption(graph)
+    describeWorkspace(graph, baseTrain)
+    checkWorkspaceBuild(graph, baseTrain)
+    let host = match readHost(graph.root) {
+        Ok(read) -> read
+        Error(problem) -> {
+            log fault("the host cannot build Tessera", problem)
+            return 2
+        }
+    }
+    let architecture = architectureNamed(
+        graph.option(
+            Choice {
+                name: "arch",
+                summary: "the architecture to build for",
+                values: ["x86_64", "aarch64"],
+                fallback: host.architecture.name()
+            }
+        )
+    )
+    let valgrind = graph.option(
+        Choice {
+            name: "valgrind",
+            summary: "the program or application started under Valgrind's memcheck",
+            values: valgrindChoices(),
+            fallback: "none"
+        }
+    )
+    let symbols = graph.option(
+        Choice {
+            name: "symbols",
+            summary: "whether the system carries every component's debug information under System/Developer/Symbols, as a dev OS does, for the crash reporter to name frames from",
+            values: ["developer", "none"],
+            fallback: "developer"
+        }
+    )
+    let lldb = graph.option(
+        Choice {
+            name: "lldb",
+            summary: "whether a dev system carries LLVM's lldb-server and lldb, cross-built on the build host",
+            values: ["on", "off"],
+            fallback: "on"
+        }
+    )
+    let profile = graph.option(
+        Choice {
+            name: "profile",
+            summary: "how every component compiles: debug, or release with KIR's O2 optimizer",
+            values: ["debug", "release"],
+            fallback: "release"
+        }
+    )
+    let sysroot = match debianSysroot(graph, host, architecture) {
+        Ok(staged) -> staged
+        Error(problem) -> {
+            log fault("no sysroot", problem)
+            return 2
+        }
+    }
+    let staged = stagedSysroot(host, architecture)
+    graph.step(
+        Step {
+            name: "sysroot",
+            summary: "the sysroot every compile reads, linked at \(staged) for the scripts and knvm",
+            produces: [copy sysroot.compiled],
+            run: .Some({ run in return linkSysroot(staged, run) })
+        }
+    )
+    describeSetup(graph, host)
+    let context = BuildContext {
+        host: copy host,
+        architecture: architecture,
+        sysroot: sysroot,
+        kira: graph.kira(),
+        sealKey: graph.signingKey(sealKeyPath(host), true),
+        valgrind: valgrind,
+        release: profile == "release",
+        symbols: symbolPlacementOf(symbols),
+        lldb: lldb == "on"
+    }
+    let release = match describeRelease(graph, context) {
+        Ok(described) -> described
+        Error(problem) -> {
+            log fault("the release cannot be described", problem)
+            return 2
+        }
+    }
+    let image = initramfsImage(graph, context, release.initramfsRoot)
+    let initramfsLoaders = checkLoaders(
+        graph,
+        "loaders of the initramfs (\(architecture.name()))",
+        "initramfs-loaders",
+        release.initramfsRoot
+    )
+    graph.step(
+        Step {
+            name: "initramfs",
+            summary: "the initramfs image",
+            produces: [image, initramfsLoaders]
+        }
+    )
+    let volume = systemImage(graph, context, "system", copy release.systemRoot)
+    let tampered = tamperedSystemImage(graph, context, copy release.systemRoot)
+    let updated = updatedSystemImage(graph, context, copy release.systemRoot)
+    let volumeLoaders = checkLoaders(
+        graph,
+        "loaders of the system volume (\(architecture.name()))",
+        "system-loaders",
+        release.systemRoot
+    )
+    graph.step(
+        Step {
+            name: "system-volume",
+            summary: "the system volume image",
+            produces: [volume, volumeLoaders]
+        }
+    )
+    graph.step(
+        Step {
+            name: "release",
+            summary: "the initramfs's root, as a tree",
+            produces: [release.initramfsRoot]
+        }
+    )
+    graph.step(
+        Step {
+            name: "sdk",
+            summary: "the internal SDK: every framework's contract",
+            produces: [release.sdk]
+        }
+    )
+    graph.step(
+        Step {
+            name: "symbols",
+            summary: "every component's debug information, in dSYM bundles",
+            produces: [release.symbols]
+        }
+    )
+    describeCapture(graph, release, host, architecture)
+    describeTests(graph, context, release)
+    describeContainer(graph, host, architecture)
+    // Last: it reads its arguments, which are what no option declared before
+    // it took.
+    describeDevRoot(graph, release, host, architecture)
+    // A step per component, named after it, but for a component whose name a
+    // step above already has: the devroot service's is `devroot`'s.
+    for described in release.components {
+        var taken = false
+        for step in graph.steps {
+            if step.name == described.component.name { taken = true }
+        }
+        if !taken {
+            graph.step(
+                Step {
+                    name: copy described.component.name,
+                    summary: "the install root of \(described.component.name)",
+                    produces: [described.roots.install]
+                }
+            )
+        }
+    }
+    // What the boot step needs built, and the role each plays in the boot
+    // (Boot.kira); the loader reports are built to be checked and play none.
+    let disks = bootDisks(graph, host)
+    var booted = [image, volume, initramfsLoaders, volumeLoaders, disks.scratch, disks.stick, disks.disc, tampered, updated]
+    var bootRoles = ["initramfs", "system", "", "", "scratch", "stick", "disc", "tampered", "updated"]
+    // The installer image, and the recovery media: the system and what
+    // installs it, sealed as a system is, which `boot -recovery`
+    // installs onto a volume of its own and boots beside the machine's
+    // blank disk.
+    match btrfsTools(graph, context) {
+        Ok(tools) -> {
+            let root = installerRoot(graph, context, release, copy tools)
+            let installer = installerImage(graph, context, move root)
+            graph.step(
+                Step {
+                    name: "installer-image",
+                    summary: "the installer image, which installs a system onto the volume",
+                    produces: [copy installer]
+                }
+            )
+            booted.append(installer)
+            bootRoles.append("installer")
+            let recovery = systemImage(
+                graph,
+                context,
+                "recovery",
+                recoveryRoot(graph, context, release, move tools, copy volume)
+            )
+            graph.step(
+                Step {
+                    name: "recovery-image",
+                    summary: "the recovery media: the system with the installer and the system it installs",
+                    produces: [copy recovery]
+                }
+            )
+            booted.append(recovery)
+            bootRoles.append("recovery")
+        }
+        Error(problem) -> log warn("the installer and the recovery media are left out", problem)
+    }
+    match kernelBuild(graph, context) {
+        Ok(kernel) -> {
+            graph.step(
+                Step { name: "kernel", summary: "the kernel image", produces: [kernel.image] }
+            )
+            graph.step(
+                Step {
+                    name: "uapi",
+                    summary: "the kernel's uapi headers, as a userland includes them",
+                    produces: [kernel.headers]
+                }
+            )
+            booted.append(copy kernel.image)
+            bootRoles.append("kernel")
+        }
+        Error(problem) -> log warn("the kernel is left out, and boot cannot run", problem)
+    }
+    // The venus QEMU, and on a Mac the Vulkan driver it forwards to.
+    let emulator = hostGraphics(graph, host)
+    graph.step(
+        Step {
+            name: "host-gpu",
+            summary: "virglrenderer with venus and the QEMU a boot runs",
+            produces: [copy emulator]
+        }
+    )
+    booted.append(emulator)
+    bootRoles.append("emulator")
+    if host.darwin {
+        let driver = kosmicKrisp(graph, host)
+        graph.step(
+            Step {
+                name: "kosmickrisp",
+                summary: "Mesa's Vulkan over Metal, which venus forwards a guest's Vulkan to",
+                produces: [copy driver]
+            }
+        )
+        booted.append(driver)
+        bootRoles.append("vulkan")
+    }
+    describeTrain(graph, context, release, booted, bootRoles)
+    describeTrainOverlay(graph, context, release, baseTrain)
+    if baseTrain.count > 0 && graph.requested("boot") {
+        match trainBootArtifacts(graph, context, baseTrain) {
+            Ok(pair) -> {
+                let (artifacts, roles) = pair
+                booted = artifacts
+                bootRoles = roles
+            }
+            Error(problem) -> {
+                log fault("cannot select release train", problem)
+                return 2
+            }
+        }
+    }
+    var overlay = TrainOverlayDescription { roots: [], names: [], base: [] }
+    if baseTrain.count > 0 && graph.requested("boot")
+        && (graph.passed("boot").contains("-dev") || graph.passed("boot").contains("-dev-mobile")) {
+        match trainOverlayDescription(graph, context, release, baseTrain) {
+            Ok(found) -> overlay = found
+            Error(problem) -> {
+                log fault("cannot describe workspace overlay", problem)
+                return 2
+            }
+        }
+        for root in overlay.roots { booted.append(copy root) }
+    }
+    let options = bootOptions(graph)
+    graph.step(
+        Step {
+            name: "boot",
+            summary: "the release booted in QEMU; `-test` and the other modes after it (Boot.kira)",
+            produces: booted,
+            materialize: baseTrain.count == 0,
+            run: .Some({ run in
+                if baseTrain.count > 0 { return bootTrain(host, architecture, baseTrain, options, bootRoles, overlay, run) }
+                return boot(host, architecture, options, bootRoles, run)
+            })
+        }
+    )
+    return graph.run()
+}

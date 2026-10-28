@@ -1,0 +1,579 @@
+import Foundation
+import Heap
+
+// `Process.launch` (§11.3), done by the library itself until the Launcher
+// service exists.
+//
+// The parent writes the Startup message to a new bootstrap channel, then the
+// kernel backend starts the child in the job named, with its end of the
+// channel as its startup channel and nothing else inherited, running the
+// executable Node. The child is
+// given the parent's entitlements: no Launcher exists yet to narrow them to
+// what the executable declares.
+
+public struct LaunchOptions {
+    var name: String
+    var arguments: Handle?
+    var initialHandles: [StartupEntry]
+    var flags: LaunchFlags
+    var job: Handle?
+    var stackSize: UNumber
+}
+
+// `LaunchOptions.flags`.
+@Derive(Copy)
+public distinct LaunchFlags = UNumber
+
+public namespace LaunchFlags {
+    let none: LaunchFlags = LaunchFlags(0)
+    let suspended: LaunchFlags = LaunchFlags(1)
+    let inheritQos: LaunchFlags = LaunchFlags(2)
+    // The child sees only the platform's runtime, read-only, and the bundle
+    // and containers among its initial handles (§21): what it was not given
+    // it cannot name.
+    let confined: LaunchFlags = LaunchFlags(4)
+}
+
+// Why a process was started (`LaunchInfo.reason`, §11.4).
+@Derive(Copy)
+public enum LaunchReason: U32 {
+    Cold = 0
+    Resume = 1
+    Url = 2
+    Intent = 3
+    Helper = 4
+    Debug = 5
+}
+
+// A Memory holding the `LaunchInfo` (§11.4) for `reason` and `arguments`:
+// the reason padded to eight, then a `Vector<String>` (a count, then each
+// string's length and its bytes padded to eight), then no URL, no intent, no
+// locale and no working directory, each one empty word.
+public function launchInfoCreate(
+    reason: LaunchReason,
+    arguments: borrow [String]
+) -> Result<Handle, TesseraError> {
+    var size = 16 + 32
+    for index in 0..arguments.count { size += 8 + trunc((arguments[index].count + 7) / 8) * 8 }
+    let blockBytes = zeroedBlock(count: size, alignment: 16)
+    let block = blockBytes.pointer()
+    heapStore<U32>(block, 0, code(reason))
+    heapStore<U64>(block, 8, U64(arguments.count))
+    var at = 16
+    for index in 0..arguments.count {
+        heapStore<U64>(block, at, U64(arguments[index].count))
+        copyBytes(heapOffset(block, at + 8), arguments[index].data, arguments[index].count)
+        at += 8 + trunc((arguments[index].count + 7) / 8) * 8
+    }
+    let memory = try memoryCreate(memoryPageRound(size), MemoryOptions.none)
+    match memoryWrite(memory, U64(0), Buffer { address: block, length: U64(size) }) {
+        Ok -> return .Ok(memory)
+        Error(failed) -> {
+            handleDrop(memory)
+            return .Error(failed)
+        }
+    }
+}
+
+// The tags a parent may fill itself.
+function startupTagFromParent(tag: StartupTag) -> Bool {
+    if tag.raw >= StartupTag.firstApp.raw { return true }
+    return tag == StartupTag.containerData || tag == StartupTag.containerCache || tag == StartupTag.containerTemp
+        || tag == StartupTag.bundle || tag == StartupTag.stdIn || tag == StartupTag.stdOut || tag == StartupTag.stdErr
+}
+
+// The arguments a `LaunchInfo` Memory holds (a `u32` reason padded to 8,
+// then `Vector<String>`); none when no `LaunchInfo` is given.
+function launchInfoArguments(given: borrow Handle?) -> Result<[String], TesseraError> {
+    var argv: [String] = []
+    let arguments = try given otherwise return .Ok(argv)
+    let object = try resolveObject(arguments, .Memory, Rights.read)
+    let memory = try memoryOf(object)
+    let size = memory.size
+    if size < U64(16) { return .Error(failure(.InvalidArgument)) }
+    let blockBytes = zeroedBlock(count: Number(size + U64(8)), alignment: 16)
+    let block = blockBytes.pointer()
+    let backing = try backingOf(object)
+    try kernelReadAt(backing, block, size, memory.offset)
+    let count = heapLoad<U64>(block, 8)
+    var at = U64(16)
+    for _ in 0..Number(count) {
+        if at + U64(8) > size { return .Error(failure(.InvalidArgument)) }
+        let length = heapLoad<U64>(block, at)
+        at += U64(8)
+        if at + length > size { return .Error(failure(.InvalidArgument)) }
+        argv.append(stringFromCBytes(heapOffset(block, at), length))
+        at += ((length + U64(7)) & ~U64(7))
+    }
+    return .Ok(argv)
+}
+
+// The argument vector for a launch: `arguments`' own, or only the name when
+// there are none.
+function launchArguments(
+    arguments: borrow Handle?,
+    name: borrow String
+) -> Result<[String], TesseraError> {
+    var argv = try launchInfoArguments(arguments)
+    if argv.count == 0 { argv.append(name) }
+    return .Ok(argv)
+}
+
+// The arguments this process was launched with, its own name first as its
+// parent gave it. A system process, started before any LibTessera process
+// with no `LaunchInfo`, has the vector the kernel started it with: PID 1's
+// are the words after `--` on the kernel's command line.
+public function processArguments() -> Result<[String], TesseraError> {
+    let launch = startupHandle(StartupTag.launch)
+    if launch == .None { return kernelProcessArguments() }
+    return launchInfoArguments(launch)
+}
+
+// A second handle to `handle`'s object with `rights`, for the child; the
+// caller keeps its own.
+function launchShare(handle: Handle, rights: Rights) -> Result<Handle, TesseraError> {
+    let slot = try handleSlotOf(handle) otherwise return .Error(failure(.InvalidHandle))
+    return handleMint(objectOfSlot(slot), (library.handles[slot].rights & rights) | Rights.transfer)
+}
+
+function launchConsume(entries: borrow [StartupEntry]) {
+    for index in 0..entries.count {
+        handleDrop(entries[index].handle)
+    }
+}
+
+public function processLaunch(
+    executable: Handle,
+    options: borrow LaunchOptions,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    let entries = options.initialHandles
+    let checked = launchCheck(executable, options, port)
+    if !succeeded(checked) {
+        launchConsume(entries)
+        return checked
+    }
+    let portObject = try resolveObject(port, .Port, Rights.none)
+    let resolved = match launchResolve(executable, options, entries) {
+        Ok(value) -> value
+        Error(failed) -> {
+            launchConsume(entries)
+            return .Error(failed)
+        }
+    }
+    let arguments = match launchArguments(options.arguments, options.name) {
+        Ok(value) -> value
+        Error(failed) -> {
+            launchConsume(entries)
+            launchReleaseStreams(resolved)
+            return .Error(failed)
+        }
+    }
+    // Worked out while the entries are still this process's.
+    let view = match launchView(options, entries) {
+        Ok(value) -> value
+        Error(failed) -> {
+            launchConsume(entries)
+            launchReleaseStreams(resolved)
+            return .Error(failed)
+        }
+    }
+    let bootstrap = match channelCreate() {
+        Ok(pair) -> pair
+        Error(failed) -> {
+            launchConsume(entries)
+            launchReleaseStreams(resolved)
+            return .Error(failed)
+        }
+    }
+    let ends = match launchEnds(bootstrap) {
+        Ok(value) -> value
+        Error(failed) -> {
+            launchConsume(entries)
+            launchReleaseStreams(resolved)
+            handleDrop(bootstrap.first)
+            handleDrop(bootstrap.second)
+            return .Error(failed)
+        }
+    }
+    let linked = match channelCreate() {
+        Ok(pair) -> pair
+        Error(failed) -> {
+            launchConsume(entries)
+            launchReleaseStreams(resolved)
+            handleDrop(bootstrap.first)
+            handleDrop(bootstrap.second)
+            return .Error(failed)
+        }
+    }
+    let message = match launchStartupMessage(
+        executable,
+        options,
+        entries,
+        resolved,
+        linked.second
+    ) {
+        Ok(value) -> value
+        Error(failed) -> {
+            launchConsume(entries)
+            launchReleaseStreams(resolved)
+            handleDrop(bootstrap.first)
+            handleDrop(bootstrap.second)
+            handleDrop(linked.first)
+            handleDrop(linked.second)
+            return .Error(failed)
+        }
+    }
+    // The entries are gone from this process once the message is sent.
+    let sent = launchSendStartup(ends.parent, message.tags, message.handles)
+    handleDrop(bootstrap.first)
+    if !succeeded(sent) {
+        launchReleaseStreams(resolved)
+        handleDrop(bootstrap.second)
+        handleDrop(linked.first)
+        return sent
+    }
+    let childStartup = try backingOf(ends.child)
+    var jobBacking: Number? = .None
+    match resolved.job {
+        Some(job) -> {
+            let backing = try backingOf(job)
+            jobBacking = .Some(backing)
+        }
+        None -> {}
+    }
+    let jobId = match resolved.job {
+        Some(job) -> library.objects[job].id
+        None -> U64(0)
+    }
+    let nodeBacking = try backingOf(resolved.node)
+    let started = launchStart(
+        nodeBacking,
+        childStartup,
+        arguments,
+        jobBacking,
+        jobId,
+        options.flags.has(LaunchFlags.suspended),
+        resolved.output,
+        resolved.errors,
+        view
+    )
+    handleDrop(bootstrap.second)
+    launchReleaseStreams(resolved)
+    match started {
+        Ok(child) -> {
+            let process = child.object
+            match resolved.job {
+                Some(job) -> jobMarkPopulated(job)
+                None -> {}
+            }
+            library.objects[process].name = options.name
+            let rights = Rights.wait | Rights.inspect | Rights.manage | Rights.duplicate
+            match handleForNew(process, rights) {
+                Ok(processHandle) -> portComplete(
+                    portObject,
+                    key,
+                    .Ok,
+                    .Launch,
+                    processHandle.raw,
+                    linked.first.raw,
+                    child.pid
+                )
+                Error(failed) -> {
+                    handleDrop(linked.first)
+                    portComplete(portObject, key, .Error(failed), .Launch, U64(0), U64(0), U64(0))
+                }
+            }
+        }
+        Error(failed) -> {
+            handleDrop(linked.first)
+            portComplete(portObject, key, .Error(failed), .Launch, U64(0), U64(0), U64(0))
+        }
+    }
+    return .Ok
+}
+
+function launchCheck(
+    executable: Handle,
+    options: borrow LaunchOptions,
+    port: Handle
+) -> Result<Void, TesseraError> {
+    if options.name.count > 64 || options.flags.raw > U32(7) {
+        return .Error(failure(.InvalidArgument))
+    }
+    let node = try resolveObject(executable, .Node, Rights.read | Rights.execute)
+    if !entitlementHeld("tessera.process.launch") { return .Error(failure(.NotEntitled)) }
+    let portChecked = resolveObject(port, .Port, Rights.none)
+    try portChecked
+    var job = startupHandle(StartupTag.job)
+    match options.job {
+        Some(given) -> {
+            try resolveObject(given, .Job, Rights.manage)
+            job = .Some(given)
+        }
+        None -> {}
+    }
+    match job {
+        Some(jobHandle) -> match handleSlotOf(jobHandle) {
+            Some(jobSlot) -> {
+                let held = try jobOf(objectOfSlot(jobSlot))
+                if held.policy.flags.has(JobDeny.launch) {
+                    return .Error(failure(.AccessDenied))
+                }
+            }
+            None -> {}
+        }
+        None -> {}
+    }
+    for index in 0..options.initialHandles.count {
+        if !startupTagFromParent(options.initialHandles[index].tag) {
+            return .Error(failure(.InvalidArgument))
+        }
+        let slot = try handleSlotOf(options.initialHandles[index].handle) otherwise return .Error(
+            failure(.InvalidHandle)
+        )
+        if !library.handles[slot].rights.has(Rights.transfer) {
+            return .Error(failure(.AccessDenied))
+        }
+    }
+    if library.objects[node].backing.isNone() { return .Error(failure(.BadState)) }
+    return .Ok
+}
+
+// `StartupMessage`: 48 bytes, then `{tag, handleIndex}` per entry.
+function launchSendStartup(
+    channel: Number,
+    tags: borrow [StartupTag],
+    handles: borrow [Handle]
+) -> Result<Void, TesseraError> {
+    let size = U64(48 + tags.count * 8)
+    let blockBytes = zeroedBlock(count: size, alignment: 16)
+    let block = blockBytes.pointer()
+    heapStore<U32>(block, 0, startupMagic)
+    heapStore<U32>(block, 4, U32(1))
+    heapStore<U32>(block, 8, U32(tags.count))
+    heapStore<U32>(block, 12, (library.startup.flags & StartupFlags.debugImage).raw)
+    heapStore<U64>(block, 16, library.startup.appId)
+    for index in 0..tags.count {
+        heapStore<U32>(block, (48 + index * 8), tags[index].raw)
+        heapStore<U32>(block, (52 + index * 8), U32(index))
+    }
+    var sent = transferCheck(handles, channel)
+    if succeeded(sent) {
+        let channelBacking = try backingOf(channel)
+        sent = channelSend(channelBacking, Buffer { address: block, length: size }, handles)
+    }
+    transferRelease(handles)
+    return sent
+}
+
+// A child launched: its Process object and its pid.
+struct LaunchStarted {
+    var object: Number
+    var pid: U64
+}
+
+// The child, as a Process object in the job `jobId` (0 for none).
+function launchStart(
+    executable: Number,
+    startup: Number,
+    arguments: borrow [String],
+    job: borrow Number?,
+    jobId: U64,
+    suspended: Bool,
+    output: borrow Number?,
+    errors: borrow Number?,
+    view: borrow KernelView?
+) -> Result<LaunchStarted, TesseraError> {
+    let child = try kernelLaunch(
+        executable,
+        startup,
+        arguments,
+        job,
+        suspended,
+        output,
+        errors,
+        view
+    )
+    let process = match processStarted(child.pid, jobId) {
+        Ok(value) -> value
+        Error(failed) -> {
+            kernelRelease(child.backing)
+            return .Error(failed)
+        }
+    }
+    let object = objectCreate(.Process(move process), child.backing)
+    return .Ok(LaunchStarted { object: object, pid: child.pid })
+}
+
+// A backing of its own for the entry tagged `tag`, when there is one.
+function launchStreamBacking(
+    entries: borrow [StartupEntry],
+    tag: StartupTag
+) -> Result<Number?, TesseraError> {
+    for index in 0..entries.count {
+        if entries[index].tag == tag {
+            let object = try resolveObject(entries[index].handle, .None, Rights.none)
+            let held = try backingOf(object)
+            let backing = try kernelDuplicate(held)
+            return .Ok(.Some(backing))
+        }
+    }
+    return .Ok(.None)
+}
+
+// The Startup message's entries: each tag and the handle it carries.
+struct StartupMessage {
+    var tags: [StartupTag]
+    var handles: [Handle]
+}
+
+// The handles the child is given. One that cannot be made fails the launch,
+// and the handles made for it so far are dropped.
+function launchStartupMessage(
+    executable: Handle,
+    options: borrow LaunchOptions,
+    entries: borrow [StartupEntry],
+    resolved: borrow LaunchResolved,
+    parentChannel: Handle
+) -> Result<StartupMessage, TesseraError> {
+    var message = StartupMessage { tags: [StartupTag.parentChannel], handles: [parentChannel] }
+    match launchStartupEntries(message, executable, options, entries, resolved) {
+        Ok -> return .Ok(message)
+        Error(failed) -> {
+            // The parent channel is the caller's to drop.
+            for index in 1..message.handles.count { handleDrop(message.handles[index]) }
+            return .Error(failed)
+        }
+    }
+}
+
+function launchStartupEntries(
+    message: borrow mut StartupMessage,
+    executable: Handle,
+    options: borrow LaunchOptions,
+    entries: borrow [StartupEntry],
+    resolved: borrow LaunchResolved
+) -> Result<Void, TesseraError> {
+    message.handles.append(
+        try launchShare(executable, Rights.read | Rights.execute | Rights.inspect)
+    )
+    message.tags.append(StartupTag.executable)
+    let confined = options.flags.has(LaunchFlags.confined)
+    message.handles.append(try entitlementsForChild(confined))
+    message.tags.append(StartupTag.entitlements)
+    match options.job {
+        Some(job) -> {
+            message.handles.append(try launchShare(job, Rights.inspect | Rights.wait))
+            message.tags.append(StartupTag.job)
+        }
+        None -> {}
+    }
+    // The root is for system processes only: a confined child given it
+    // could open what its view leaves out, through a descriptor that names
+    // the parent's root rather than its own.
+    match startupHandle(StartupTag.systemRoot) {
+        Some(root) -> if !confined {
+            message.handles.append(try launchShare(root, Rights.same))
+            message.tags.append(StartupTag.systemRoot)
+        }
+        None -> {}
+    }
+    match options.arguments {
+        Some(arguments) -> {
+            message.handles.append(
+                try launchShare(arguments, Rights.read | Rights.map | Rights.inspect)
+            )
+            message.tags.append(StartupTag.launch)
+        }
+        None -> {}
+    }
+    for index in 0..entries.count {
+        let slot = resolved.entrySlots[index]
+        var handle = entries[index].handle
+        match entries[index].rights {
+            Some(narrowed) -> {
+                handle = try handleRemint(
+                    slot,
+                    library.handles[slot].rights & (narrowed | Rights.transfer)
+                )
+            }
+            // Passed with the rights it has.
+            None -> {}
+        }
+        message.handles.append(handle)
+        message.tags.append(entries[index].tag)
+    }
+    return .Ok
+}
+
+// What a launch works from, looked up before anything is made: the
+// executable's and the job's objects, each entry's slot, and the backings
+// the child's standard output and error are placed from.
+struct LaunchResolved {
+    var node: Number
+    var job: Number?
+    var entrySlots: [Number]
+    var output: Number?
+    var errors: Number?
+}
+
+function launchResolve(
+    executable: Handle,
+    options: borrow LaunchOptions,
+    entries: borrow [StartupEntry]
+) -> Result<LaunchResolved, TesseraError> {
+    let node = try resolveObject(executable, .None, Rights.none)
+    var job: Number? = .None
+    match options.job {
+        Some(given) -> {
+            let object = try resolveObject(given, .None, Rights.none)
+            job = .Some(object)
+        }
+        None -> {}
+    }
+    var entrySlots: [Number] = []
+    for entry in entries { entrySlots.append(try resolve(entry.handle, .None, Rights.none)) }
+    let output = try launchStreamBacking(entries, StartupTag.stdOut)
+    let errors = match launchStreamBacking(entries, StartupTag.stdErr) {
+        Ok(value) -> value
+        Error(failed) -> {
+            launchReleaseBacking(output)
+            return .Error(failed)
+        }
+    }
+    return .Ok(
+        LaunchResolved {
+            node: node,
+            job: job,
+            entrySlots: entrySlots,
+            output: output,
+            errors: errors
+        }
+    )
+}
+
+function launchReleaseBacking(backing: borrow Number?) {
+    match backing {
+        Some(owned) -> kernelRelease(owned)
+        None -> {}
+    }
+}
+
+function launchReleaseStreams(resolved: borrow LaunchResolved) {
+    launchReleaseBacking(resolved.output)
+    launchReleaseBacking(resolved.errors)
+}
+
+// The objects behind the bootstrap channel's two ends.
+struct LaunchEnds {
+    var parent: Number
+    var child: Number
+}
+
+function launchEnds(bootstrap: borrow HandlePair) -> Result<LaunchEnds, TesseraError> {
+    let parent = try resolveObject(bootstrap.first, .None, Rights.none)
+    let child = try resolveObject(bootstrap.second, .None, Rights.none)
+    return .Ok(LaunchEnds { parent: parent, child: child })
+}

@@ -1,0 +1,35 @@
+TessIcon {
+    fill: Choice { light: .LinearGradient(Gradient { from: Color { space: .Srgb, red: 0.835, green: 0.835, blue: 0.835, alpha: 1 }, to: Color { space: .Srgb, red: 0.741, green: 0.741, blue: 0.741, alpha: 1 }, start: Point { x: 0.5, y: 0 }, stop: Point { x: 0.5, y: 1 } }), dark: .Automatic },
+    groups: [
+        Group {
+            name: "Group",
+            layers: [
+                Layer { name: "4.tessera.mark", image: "4.tessera.mark.svg", fill: Choice { light: .Solid(Color { space: .Gray, red: 0.45, green: 0.45, blue: 0.45, alpha: 1 }), dark: .Solid(Color { space: .Gray, red: 0.423, green: 0.423, blue: 0.423, alpha: 1 }) } }
+            ],
+            lighting: .Individual,
+            specular: .Inside,
+            translucency: Translucency { enabled: true, amount: 0.15 },
+            shadow: Shadow { kind: .Neutral, opacity: 0.5 }
+        },
+        Group {
+            name: "Group 2",
+            layers: [
+                Layer { name: "1.wrench.extended", image: "1.wrench.extended.svg", fill: Choice { light: .Solid(Color { space: .Gray, red: 0.45, green: 0.45, blue: 0.45, alpha: 1 }), dark: .Solid(Color { space: .Gray, red: 0.67, green: 0.67, blue: 0.67, alpha: 1 }) }, position: Position { scale: 1, x: 0, y: 30 } }
+            ],
+            lighting: .Individual,
+            specular: Choice { light: .Inside, dark: .Outside },
+            translucency: Translucency { enabled: true, amount: 0.28 },
+            shadow: Shadow { kind: .Neutral, opacity: 0.8 }
+        },
+        Group {
+            name: "Group 3",
+            layers: [
+                Layer { name: "3.hexagon", image: "3.hexagon.svg", fill: Choice { light: .Solid(Color { space: .Gray, red: 1, green: 1, blue: 1, alpha: 1 }), dark: .Solid(Color { space: .Srgb, red: 1, green: 1, blue: 1, alpha: 1 }) } }
+            ],
+            lighting: .Individual,
+            specular: .Outside,
+            translucency: Translucency { enabled: true, amount: 0.25 },
+            shadow: Shadow { kind: .Neutral, opacity: 0.6 }
+        }
+    ]
+}

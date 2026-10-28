@@ -1,0 +1,131 @@
+import Foundation
+
+// What a crashed process was doing when it died, read by the system from
+// outside it (§20.2): the kernel hands a crash reporter the process's core as
+// it dies, and keeps the process until the reporter is done with it. The
+// threads come with the registers the kernel saved and the frames their frame
+// pointers chain through, the crashed thread first; the images are the
+// executables and libraries it had mapped. Root only.
+
+public struct CrashedThread {
+    let id: Number
+    var name: String = ""
+    // As the kernel saved them: x0 to x30, sp, pc and pstate on arm64; on
+    // x86-64 Linux's `user_regs_struct`, r15 first.
+    let registers: [U64]
+    // Return addresses, innermost first, the first the program counter.
+    var frames: [U64] = []
+    // Each frame's function and the offset into it, `name + 0x24`, from its
+    // image's symbol table; none where the image names none.
+    var symbols: [String?] = []
+}
+
+public struct CrashedImage {
+    // From its first mapping to the end of its last.
+    let start: U64
+    var end: U64
+    let path: String
+    // The GNU build ID, as hex; none when the file has none.
+    var identifier: String? = .None
+    // Whether it is mapped executable: the images frames can lie in.
+    var executable: Bool = false
+}
+
+// One mapping of the process, as /proc/<pid>/maps lists it.
+public struct CrashedRegion {
+    let start: U64
+    let end: U64
+    // `r-xp`: read, write, execute, private or shared.
+    let permissions: String
+    // The file mapped, or `[stack]`, `[heap]` and the like; empty for
+    // anonymous memory.
+    let path: String
+}
+
+// A file descriptor the process held, and what it named.
+public struct CrashedFile {
+    let descriptor: Number
+    let target: String
+}
+
+public struct CrashCapture {
+    var pid: Number = 0
+    var parentPid: Number = 0
+    var parentName: String? = .None
+    var userId: Number = 0
+    var name: String = ""
+    var path: String = ""
+    var arguments: [String] = []
+    var architecture: Architecture = .Arm64
+    var signal: Number = 0
+    var signalCode: Number = 0
+    // The address a fault was taken at; 0 for a signal that is not a fault.
+    var faultAddress: U64 = U64(0)
+    // The process that sent the signal, for one sent by `kill`.
+    var senderPid: Number = 0
+    // The `KLF-RT` number of the Kira trap that ended it; 0 when no trap did.
+    var trapCode: Number = 0
+    var threads: [CrashedThread] = []
+    var images: [CrashedImage] = []
+    var regions: [CrashedRegion] = []
+    var files: [CrashedFile] = []
+    // Its /proc status, as the kernel wrote it.
+    var status: String = ""
+    // Seconds after boot it started, and the machine had been up.
+    var startedAfterBoot: Number = 0
+    var uptime: Number = 0
+    // What could not be read, a line each; empty when all was.
+    var problems: [String] = []
+}
+
+// A trap in a Tessera program is a crash, as a Swift trap is on a Mac: the
+// trap's line goes out, then the thread takes SIGTRAP, so the kernel hands
+// the process's core to the crash reporter before it ends. The Kira runtime
+// would otherwise end it with status 1 and nothing to read.
+// Opens standard output and error onto the kernel's log for a crash reporter
+// the kernel started without them. It runs first, before anything opens a
+// file that would take their numbers.
+public function crashStandardStreams() {
+    kernelCrashStreams()
+}
+
+// The core of process `pid`, piped in on standard input by the kernel, and
+// what /proc still says of it.
+public function crashCapture(pid: Number) -> Result<CrashCapture, TesseraError> {
+    if !entitlementHeld("tessera.debug.crash") { return .Error(failure(.NotEntitled)) }
+    crashReleaseInput()
+    return kernelCrashCapture(pid)
+}
+
+// The library keeps a copy of standard input as the process starts. The core
+// ends when every reader of its pipe has closed it, and until it ends the
+// kernel holds the dying process, so that copy goes first.
+function crashReleaseInput() {
+    var tags: [StartupTag] = []
+    var handles: [Handle] = []
+    for index in 0..library.startupTags.count {
+        if library.startupTags[index] == StartupTag.stdIn {
+            handleDrop(library.startupHandles[index])
+        } else {
+            tags.append(library.startupTags[index])
+            handles.append(library.startupHandles[index])
+        }
+    }
+    library.startupTags = tags
+    library.startupHandles = handles
+}
+
+// The name of running process `pid`; none when there is none.
+public function crashProcessName(pid: Number) -> Result<String?, TesseraError> {
+    return kernelProcessName(pid)
+}
+
+// The image `address` lies in, if it lies in one mapped executable.
+public function crashImageOf(images: borrow [CrashedImage], address: U64) -> CrashedImage? {
+    for image in images {
+        if image.executable && address >= image.start && address < image.end {
+            return .Some(copy image)
+        }
+    }
+    return .None
+}

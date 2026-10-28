@@ -1,0 +1,28 @@
+//! The About window's view: the name, version and machine the window shows.
+//!
+import KiraUI
+import ReleaseText
+
+/// The About window: the system's name, its version and its machine.
+construct AboutView(release: Release) extends Widget {
+    body {
+        VStack(spacing = .Medium) {
+            Text("Tessera")
+            .font(size = scaledMetric(64, relativeTo: .largeTitle), weight = .Bold)
+
+            Text("Version " + release.version)
+            .typography(.title2)
+            .fontWeight(.Medium)
+            .foregroundColor(.Secondary)
+
+            Text("Running on " + release.architecture)
+            .typography(.title3)
+            .foregroundColor(.Secondary)
+
+            Text("Kira UI, drawn by Ember on Vulkan, shown by MosaicDisplay")
+            .typography(.body)
+            .foregroundColor(.Secondary)
+        }
+        .padding(resolvedLength(104))
+    }
+}

@@ -1,0 +1,174 @@
+import Foundation
+import Heap
+import LibTessera
+import DeviceKit
+
+// Haptic streams through DeviceKit's Haptic family.
+//
+// A slot holds `f32` amplitudes, one per period of the pattern's rate. The
+// front slot is uploaded as one effect and played; the slot goes back when
+// its last period has passed (`playUntil`, which the main loop wakes for),
+// the effect is erased, and the next slot plays.
+
+namespace HapticDefault {
+    let rate: Number = 100
+    let highestRate: Number = 1000
+    let sampleBytes: Number = 4
+    // A pattern: the rate (`u32`), then the amplitudes.
+    let patternHeaderBytes: Number = 4
+    // A slot holds a tenth of a second when nothing says otherwise.
+    let slotsPerSecond: Number = 10
+    // The most a gain can be.
+    let highestGain: Number = 65535
+}
+
+function configureHaptic(
+    service: borrow mut Service,
+    stream: Number
+) -> Result<Void, TesseraError> {
+    let capabilities = try hapticCapabilities(service.streams[stream].connection)
+    if capabilities == HapticCapabilities.none { return .Error(failure(.Unsupported)) }
+    let descriptor = service.streams[stream].descriptor
+    var rate = descriptor.format.rateHz
+    if rate == 0 { rate = HapticDefault.rate }
+    if rate > HapticDefault.highestRate { rate = HapticDefault.highestRate }
+    var size = descriptor.bufferSize
+    if size == 0 { size = floor(rate / HapticDefault.slotsPerSecond) * HapticDefault.sampleBytes }
+    size = floor(size / HapticDefault.sampleBytes) * HapticDefault.sampleBytes
+    if size == 0 { size = HapticDefault.sampleBytes }
+    service.streams[stream].descriptor.format.rateHz = rate
+    service.streams[stream].descriptor.bufferSize = size
+    service.streams[stream].frameBytes = HapticDefault.sampleBytes
+    return .Ok
+}
+
+// Uploads and starts a pattern, removing an uploaded effect if play fails.
+function startPattern(connection: Ref, pattern: borrow ByteBlock, size: Number) -> Result<UN32, TesseraError> {
+    let effect = try hapticUpload(connection, Buffer { address: pattern.pointer(), length: size })
+    match hapticPlay(connection, effect, 1) {
+        Ok -> return .Ok(effect)
+        Error(reason) -> return rejectedPattern(connection, effect, reason)
+    }
+}
+
+function rejectedPattern(connection: Ref, effect: UN32, reason: borrow TesseraError) -> Result<UN32, TesseraError> {
+    eraseEffect(connection, effect)
+    return .Error(reason)
+}
+
+// The packet failed; its client receives the device's reason.
+function failedPattern(service: borrow mut Service, stream: Number, front: Number, reason: borrow TesseraError) {
+    let now = match streamTime(service, stream) {
+        Some(value) -> value
+        None -> return
+    }
+    done(service, stream, front, reason.code, now, 0, PacketFlags.none)
+}
+
+// Plays the front slot when nothing is playing.
+function stepHaptic(service: borrow mut Service, stream: Number) {
+    let connection = service.streams[stream].connection
+    while service.streams[stream].playUntil.isNone() {
+        let front = match frontSlot(service, stream) {
+            Some(value) -> value
+            None -> return
+        }
+        let slot = service.streams[stream].slots[front]
+        let samples = floor(slot.length / HapticDefault.sampleBytes)
+        if samples == 0 {
+            let now = match streamTime(service, stream) {
+                Some(value) -> value
+                None -> return
+            }
+            done(service, stream, front, .Ok, now, 0, slot.flags)
+            continue
+        }
+        let rate = service.streams[stream].descriptor.format.rateHz
+        let amplitudes = samples * HapticDefault.sampleBytes
+        let size = HapticDefault.patternHeaderBytes + amplitudes
+        let pattern = zeroedBlock(count: size, alignment: 16)
+        blockStore<U32>(pattern, 0, UN32(rate))
+        copyBytes(
+            heapOffset(pattern.pointer(), HapticDefault.patternHeaderBytes),
+            slot.address,
+            amplitudes
+        )
+        match startPattern(connection, pattern, size) {
+            Ok(effect) -> {
+                service.streams[stream].effect = .Some(effect)
+                let started = match streamTime(service, stream) {
+                    Some(value) -> value
+                    None -> return
+                }
+                service.streams[stream].playUntil = .Some(
+                    started + floor(samples * Nanoseconds.perSecond / rate)
+                )
+            }
+            Error(reason) -> failedPattern(service, stream, front, reason)
+        }
+        if service.streams[stream].playUntil.isNone() { return }
+    }
+}
+
+function eraseEffect(connection: Ref, effect: UN32) {
+    match hapticErase(connection, effect) {
+        Ok -> {}
+        Error(failed) -> log warn("a haptic effect could not be erased", error: errorName(failed))
+    }
+}
+
+function releaseEffect(service: borrow mut Service, stream: Number) {
+    let connection = service.streams[stream].connection
+    match service.streams[stream].effect {
+        Some(effect) -> {
+            match hapticStop(connection, effect) {
+                Ok -> {}
+                Error(failed) -> log warn(
+                    "a haptic effect could not be stopped",
+                    error: errorName(failed)
+                )
+            }
+            eraseEffect(connection, effect)
+        }
+        None -> {}
+    }
+    service.streams[stream].effect = .None
+    service.streams[stream].playUntil = .None
+}
+
+// The front slot's last period has passed.
+function finishHaptic(service: borrow mut Service, stream: Number) {
+    releaseEffect(service, stream)
+    match frontSlot(service, stream) {
+        Some(front) -> {
+            let slot = service.streams[stream].slots[front]
+            let now = match streamTime(service, stream) {
+                Some(value) -> value
+                None -> return
+            }
+            done(service, stream, front, .Ok, now, slot.length, slot.flags)
+        }
+        None -> {}
+    }
+    if service.streams[stream].state == .Running { stepHaptic(service, stream) }
+}
+
+let knownHapticControls: [HapticControl] = [HapticControl.Intensity]
+
+// `Intensity`: a gain, 0 to 65535, which can be set but not read.
+function controlHaptic(
+    service: borrow mut Service,
+    stream: Number,
+    request: borrow ControlRequest
+) -> Result<Number?, TesseraError> {
+    match caseWithCode(knownHapticControls, request.control) {
+        Some(control) -> match control {
+            Intensity -> {}
+        }
+        None -> return .Error(failure(.Unsupported))
+    }
+    let gain = try request.value otherwise return .Error(failure(.InvalidArgument))
+    if gain > HapticDefault.highestGain { return .Error(failure(.OutOfRange)) }
+    try hapticSetGain(service.streams[stream].connection, gain)
+    return .Ok(.None)
+}

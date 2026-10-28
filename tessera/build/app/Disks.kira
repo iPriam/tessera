@@ -1,0 +1,47 @@
+import Foundation
+import Build
+
+// The small ext4 disks a services boot attaches, made once by the graph and
+// kept in its store: the scratch disk the Volume service probes, the USB
+// stick the media and multi boots plug in, and the CD the restart boot
+// ejects. Each is 4 MiB.
+
+struct BootDisks {
+    let scratch: Artifact
+    let stick: Artifact
+    let disc: Artifact
+}
+
+function bootDisks(graph: borrow mut Graph, host: borrow Host) -> BootDisks {
+    let none: [String] = []
+    return BootDisks {
+        scratch: ext4Disk(graph, host, "scratch", none),
+        stick: ext4Disk(graph, host, "stick", none),
+        // In 4 KiB blocks, which a 2 KiB-sector drive holds, and with no
+        // journal, as nothing writes to a CD.
+        disc: ext4Disk(graph, host, "disc", ["-b", "4096", "-O", "^has_journal"])
+    }
+}
+
+// A 4 MiB ext4 image labelled `label`, made with `options` besides.
+function ext4Disk(
+    graph: borrow mut Graph,
+    host: borrow Host,
+    label: borrow String,
+    options: borrow [String]
+) -> Artifact {
+    var arguments: [Argument] = [.Text("-q"), .Text("-F")]
+    for option in options { arguments.append(.Text(copy option)) }
+    arguments.append(.Text("-L"))
+    arguments.append(.Text(copy label))
+    arguments.append(.Output("\(label).img"))
+    arguments.append(.Text("4M"))
+    return graph.command(
+        CommandAction {
+            label: "ext4 disk \(label)",
+            tool: host.find("mkfs.ext4"),
+            arguments: arguments,
+            outputs: [Output { name: "\(label).img" }]
+        }
+    )[0]
+}

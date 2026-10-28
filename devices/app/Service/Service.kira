@@ -1,0 +1,170 @@
+import Foundation
+import LibTessera
+import DeviceKit
+
+// The service's state: its ports, its listener, its connections and their
+// streams, and the devices it last told the system about. `main` makes it
+// and lends it to everything that runs.
+
+struct Service {
+    var port: Handle
+    // Device opens wait here, so no other completion is taken in their place.
+    var openPort: Handle
+    var listener: Handle
+    var clients: [Client]
+    var nextClient: Number
+    var streams: [Stream]
+    var watches: [Ref]
+    var known: [KnownDevice]
+}
+
+namespace ServiceName {
+    let devices: String = "tessera.devices"
+}
+
+// The keys this service's waits are made under. A connection's keys are its
+// id times `lanes` plus the lane; the listener and the termination watch
+// take keys no connection has, since connection ids start at 1 and no lane
+// is 4.
+namespace PortKey {
+    let listener: Number = 1
+    let termination: Number = 4
+    let lanes: Number = 16
+    let channel: Number = 1
+    let device: Number = 2
+    let watch: Number = 3
+    // The most completions taken in one wait.
+    let batch: Number = 32
+}
+
+// What a completion key names.
+enum Waker {
+    Listener
+    Termination
+    Channel(Number)
+    Device(Number)
+    Watch(Number)
+    Unknown
+}
+
+function channelKey(client: Number) -> Number { return client * PortKey.lanes + PortKey.channel }
+function deviceKey(client: Number) -> Number { return client * PortKey.lanes + PortKey.device }
+function watchKey(index: Number) -> Number { return index * PortKey.lanes + PortKey.watch }
+
+function wakerOf(key: Number) -> Waker {
+    if key == PortKey.listener { return .Listener }
+    if key == PortKey.termination { return .Termination }
+    let owner = floor(key / PortKey.lanes)
+    let lane = key - owner * PortKey.lanes
+    if lane == PortKey.channel { return .Channel(owner) }
+    if lane == PortKey.device { return .Device(owner) }
+    if lane == PortKey.watch { return .Watch(owner) }
+    return .Unknown
+}
+
+function failure(code: borrow ErrorCode) -> TesseraError {
+    return TesseraError {
+        code: code,
+        subsystem: .Devices,
+        flags: ErrorFlags.none,
+        detail: UNumber(0)
+    }
+}
+
+// The ports and the listener; nothing is connected yet.
+function startService() -> Result<Service, TesseraError> {
+    let port = try portCreate(.None)
+    let openPort = try portCreate(.None)
+    let listener = try serviceListen(ServiceName.devices)
+    try objectWaitAsync(listener, Signals.readable, .Repeat, port, PortKey.listener)
+    match processWatchTermination(port, PortKey.termination) {
+        Ok -> {}
+        Error(failed) -> log warn("cannot hear a request to stop", error: errorName(failed))
+    }
+    return .Ok(
+        Service {
+            port: port,
+            openPort: openPort,
+            listener: listener,
+            clients: [],
+            nextClient: 1,
+            streams: [],
+            watches: [],
+            known: [],
+        }
+    )
+}
+
+// Takes completions until asked to stop.
+function run(service: borrow mut Service) {
+    while true {
+        match portWait(service.port, PortKey.batch, nextDeadline(service)) {
+            Ok(completions) -> {
+                for completion in completions {
+                    match wakerOf(Number(completion.key)) {
+                        Termination -> {
+                            log info("asked to stop")
+                            return
+                        }
+                        Listener -> accept(service)
+                        Channel(client) -> serveClient(service, client)
+                        Device(client) -> deviceReady(service, client, completion)
+                        Watch(index) -> watchWoke(service, index)
+                        Unknown -> log warn(
+                            "a completion no wait was made for",
+                            key: completion.key
+                        )
+                    }
+                }
+            }
+            Error(failed) -> reportWaitFailure(failed)
+        }
+        tick(service)
+    }
+}
+
+function reportWaitFailure(reason: borrow TesseraError) {
+    if reason.code != .Timeout { log warn("port wait failed", error: errorName(reason)) }
+}
+
+// The monotonic clock, in nanoseconds. A clock that cannot be read is the
+// caller's to act on; see `streamTime` for the stream that asks.
+function monotonic() -> Result<Number, TesseraError> {
+    return match timeRead(.Monotonic) {
+        Ok(value) -> .Ok(Number(value))
+        Error(failed) -> .Error(failed)
+    }
+}
+
+function closeHandle(handle: Handle) {
+    match handleClose(handle) {
+        Ok -> {}
+        Error(failed) -> log warn("a handle could not be closed", error: errorName(failed))
+    }
+}
+
+function closeHandles(handles: borrow [Handle]) {
+    if handles.count == 0 { return }
+    match handleCloseMany(handles) {
+        Ok -> {}
+        Error(failed) -> log warn("handles could not be closed", error: errorName(failed))
+    }
+}
+
+function closeRef(ref: Ref) {
+    match refClose(ref) {
+        Ok -> {}
+        Error(failed) -> log warn(
+            "a device connection could not be closed",
+            error: errorName(failed)
+        )
+    }
+}
+
+// Cancels what is armed under `key`; there may be nothing.
+function cancelWaits(port: Handle, key: Number) {
+    match portCancel(port, key) {
+        Ok(cancelled) -> {}
+        Error(failed) -> log warn("a wait could not be cancelled", key, error: errorName(failed))
+    }
+}

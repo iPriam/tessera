@@ -1,0 +1,7 @@
+//! The reportcrash package: writes a report when a process crashes.
+/// The Tessera reportcrash package: the crash report writer.
+construct TesseraReportCrash extends Package {
+    let version: String = "0.1.0"
+    let kind: PackageKind = .App
+    let moduleRoot: String = "TesseraReportCrash"
+}

@@ -1,0 +1,256 @@
+//! The USB side of the CCID driver: the descriptors, the bulk transfers and the card slots.
+import Foundation
+import Heap
+import LibTessera
+import DeviceKit
+
+// The reader, through DeviceKit's Usb family: its descriptors, the CCID
+// interface and its bulk pipes, and one exchange of a CCID message.
+
+/// The layout of the USB descriptors the driver reads: the configuration's, one descriptor after another, each led by its length and its type.
+namespace UsbDescriptor {
+    let bufferBytes: Number = 4096
+    let deviceBytes: Number = 18
+    // idVendor and idProduct in the device descriptor, little-endian.
+    let vendorAt: Number = 8
+    let productAt: Number = 10
+    let kindAt: Number = 1
+    let interfaceNumberAt: Number = 2
+    let interfaceClassAt: Number = 5
+    let endpointAddressAt: Number = 2
+    let endpointAttributesAt: Number = 3
+    let ccidClass: UN8 = UN8(0x0B)
+    let transferTypeMask: UN8 = UN8(3)
+    let bulkTransfer: UN8 = UN8(2)
+    let directionIn: UN32 = UN32(0x80)
+}
+
+/// The CCID class's constants: the class code and the message types the smart card reader speaks.
+namespace Ccid {
+    let messageBytes: Number = 64
+    let headerBytes: Number = 10
+    let getSlotStatus: UN8 = UN8(0x65)
+    let slotStatus: UN8 = UN8(0x81)
+    // `bStatus` in `RDR_to_PC_SlotStatus`; bits 0-1 are the card's state.
+    let statusAt: Number = 7
+    let cardStateMask: UN8 = UN8(3)
+}
+
+/// The nanoseconds in the units the driver waits in.
+namespace Nanoseconds {
+    let completion: Number = 10000000000
+    let transfer: Number = 2000000000
+}
+
+/// The keys this driver's completions carry.
+namespace PortKey {
+    let claim: UNumber = UNumber(1)
+    let open: UNumber = UNumber(2)
+    let bulkOut: UNumber = UNumber(10)
+    let bulkIn: UNumber = UNumber(11)
+}
+
+/// The reader's endpoints the driver found: the bulk in and out pipes and the interrupt endpoint.
+struct Pipes {
+    var interface: Number
+    var bulkOut: UN32
+    var bulkIn: UN32
+    var vendorId: Number
+    var productId: Number
+}
+
+/// What the descriptors seen so far say of the reader's interface.
+struct PipeScan {
+    var interface: Number?
+    var inside: Bool
+    var bulkOut: UN32?
+    var bulkIn: UN32?
+}
+
+/// The kinds of USB descriptor the driver tells apart.
+enum DescriptorKind {
+    Interface
+    Endpoint
+    Other
+}
+
+/// The state a smart card slot reports: active, inactive, or absent.
+@Derive(Copy)
+enum CardState: UN8 {
+    Active = 0
+    Inactive = 1
+    Absent = 2
+}
+
+/// The card states in the order the reader numbers them.
+let cardStates: [CardState] = [CardState.Active, CardState.Inactive, CardState.Absent]
+
+/// The driver's error with `code`.
+function failure(code: ErrorCode) -> TesseraError {
+    return TesseraError {
+        code: code,
+        subsystem: .DeviceKit,
+        flags: ErrorFlags.none,
+        detail: UNumber(0)
+    }
+}
+
+/// The hexadecimal text of `value`, padded to `digits` digits.
+function hexText(value: Number, digits: Number) -> String {
+    let alphabet = "0123456789abcdef"
+    var text = ""
+    var rest = UNumber(value)
+    for _ in 0..digits {
+        let digit = Number(rest & UNumber(15))
+        text = alphabet.substring(digit, digit + 1) + text
+        rest = rest >> UNumber(4)
+    }
+    return text
+}
+
+/// The completion for `key`, waiting at most ten seconds; only one operation is in flight at a time, so no other completion is lost.
+function completionFor(port: Handle, key: UNumber) -> Result<Completion, TesseraError> {
+    let deadline = try timeRead(.Monotonic) + Nanoseconds.completion
+    while true {
+        let waited = try portWait(port, 1, deadline)
+        if waited.count == 0 { return .Error(failure(.Timeout)) }
+        for completion in waited {
+            if completion.key == key {
+                if completion.error.code != .Ok { return .Error(completion.error) }
+                return .Ok(completion)
+            }
+        }
+    }
+    return .Error(failure(.Timeout))
+}
+
+/// The kind of descriptor `raw` names.
+function descriptorKind(raw: UN8) -> DescriptorKind {
+    return match raw {
+        4 -> .Interface
+        5 -> .Endpoint
+        else -> .Other
+    }
+}
+
+/// The byte at `at` in the buffer at `base`.
+function byteAt(base: RawPtr, at: Number) -> UN8 { return heapLoad<U8>(base, at) }
+
+/// Notes what one descriptor at `at` says of the reader's interface.
+function scanDescriptor(scan: borrow mut PipeScan, base: RawPtr, at: Number) {
+    match descriptorKind(byteAt(base, at + UsbDescriptor.kindAt)) {
+        Interface -> {
+            scan.inside = scan.interface.isNone() && byteAt(
+                base,
+                at + UsbDescriptor.interfaceClassAt
+            ) == UsbDescriptor.ccidClass
+            if scan.inside {
+                scan.interface = .Some(Number(byteAt(base, at + UsbDescriptor.interfaceNumberAt)))
+            }
+        }
+        Endpoint -> {
+            let attributes = byteAt(base, at + UsbDescriptor.endpointAttributesAt)
+            if scan.inside && (
+                attributes & UsbDescriptor.transferTypeMask
+            ) == UsbDescriptor.bulkTransfer {
+                let address = UN32(byteAt(base, at + UsbDescriptor.endpointAddressAt))
+                if (address & UsbDescriptor.directionIn) != UN32(0) {
+                    scan.bulkIn = .Some(address)
+                } else {
+                    scan.bulkOut = .Some(address)
+                }
+            }
+        }
+        // Other descriptors say nothing of the pipes.
+        Other -> {}
+    }
+}
+
+/// The little-endian 16-bit word at `at` in the buffer at `base`.
+function wordAt(base: RawPtr, at: Number) -> Number {
+    return Number(byteAt(base, at)) + Number(byteAt(base, at + 1)) * 256
+}
+
+/// The reader's interface and its bulk and interrupt endpoints, or the error that stopped the search.
+function findPipes(usb: Ref) -> Result<Pipes, TesseraError> {
+    let outBytes = zeroedBlock(count: UsbDescriptor.bufferBytes, alignment: 16)
+    let out = Buffer { address: outBytes.pointer(), length: Number(UsbDescriptor.bufferBytes) }
+    let size = Number(try usbDescriptors(usb, out))
+    if size < UsbDescriptor.deviceBytes || size > UsbDescriptor.bufferBytes {
+        return .Error(failure(.Internal))
+    }
+    var scan = PipeScan { interface: .None, inside: false, bulkOut: .None, bulkIn: .None }
+    var at = UsbDescriptor.deviceBytes
+    while at + 2 <= size {
+        let length = Number(byteAt(out.address, at))
+        if length < 2 || at + length > size { return .Error(failure(.Internal)) }
+        scanDescriptor(scan, out.address, at)
+        at += length
+    }
+    let interface = try scan.interface otherwise return .Error(failure(.NotFound))
+    let bulkOut = try scan.bulkOut otherwise return .Error(failure(.NotFound))
+    let bulkIn = try scan.bulkIn otherwise return .Error(failure(.NotFound))
+    return .Ok(
+        Pipes {
+            interface: interface,
+            bulkOut: bulkOut,
+            bulkIn: bulkIn,
+            vendorId: wordAt(out.address, UsbDescriptor.vendorAt),
+            productId: wordAt(out.address, UsbDescriptor.productAt),
+        }
+    )
+}
+
+/// Sends `message` to the reader over the bulk pipe and answers its reply.
+function bulk(
+    usb: Ref,
+    endpoint: UN32,
+    buffer: borrow Buffer,
+    port: Handle,
+    key: UNumber
+) -> Result<Number, TesseraError> {
+    let transfer = UsbTransfer {
+        endpoint: endpoint,
+        transferType: .Bulk,
+        buffer: Buffer { address: buffer.address, length: buffer.length },
+        timeout: UNumber(Nanoseconds.transfer),
+        setup: UNumber(0),
+        flags: UN32(0),
+    }
+    try usbSubmit(usb, transfer, port, key)
+    let done = try completionFor(port, key)
+    return .Ok(Number(done.result0))
+}
+
+/// The slot status the reader reports for its slot.
+function slotStatus(
+    usb: Ref,
+    pipes: borrow Pipes,
+    port: Handle
+) -> Result<CardState, TesseraError> {
+    let messageBytes = zeroedBlock(count: Ccid.messageBytes, alignment: 16)
+    let message = Buffer { address: messageBytes.pointer(), length: Number(Ccid.messageBytes) }
+    heapStore<U8>(message.address, 0, Ccid.getSlotStatus)
+    let request = Buffer { address: message.address, length: Ccid.headerBytes }
+    let sent = try bulk(usb, pipes.bulkOut, request, port, PortKey.bulkOut)
+    if sent < Ccid.headerBytes { return .Error(failure(.Internal)) }
+    zeroBytes(message.address, Ccid.messageBytes)
+    let got = try bulk(usb, pipes.bulkIn, message, port, PortKey.bulkIn)
+    if got < Ccid.headerBytes || byteAt(message.address, 0) != Ccid.slotStatus {
+        return .Error(failure(.Internal))
+    }
+    let bits = byteAt(message.address, Ccid.statusAt) & Ccid.cardStateMask
+    return match caseWithCode(cardStates, bits) {
+        Some(state) -> .Ok(state)
+        None -> .Ok(CardState.Absent)
+    }
+}
+
+/// The card state as the driver prints it.
+function cardText(state: borrow CardState) -> String {
+    return match state {
+        Active -> "card present, powered"
+        Inactive -> "card present, not powered"
+        Absent -> "no card"
+    }
+}

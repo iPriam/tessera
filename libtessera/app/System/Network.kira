@@ -1,0 +1,77 @@
+import Foundation
+
+// How the machine reaches a network, as a status bar shows it: through
+// Wi-Fi, through a cable, or not at all. Read from the kernel's interfaces
+// under `/sys/class/net`; the loopback reaches nothing.
+
+public enum NetworkMedium {
+    Wired
+    Wireless
+}
+
+public struct NetworkLink {
+    var medium: NetworkMedium
+    // Whether the interface is up and has its carrier.
+    var connected: Bool
+}
+
+// The link the machine has, none without an interface: a connected one
+// before one that is not, and Wi-Fi before a cable when both are. Read at
+// most once a second: a status bar asks for it every frame it builds.
+public function networkLink() -> NetworkLink? {
+    let now = monotonicNow()
+    match library.networkChecked {
+        Some(checked) -> if now - checked < U64(1000000000) { return library.networkKnown }
+        None -> {}
+    }
+    let link = networkLinkRead()
+    library.networkChecked = .Some(now)
+    library.networkKnown = link
+    return link
+}
+
+function networkLinkRead() -> NetworkLink? {
+    let listed = match listPath("/sys/class/net") {
+        Ok(entries) -> entries
+        // No `/sys/class/net`: no interface to tell of.
+        Error(failure) -> return .None
+    }
+    var best: NetworkLink? = .None
+    for entry in listed {
+        let name = entry.name
+        if name == "." || name == ".." || name == "lo" { continue }
+        let base = "/sys/class/net/" + name
+        let link = NetworkLink {
+            medium: isDirectory(base + "/wireless") ? .Wireless : .Wired,
+            connected: interfaceConnected(base)
+        }
+        let better = match best {
+            Some(kept) -> link.connected && !kept.connected
+                || link.connected == kept.connected && link.medium == .Wireless && kept.medium == .Wired
+            None -> true
+        }
+        if better { best = .Some(link) }
+    }
+    return best
+}
+
+// Whether the interface at `base` is up with its carrier: `operstate` says
+// `up`, or `unknown` for a driver that does not report it with a carrier.
+function interfaceConnected(base: borrow String) -> Bool {
+    let state = match readSmallFileIfPresent(AtDirectory.current, base + "/operstate") {
+        Ok(read) -> match read {
+            Some(text) -> text.trim()
+            None -> return false
+        }
+        Error(failure) -> return false
+    }
+    if state == "up" { return true }
+    if state != "unknown" { return false }
+    return match readSmallFileIfPresent(AtDirectory.current, base + "/carrier") {
+        Ok(read) -> match read {
+            Some(text) -> text.trim() == "1"
+            None -> false
+        }
+        Error(failure) -> false
+    }
+}

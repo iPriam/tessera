@@ -1,0 +1,74 @@
+//! Tests of the menu bar's round trip: the menus an application exports, sent to the platform as AppKit's records, and read back.
+import Foundation
+import KiraUI
+import AppKit
+import TesseraUI
+
+/// A menu with one item, bearing `key` and `modifiers`, for the round trip to carry.
+function menuWith(key: String, modifiers: [EventModifier]) -> [ExportedMenu] {
+    let item = ExportedMenuItem {
+        number: 1,
+        title: "Open",
+        shortcut: KeyboardShortcut { key: key, modifiers: modifiers },
+        enabled: true,
+        separator: false
+    }
+    return [ExportedMenu { title: "File", application: false, items: [item] }]
+}
+
+/// A shortcut keeps its key and every modifier through the bridge.
+@Test
+function shortcutKeepsItsKeyAndModifiers() {
+    let back = exportedMenusOf(bridgeMenusOf(menuWith("o", [.Command, .Shift])))
+    expect!(back[0].items[0].shortcut.key == "o")
+    expect!(back[0].items[0].shortcut.modifiers.count == 2)
+}
+
+/// Each modifier comes back as the modifier that was sent, in its order.
+@Test
+function modifiersComeBackInOrder() {
+    let back = exportedMenusOf(bridgeMenusOf(menuWith("s", [.Option, .Control])))
+    expect!(back[0].items[0].shortcut.modifiers[0] == EventModifier.Option)
+    expect!(back[0].items[0].shortcut.modifiers[1] == EventModifier.Control)
+}
+
+/// Menus keep their order and their application flag.
+@Test
+function menusKeepTheirOrderAndApplicationFlag() {
+    let menus = [
+        ExportedMenu { title: "App", application: true, items: [] },
+        ExportedMenu { title: "Edit", application: false, items: [] }
+    ]
+    let back = exportedMenusOf(bridgeMenusOf(menus))
+    expect!(back.count == 2)
+    expect!(back[0].title == "App")
+    expect!(back[0].application)
+    expect!(back[1].title == "Edit")
+    expect!(!back[1].application)
+}
+
+/// A separator stays a separator and a disabled item stays disabled.
+@Test
+function separatorsAndDisabledItemsKeepTheirFlags() {
+    let items = [
+        ExportedMenuItem {
+            number: 2,
+            title: "",
+            shortcut: KeyboardShortcut {},
+            enabled: true,
+            separator: true
+        },
+        ExportedMenuItem {
+            number: 3,
+            title: "Paste",
+            shortcut: KeyboardShortcut {},
+            enabled: false,
+            separator: false
+        }
+    ]
+    let back = exportedMenusOf(
+        bridgeMenusOf([ExportedMenu { title: "Edit", application: false, items: items }])
+    )
+    expect!(back[0].items[0].separator)
+    expect!(!back[0].items[1].enabled)
+}

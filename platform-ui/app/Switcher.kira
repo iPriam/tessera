@@ -1,0 +1,143 @@
+import Foundation
+import KiraUI
+import PlatformKit
+
+// The application switcher (roadmap/11-adaptive-desktop.md, "The switcher"):
+// what is running, as a row of icons on glass in the middle of the screen,
+// the one chosen on a lighter square with its name under the row, as a Mac's
+// Command-Tab draws it. The glass is the compositor's (`switcherGlass`), so
+// it refracts the windows under it; the switcher is drawn at the size of that
+// glass so the two agree.
+
+// One application in the switcher: its name and whether it is the one chosen.
+public struct SwitcherItem {
+    let name: String
+    let selected: Bool
+}
+
+// How the switcher is laid out, in points.
+namespace SwitcherMetrics {
+    // The side of an icon, and how far the chosen one's square stands out
+    // round it.
+    let icon: Number = 96
+    let selection: Number = 12
+    // The gap between two squares.
+    let spacing: Number = 4
+    // How far the row stands in from the glass's edges.
+    let inset: Number = 16
+    // The glass's corner, and the chosen square's.
+    let corner: Number = 30
+    let selectionCorner: Number = 20
+    // The name's size, the height of its line, and its gap below the row.
+    let label: Number = 15
+    let labelLine: Number = 20
+    let labelGap: Number = 6
+}
+
+let switcherSelection: RGBAColor = RGBAColor { r: 1.0, g: 1.0, b: 1.0, a: 0.2 }
+let switcherNone: RGBAColor = RGBAColor { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }
+let switcherLabel: RGBAColor = RGBAColor { r: 1.0, g: 1.0, b: 1.0, a: 0.92 }
+
+// What `state`'s switcher shows while it is open; nothing while it is not.
+public function switcherItems(state: borrow PlatformState) -> [SwitcherItem] {
+    if !state.switcherOpen { return [] }
+    var items: [SwitcherItem] = []
+    for application in state.switchableApplications() {
+        items.append(
+            SwitcherItem {
+                name: copy application.name,
+                selected: state.switcherSelection == .Some(application.id),
+            }
+        )
+    }
+    return items
+}
+
+// One application's place in the switcher.
+function switcherTile(item: borrow SwitcherItem) -> Any Widget {
+    let side = SwitcherMetrics.icon + SwitcherMetrics.selection * 2
+    return ZStack(alignment = .Center) {
+        RoundedRectangle(cornerRadius = SwitcherMetrics.selectionCorner, style = .Continuous)
+        .fill(item.selected ? switcherSelection : switcherNone)
+        ApplicationIcon(name = copy item.name, side = SwitcherMetrics.icon)
+    }
+    .width(resolvedLength(side))
+    .height(resolvedLength(side))
+}
+
+// The name of the chosen application, under the row.
+function switcherName(items: borrow [SwitcherItem]) -> String? {
+    for item in items {
+        if item.selected { return .Some(copy item.name) }
+    }
+    return .None
+}
+
+// The switcher in the middle of the screen, holding `items`; nothing when
+// there are none. A platform that has the compositor draw its glass
+// (`switcherGlass`) leaves `ownGlass` unset.
+public construct ApplicationSwitcher(items: [SwitcherItem], ownGlass: Bool) extends Widget {
+    body {
+        var tiles: [Any Widget] = []
+        for item in items { tiles.append(switcherTile(item)) }
+        VStack(alignment = .Center) {
+            Spacer()
+            if items.count > 0 {
+                switcherPanel(move tiles, switcherName(items), ownGlass)
+            }
+            Spacer()
+        }
+        .fillWidth()
+        .fillHeight()
+    }
+}
+
+// The row and the chosen name, at the size of the switcher's glass.
+function switcherPanel(tiles: [Any Widget], name: String?, ownGlass: Bool) -> Any Widget {
+    let count = tiles.count
+    let panel = VStack(spacing = .Length(SwitcherMetrics.labelGap), alignment = .Center) {
+        HStack(spacing = .Length(SwitcherMetrics.spacing), alignment = .Center, children = tiles)
+        .hugWidth()
+        match name {
+            Some(label) -> Text(label)
+                .font(size: resolvedLength(SwitcherMetrics.label), weight: .Medium)
+                .textColor(switcherLabel)
+                .height(resolvedLength(SwitcherMetrics.labelLine))
+            None -> EmptyView()
+        }
+    }
+    .padding(resolvedLength(SwitcherMetrics.inset))
+    .width(resolvedLength(switcherWidth(count)))
+    .height(resolvedLength(switcherHeight()))
+    if !ownGlass { return panel }
+    return panel.glassEffect(dockGlassMaterial(), .Squircle(SwitcherMetrics.corner))
+}
+
+// How wide the switcher's glass is round `count` applications, and how tall.
+function switcherWidth(count: Number) -> Number {
+    let side = SwitcherMetrics.icon + SwitcherMetrics.selection * 2
+    return side * count + SwitcherMetrics.spacing * (count - 1) + SwitcherMetrics.inset * 2
+}
+
+function switcherHeight() -> Number {
+    let side = SwitcherMetrics.icon + SwitcherMetrics.selection * 2
+    return side + SwitcherMetrics.labelGap + SwitcherMetrics.labelLine + SwitcherMetrics.inset * 2
+}
+
+// Where the switcher's glass stands on an output `width` by `height` points
+// while it shows `items`: in the middle. Empty while it is not open.
+public function switcherGlass(
+    items: borrow [SwitcherItem],
+    width: Number,
+    height: Number
+) -> SurfaceFrame {
+    if items.count == 0 { return SurfaceFrame { x: 0, y: 0, width: 0, height: 0 } }
+    let glassWidth = switcherWidth(items.count)
+    let glassHeight = switcherHeight()
+    return SurfaceFrame {
+        x: (width - glassWidth) / 2,
+        y: (height - glassHeight) / 2,
+        width: glassWidth,
+        height: glassHeight,
+    }
+}

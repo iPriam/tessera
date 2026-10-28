@@ -1,0 +1,372 @@
+import Foundation
+
+// A system image installed onto the machine's volume, by booting the
+// installer. The volume is one btrfs (roadmap/05-storage-and-state.md):
+// `boot/`, `system/<version>` and the `data` subvolume. The build host
+// cannot make one, on a Mac, so the guest does: the installer initramfs is
+// PID 1, the volume its first disk and the system image its second, and it
+// formats a blank volume, writes the system as a read-only
+// `system/<version>` and records it current. A volume holding a system
+// keeps its data: the install is an update.
+//
+// The version is the image's digest. A volume already recording it is left
+// alone, so a boot of an unchanged system pays for no install.
+
+namespace VolumeLayout {
+    // From the machine directory, kept from boot to boot.
+    let volume: String = "volume.img"
+    let installed: String = "volume.installed"
+    // The recovery media's own volume, and what was last installed there.
+    let recoveryVolume: String = "recovery-volume.img"
+    let recoveryInstalled: String = "recovery-volume.installed"
+    // The internal disk the recovery media installs onto: blank until
+    // Recovery partitions it.
+    let internalDisk: String = "internal.img"
+    // The tampered system's volume, and what was last installed there.
+    let tamperedVolume: String = "tampered-volume.img"
+    let tamperedInstalled: String = "tampered-volume.installed"
+    // The volume an install was stopped on, made again at each such boot.
+    let interruptedVolume: String = "interrupted-volume.img"
+    // What the installer logs once the volume holds its data subvolume and
+    // before it writes the system: where the interrupted install stops.
+    let interruptAt: String = "made the data subvolume"
+    // The volume `boot -update` installs and updates, made again each time.
+    let updateVolume: String = "update-volume.img"
+    let updateInstalled: String = "update-volume.installed"
+    let stick: String = "stick.img"
+    // Sparse on the host, so their size costs only the blocks written.
+    let volumeBytes: UNumber = 8589934592
+    let internalBytes: UNumber = 68719476736
+    // The line the installer prints once the record is written, before the
+    // version.
+    let success: String = "tessera: installed system "
+}
+
+// The volume a boot attaches, with the image it runs installed onto it.
+function bootVolume(
+    host: borrow Host,
+    architecture: Architecture,
+    images: borrow BootImages,
+    mode: borrow BootMode,
+    options: borrow BootOptions
+) -> Result<String, String> {
+    if options.train.count > 0 && mode.dev {
+        return trainVolume(host, architecture, images, options)
+    }
+    let machine = host.machineDirectory(architecture)
+    if mode.recovery && images.recovery.count > 0 {
+        let volume = "\(machine)/\(VolumeLayout.recoveryVolume)"
+        return match installSystem(
+            host,
+            architecture,
+            images,
+            images.recovery,
+            images.recoveryDigest,
+            volume,
+            "\(machine)/\(VolumeLayout.recoveryInstalled)",
+            options
+        ) {
+            Ok -> .Ok(volume)
+            Error(problem) -> .Error(
+                "the recovery media could not be installed onto its volume: \(problem)"
+            )
+        }
+    }
+    if mode.tampered {
+        let volume = "\(machine)/\(VolumeLayout.tamperedVolume)"
+        return match installSystem(
+            host,
+            architecture,
+            images,
+            images.tampered,
+            images.tamperedDigest,
+            volume,
+            "\(machine)/\(VolumeLayout.tamperedInstalled)",
+            options
+        ) {
+            Ok -> .Ok(volume)
+            Error(problem) -> .Error(
+                "the tampered system could not be installed onto its volume: \(problem)"
+            )
+        }
+    }
+    if mode.interrupted {
+        return interruptedInstall(host, architecture, images, options)
+    }
+    // The update boots run on the volume `updateBoots` installed onto.
+    if mode.update { return .Ok("\(machine)/\(VolumeLayout.updateVolume)") }
+    if mode.installed {
+        let internal = "\(machine)/\(VolumeLayout.internalDisk)"
+        if !fileExists(internal) {
+            return .Error("no internal disk: install onto it from `kira build boot -recovery`")
+        }
+        return .Ok(internal)
+    }
+    let volume = "\(machine)/\(VolumeLayout.volume)"
+    return match installSystem(
+        host,
+        architecture,
+        images,
+        images.system,
+        images.systemDigest,
+        volume,
+        "\(machine)/\(VolumeLayout.installed)",
+        options
+    ) {
+        Ok -> .Ok(volume)
+        Error(problem) -> .Error("the system could not be installed onto the volume: \(problem)")
+    }
+}
+
+// Installs `image`, whose store digest is `digest`, onto `volume`, unless
+// `record` already names its version.
+function installSystem(
+    host: borrow Host,
+    architecture: Architecture,
+    images: borrow BootImages,
+    image: borrow String,
+    digest: borrow String,
+    volume: borrow String,
+    record: borrow String,
+    options: borrow BootOptions
+) -> Result<Void, String> {
+    return installSystemAs(
+        host,
+        architecture,
+        images,
+        image,
+        digest,
+        volume,
+        record,
+        options,
+        false
+    )
+}
+
+// `installSystem`, as an update the machine tries before it keeps when
+// `update` says so (roadmap/13).
+function installSystemAs(
+    host: borrow Host,
+    architecture: Architecture,
+    images: borrow BootImages,
+    image: borrow String,
+    digest: borrow String,
+    volume: borrow String,
+    record: borrow String,
+    options: borrow BootOptions,
+    update: Bool
+) -> Result<Void, String> {
+    if image.count == 0 { return .Error("the graph built no image to install") }
+    let version = digest.substring(0, 16)
+    if fileExists(volume) {
+        match readFile(record) {
+            Ok(contents) -> {
+                if contents.text.trim() == version { return .Ok }
+            }
+            Error(failure) -> absorb failure
+        }
+    }
+    if images.installer.count == 0 { return .Error("the graph built no installer image") }
+    if !fileExists(volume) {
+        match setFileLength(volume, VolumeLayout.volumeBytes) {
+            Ok -> {}
+            Error(failure) -> return .Error("\(volume) cannot be made: \(traceText(failure))")
+        }
+    }
+    let logPath = "\(host.logDirectory())/install-\(architecture.name()).log"
+    let command = installerCommand(
+        host,
+        architecture,
+        images,
+        image,
+        volume,
+        version,
+        options,
+        logPath,
+        update
+    )
+    log info("installing a system onto the volume", version: version, update: update)
+    let timeout = architecture == .Aarch64 && !host.darwin ? 600 : 180
+    let child = match command.start() {
+        Ok(started) -> started
+        Error(failure) -> return .Error("QEMU did not start: \(traceText(failure))")
+    }
+    var ended = false
+    match child.waitUpTo(timeout) {
+        Ok(exit) -> ended = exit != .None
+        Error(failure) -> absorb failure
+    }
+    if !ended {
+        match child.signal(.Terminate) {
+            Ok -> {}
+            Error(failure) -> absorb failure
+        }
+        match child.wait() {
+            Ok(exit) -> {}
+            Error(failure) -> absorb failure
+        }
+    }
+    match child.release() {
+        Ok -> {}
+        Error(failure) -> absorb failure
+    }
+    let written = readBootLog(logPath)
+    if written.shows(VolumeLayout.success + version) {
+        match writeFile(record, version + "\n") {
+            Ok -> {}
+            Error(failure) -> return .Error("\(record) cannot be written: \(traceText(failure))")
+        }
+        log info("the volume runs the system", version: version, log: logPath)
+        return .Ok
+    }
+    return .Error(
+        "system \(version) was not installed; the last lines of \(logPath):\n\(written.tail(40))"
+    )
+}
+
+// The QEMU that boots the installer to install `image` as `version` onto
+// `volume`, writing its serial log to `logPath`; as an update with `update`.
+function installerCommand(
+    host: borrow Host,
+    architecture: Architecture,
+    images: borrow BootImages,
+    image: borrow String,
+    volume: borrow String,
+    version: borrow String,
+    options: borrow BootOptions,
+    logPath: borrow String,
+    update: Bool
+) -> ProcessCommand {
+    let darwinHost = host.darwin && host.architecture == .Aarch64
+    var arguments = [
+        "-m", "1G",
+        "-kernel", copy images.kernel,
+        "-initrd", copy images.installer,
+        "-append", architecture.console() + " panic=-1" + kernelLogWords(
+            options.kernelLog
+        ) + " -- tessera.version=" + version + (update ? " tessera.update" : ""),
+        // The installer's syncs each became an fsync of the image on the host.
+        "-drive", "file=\(volume),if=virtio,format=raw,cache=unsafe",
+        "-drive", "file=\(image),if=virtio,format=raw,readonly=on",
+        "-no-reboot",
+        // No network, VGA card or CD-ROM drive, whose probe holds up PID 1.
+        "-nodefaults",
+        "-display", "none"
+    ]
+    for word in consoleArguments("") { arguments.append(word) }
+    let machine = match architecture {
+        X86_64 -> ["-machine", "q35,accel=kvm:tcg", "-cpu", "max", "-smp", "4"]
+        Aarch64 -> darwinHost
+        ? ["-machine", "virt,accel=hvf", "-cpu", "host,pmu=off", "-smp", "4"]
+        : ["-machine", "virt", "-cpu", "cortex-a72", "-smp", "4"]
+    }
+    for word in machine { arguments.append(word) }
+    let logs = host.logDirectory()
+    return ProcessCommand {
+        program: host.find(architecture.qemu()),
+        arguments: arguments,
+        input: .Null,
+        output: .File(copy logPath),
+        errors: .File("\(logs)/install-\(architecture.name())-qemu.log")
+    }
+}
+
+// A blank volume the installer was stopped on, as a machine that lost power
+// mid-install is: QEMU is killed once the installer logs
+// `VolumeLayout.interruptAt`, after it formatted the volume and before it
+// wrote the system or recorded it current.
+function interruptedInstall(
+    host: borrow Host,
+    architecture: Architecture,
+    images: borrow BootImages,
+    options: borrow BootOptions
+) -> Result<String, String> {
+    if images.system.count == 0 || images.installer.count == 0 {
+        return .Error("the graph built no system or no installer to interrupt")
+    }
+    let volume = "\(host.machineDirectory(architecture))/\(VolumeLayout.interruptedVolume)"
+    if fileExists(volume) {
+        match removePath(volume) {
+            Ok -> {}
+            Error(failure) -> return .Error("\(volume) cannot be removed: \(traceText(failure))")
+        }
+    }
+    match setFileLength(volume, VolumeLayout.volumeBytes) {
+        Ok -> {}
+        Error(failure) -> return .Error("\(volume) cannot be made: \(traceText(failure))")
+    }
+    let version = images.systemDigest.substring(0, 16)
+    let logPath = "\(host.logDirectory())/install-\(architecture.name())-interrupted.log"
+    let command = installerCommand(
+        host,
+        architecture,
+        images,
+        images.system,
+        volume,
+        version,
+        options,
+        logPath,
+        false
+    )
+    let child = match command.start() {
+        Ok(started) -> started
+        Error(failure) -> return .Error("QEMU did not start: \(traceText(failure))")
+    }
+    var reached = false
+    var ended = false
+    // Every 20 ms for 180 s: the installer writes the system within a
+    // second of making the data subvolume.
+    for poll in 0..9000 {
+        if readBootLog(logPath).shows(VolumeLayout.interruptAt) {
+            reached = true
+            break
+        }
+        match child.waitUpTo(0) {
+            Ok(exit) -> ended = exit != .None
+            Error(failure) -> absorb failure
+        }
+        if ended { break }
+        processSleep(20)
+    }
+    match child.signal(.Kill) {
+        Ok -> {}
+        Error(failure) -> absorb failure
+    }
+    match child.wait() {
+        Ok -> {}
+        Error(failure) -> absorb failure
+    }
+    match child.release() {
+        Ok -> {}
+        Error(failure) -> absorb failure
+    }
+    let written = readBootLog(logPath)
+    if written.shows(VolumeLayout.success) {
+        return .Error("the install finished before it was stopped; \(logPath)")
+    }
+    if !reached {
+        return .Error(
+            "the installer never logged \"\(VolumeLayout.interruptAt)\"; the last lines of \(logPath):\n\(written.tail(40))"
+        )
+    }
+    log info("stopped the installer", at: VolumeLayout.interruptAt, log: logPath)
+    return .Ok(volume)
+}
+
+// Removes test volumes a boot that passed has no more use for: each is made
+// again from nothing the next time, and an 8 GiB sparse image grows with
+// every install written to it.
+function dropScratch(paths: borrow [String]) {
+    for path in paths {
+        if fileExists(path) {
+            match removePath(path) {
+                Ok -> {}
+                Error(failure) -> log warn(
+                    "a test volume could not be removed",
+                    path: path,
+                    error: traceText(failure)
+                )
+            }
+        }
+    }
+}

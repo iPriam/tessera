@@ -1,0 +1,218 @@
+import Foundation
+import LibTessera
+
+// Stopping the machine, asking first.
+//
+// Every service is asked to stop and given until the deadline. A service
+// that exits by itself rather than being killed on the deadline is the
+// assertion that matters: it was asked and went.
+
+// How long to wait for a service to stop before insisting.
+//
+// The deadline is the whole design. An init that waits forever for a service
+// to exit is an init that hangs the machine on shutdown, which is the single
+// most visible bug an operating system can have.
+let stopDeadlineSeconds: Number = 3
+
+// How one service went when the machine stopped.
+enum StopOutcome {
+    // Not gone yet.
+    Running
+    // It was asked and went.
+    Exited
+    // It was killed on the deadline, or did not end cleanly.
+    Insisted
+
+    function isRunning(borrow self) -> Bool {
+        match self {
+            Running -> return true
+            Exited, Insisted -> return false
+        }
+    }
+}
+
+// Asks the service in `slot` to stop, and for a completion on `port` when it
+// has. What it writes on the way out is relayed as it is written.
+function askToStop(fleet: borrow Fleet, slot: Number, port: Handle) {
+    match processAskToStop(fleet.processes[slot]) {
+        Ok -> {}
+        // The deadline insists on it instead.
+        Error(failed) -> log warn(
+            "could not ask a service to stop",
+            service: fleet.services[slot].name,
+            error: errorName(failed)
+        )
+    }
+    watchOutput(fleet, slot, port)
+    match objectWaitAsync(
+        fleet.processes[slot],
+        Signals.terminated,
+        .Once,
+        port,
+        slotKey(fleet, slot, .Ended)
+    ) {
+        Ok -> {}
+        Error(failed) -> log warn(
+            "cannot watch a service stop",
+            service: fleet.services[slot].name,
+            error: errorName(failed)
+        )
+    }
+}
+
+// Kills every service still running on the deadline. Whatever is still here
+// is not going to leave by itself.
+function insistOnTheRest(fleet: borrow Fleet, stopped: borrow mut [StopOutcome]) {
+    for slot in 0..fleet.services.count {
+        if running(fleet, slot) && stopped[slot].isRunning() {
+            log warn("a service did not stop; killing it", service: fleet.services[slot].name)
+            match processKill(fleet.processes[slot]) {
+                Ok -> {}
+                Error(failed) -> log warn(
+                    "could not kill a service",
+                    service: fleet.services[slot].name,
+                    error: errorName(failed)
+                )
+            }
+            stopped[slot] = .Insisted
+        }
+    }
+}
+
+// Asks every running service to stop, waits, and insists on the ones that
+// did not.
+//
+// In reverse start order, because a service started after another may be
+// using it. Asking first because a program that wants to save something
+// should be allowed to; killing after a deadline because a machine that will
+// not switch off is worse than one that lost a file.
+function stopAll(fleet: borrow mut Fleet) {
+    let port = match portCreate(.None) {
+        Ok(value) -> value
+        Error(failed) -> {
+            log fault("no port to stop the services on", error: errorName(failed))
+            return
+        }
+    }
+    var stopped: [StopOutcome] = []
+    var remaining = 0
+    for slot in 0..fleet.services.count {
+        stopped.append(.Running)
+        if running(fleet, slot) { remaining += 1 }
+    }
+    for step in 0..fleet.services.count {
+        let index = fleet.services.count - 1 - step
+        if running(fleet, index) {
+            log info("stopping a service", service: fleet.services[index].name)
+            askToStop(fleet, index, port)
+        }
+    }
+
+    var deadline = Deadline.infinite
+    var insisted = false
+    match now() {
+        Ok(value) -> deadline = value + seconds(stopDeadlineSeconds)
+        Error(failed) -> {
+            log fault("cannot time a graceful shutdown", error: errorName(failed))
+            insistOnTheRest(fleet, stopped)
+            insisted = true
+        }
+    }
+    while remaining > 0 {
+        // Checked on every wake, not only when the wait times out: a service
+        // that keeps writing output keeps the wait from ever timing out.
+        if !insisted {
+            match now() {
+                Ok(value) -> {
+                    if value >= deadline {
+                        insistOnTheRest(fleet, stopped)
+                        insisted = true
+                    }
+                }
+                Error(failed) -> {
+                    log fault("cannot time a graceful shutdown", error: errorName(failed))
+                    insistOnTheRest(fleet, stopped)
+                    insisted = true
+                }
+            }
+        }
+        match portWait(port, 1, insisted ? Deadline.infinite : deadline) {
+            Error(failed) -> {
+                if failed.code != .Timeout || insisted {
+                    log fault("could not wait for the services to stop", error: errorName(failed))
+                    remaining = 0
+                }
+            }
+            Ok(done) -> {
+                let key = Number(done[0].key)
+                let slot = keySlot(key)
+                if keyKind(key) == .Output {
+                    handleOutput(fleet, slot, .Some(port))
+                    continue
+                }
+                handleOutput(fleet, slot, .None)
+                let clean = match reap(
+                    fleet.processes[slot],
+                    fleet.services[slot].name,
+                    fleet.services[slot].restart
+                ) {
+                    Ok(value) -> value
+                    Error(failed) -> {
+                        log warn(
+                            "a stopped service could not be asked how it ended",
+                            service: fleet.services[slot].name,
+                            error: errorName(failed)
+                        )
+                        false
+                    }
+                }
+                fleet.processes[slot] = Handle.invalid
+                if stopped[slot].isRunning() { stopped[slot] = clean ? .Exited : .Insisted }
+                remaining -= 1
+            }
+        }
+    }
+    // One entry for the whole stop, in start order: the log shows only some
+    // repeats of an entry, and a machine has more services than that.
+    var exited = ""
+    var otherwise = ""
+    for slot in 0..fleet.services.count {
+        match stopped[slot] {
+            Exited -> {
+                if exited.count > 0 { exited = exited + ", " }
+                exited = exited + fleet.services[slot].name
+            }
+            Insisted -> {
+                if otherwise.count > 0 { otherwise = otherwise + ", " }
+                otherwise = otherwise + fleet.services[slot].name
+            }
+            Running -> {}
+        }
+    }
+    log info("stopped the services", exited, otherwise)
+    // Output a service handed on to a process of its own that outlived it
+    // is not waited for: what is there is written, and the rest goes.
+    for slot in 0..fleet.services.count {
+        if fleet.outputs[slot] != Handle.invalid {
+            handleOutput(fleet, slot, .None)
+            if fleet.outputs[slot] != Handle.invalid { closeOutput(fleet, slot) }
+        }
+    }
+    release(port)
+}
+
+// Stops the machine, having stopped everything on it first.
+function powerOff(fleet: borrow mut Fleet, reason: borrow String) {
+    log info("shutting down", reason)
+    stopAll(fleet)
+    writeSystemLog(fleet.systemLog, "init", "every service is stopped; powering off: \(reason)")
+    closeSystemLog(fleet.systemLog)
+    log info("every service is stopped; powering off")
+    // Only answered if the platform refuses, and there is nothing left to
+    // do here but stop using a processor.
+    match machineStop(.PowerOff) {
+        Ok -> log fault("power off answered without powering off")
+        Error(failed) -> log fault("power off was refused", error: errorName(failed))
+    }
+    idleForever()
+}

@@ -1,0 +1,8 @@
+//! The caffeinate package: the command that holds a wake lock for a while, or while a utility runs.
+/// The Tessera caffeinate package: the command that keeps the machine awake for a while.
+construct TesseraCaffeinate extends Package {
+    let version: String = "0.1.0"
+    let kind: PackageKind = .App
+    let moduleRoot: String = "TesseraCaffeinate"
+    let dependencies: [Dependency] = [Dependency { name: "ArgumentParser", path: "../argument-parser" }]
+}

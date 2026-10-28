@@ -1,0 +1,190 @@
+import Foundation
+
+// The guest's serial line as a boot wrote it, and the questions the boot
+// checks ask of it. An entry of Kira's log is its `level[Module.File]:
+// message` header and the lines under it up to the next header; a field
+// line under it reads `   = name: value`.
+
+struct BootLog {
+    // Every line, each with the `\r` the serial line ends it with.
+    let lines: [String]
+    let entries: [LogEntry]
+}
+
+struct LogEntry {
+    // The header from its level on.
+    let header: String
+    // The lines under it.
+    let body: [String]
+}
+
+// The log at `path` as it stands; empty when there is none yet.
+function readBootLog(path: borrow String) -> BootLog {
+    let text = match readFile(path) {
+        Ok(contents) -> contents.text
+        Error(failure) -> {
+            absorb failure
+            ""
+        }
+    }
+    let lines = text.split("\n")
+    var entries: [LogEntry] = []
+    var header = ""
+    var body: [String] = []
+    var inside = false
+    for line in lines {
+        match headerStart(line) {
+            Some(start) -> {
+                if inside { entries.append(LogEntry { header: header, body: body }) }
+                header = line.substring(start, line.count)
+                body = []
+                inside = true
+            }
+            None -> {
+                if inside { body.append(copy line) }
+            }
+        }
+    }
+    if inside { entries.append(LogEntry { header: header, body: body }) }
+    return BootLog { lines: lines, entries: entries }
+}
+
+// Where the first `level[Module]: ` in `line` starts, the level one of
+// fault, warn, info, debug and trace and the module letters, digits, `_` and
+// `.`.
+function headerStart(line: borrow String) -> Number? {
+    var first: Number? = .None
+    for level in ["fault[", "warn[", "info[", "debug[", "trace["] {
+        var from = 0
+        while true {
+            let found = match line.indexOf(level, from) {
+                Some(at) -> at
+                None -> break
+            }
+            if headerEndsAt(line, found + level.count) {
+                let earlier = match first {
+                    Some(seen) -> found < seen
+                    None -> true
+                }
+                if earlier { first = .Some(found) }
+                break
+            }
+            from = found + 1
+        }
+    }
+    return first
+}
+
+// Whether a module name at `start` of `line` is followed by `]: `.
+function headerEndsAt(line: borrow String, start: Number) -> Bool {
+    for at in start..line.count {
+        let byte = line.charAt(at)
+        if byte == 93 { return line.substring(at, min(at + 3, line.count)) == "]: " }
+        let letter = (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122)
+        let digit = byte >= 48 && byte <= 57
+        if !letter && !digit && byte != 95 && byte != 46 { return false }
+    }
+    return false
+}
+
+extend BootLog {
+    // How many entries say `spec`'s message and carry every one of its
+    // fields: `message|field|field`, such as `a service checked in|service:
+    // "tessera.power"`. A field's value matches as a prefix, except a bare
+    // number, which matches whole. The message may start with the end of the
+    // module, `Devices]: a device was added`.
+    function count(borrow self, spec: borrow String) -> Number {
+        let parts = spec.split("|")
+        var hits = 0
+        for entry in entries {
+            if !entry.header.contains(parts[0]) { continue }
+            var all = true
+            for index in 1..parts.count {
+                var found = false
+                for line in entry.body {
+                    if fieldIn(line, parts[index]) {
+                        found = true
+                        break
+                    }
+                }
+                if !found {
+                    all = false
+                    break
+                }
+            }
+            if all { hits = hits + 1 }
+        }
+        return hits
+    }
+
+    function has(borrow self, spec: borrow String) -> Bool {
+        return count(spec) > 0
+    }
+
+    // Whether any line holds `text` as printed.
+    function shows(borrow self, text: borrow String) -> Bool {
+        for line in lines {
+            if line.contains(text) { return true }
+        }
+        return false
+    }
+
+    // Whether the log holds `line`: an entry as `has` takes it when it
+    // starts with `log:`, and otherwise a line as printed. Alternatives
+    // separated by ` || ` hold when any one does.
+    function seen(borrow self, line: borrow String) -> Bool {
+        for alternative in line.split(" || ") {
+            if alternative.startsWith("log:") {
+                if has(alternative.substring(4, alternative.count)) { return true }
+            } else if shows(alternative) {
+                return true
+            }
+        }
+        return false
+    }
+
+    // The last `count` lines, for a failure's report.
+    function tail(borrow self, count: Number) -> String {
+        var text = ""
+        let start = max(lines.count - count, 0)
+        for index in start..lines.count {
+            text.append(lines[index])
+            text.append("\n")
+        }
+        return text
+    }
+}
+
+// Whether `line` carries `field` after its `= `. A field whose value is a
+// bare number names the whole number: key 4 is not key 44.
+function fieldIn(line: borrow String, field: borrow String) -> Bool {
+    let wanted = "= " + field
+    let at = try line.indexOf(wanted) otherwise return false
+    if !bareNumberField(field) { return true }
+    let after = at + wanted.count
+    return after >= line.count || line.charAt(after) == 13
+}
+
+// Whether `field`'s value, after its `: `, is a number and nothing else.
+function bareNumberField(field: borrow String) -> Bool {
+    let colon = try field.lastIndexOf(": ") otherwise return false
+    var first = colon + 2
+    if first < field.count && field.charAt(first) == 45 { first = first + 1 }
+    if first >= field.count { return false }
+    for at in first..field.count {
+        let byte = field.charAt(at)
+        if (byte < 48 || byte > 57) && byte != 46 { return false }
+    }
+    return true
+}
+
+// Whether `line` is a line of an entry's header as the boot checks' own
+// scans take one: any line naming an info, warn or fault level.
+function messageLine(line: borrow String) -> Bool {
+    return line.contains("info[") || line.contains("warn[") || line.contains("fault[")
+}
+
+// Whether `line` ends in `text`, before the serial line's `\r`.
+function endsWithField(line: borrow String, text: borrow String) -> Bool {
+    return line.endsWith(text) || line.endsWith(text + "\r")
+}

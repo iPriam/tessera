@@ -1,0 +1,141 @@
+import Foundation
+import RenderBox
+
+// SVG's elliptical arc, as SVG 1.1 F.6.5 turns its endpoints into a centre
+// and angles, drawn as cubics of a quarter turn at most, each with its
+// control points 4/3 tan(θ/4) along the tangents.
+
+namespace ArcSlot {
+    let radiusX: Number = 0
+    let radiusY: Number = 1
+    let rotation: Number = 2
+    let large: Number = 3
+    let sweep: Number = 4
+}
+
+// An arc's ellipse, its axes turned by `cosPhi`, `sinPhi`, and the angles it
+// runs between.
+struct ArcEllipse {
+    let centre: Point
+    let rx: Number
+    let ry: Number
+    let cosPhi: Number
+    let sinPhi: Number
+    let startAngle: Number
+    let sweepAngle: Number
+}
+
+extend ArcEllipse {
+    function placed(borrow self, x: Number, y: Number) -> Point {
+        return Point {
+            x: cosPhi * x - sinPhi * y + centre.x,
+            y: sinPhi * x + cosPhi * y + centre.y
+        }
+    }
+
+    function pointAt(borrow self, angle: Number) -> Point {
+        return placed(rx * cos(angle), ry * sin(angle))
+    }
+
+    // The tangent at `angle`, `reach` long.
+    function tangentAt(borrow self, angle: Number, reach: Number) -> Point {
+        let x = -rx * sin(angle) * reach
+        let y = ry * cos(angle) * reach
+        return Point { x: cosPhi * x - sinPhi * y, y: sinPhi * x + cosPhi * y }
+    }
+}
+
+// The centre form of the arc from `from` to `end` with radii and flags `v`;
+// none when a radius is zero and the arc is a line.
+function arcEllipse(v: borrow [Number], from: borrow Point, end: borrow Point) -> ArcEllipse? {
+    if v[ArcSlot.radiusX] == 0 || v[ArcSlot.radiusY] == 0 { return .None }
+    let phi = radians(v[ArcSlot.rotation])
+    let cosPhi = cos(phi)
+    let sinPhi = sin(phi)
+    let dx = (from.x - end.x) / 2
+    let dy = (from.y - end.y) / 2
+    let x1 = cosPhi * dx + sinPhi * dy
+    let y1 = -sinPhi * dx + cosPhi * dy
+    let (rx, ry) = arcRadii(abs(v[ArcSlot.radiusX]), abs(v[ArcSlot.radiusY]), x1, y1)
+    let opposite = (v[ArcSlot.large] != 0) == (v[ArcSlot.sweep] != 0)
+    let (cx1, cy1) = centreOffset(rx, ry, x1, y1, opposite)
+    let centre = Point {
+        x: cosPhi * cx1 - sinPhi * cy1 + (from.x + end.x) / 2,
+        y: sinPhi * cx1 + cosPhi * cy1 + (from.y + end.y) / 2
+    }
+    let startAngle = atan2((y1 - cy1) / ry, (x1 - cx1) / rx)
+    let sweepAngle = sweptAngle(
+        atan2((-y1 - cy1) / ry, (-x1 - cx1) / rx) - startAngle,
+        v[ArcSlot.sweep] != 0
+    )
+    return .Some(
+        ArcEllipse {
+            centre: centre,
+            rx: rx,
+            ry: ry,
+            cosPhi: cosPhi,
+            sinPhi: sinPhi,
+            startAngle: startAngle,
+            sweepAngle: sweepAngle
+        }
+    )
+}
+
+// The radii grown, keeping their ratio, until the ellipse reaches the half
+// chord (x1, y1).
+function arcRadii(rx: Number, ry: Number, x1: Number, y1: Number) -> (Number, Number) {
+    let grow = (x1 * x1) / (rx * rx) + (y1 * y1) / (ry * ry)
+    if grow > 1 { return (rx * sqrt(grow), ry * sqrt(grow)) }
+    return (rx, ry)
+}
+
+// The centre's offset from the chord's middle in the ellipse's frame, on the
+// side the flags choose.
+function centreOffset(rx: Number, ry: Number, x1: Number, y1: Number, opposite: Bool) -> (
+    Number,
+    Number
+) {
+    let numerator = rx * rx * ry * ry - rx * rx * y1 * y1 - ry * ry * x1 * x1
+    let denominator = rx * rx * y1 * y1 + ry * ry * x1 * x1
+    var root = denominator > 0 ? sqrt(max(numerator / denominator, 0)) : 0
+    if opposite { root = -root }
+    return (root * rx * y1 / ry, -root * ry * x1 / rx)
+}
+
+// The angle an arc sweeps, turned the way its sweep flag says.
+function sweptAngle(angle: Number, positive: Bool) -> Number {
+    let turn = 2 * SvgAngle.halfTurn
+    if positive && angle < 0 { return angle + turn }
+    if !positive && angle > 0 { return angle - turn }
+    return angle
+}
+
+extend PathPen {
+    function arcTo(borrow mut self, v: borrow [Number], end: Point) {
+        let found = arcEllipse(v, at, end)
+        let ellipse = match found {
+            Some(ellipse) -> ellipse
+            None -> {
+                lineTo(move end)
+                return
+            }
+        }
+        let quarter = SvgAngle.halfTurn / 2
+        let pieces = max(ceil(abs(ellipse.sweepAngle) / quarter - 0.000000001), 1)
+        let step = ellipse.sweepAngle / pieces
+        let reach = 4 / 3 * tan(step / 4)
+        for index in 0..pieces {
+            let from = ellipse.startAngle + step * index
+            let to = from + step
+            let start = ellipse.pointAt(from)
+            let stop = index == pieces - 1 ? copy end : ellipse.pointAt(to)
+            let out = ellipse.tangentAt(from, reach)
+            let back = ellipse.tangentAt(to, reach)
+            cubicTo(
+                Point { x: start.x + out.x, y: start.y + out.y },
+                Point { x: stop.x - back.x, y: stop.y - back.y },
+                move stop
+            )
+        }
+    }
+}

@@ -1,0 +1,116 @@
+import Foundation
+import Heap
+import LibTessera
+
+// Clients that follow the volumes, as DiskArbitration's
+// DARegisterDiskAppearedCallback, DARegisterDiskDisappearedCallback and
+// DARegisterDiskDescriptionChangedCallback do.
+//
+// A `Watch` request keeps its channel instead of closing it. The service
+// sends every volume it holds as `Appeared`, then `Idle`, and from then on
+// one message per change: the header with `op` 5 and the change in `a`,
+// then the volume's 160-byte record as `List` gives it. A volume that comes
+// is `Appeared` before the service mounts it; one that is mounted or
+// unmounted is `DescriptionChanged`; one that is ejected or goes away is
+// `Disappeared`. A watcher whose channel no longer takes a message is
+// closed and forgotten.
+
+@Derive(Copy)
+enum Change: UN32 {
+    Appeared = 1
+    Disappeared = 2
+    DescriptionChanged = 3
+    Idle = 4
+}
+
+// Every application hears a volume mounted or unmounted as
+// `System/volumeChanged` on its System channel, as NSWorkspace posts
+// didMountNotification and didUnmountNotification to every application.
+// The body, §10.3-encoded: `mounted` @0, then the mount point as a
+// `String`, its length @8 and its bytes @16.
+// The head of a `volumeChanged` body; the path follows it.
+@FFI.Struct { layout: c }
+struct VolumeChangedHead {
+    var mounted: U8
+    var length: U64
+}
+
+namespace VolumeChanged {
+    let method: String = "System/volumeChanged"
+    let textAt: Number = 16
+    // The longest mount point a body carries.
+    let longestPath: Number = 144
+}
+
+// Sends `change` with `volume`'s record, or with none, to one watcher.
+function tell(
+    channel: Handle,
+    change: borrow Change,
+    volume: borrow Volume?
+) -> Result<Void, TesseraError> {
+    return match volume {
+        Some(told) -> {
+            let block = zeroedBlock(count: VolumeWire.recordBytes, alignment: 16)
+            storeRecord(block.pointer(), told)
+            let record = Buffer { address: block.pointer(), length: VolumeWire.recordBytes }
+            send(channel, code(Operation.Watch), .Ok, Number(code(change)), record)
+        }
+        None -> send(channel, code(Operation.Watch), .Ok, Number(code(change)), noPayload())
+    }
+}
+
+// A new watcher: everything there is, then `Idle`.
+function watchFrom(service: borrow mut Service, channel: Handle) {
+    for volume in service.volumes {
+        match tell(channel, .Appeared, .Some(volume)) {
+            Ok -> {}
+            Error(failed) -> {
+                // The watcher's channel is released before giving up on it;
+                // try could not.
+                closeHandle(channel)
+                return
+            }
+        }
+    }
+    match tell(channel, .Idle, .None) {
+        Ok -> service.watchers.append(channel)
+        Error(failed) -> closeHandle(channel)
+    }
+}
+
+// Tells every watcher of `change` to the volume at `index`.
+function notify(service: borrow mut Service, change: Change, index: Number) {
+    if service.watchers.count == 0 { return }
+    let volume = service.volumes[index]
+    var kept: [Handle] = []
+    for watcher in service.watchers {
+        match tell(watcher, change, .Some(volume)) {
+            Ok -> kept.append(watcher)
+            Error(failed) -> closeHandle(watcher)
+        }
+    }
+    service.watchers = kept
+}
+
+// Posts a mount or an unmount after the first scan.
+function announce(service: borrow Service, path: borrow String, mounted: Bool) {
+    if !service.announcing { return }
+    let length = Number(path.count)
+    if length > VolumeChanged.longestPath { return }
+    let bytes = VolumeChanged.textAt + ceil(length / 8) * 8
+    let block = zeroedBlock(count: bytes, alignment: 16)
+    heapStore(
+        block.pointer(),
+        VolumeChangedHead { mounted: mounted ? UN8(1) : UN8(0), length: UNumber(length) }
+    )
+    storeText(block.pointer(), VolumeChanged.textAt, path, length + 1)
+    let body = Buffer { address: block.pointer(), length: bytes }
+    match serviceNotify(service.listener, VolumeChanged.method, body, "") {
+        Ok -> {}
+        Error(failed) -> log warn(
+            "cannot announce a mount point",
+            mountPoint: path,
+            error: errorName(failed)
+        )
+    }
+}

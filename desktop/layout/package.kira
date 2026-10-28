@@ -1,0 +1,6 @@
+// HomeLayout: Home's arrangement as data, its text form and its edits, on
+// Foundation alone, so its rules are tested on any host (tests/layout_kik).
+construct HomeLayout extends Package {
+    let version: String = "0.1.0"
+    let kind: PackageKind = .Library
+}

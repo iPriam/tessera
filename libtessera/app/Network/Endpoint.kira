@@ -1,0 +1,457 @@
+import Foundation
+import Heap
+
+// Endpoints (§15.3): nonblocking kernel endpoints. Bind, listen, shutdown
+// and the options are direct; accept, connect, send and receive are pending
+// operations the port's engine retries when the endpoint is ready.
+//
+// A send or receive keeps its state in an `EndpointWork`: the buffers, the
+// flags, the bytes moved so far (for `WaitAll`) and its `TransferForm`. An
+// address going out, or the room for one coming in, is the 32-byte
+// `NetAddress` at `address`; where the caller wants a received one copied is
+// `source`.
+
+// What a pending send or receive moves.
+@Derive(Copy)
+enum TransferForm {
+    Plain
+    // It names an address.
+    Addressed
+    // A batch of `Datagram`s.
+    Batched
+}
+
+public function endpointCreate(
+    family: AddressFamily,
+    protocol: Protocol,
+    options: EndpointOptions
+) -> Result<Handle, TesseraError> {
+    if (options.raw | EndpointOptions.all.raw) != EndpointOptions.all.raw {
+        return .Error(failure(.InvalidArgument))
+    }
+    if options.has(EndpointOptions.dualStack) && family != .Ipv6 {
+        return .Error(failure(.InvalidArgument))
+    }
+    if protocol == .Raw || protocol == .Icmp {
+        if !entitlementHeld("tessera.network.raw") {
+            return .Error(failureIn(.NotEntitled, .Network))
+        }
+    } else if !entitlementHeld("tessera.network.client") && !entitlementHeld(
+        "tessera.network.server"
+    ) && !entitlementHeld("tessera.network.local") {
+        return .Error(failureIn(.NotEntitled, .Network))
+    }
+    let created = kernelEndpointCreate(
+        family,
+        protocol,
+        options.has(EndpointOptions.reuseAddress),
+        options.has(EndpointOptions.dualStack)
+    )
+    let backing = try created
+    let object = objectCreate(.Endpoint(endpointFresh(family, protocol, .Unbound)), backing)
+    return handleForNew(object, Rights.processDefault)
+}
+
+// Whether the process may use `address`: anything with `client` (or
+// `server`, when `serving`), loopback with `local`.
+function endpointAllowed(address: borrow NetAddress, serving: Bool) -> Bool {
+    if entitlementHeld(serving ? "tessera.network.server" : "tessera.network.client") {
+        return true
+    }
+    return addressIsLoopback(address) && entitlementHeld("tessera.network.local")
+}
+
+public function endpointBind(
+    endpoint: Handle,
+    address: borrow NetAddress
+) -> Result<Void, TesseraError> {
+    let object = try resolveObject(endpoint, .Endpoint, Rights.setProperty)
+    let held = try endpointOf(object)
+    if held.state != .Unbound { return .Error(failure(.BadState)) }
+    if address.port != U16(0) && !endpointAllowed(address, true) {
+        return .Error(failureIn(.NotEntitled, .Network))
+    }
+    let backing = try backingOf(object)
+    let bound = kernelEndpointBind(backing, held.family, address)
+    try bound
+    endpointSetState(object, .Bound)
+    return .Ok
+}
+
+public function endpointListen(endpoint: Handle, backlog: UNumber) -> Result<Void, TesseraError> {
+    let object = try resolveObject(endpoint, .Endpoint, Rights.setProperty)
+    let held = try endpointOf(object)
+    let listenable = match held.state {
+        Unbound, Bound, Listening -> true
+        Connecting, Connected, Closed -> false
+    }
+    if !endpointStream(held) || !listenable { return .Error(failure(.BadState)) }
+    let blockBytes = zeroedBlock(count: 32, alignment: 16)
+    let block = blockBytes.pointer()
+    let backing = try backingOf(object)
+    try kernelEndpointAddress(backing, false, block)
+    let local = try netAddressLoad(block) otherwise return .Error(failureIn(.Internal, .Network))
+    if !endpointAllowed(local, true) { return .Error(failureIn(.NotEntitled, .Network)) }
+    var depth = backlog
+    if depth == 0 || depth > 4096 { depth = 4096 }
+    let backing = try backingOf(object)
+    let listening = kernelEndpointListen(backing, depth)
+    try listening
+    endpointSetState(object, .Listening)
+    return .Ok
+}
+
+// The pending operation for a call on an endpoint, or the synchronous error.
+function endpointSubmit(
+    endpoint: Handle,
+    rights: Rights,
+    work: PendingWork,
+    port: Handle,
+    key: U64
+) -> Result<Number, TesseraError> {
+    let slot = try resolve(endpoint, .Endpoint, rights)
+    let target = try portTarget(port)
+    return .Ok(pendingAdd(move work, .Handle(slot), target, key))
+}
+
+// `peer`, when 32 bytes or more, receives the new connection's address.
+public function endpointAccept(
+    endpoint: Handle,
+    peer: borrow Buffer,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    let object = try resolveObject(endpoint, .Endpoint, Rights.read)
+    let held = try endpointOf(object)
+    if held.state != .Listening { return .Error(failure(.BadState)) }
+    var wanted: RawPtr? = .None
+    if peer.length >= U64(32) { wanted = .Some(peer.address) }
+    let accept = AcceptWork { peer: move wanted }
+    let index = try endpointSubmit(endpoint, Rights.read, .Accept(move accept), port, key)
+    endpointStep(index)
+    return .Ok
+}
+
+public function endpointConnect(
+    endpoint: Handle,
+    address: borrow NetAddress,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    let object = try resolveObject(endpoint, .Endpoint, Rights.write)
+    let held = try endpointOf(object)
+    let state = held.state
+    if state == .Listening || state == .Connecting { return .Error(failure(.BadState)) }
+    if state == .Connected && endpointStream(held) { return .Error(failure(.BadState)) }
+    if !endpointAllowed(address, false) { return .Error(failureIn(.NotEntitled, .Network)) }
+    if !kernelAddressSuits(address, held.family) {
+        return .Error(failure(.InvalidArgument))
+    }
+    let index = try endpointSubmit(endpoint, Rights.write, .Connect, port, key)
+    let backing = try backingOf(object)
+    let started = kernelEndpointConnect(backing, held.family, address)
+    if succeeded(started) {
+        endpointSetState(object, .Connected)
+        pendingFinish(index, .Ok, U64(0), U64(0), U64(0))
+    } else if failedWith(started, .ShouldWait) {
+        endpointSetState(object, .Connecting)
+    } else {
+        pendingFinish(index, started, U64(0), U64(0), U64(0))
+    }
+    return .Ok
+}
+
+function endpointTransfer(
+    endpoint: Handle,
+    direction: TransferDirection,
+    buffers: borrow [Buffer],
+    flags: U32,
+    port: Handle,
+    key: U64
+) -> Result<Number, TesseraError> {
+    if buffers.count == 0 || buffers.count > 1024 || flags > U32(3) {
+        return .Error(failure(.InvalidArgument))
+    }
+    var kept: [Buffer] = []
+    for at in 0..buffers.count { kept.append(buffers[at]) }
+    let transfer = EndpointWork {
+        form: .Plain,
+        buffers: move kept,
+        flags: flags,
+        moved: U64(0),
+        address: .None,
+        source: .None,
+        count: U64(0),
+    }
+    return endpointSubmitTransfer(endpoint, direction, move transfer, port, key)
+}
+
+public function endpointSend(
+    endpoint: Handle,
+    buffers: borrow [Buffer],
+    flags: SendFlags,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    return match endpointTransfer(endpoint, .Send, buffers, flags.raw, port, key) {
+        Ok(index) -> endpointStarted(index)
+        Error(failed) -> .Error(failed)
+    }
+}
+
+public function endpointReceive(
+    endpoint: Handle,
+    buffers: borrow [Buffer],
+    flags: ReceiveFlags,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    return match endpointTransfer(endpoint, .Receive, buffers, flags.raw, port, key) {
+        Ok(index) -> endpointStarted(index)
+        Error(failed) -> .Error(failed)
+    }
+}
+
+function endpointSubmitTransfer(
+    endpoint: Handle,
+    direction: TransferDirection,
+    transfer: EndpointWork,
+    port: Handle,
+    key: U64
+) -> Result<Number, TesseraError> {
+    return match direction {
+        Send -> endpointSubmit(endpoint, Rights.write, .Send(move transfer), port, key)
+        Receive -> endpointSubmit(endpoint, Rights.read, .Receive(move transfer), port, key)
+    }
+}
+
+// Gives the pending send or receive `index` the address block it owns, and
+// where the caller wants the sender's address.
+function endpointAddressed(index: Number, block: RawPtr, source: RawPtr?) {
+    match library.pending[index].work {
+        Send(held) -> library.pending[index].work = .Send(
+            endpointWithAddress(move held, block, move source)
+        )
+        Receive(held) -> library.pending[index].work = .Receive(
+            endpointWithAddress(move held, block, move source)
+        )
+        WaitAsync, Timer, Accept, Connect, Wake, Stream, Call, Lock, Source, Transfer -> {}
+    }
+}
+
+function endpointWithAddress(
+    transfer: EndpointWork,
+    block: RawPtr,
+    source: RawPtr?
+) -> EndpointWork {
+    var addressed = move transfer
+    addressed.form = .Addressed
+    addressed.address = .Some(block)
+    addressed.source = move source
+    return addressed
+}
+
+function endpointStarted(index: Number) -> Result<Void, TesseraError> {
+    endpointStep(index)
+    return .Ok
+}
+
+public function endpointSendTo(
+    endpoint: Handle,
+    buffers: borrow [Buffer],
+    address: borrow NetAddress,
+    flags: SendFlags,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    let index = try endpointTransfer(endpoint, .Send, buffers, flags.raw, port, key)
+    let object = library.pending[index].object
+    let endpointState = match endpointOf(object) {
+        Ok(value) -> value
+        Error(failed) -> {
+            pendingDrop(index)
+            return .Error(failed)
+        }
+    }
+    let block = allocateZeroed(memoryLayout(32, 16))
+    var suits = false
+    if !isNull(block) {
+        netAddressWrite(address, block)
+        suits = kernelAddressSuits(address, endpointState.family)
+    }
+    if !isNull(block) { endpointAddressed(index, block, .None) }
+    if !suits {
+        pendingDrop(index)
+        return .Error(failure(isNull(block) ? .OutOfMemory : .InvalidArgument))
+    }
+    if !endpointAllowed(address, false) {
+        pendingDrop(index)
+        return .Error(failureIn(.NotEntitled, .Network))
+    }
+    return endpointStarted(index)
+}
+
+// `source`, when 32 bytes or more, receives the sender's address.
+public function endpointReceiveFrom(
+    endpoint: Handle,
+    buffers: borrow [Buffer],
+    source: borrow Buffer,
+    flags: ReceiveFlags,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    let index = try endpointTransfer(endpoint, .Receive, buffers, flags.raw, port, key)
+    let block = allocateZeroed(memoryLayout(32, 16))
+    if isNull(block) {
+        pendingDrop(index)
+        return .Error(failure(.OutOfMemory))
+    }
+    var wanted: RawPtr? = .None
+    if source.length >= U64(32) { wanted = .Some(source.address) }
+    endpointAddressed(index, block, move wanted)
+    return endpointStarted(index)
+}
+
+// `messages` is an array of 56-byte `Datagram`s in caller memory, read and
+// written back when the operation completes.
+function endpointMany(
+    endpoint: Handle,
+    direction: TransferDirection,
+    messages: borrow Buffer,
+    flags: U32,
+    port: Handle,
+    key: U64
+) -> Result<Void, TesseraError> {
+    let count = messages.length / U64(56)
+    if count == U64(0) || count > U64(1024) || flags > U32(3) {
+        return .Error(failure(.InvalidArgument))
+    }
+    let transfer = EndpointWork {
+        form: .Batched,
+        buffers: [messages],
+        flags: flags,
+        moved: U64(0),
+        address: .None,
+        source: .None,
+        count: count,
+    }
+    let index = try endpointSubmitTransfer(endpoint, direction, move transfer, port, key)
+    return endpointStarted(index)
+}
+
+public function endpointSendMany(
+    endpoint: Handle,
+    messages: borrow Buffer,
+    flags: SendFlags,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    return endpointMany(endpoint, .Send, messages, flags.raw, port, key)
+}
+
+public function endpointReceiveMany(
+    endpoint: Handle,
+    messages: borrow Buffer,
+    flags: ReceiveFlags,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    return endpointMany(endpoint, .Receive, messages, flags.raw, port, key)
+}
+
+public function endpointShutdown(endpoint: Handle, how: ShutdownHow) -> Result<Void, TesseraError> {
+    let object = try resolveObject(endpoint, .Endpoint, Rights.write)
+    let backing = try backingOf(object)
+    let closed = kernelEndpointShutdown(backing, how)
+    try closed
+    if how == .Both { endpointSetState(object, .Closed) }
+    return .Ok
+}
+
+// Values are `u32`, except `MulticastJoin`/`Leave` (a `NetAddress`, then the
+// interface index as `u32`), `BindToInterface` (the name) and `Linger`
+// (seconds; `0xFFFFFFFF` turns it off).
+public function endpointSetOption(
+    endpoint: Handle,
+    option: EndpointOption,
+    value: borrow Buffer
+) -> Result<Void, TesseraError> {
+    let object = try resolveObject(endpoint, .Endpoint, Rights.setProperty)
+    let held = try endpointOf(object)
+    let family = held.family
+    let number = try endpointOptionNumber(option, value)
+    let backing = try backingOf(object)
+    try kernelEndpointSetOption(backing, family, option, value)
+    if option == EndpointOption.ReceiveTimestamps {
+        var stamped = held
+        stamped.timestamps = number != U32(0)
+        setEndpoint(object, move stamped)
+    }
+    return .Ok
+}
+
+public function endpointGetOption(
+    endpoint: Handle,
+    option: EndpointOption,
+    out: borrow Buffer
+) -> Result<UNumber, TesseraError> {
+    let object = try resolveObject(endpoint, .Endpoint, Rights.inspect)
+    let held = try endpointOf(object)
+    let blockBytes = zeroedBlock(count: 32, alignment: 16)
+    let block = blockBytes.pointer()
+    let backing = try backingOf(object)
+    let size = try kernelEndpointGetOption(backing, held.family, option, block)
+    if out.length < size {
+        return .Error(failureDetail(.BufferTooSmall, size))
+    }
+    copyBytes(out.address, block, size)
+    return .Ok(size)
+}
+
+// The `u32` an option takes, after checking the value is the size the option
+// reads; 0 for the options that take a name or a group instead.
+function endpointOptionNumber(
+    option: EndpointOption,
+    value: borrow Buffer
+) -> Result<U32, TesseraError> {
+    return match option {
+        BindToInterface -> {
+            if value.length == U64(0) || value.length > U64(15) {
+                return .Error(failure(.InvalidArgument))
+            }
+            .Ok(U32(0))
+        }
+        MulticastJoin -> endpointGroupChecked(value)
+        MulticastLeave -> endpointGroupChecked(value)
+        NoDelay -> endpointNumberOf(value)
+        KeepAlive -> endpointNumberOf(value)
+        KeepAliveIdle -> endpointNumberOf(value)
+        KeepAliveInterval -> endpointNumberOf(value)
+        KeepAliveCount -> endpointNumberOf(value)
+        ReceiveBuffer -> endpointNumberOf(value)
+        SendBuffer -> endpointNumberOf(value)
+        Ttl -> endpointNumberOf(value)
+        HopLimit -> endpointNumberOf(value)
+        Broadcast -> endpointNumberOf(value)
+        MulticastTtl -> endpointNumberOf(value)
+        MulticastLoop -> endpointNumberOf(value)
+        Linger -> endpointNumberOf(value)
+        ReceiveTimestamps -> endpointNumberOf(value)
+        TcpUserTimeout -> endpointNumberOf(value)
+        TypeOfService -> endpointNumberOf(value)
+        ReceiveErrorQueue -> endpointNumberOf(value)
+        TcpFastOpen -> endpointNumberOf(value)
+        IpV6Only -> endpointNumberOf(value)
+    }
+}
+
+// An `ip_mreqn` or `ipv6_mreq` with room for either family's address.
+function endpointGroupChecked(value: borrow Buffer) -> Result<U32, TesseraError> {
+    if value.length < U64(36) { return .Error(failure(.InvalidArgument)) }
+    return .Ok(U32(0))
+}
+
+function endpointNumberOf(value: borrow Buffer) -> Result<U32, TesseraError> {
+    if value.length < U64(4) { return .Error(failure(.InvalidArgument)) }
+    return .Ok(heapLoad<U32>(value.address, 0))
+}

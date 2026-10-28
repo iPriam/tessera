@@ -1,0 +1,152 @@
+import Foundation
+import LibTessera
+import DeviceKit
+
+// What each class of stream does with its device, chosen by the class.
+
+function engineConfigure(
+    service: borrow mut Service,
+    stream: Number
+) -> Result<Void, TesseraError> {
+    return match service.streams[stream].descriptor.streamClass {
+        AudioInput -> configureAudio(service, stream)
+        AudioOutput -> configureAudio(service, stream)
+        Camera -> configureCamera(service, stream)
+        Sensor -> configureSensor(service, stream)
+        Haptic -> configureHaptic(service, stream)
+    }
+}
+
+// The slots exist; a camera is told where they are.
+function engineAttach(service: borrow mut Service, stream: Number) {
+    if service.streams[stream].descriptor.streamClass == .Camera { attachCamera(service, stream) }
+}
+
+function engineEnqueue(service: borrow mut Service, stream: Number, slot: Number) {
+    if service.streams[stream].descriptor.streamClass == .Camera {
+        queueCamera(service, stream, slot)
+    }
+}
+
+function engineStart(service: borrow mut Service, stream: Number) -> Result<Void, TesseraError> {
+    let connection = service.streams[stream].connection
+    return match service.streams[stream].descriptor.streamClass {
+        AudioInput -> audioStart(connection)
+        AudioOutput -> audioStart(connection)
+        Camera -> cameraStart(connection)
+        Sensor -> sensorStart(connection)
+        Haptic -> .Ok
+    }
+}
+
+function engineStop(service: borrow mut Service, stream: Number) {
+    let connection = service.streams[stream].connection
+    let id = service.streams[stream].device.id
+    match service.streams[stream].descriptor.streamClass {
+        AudioInput -> reportStop(id, audioStop(connection, false))
+        AudioOutput -> reportStop(id, audioStop(connection, false))
+        Camera -> reportStop(id, cameraStop(connection))
+        Sensor -> reportStop(id, sensorStop(connection))
+        Haptic -> releaseEffect(service, stream)
+    }
+    service.streams[stream].progress = 0
+}
+
+function reportStop(id: Number, stopped: borrow Result<Void, TesseraError>) {
+    match stopped {
+        Ok -> {}
+        Error(failed) -> log warn("a device did not stop", id, error: errorName(failed))
+    }
+}
+
+function engineStep(service: borrow mut Service, stream: Number) {
+    if service.streams[stream].state != .Running { return }
+    match service.streams[stream].descriptor.streamClass {
+        AudioOutput -> play(service, stream)
+        AudioInput -> capture(service, stream)
+        Camera -> stepCamera(service, stream)
+        Sensor -> stepSensor(service, stream)
+        Haptic -> stepHaptic(service, stream)
+    }
+    flushCheck(service, stream)
+}
+
+// Whether the device has played everything it was given. A position that
+// cannot be read is the failure the caller acts on.
+function engineDrained(service: borrow Service, stream: Number) -> Result<Bool, TesseraError> {
+    return match service.streams[stream].descriptor.streamClass {
+        AudioOutput -> match audioPosition(service.streams[stream].connection) {
+            Ok(position) -> .Ok(position.delay == UN32(0))
+            Error(failed) -> .Error(failed)
+        }
+        Haptic -> .Ok(service.streams[stream].playUntil.isNone())
+        // What these take in, they hand over as it comes.
+        AudioInput -> .Ok(true)
+        Camera -> .Ok(true)
+        Sensor -> .Ok(true)
+    }
+}
+
+// How long a frame written now takes to be heard, in nanoseconds. Only an
+// audio output has a delay to report; the others have none, so 0.
+function engineLatency(service: borrow Service, stream: Number) -> Result<Number, TesseraError> {
+    if !isAudio(service.streams[stream].descriptor.streamClass) { return .Ok(0) }
+    let rate = service.streams[stream].descriptor.format.sampleRate
+    if rate == 0 { return .Ok(0) }
+    return match audioPosition(service.streams[stream].connection) {
+        Ok(position) -> .Ok(floor(Number(position.delay) * Nanoseconds.perSecond / rate))
+        Error(failed) -> .Error(failed)
+    }
+}
+
+// A control's value when it was read, none when it was set.
+function engineControl(
+    service: borrow mut Service,
+    stream: Number,
+    request: borrow ControlRequest
+) -> Result<Number?, TesseraError> {
+    return match service.streams[stream].descriptor.streamClass {
+        Camera -> controlCamera(service, stream, request)
+        Haptic -> controlHaptic(service, stream, request)
+        AudioInput -> .Error(failure(.Unsupported))
+        AudioOutput -> .Error(failure(.Unsupported))
+        Sensor -> .Error(failure(.Unsupported))
+    }
+}
+
+// The deadline the main loop must wake for: a haptic sample ending or a
+// flush to look at again.
+// A stream whose clock cannot be read fails in `streamTime`, and contributes
+// no deadline.
+function nextDeadline(service: borrow mut Service) -> Number {
+    var next = Number(Deadline.infinite)
+    for stream in 0..service.streams.count {
+        match service.streams[stream].playUntil {
+            Some(until) -> if until < next { next = until }
+            None -> {}
+        }
+        if service.streams[stream].flushDeadline.isSome() {
+            match streamTime(service, stream) {
+                Some(now) -> {
+                    let soon = now + Nanoseconds.flushPoll
+                    if soon < next { next = soon }
+                }
+                None -> {}
+            }
+        }
+    }
+    return next
+}
+
+function tick(service: borrow mut Service) {
+    for stream in 0..service.streams.count {
+        match service.streams[stream].playUntil {
+            Some(until) -> match streamTime(service, stream) {
+                Some(now) -> if now >= until { finishHaptic(service, stream) }
+                None -> {}
+            }
+            None -> {}
+        }
+        flushCheck(service, stream)
+    }
+}

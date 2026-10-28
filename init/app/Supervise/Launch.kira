@@ -1,0 +1,370 @@
+import Foundation
+import Heap
+import LibTessera
+
+// Opening an application, which PID 1 does for the desktop as launchd does
+// for a Mac's Finder.
+//
+// The desktop sends the path of the executable inside an application bundle
+// over the channel PID 1 gave it. PID 1 checks that the path is one, starts
+// it as a service that is not restarted, and links it to the display server
+// the way every display client is linked at boot: one channel, an end to
+// each. MosaicDisplay admits it while running and gives it the next surface.
+
+// The longest request read: the header and a 240-byte path.
+let launchRequestLimit: Number = 256
+
+// What the desktop asks PID 1 to do with a path.
+enum DesktopAsk {
+    Launch
+    Install
+    Uninstall
+    // Only the platform asks it; the path is the platform to switch to.
+    SwitchPlatform
+}
+
+// The ask whose opcode is `raw`, if it is one the desktop sends.
+function desktopAsk(raw: UN32) -> DesktopAsk? {
+    match raw {
+        4 -> return .Some(.Launch)
+        6 -> return .Some(.Install)
+        7 -> return .Some(.Uninstall)
+        11 -> return .Some(.SwitchPlatform)
+        else -> return .None
+    }
+}
+
+struct LaunchRequest {
+    var ask: DesktopAsk
+    var path: String
+    // The channel the desktop waits for an answer on, or `Handle.invalid`.
+    var reply: Handle
+}
+
+// What one read of the desktop's channel found.
+enum ReceivedRequest {
+    Asked(LaunchRequest)
+    // Nothing that is a request, which has been said.
+    Nothing
+    // The desktop has gone.
+    Closed
+}
+
+function receiveLaunchRequest(channel: Handle) -> ReceivedRequest {
+    let bodyBytes = zeroedBlock(count: launchRequestLimit, alignment: 16)
+    let body = bodyBytes.pointer()
+    let received = match channelRead(
+        channel,
+        Buffer { address: body, length: launchRequestLimit },
+        4
+    ) {
+        Ok(value) -> value
+        Error(failed) -> {
+            if failed.code == .PeerClosed { return .Closed }
+            if failed.code != .ShouldWait {
+                log warn("could not read a request from a service", error: errorName(failed))
+            }
+            return .Nothing
+        }
+    }
+    // The first handle is the channel to answer on; there is no use for more.
+    var reply = Handle.invalid
+    for index in 0..received.handles.count {
+        if index == 0 { reply = received.handles[0] } else { release(received.handles[index]) }
+    }
+    let count = Number(received.bytes)
+    let length = Number(heapLoad<U32>(body, 12))
+    let ask = count >= ServiceMessage.headerBytes ? desktopAsk(heapLoad<U32>(body, 0)) : .None
+    match ask {
+        Some(asked) -> {
+            if length > 0 && ServiceMessage.headerBytes + length == count {
+                return .Asked(
+                    LaunchRequest {
+                        ask: asked,
+                        path: textOf(heapOffset(body, ServiceMessage.headerBytes), length),
+                        reply: reply
+                    }
+                )
+            }
+        }
+        None -> {}
+    }
+    log warn("a service sent a request that is not one", bytes: count)
+    if reply != Handle.invalid { release(reply) }
+    return .Nothing
+}
+
+// Whether `path` is the executable of an application bundle,
+// `<Name>.app/Contents/MacOS/<Name>`, in a place applications open from:
+// `/System/Applications` or `/Applications`, where they are installed, the
+// top of a read-only volume in `/Volumes`, a container opened as a Mac
+// opens a .dmg, or an installed image mounted in `/run/Applications`.
+// Nothing that climbs out of those counts.
+function isApplicationExecutable(path: borrow String) -> Result<Bool, TesseraError> {
+    if path.contains("..") || path.contains("//") { return .Ok(false) }
+    var rest = ""
+    let system = "/" + SystemDirectory.systemApplications + "/"
+    let installed = "/" + SystemDirectory.applications + "/"
+    if path.startsWith(system) {
+        rest = path.substring(system.count, path.count)
+    } else if path.startsWith(installed) {
+        rest = path.substring(installed.count, path.count)
+    } else if path.startsWith("/" + SystemDirectory.volumes + "/") || path.startsWith(
+        Installed.imagesDirectory + "/"
+    ) {
+        let mounts = path.startsWith(
+            "/" + SystemDirectory.volumes + "/"
+        ) ? "/" + SystemDirectory.volumes + "/" : Installed.imagesDirectory + "/"
+        let inside = path.substring(mounts.count, path.count)
+        let slash = try inside.indexOf("/") otherwise return .Ok(false)
+        if slash == 0 { return .Ok(false) }
+        let volume = mounts + inside.substring(0, slash)
+        let volumeIsReadOnly = match readOnlyVolumeAt(volume) {
+            Ok(value) -> value
+            Error(failed) -> return .Error(failed)
+        }
+        if !volumeIsReadOnly {
+            log warn("an application on a volume that can be written was not opened", volume)
+            return .Ok(false)
+        }
+        rest = inside.substring(slash + 1, inside.count)
+    } else {
+        return .Ok(false)
+    }
+    let marker = ".app/Contents/MacOS/"
+    let at = try rest.indexOf(marker) otherwise return .Ok(false)
+    if at == 0 { return .Ok(false) }
+    let bundle = rest.substring(0, at)
+    let executable = rest.substring(at + marker.count, rest.count)
+    return .Ok(bundle == executable && !bundle.contains("/"))
+}
+
+// The number MosaicDisplay knows the display client in `slot` by: its place
+// among the display clients, counted as `connectDisplayClients` counts them.
+function displayClientNumber(fleet: borrow Fleet, slot: Number) -> Number {
+    let server = displayServerSlot(fleet.services)
+    var number = 0
+    for at in 0..slot + 1 {
+        if fleet.channels[at] != Handle.invalid && !isSlot(
+            server,
+            at
+        ) && fleet.services[at].isDisplayClient() {
+            number += 1
+        }
+    }
+    return number
+}
+
+// Links the display client just started in `slot` to the running display
+// server: an application just opened, or the desktop restarted.
+function connectLaunchedClient(fleet: borrow Fleet, slot: Number) {
+    let server = try displayServerSlot(fleet.services) otherwise return
+    if fleet.channels[server] == Handle.invalid || fleet.channels[slot] == Handle.invalid { return }
+    let link = match channelCreate() {
+        Ok(value) -> value
+        Error(failed) -> {
+            log warn(
+                "no display link for an application",
+                application: fleet.services[slot].name,
+                error: errorName(failed)
+            )
+            return
+        }
+    }
+    let number = displayClientNumber(fleet, slot)
+    // Past boot the count is the client's number, which MosaicDisplay makes
+    // its surface, so a desktop that is restarted comes back as the surface
+    // the platform already knows.
+    handLink(
+        fleet.channels[server],
+        "mosaicdisplay",
+        link.first,
+        displayLinkDetail(UN32(number), fleet.services[slot].displayRole)
+    )
+    handLink(fleet.channels[slot], fleet.services[slot].name, link.second, UN32(number))
+    log info(
+        "linked an application to the display",
+        application: fleet.services[slot].name,
+        client: number
+    )
+}
+
+// Asks the display server to bring the client running in `slot` to the
+// front. The server leaves the decision to the platform.
+function bringClientForward(fleet: borrow Fleet, slot: Number) {
+    let server = try displayServerSlot(fleet.services) otherwise return
+    if fleet.channels[server] == Handle.invalid || fleet.channels[slot] == Handle.invalid { return }
+    let none: [Handle] = []
+    match sendMessage(
+        fleet.channels[server],
+        .BringForward,
+        UN32(displayClientNumber(fleet, slot)),
+        none
+    ) {
+        Ok -> {}
+        Error(failed) -> log warn(
+            "could not ask the display to bring an application forward",
+            application: fleet.services[slot].name,
+            error: errorName(failed)
+        )
+    }
+}
+
+// What opening an application did.
+enum OpenOutcome {
+    // Started in this slot.
+    Started(Number)
+    // Already running; brought to the front in this slot.
+    AlreadyOpen(Number)
+}
+
+// Why an application was not opened.
+enum OpenFailure {
+    // Its installed image could not be made into an executable.
+    Image(InstalledImageFailure)
+    // The path is not an application executable.
+    NotAnApplication
+    ExecutableCheck(TesseraError)
+    ImageCheck(TesseraError)
+    // The image's signature does not allow it to run here.
+    NotPermitted
+    // It was added to the fleet, but its process did not start.
+    Start(TesseraError)
+}
+
+// Starts the application whose executable is `path` in a new slot. An
+// application already running is not started twice: it is brought to the
+// front, and the slot it runs in is the answer.
+function openApplication(
+    calls: Handle,
+    asked: borrow String,
+    fleet: borrow mut Fleet
+) -> Result<OpenOutcome, OpenFailure> {
+    var path = copy asked
+    match installedImageName(asked) {
+        Some(_) -> {
+            // An installed application is an image to mount first.
+            match openInstalledImage(calls, asked, fleet.consent) {
+                Ok(executable) -> path = executable
+                Error(reason) -> {
+                    match reason {
+                        NotNamed -> log warn(
+                            "an installed application has no usable name",
+                            path: asked
+                        )
+                        NotIntact -> log warn(
+                            "an installed application's image is not intact",
+                            path: asked
+                        )
+                        NoDirectory -> log warn(
+                            "no directory for an installed application's image",
+                            path: asked
+                        )
+                        MountFailed -> log warn(
+                            "an installed application's image did not mount",
+                            path: asked
+                        )
+                        CouldNotRead(failed) -> log warn(
+                            "could not read an installed application's image or digest",
+                            path: asked,
+                            error: errorName(failed)
+                        )
+                    }
+                    return .Error(.Image(reason))
+                }
+            }
+        }
+        None -> {}
+    }
+    match isApplicationExecutable(path) {
+        Ok(executable) -> if !executable {
+            log warn("refused to open something that is not an application", path)
+            return .Error(.NotAnApplication)
+        }
+        Error(failed) -> {
+            log warn(
+                "could not check whether this is an application",
+                path,
+                error: errorName(failed)
+            )
+            return .Error(.ExecutableCheck(failed))
+        }
+    }
+    for at in 0..fleet.services.count {
+        if fleet.services[at].path == path && running(fleet, at) {
+            log info(
+                "the application is already open; bringing it forward",
+                application: fleet.services[at].name
+            )
+            bringClientForward(fleet, at)
+            return .Ok(.AlreadyOpen(at))
+        }
+    }
+    // An application on a disk image opens only as its signature allows.
+    match containedImagePermitted(calls, path, fleet.consent) {
+        Ok(permission) -> match permission {
+            Allowed -> {}
+            Refused -> return .Error(.NotPermitted)
+        }
+        Error(failed) -> {
+            log warn(
+                "could not check whether the image may be opened",
+                path,
+                error: errorName(failed)
+            )
+            return .Error(.ImageCheck(failed))
+        }
+    }
+    ensureApplicationData(calls, nameOf(path))
+    fleet.services.append(
+        Service {
+            name: nameOf(path),
+            path: copy path,
+            arguments: [],
+            restart: false,
+            displayRole: DisplayRole.Application,
+        }
+    )
+    fleet.processes.append(Handle.invalid)
+    fleet.channels.append(Handle.invalid)
+    fleet.outputs.append(Handle.invalid)
+    fleet.jobs.append(Handle.invalid)
+    fleet.partial.append("")
+    fleet.starts.append(0)
+    fleet.deaths.append(Deaths {})
+    let slot = fleet.services.count - 1
+    match startSlot(calls, fleet, slot) {
+        Ok -> {}
+        Error(failed) -> {
+            log warn("could not open an application", path, error: errorName(failed))
+            return .Error(.Start(failed))
+        }
+    }
+    log info("opened an application", application: fleet.services[slot].name, path)
+    return .Ok(.Started(slot))
+}
+
+// Makes the application's data folder, `/data/appdata/<Name>`, unless it is
+// there (roadmap/05-storage-and-state.md): where it keeps what it makes, and
+// what uninstalling it leaves. A machine without a data volume has none.
+function ensureApplicationData(calls: Handle, name: borrow String) {
+    let data = "/" + SystemDirectory.applicationData
+    match pathPresent(calls, data) {
+        Ok(present) -> if !present { return }
+        Error(failed) -> {
+            log warn(
+                "could not check whether application data is available",
+                error: errorName(failed)
+            )
+            return
+        }
+    }
+    match ensureDirectory(calls, data + "/" + name) {
+        Ok -> {}
+        Error(failed) -> log warn(
+            "application data will not be available",
+            application: name,
+            error: errorName(failed)
+        )
+    }
+}

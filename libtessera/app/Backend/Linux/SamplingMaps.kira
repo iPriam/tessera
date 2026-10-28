@@ -1,0 +1,175 @@
+import Foundation
+
+// Each sampled process's /proc maps and name, read when its first stack is seen,
+// again when a later stack's innermost user frame is at an address none of
+// them cover, and once more as the sampling ends: a program seen as it
+// starts has mapped only its executable, and its libraries come after. A
+// re-read keeps the lines it no longer has, so a library unmapped since
+// still names the stacks taken in it.
+
+namespace SampledMapsLimits {
+    // Addresses from here up are the kernel's or the call chain markers.
+    let userEnd: U64 = U64(0x1000000000000)
+}
+
+struct SampledMaps {
+    let index: Number
+    var ranges: [U64]
+    // The stack count when its maps were last read, so a stack no read
+    // could cover is looked up once a drain, not once a stack.
+    var readAt: Number
+}
+
+// Names the processes the stacks from `checked` on were taken in, while they
+// still run: an application opened and closed during the sampling is gone by
+// its end. Answers how many stacks have been looked at.
+function describeNewProcesses(
+    samples: borrow mut MachineSamples,
+    known: borrow mut Map<Number, SampledMaps>,
+    checked: Number
+) -> Result<Number, TesseraError> {
+    for index in checked..samples.stacks.count {
+        let pid = samples.stacks[index].pid
+        match known.value(pid) {
+            None -> {
+                match describeSampledProcess(pid) {
+                    Ok(process) -> {
+                        let ranges = try mapsRanges(process.maps)
+                        known.set(
+                            pid,
+                            SampledMaps {
+                                index: samples.processes.count,
+                                ranges: ranges,
+                                readAt: checked
+                            }
+                        )
+                        samples.processes.append(process)
+                    }
+                    Error(failed) -> {
+                        // A short-lived process can end after its stack was
+                        // recorded but before /proc can name its mappings.
+                        if failed.code != .NotFound { return .Error(failed) }
+                    }
+                }
+            }
+            Some(entry) -> {
+                if entry.readAt == checked || covered(entry.ranges, samples.stacks[index].frames) {
+                    continue
+                }
+                try rereadMaps(samples, known, pid, entry, checked)
+            }
+        }
+    }
+    return .Ok(samples.stacks.count)
+}
+
+// Every sampled process's maps read again, for the libraries mapped after
+// its stacks were last looked at.
+function rereadAllMaps(
+    samples: borrow mut MachineSamples,
+    known: borrow mut Map<Number, SampledMaps>,
+    checked: Number
+) -> Result<Void, TesseraError> {
+    for entry in known.entries() {
+        match rereadMaps(samples, known, entry.key, entry.value, checked) {
+            Ok -> {}
+            Error(failed) -> {
+                // A process may exit before its final maps read.
+                if failed.code != .NotFound { return .Error(failed) }
+            }
+        }
+    }
+    return .Ok
+}
+
+function rereadMaps(
+    samples: borrow mut MachineSamples,
+    known: borrow mut Map<Number, SampledMaps>,
+    pid: Number,
+    entry: borrow SampledMaps,
+    checked: Number
+) -> Result<Void, TesseraError> {
+    var refreshed = copy entry
+    refreshed.readAt = checked
+    let old = samples.processes[entry.index]
+    let directory = "/proc/" + stringFromUnsigned(U64(pid))
+    let maps = match kernelReadText(directory + "/maps") {
+        Ok(text) -> text
+        Error(failed) -> {
+            if failed.code == .NotFound { return .Error(failed) }
+            return .Error(failed)
+        }
+    }
+    if !maps.isEmpty() {
+        let merged = mergedMaps(old.maps, maps)
+        refreshed.ranges = try mapsRanges(merged)
+        // A process first seen before its exec had the launcher's name.
+        let name = try readSmallFile(AtDirectory.current, directory + "/comm")
+        samples.processes[entry.index] = SampledProcess {
+            pid: pid,
+            name: name.isEmpty() ? copy old.name : name,
+            maps: merged
+        }
+    }
+    known.set(pid, move refreshed)
+    return .Ok
+}
+
+function describeSampledProcess(pid: Number) -> Result<SampledProcess, TesseraError> {
+    let directory = "/proc/" + stringFromUnsigned(U64(pid))
+    let name = try readSmallFile(AtDirectory.current, directory + "/comm")
+    let maps = try kernelReadText(directory + "/maps")
+    return .Ok(SampledProcess { pid: pid, name: name, maps: maps })
+}
+
+// Whether a stack's innermost user frame lies in one of `ranges`, start and
+// end pairs sorted by start, as /proc lists them.
+function covered(ranges: borrow [U64], frames: borrow [U64]) -> Bool {
+    for frame in frames {
+        if frame >= SampledMapsLimits.userEnd { continue }
+        var low = 0
+        var high = trunc(ranges.count / 2)
+        while low < high {
+            let middle = trunc((low + high) / 2)
+            if ranges[middle * 2] <= frame { low = middle + 1 } else { high = middle }
+        }
+        return low > 0 && frame < ranges[low * 2 - 1]
+    }
+    return true
+}
+
+struct MappedRange {
+    let start: U64
+    let end: U64
+}
+
+// Start and end pairs, sorted by start: a merge puts the lines a process
+// no longer has after the ones it does.
+function mapsRanges(maps: borrow String) -> Result<[U64], TesseraError> {
+    var found: [MappedRange] = []
+    for line in maps.split("\n") {
+        let bounds = line.split(" ")[0].split("-")
+        if bounds.count != 2 { continue }
+        let start = try parseHexadecimal(bounds[0])
+        let end = try parseHexadecimal(bounds[1])
+        found.append(MappedRange { start: start, end: end })
+    }
+    var ranges: [U64] = []
+    for range in found.sorted({ left, right in return left.start < right.start }) {
+        ranges.append(range.start)
+        ranges.append(range.end)
+    }
+    return .Ok(ranges)
+}
+
+function mergedMaps(old: borrow String, new: borrow String) -> String {
+    var seen: Map<String, Bool> = Map {}
+    for line in new.split("\n") { seen.set(copy line, true) }
+    var gone: [String] = []
+    for line in old.split("\n") {
+        if !line.isEmpty() && seen.value(line).isNone() { gone.append(copy line) }
+    }
+    if gone.count == 0 { return copy new }
+    let tail = new.endsWith("\n") ? "" : "\n"
+    return new + tail + joined(gone, "\n") + "\n"
+}

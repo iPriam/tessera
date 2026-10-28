@@ -1,0 +1,108 @@
+import Foundation
+import Heap
+import LibTessera
+
+// `diskutil activity`: the Volume service's changes as they happen, as
+// macOS's `diskutil activity` prints DiskArbitration's callbacks.
+//
+// One `Watch` request keeps its channel open. The service answers every
+// volume it holds as `Appeared`, then `Idle`, and from then on one message
+// per change: a header whose `a` is the kind, then the volume's 160-byte
+// record (`Volume.kira`). It runs until the service goes.
+
+@Open enum ActivityKind: UNumber {
+    Appeared = 1
+    Disappeared = 2
+    DescriptionChanged = 3
+    Idle = 4
+}
+
+// One line in macOS's words: the callback, the node's name, where it is
+// mounted and what it holds.
+function activityLine(kind: borrow ActivityKind, volume: borrow Volume) -> String {
+    let callback = match kind {
+        Disappeared -> "DiskDisappeared"
+        DescriptionChanged -> "DiskDescriptionChanged"
+        else -> "DiskAppeared"
+    }
+    let path = match volume.mountPoint {
+        Some(mountPoint) -> "'\(mountPoint)'"
+        None -> "'<null>'"
+    }
+    return "***\(callback) ('\(volume.name)', DAVolumePath = \(path), DAVolumeKind = '\(volume.content.name())')"
+}
+
+// What reading the watch channel found.
+enum Drained {
+    // Everything it held is printed; more may come.
+    Waiting
+    // The service has gone.
+    Closed
+}
+
+// Prints every message `channel` holds now.
+function printActivity(channel: Handle) -> Drained {
+    let size = VolumeWire.headerBytes + VolumeWire.recordBytes
+    let block = zeroedBlock(count: size, alignment: VolumeWire.alignment)
+    var drained = Drained.Waiting
+    while true {
+        match channelRead(channel, Buffer { address: block.pointer(), length: size }, UN32(0)) {
+            Ok(received) -> {
+                let kind = fromCode<ActivityKind>(heapLoad<WireHeader>(block.pointer()).a)
+                match kind {
+                    Idle -> print("***DAIdle (no more changes in the near future)")
+                    else -> {
+                        if received.bytes >= size {
+                            print(
+                                activityLine(
+                                    kind,
+                                    volumeAt(heapOffset(block.pointer(), VolumeWire.headerBytes))
+                                )
+                            )
+                        }
+                    }
+                }
+            }
+            Error(failed) -> {
+                // Empty for now: wait for more.
+                if failed.code == .ShouldWait {
+                    absorb failed
+                    break
+                }
+                if failed.code != .PeerClosed {
+                    log warn("cannot read the Volume service's activity", failed)
+                }
+                drained = .Closed
+                break
+            }
+        }
+    }
+    return drained
+}
+
+function activity(service: borrow VolumeService) -> DiskutilExit {
+    let channel = match service.send(.Watch, 0) {
+        Ok(value) -> value
+        Error(failed) -> {
+            log warn("cannot reach the Volume service", failed)
+            return DiskutilExit.Unreachable
+        }
+    }
+    print("***Begin monitoring DiskArbitration activity")
+    while true {
+        match service.awaitReadable(channel, Deadline.infinite) {
+            Ok -> {}
+            Error(failed) -> {
+                log warn("could not wait for disk activity", failed)
+                break
+            }
+        }
+        match printActivity(channel) {
+            Waiting -> continue
+            Closed -> break
+        }
+    }
+    closeChannel(channel)
+    print("***End monitoring DiskArbitration activity")
+    return DiskutilExit.Refused
+}

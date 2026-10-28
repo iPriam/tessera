@@ -1,0 +1,137 @@
+//! The wire the pasteboard speaks: the request and answer layouts, and how they are received and sent.
+import Foundation
+import Heap
+import LibTessera
+
+// The wire, as LibTessera `app/Pasteboard/Pasteboard.kira` speaks it: a
+// 32-byte header, `op` @0, `code` @4 (an `ErrorCode` value), `a` @8, `b` @16,
+// `c` @24, then the operation's bytes. An answer carries the request's `op`.
+
+/// The wire's sizes: the header's length and how many handles a request may carry.
+namespace PasteboardWire {
+    let headerBytes: Number = 32
+    // The largest item, in bytes of UTF-8. It is the limit LibTessera checks
+    // before sending a write.
+    let maximumBytes: Number = 65536
+    // A client's request carries no handles; a few are taken to close them.
+    let handleCapacity: Number = 4
+}
+
+/// The operations a client may ask of the pasteboard.
+@Derive(Copy)
+@Derive(CaseIterable)
+enum Operation: UN32 {
+    Write = 1
+    Read = 2
+}
+
+/// The read token's words, as a read sends them.
+struct ReadToken {
+    var idLow: UNumber
+    var idHigh: UNumber
+    var surfaceId: UNumber
+}
+
+/// A request decoded from a message.
+enum Request {
+    Write(String)
+    Read(ReadToken)
+}
+
+/// Why nothing could be taken off a channel as a request.
+enum ReceiveFailure {
+    // The channel had nothing (`ShouldWait`) or failed.
+    Channel(TesseraError)
+    // An operation a client does not send; it is answered `Unsupported`.
+    UnknownOperation(UN32)
+    // A request refused as it was sent, answered with the reason.
+    Refused(Refusal)
+}
+
+/// A request refused as it was sent: the operation, and why.
+struct Refusal {
+    var operation: Operation
+    var reason: ErrorCode
+}
+
+/// The pasteboard error with `code`.
+function failure(code: borrow ErrorCode) -> TesseraError {
+    return TesseraError {
+        code: code,
+        subsystem: .Pasteboard,
+        flags: ErrorFlags.none,
+        detail: UNumber(0)
+    }
+}
+
+/// The next request on `channel`; handles a client sends are closed, since no request carries any.
+function receive(channel: Handle) -> Result<Request, ReceiveFailure> {
+    let block = zeroedBlock(count: PasteboardWire.headerBytes + PasteboardWire.maximumBytes, alignment: 16)
+    let size = PasteboardWire.headerBytes + PasteboardWire.maximumBytes
+    let bytes = Buffer { address: block.pointer(), length: size }
+    let received = match channelRead(channel, bytes, PasteboardWire.handleCapacity) {
+        Ok(value) -> value
+        Error(failed) -> return .Error(.Channel(failed))
+    }
+    closeHandles(received.handles)
+    if received.bytes < PasteboardWire.headerBytes {
+        return .Error(.Channel(failure(.InvalidArgument)))
+    }
+    let raw = blockLoad<U32>(block, 0)
+    let operation = try caseWithCode(allCases_Operation(), raw) otherwise return .Error(
+        .UnknownOperation(raw)
+    )
+    let firstArgument = blockLoad<U64>(block, 8)
+    let secondArgument = blockLoad<U64>(block, 16)
+    let thirdArgument = blockLoad<U64>(block, 24)
+    let payload = heapOffset(block.pointer(), PasteboardWire.headerBytes)
+    let payloadLength = received.bytes - PasteboardWire.headerBytes
+    return match operation {
+        Write -> writeRequest(payload, payloadLength)
+        Read -> .Ok(
+            .Read(
+                ReadToken {
+                    idLow: UNumber(firstArgument),
+                    idHigh: UNumber(secondArgument),
+                    surfaceId: UNumber(thirdArgument),
+                }
+            )
+        )
+    }
+}
+
+/// The write request a message's `payload` of `length` bytes holds.
+function writeRequest(payload: RawPtr, length: Number) -> Result<Request, ReceiveFailure> {
+    if length > PasteboardWire.maximumBytes {
+        return .Error(.Refused(Refusal { operation: .Write, reason: .InvalidArgument }))
+    }
+    return .Ok(.Write(stringFromCBytes(payload, length)))
+}
+
+/// Sends one answer under the raw `operation`: the outcome, and no payload.
+function send(
+    channel: Handle,
+    operation: UN32,
+    outcome: borrow ErrorCode,
+    payload: borrow String
+) -> Result<Void, TesseraError> {
+    let size = PasteboardWire.headerBytes + payload.count
+    let block = zeroedBlock(count: size, alignment: 16)
+    blockStore<U32>(block, 0, operation)
+    blockStore<U32>(block, 4, outcome.rawValue())
+    if payload.count > 0 {
+        copyBytes(heapOffset(block.pointer(), PasteboardWire.headerBytes), payload.data, U64(payload.count))
+    }
+    let none: [Handle] = []
+    return channelWrite(channel, Buffer { address: block.pointer(), length: size }, none)
+}
+
+/// An answer: a client that cannot be sent to has gone, and its channel's wait closes it.
+function answer(channel: Handle, operation: UN32, outcome: borrow ErrorCode) {
+    let none = ""
+    match send(channel, operation, outcome, none) {
+        // The answer is sent, so there is nothing more to do.
+        Ok -> {}
+        Error(failed) -> log warn("a client could not be answered", error: errorName(failed))
+    }
+}

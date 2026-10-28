@@ -1,0 +1,79 @@
+//! The stopwatch: its counting, its laps, and the text it shows.
+import Foundation
+import KiraUI
+
+// Clock's stopwatch, as the Stopwatch in a Mac's and an iPhone's Clock: Start
+// and Stop on one round button, Lap and Reset on the other, and the laps
+// below the time, the newest first.
+
+/// How often a running stopwatch is drawn again, in seconds: often enough for its hundredths to run as the Clock's do.
+namespace StopwatchTick {
+    let interval: Number = 0.03
+}
+
+/// The stopwatch: its start, what it counted before, and the laps it has taken, each as the total at which it was taken.
+class ClockStopwatch {
+    var startedAt: Number? = .None
+    var counted: UNumber = 0
+    var laps: [UNumber] = []
+}
+
+extend ClockStopwatch {
+    function running(borrow self) -> Bool { return startedAt.isSome() }
+
+    // Milliseconds counted at `now`, the run in progress included.
+    function elapsed(borrow self, now: Number) -> UNumber {
+        return match startedAt {
+            Some(started) -> counted + max(0, now - started)
+            None -> counted
+        }
+    }
+
+    function start(borrow mut self) {
+        if running() { return }
+        startedAt = .Some(unixMillis())
+        log info("the stopwatch started", counted: counted)
+        redrawAfter(StopwatchTick.interval)
+    }
+
+    function stop(borrow mut self) {
+        let now = unixMillis()
+        counted = elapsed(now)
+        startedAt = .None
+        log info("the stopwatch stopped", counted: counted)
+    }
+
+    // Takes a lap while it runs; clears it, laps and all, while it is stopped.
+    function lapOrReset(borrow mut self) {
+        if running() {
+            laps.append(elapsed(unixMillis()))
+            return
+        }
+        counted = 0
+        laps = []
+    }
+
+    // Asks to be drawn again while it runs, so the time keeps moving.
+    function follow(borrow self) {
+        if running() { redrawAfter(StopwatchTick.interval) }
+    }
+
+    // How long the lap at `index` took: its total less the one before it.
+    function lapLength(borrow self, index: Number) -> UNumber {
+        if index == 0 { return laps[0] }
+        return laps[index] - laps[index - 1]
+    }
+}
+
+// `01:04.27`, minutes, seconds and hundredths, as the stopwatch reads;
+// hours lead past the hour.
+function stopwatchText(millis: UNumber) -> String {
+    let hundredths = trunc(millis % Millis.second / 10)
+    let whole = trunc(millis / Millis.second)
+    let hours = trunc(whole / CivilTime.secondsPerHour)
+    let minutes = trunc(whole % CivilTime.secondsPerHour / CivilTime.secondsPerMinute)
+    let rest = whole % CivilTime.secondsPerMinute
+    let tail = "\(zeroPadded(minutes, 2)):\(zeroPadded(rest, 2)).\(zeroPadded(hundredths, 2))"
+    if hours > 0 { return "\(hours):\(tail)" }
+    return tail
+}

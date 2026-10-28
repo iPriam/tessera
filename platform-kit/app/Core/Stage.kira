@@ -1,0 +1,57 @@
+//! Stage Manager: the one application window on the stage, and the strip of the others waiting beside it.
+import Foundation
+
+// Stage Manager (roadmap/15-form-factors.md): one application's window is on
+// the stage, and every other application window shown waits in the strip down
+// the leading edge, the most recently in front at the top, as on a Mac. The
+// compositor draws the strip's pictures in the same order from its own
+// stacking order, which the platform's follows, so the platform can draw each
+// picture's icon over it.
+
+/// Whether `surface` is a shown window of an application, which the stage and
+/// the strip hold.
+function staged(state: borrow PlatformState, surface: borrow PlatformSurface) -> Bool {
+    if surface.visible != .Visible { return false }
+    return match applicationIndex(state, surface.application) {
+        Some(index) -> state.applications[index].kind == .Application
+        None -> false
+    }
+}
+
+extend PlatformState {
+    /// The window on the stage: the focused application window, or else the
+    /// shown one furthest in front; none when no application window is shown.
+    function stagedSurface(borrow self) -> PlatformSurfaceId? {
+        for surface in surfaces {
+            if surface.focused && surface.visible == .Visible {
+                match applicationIndex(self, surface.application) {
+                    Some(index) -> if applications[index].kind == .Desktop { return .None }
+                    None -> {}
+                }
+            }
+        }
+        var front: PlatformSurface? = .None
+        for surface in surfaces {
+            if !staged(self, surface) { continue }
+            if surface.focused { return .Some(surface.id) }
+            if isAtOrAbove(surface, front) { front = .Some(surface) }
+        }
+        return idOf(front)
+    }
+
+    /// The windows in the strip, the most recently in front first, at most
+    /// `limit` of them.
+    function stripSurfaces(borrow self, limit: Number) -> [PlatformSurface] {
+        let front = stagedSurface()
+        var waiting: [PlatformSurface] = []
+        for surface in surfaces {
+            if staged(self, surface) && front != .Some(surface.id) { waiting.append(surface) }
+        }
+        var strip: [PlatformSurface] = []
+        for surface in waiting.sorted({ a, b in return a.zOrder > b.zOrder }) {
+            if strip.count >= limit { break }
+            strip.append(surface)
+        }
+        return strip
+    }
+}

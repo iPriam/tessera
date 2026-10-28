@@ -1,0 +1,21 @@
+//! Traces the GPU's share of a frame, so a slow frame says where the GPU spent its time.
+import Foundation
+import Ember
+import LibTessera
+
+/// Each frame's GPU time, pass by pass, as trace counters in nanoseconds while
+/// the kernel tracer records (`gpu:frame` and `gpu:<pass label>`), and the draws each pass
+/// recorded (`draws:<pass label>`), which is
+/// how the dev root's sampler sees what the GPU spent. Read after the frame
+/// was submitted and waited for, and switched on or off for the next one.
+function traceGpu(frame: borrow RenderFrame) {
+    let stats = frame.statistics()
+    if stats.hasGpuSeconds {
+        traceCounter("gpu", "frame", trunc(stats.gpuSeconds * 1000000000))
+        for pass in stats.gpuPasses {
+            traceCounter("gpu", pass.label, pass.nanos)
+            traceCounter("draws", pass.label, pass.draws)
+        }
+    }
+    frame.measureGpu(traceEnabled("gpu"))
+}

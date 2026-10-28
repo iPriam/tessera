@@ -1,0 +1,64 @@
+import Foundation
+
+// The messages on the channel PID 1 starts a service with
+// (roadmap/04-ipc.md): a sixteen-byte header of four little-endian words,
+// opcode, length, serial and a detail word, then the body. A handle the
+// message carries travels beside it. Both ends name the opcodes from here.
+public namespace ServiceMessage {
+    let headerBytes: UNumber = 16
+}
+
+// There is no opcode 0: a zeroed block that reached a reader by accident
+// should not name a real message.
+@Derive(Copy)
+public enum ServiceOpcode: U32 {
+    // The machine describing itself, with a File to read it through.
+    Hello = 1
+    DisplayLink = 2
+    DisplayMode = 3
+    // The desktop asks PID 1 to open the bundle whose path follows.
+    Launch = 4
+    // The dev root changed the files whose paths follow, one a line, and asks
+    // PID 1 to restart every process that loads one.
+    RestartLoaders = 5
+    // The desktop asks PID 1 to install the application bundle whose path
+    // follows, at the top of a disk image in /Volumes.
+    Install = 6
+    // The desktop asks PID 1 to uninstall the installed application whose
+    // path, `/Applications/<Name>.app`, follows.
+    Uninstall = 7
+    // PID 1's answer to a desktop request, a sentence for the person, on the
+    // channel the request carried.
+    Answer = 8
+    // To MosaicDisplay: bring the client whose number is the detail word to
+    // the front, because the desktop opened an application that was open
+    // already.
+    BringForward = 9
+    // One end of a platform link (roadmap/11-adaptive-desktop.md): the channel
+    // between an application's AppKit and the running platform. The detail word
+    // is the application's display client number, which is its surface; the
+    // platform is handed the other end with the same number. A platform started
+    // again is handed a new link to every application, and each application a
+    // new end, which replaces the one it held.
+    PlatformLink = 10
+    // The running platform asks PID 1 to switch to the Dynamic Platform whose
+    // program, a `platform.dynamic` value, follows (roadmap/15-form-factors.md).
+    SwitchPlatform = 11
+}
+
+// The role PID 1 gives a display link, which MosaicDisplay keeps for the
+// client and passes on to the platform. Init, the compositor and the platforms name
+// the roles from here.
+@Derive(Copy)
+public enum DisplayRole: U32 {
+    None = 0
+    Application = 1
+    // The one session allowed to drive the compositor.
+    Platform = 2
+    // The desktop: the surface under every application, which may ask PID 1 to
+    // open one. Its channel is the only one PID 1 reads requests from.
+    Desktop = 3
+    // The Presence service's link (roadmap/16 §14): MosaicDisplay answers its
+    // token checks on it and shows no surface for it.
+    Presence = 4
+}

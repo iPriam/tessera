@@ -1,0 +1,208 @@
+import Foundation
+import Heap
+import LibTessera
+
+// What PID 1 sends a display client on its ParentChannel: a greeting, then
+// the Channel to MosaicDisplay, and a new one each time MosaicDisplay is
+// started again. An application, the desktop and the platform are also sent
+// platform links (roadmap/11-adaptive-desktop.md): the application one end, after
+// its display link, and the platform the other, and again whenever the platform is
+// started again.
+
+public struct DisplayServiceMessage {
+    var opcode: ServiceOpcode
+    // The handle the message carried, if any.
+    var handle: Handle?
+    var detail: UNumber
+    // What followed the header: a platform link's application name.
+    var body: String = ""
+}
+
+// A link to MosaicDisplay: the Channel, and the client's number, which is the
+// surface MosaicDisplay gives it.
+public struct DisplayLink {
+    var channel: Handle
+    var clientIndex: UNumber
+}
+
+// One end of a platform link: the Channel between an application's AppKit and
+// the running platform, and the application's number, which is its surface. The
+// platform holds one per application; an application holds one, and a new one
+// replaces it.
+public struct PlatformLink {
+    var channel: Handle
+    var clientIndex: UNumber
+    // The name of the application on the other end, as PID 1 opened it: what
+    // the platform's Dock knows it by. The desktop's is `desktop`.
+    var application: String = ""
+}
+
+namespace ServiceBody {
+    // The most a message from PID 1 to a display client carries after its
+    // header: an application's name.
+    let limit: UNumber = 256
+}
+
+// A link PID 1 handed over.
+public enum ServiceLink {
+    Display(DisplayLink)
+    Platform(PlatformLink)
+}
+
+// The next message PID 1 sends, or why there is none: `PeerClosed` once PID
+// 1 has gone.
+public function receiveDisplayServiceMessage() -> Result<DisplayServiceMessage, TesseraError> {
+    let capacity = ServiceMessage.headerBytes + ServiceBody.limit
+    let bodyBytes = zeroedBlock(count: capacity, alignment: 16)
+    let body = bodyBytes.pointer()
+    let channel = try serviceChannel()
+    let received = match readMessage(channel, body, capacity, 1) {
+        Ok(value) -> value
+        Error(failed) -> return .Error(failed)
+    }
+    var carried: Handle? = .None
+    for (index, handle) in received.handles.enumerated() {
+        if index == 0 { carried = .Some(handle) } else { release(handle) }
+    }
+    let opcode = received.bytes < ServiceMessage.headerBytes ? .None : serviceOpcodeOf(
+        heapLoad<U32>(body, 0)
+    )
+    match opcode {
+        Some(value) -> return .Ok(
+            DisplayServiceMessage {
+                opcode: value,
+                handle: carried,
+                detail: UNumber(heapLoad<U32>(body, 12)),
+                body: stringFromCBytes(
+                    heapOffset(body, ServiceMessage.headerBytes),
+                    received.bytes - ServiceMessage.headerBytes
+                )
+            }
+        )
+        None -> {
+            closeCarried(carried)
+            return .Error(protocolFailure(.InvalidArgument))
+        }
+    }
+}
+
+let serviceOpcodes: [ServiceOpcode] = [ServiceOpcode.Hello, ServiceOpcode.DisplayLink, ServiceOpcode.DisplayMode, ServiceOpcode.Launch, ServiceOpcode.RestartLoaders, ServiceOpcode.Install, ServiceOpcode.Uninstall, ServiceOpcode.Answer, ServiceOpcode.BringForward, ServiceOpcode.PlatformLink]
+
+function serviceOpcodeOf(raw: UN32) -> ServiceOpcode? {
+    for opcode in serviceOpcodes {
+        if opcode.rawValue() == raw { return .Some(opcode) }
+    }
+    return .None
+}
+
+function closeCarried(carried: borrow Handle?) {
+    match carried {
+        Some(handle) -> release(handle)
+        None -> {}
+    }
+}
+
+// The link `message` hands over, if it is one; anything else it carried is
+// closed.
+function linkOf(message: borrow DisplayServiceMessage) -> DisplayLink? {
+    if message.opcode == .DisplayLink && message.detail > 0 {
+        match message.handle {
+            Some(channel) -> return .Some(
+                DisplayLink { channel: channel, clientIndex: message.detail }
+            )
+            None -> return .None
+        }
+    }
+    closeCarried(message.handle)
+    return .None
+}
+
+// The link `message` hands over, display or platform, if it is one; anything
+// else it carried is closed.
+function serviceLinkOf(message: borrow DisplayServiceMessage) -> ServiceLink? {
+    if message.opcode == .PlatformLink && message.detail > 0 {
+        match message.handle {
+            Some(channel) -> return .Some(
+                .Platform(
+                    PlatformLink {
+                        channel: channel,
+                        clientIndex: message.detail,
+                        application: copy message.body
+                    }
+                )
+            )
+            None -> return .None
+        }
+    }
+    return match linkOf(message) {
+        Some(link) -> .Some(.Display(link))
+        None -> .None
+    }
+}
+
+// Takes PID 1's greeting, the first message on the service channel. A greeting
+// that cannot be taken is returned, for the caller to say.
+public function takeGreeting() -> Result<Void, TesseraError> {
+    let greeting = try receiveDisplayServiceMessage()
+    // The greeting's file is the machine's description, which a display
+    // client has no use for.
+    closeCarried(greeting.handle)
+    return .Ok
+}
+
+// The first link after PID 1's greeting. A client started while MosaicDisplay
+// is starting again gets it once that one runs, and a platform started beside
+// running applications gets their platform links first, which this closes: a
+// platform takes the greeting and then reads with `takeServiceLink`.
+public function takeInitialDisplayLink() -> Result<DisplayLink?, TesseraError> {
+    try takeGreeting()
+    return takeReplacementDisplayLink()
+}
+
+public function closeDisplayLink(link: borrow DisplayLink) {
+    release(link.channel)
+}
+
+// The link PID 1 hands over once MosaicDisplay has started again, or none
+// once PID 1 has gone.
+public function takeReplacementDisplayLink() -> Result<DisplayLink?, TesseraError> {
+    while true {
+        let message = match receiveDisplayServiceMessage() {
+            Ok(value) -> value
+            Error(failure) -> return failure.code == .PeerClosed ? .Ok(.None) : .Error(failure)
+        }
+        match linkOf(message) {
+            Some(link) -> return .Ok(.Some(link))
+            None -> {}
+        }
+    }
+    return .Ok(.None)
+}
+
+// The next link PID 1 hands over, display or platform, or none once PID 1 has
+// gone. Anything else it sends is closed. A client that holds a platform link
+// reads its service channel with this, both between display sessions and
+// when the channel is readable during one, so no platform link is lost.
+public function takeServiceLink() -> Result<ServiceLink?, TesseraError> {
+    while true {
+        let message = match receiveDisplayServiceMessage() {
+            Ok(value) -> value
+            Error(failure) -> return failure.code == .PeerClosed ? .Ok(.None) : .Error(failure)
+        }
+        match serviceLinkOf(message) {
+            Some(link) -> return .Ok(.Some(link))
+            None -> {}
+        }
+    }
+    return .Ok(.None)
+}
+
+// The ParentChannel PID 1 started this process with, for a client that waits
+// on it beside its display channel; `NotFound` when there is none.
+public function displayServiceChannel() -> Result<Handle, TesseraError> {
+    return serviceChannel()
+}
+
+public function closePlatformLink(link: borrow PlatformLink) {
+    release(link.channel)
+}

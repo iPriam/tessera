@@ -1,0 +1,313 @@
+import Foundation
+import Heap
+import LibTessera
+
+// The connection to the device manager, `devicekitd` (17 §20.1).
+//
+// It is a `SOCK_SEQPACKET` socket on the abstract name `tessera.devicekit`,
+// made the first time a call needs the manager. Every exchange is one request
+// and one reply of `Wire.bytes` bytes, with at most one descriptor riding
+// along as `SCM_RIGHTS`:
+//
+//     request   @0 op  @4 kind  @8 entry  @16 options  @24 rights
+//               @32 lifetime  @40 token high  @48 token low  @64 payload (128)
+//     reply     @0 code  @4 kind  @8 detail  @16 rights  @24 token high
+//               @32 token low  @40 entry  @48 flags  @64 payload (128)
+//
+// What a slot holds depends on the op; each request's maker says. The
+// manager answers in order, so a reply is always the answer to the request
+// just sent.
+
+namespace Wire {
+    let bytes: Number = 192
+    let payload: Number = 64
+    let address: String = "tessera.devicekit"
+}
+
+public enum ManagerOp: U32 {
+    Open = 1
+    Export = 2
+    Import = 3
+    Claim = 4
+    Publish = 5
+    Unpublish = 6
+    Published = 7
+}
+
+// A request's fixed slots.
+struct ManagerRequest {
+    var op: ManagerOp
+    var kind: U32
+    var entry: U64
+    var options: U64
+    var rights: U64
+    var lifetime: U64
+    var token: Token
+
+    // The request's bytes; a payload goes from `Wire.payload`.
+    function encode(borrow self) -> ByteBlock {
+        let blockBytes = zeroedBlock(count: Wire.bytes, alignment: 16)
+        let block = blockBytes.pointer()
+        heapStore<U32>(block, 0, code(self.op))
+        heapStore<U32>(block, 4, self.kind)
+        heapStore<U64>(block, 8, self.entry)
+        heapStore<U64>(block, 16, self.options)
+        heapStore<U64>(block, 24, self.rights)
+        heapStore<U64>(block, 32, self.lifetime)
+        heapStore<U64>(block, 40, self.token.high)
+        heapStore<U64>(block, 48, self.token.low)
+        return move blockBytes
+    }
+}
+
+// A request of `op` with every slot empty.
+function managerRequest(op: borrow ManagerOp) -> ManagerRequest {
+    return ManagerRequest {
+        op: op,
+        kind: U32(0),
+        entry: U64(0),
+        options: U64(0),
+        rights: U64(0),
+        lifetime: U64(0),
+        token: Token { high: U64(0), low: U64(0) },
+    }
+}
+
+// The manager's answer to a request it carried out, and the descriptor it
+// passed, which the caller now owns.
+struct ManagerReply {
+    var kind: U32
+    var detail: U64
+    var rights: U64
+    var token: Token
+    var entry: U64
+    var flags: U32
+    var passed: Descriptor?
+    var payload: ByteBlock
+
+    // The `u64` at `offset` in the reply's payload.
+    function payloadWord(borrow self, offset: Number) -> U64 {
+        return heapLoad<U64>(self.payload.pointer(), offset)
+    }
+}
+
+// `struct sockaddr_un` for an abstract name: the family, a NUL, the name.
+function abstractAddress(name: borrow String) -> ByteBlock {
+    let addressBytes = zeroedBlock(count: 110, alignment: 16)
+    let address = addressBytes.pointer()
+    heapStore<U16>(address, 0, U16(Socket.unix))
+    copyBytes(heapOffset(address, 3), name.data, name.count)
+    return move addressBytes
+}
+
+namespace Socket {
+    let unix: U64 = U64(1)
+    let netlink: U64 = U64(16)
+    let datagram: U64 = U64(2)
+    let sequencedPacket: U64 = U64(5)
+    // `SOCK_NONBLOCK` and `SOCK_CLOEXEC` share `open`'s numbers.
+    let nonBlock: U64 = OpenFlags.nonBlock.raw
+    let closeOnExec: U64 = OpenFlags.closeOnExec.raw
+}
+
+namespace ManagerRetry {
+    let tries: Number = 100
+    let pause: Number = 50 * Time.nanosecondsPerMillisecond
+}
+
+function pause(nanoseconds: Number) {
+    let now = match monotonicNow() {
+        Ok(value) -> value
+        Error(failed) -> {
+            log warn("the clock could not be read; not pausing", error: errorName(failed))
+            return
+        }
+    }
+    match threadSleep(now + nanoseconds) {
+        Ok -> {}
+        Error(failed) -> log warn("a pause ended early", error: errorName(failed))
+    }
+}
+
+// The manager's socket, connecting on first use. The manager is started
+// before every service that uses it, but a service restarted while the
+// manager restarts too may find nobody listening for a moment, so a refused
+// connection is retried for five seconds.
+function managerSocket() -> Result<Descriptor, TesseraError> {
+    match deviceLibrary.manager {
+        Some(socket) -> return .Ok(socket)
+        None -> {}
+    }
+    let addressBytes = abstractAddress(Wire.address)
+    let length = 3 + Wire.address.count
+    for retry in 0..ManagerRetry.tries {
+        let socket = try socketObject(
+            Socket.unix,
+            Socket.sequencedPacket | Socket.closeOnExec,
+            U64(0)
+        )
+        match socket.connect(addressBytes.pointer(), length) {
+            Ok -> {
+                deviceLibrary.manager = .Some(socket)
+                return .Ok(socket)
+            }
+            Error(failed) -> {
+                socket.close()
+                match errnoOf(failed) {
+                    ConnectionRefused -> {}
+                    NoEntry -> {}
+                    else -> return .Error(failed)
+                }
+            }
+        }
+        pause(ManagerRetry.pause)
+    }
+    return .Error(failure(.ConnectionRefused))
+}
+
+// `struct msghdr` with one vector over `block` and room for one
+// `SCM_RIGHTS` descriptor, in one allocation: the header @0, the vector @56,
+// the control message @72.
+function messageHeader(block: RawPtr, length: Number) -> ByteBlock {
+    let headerBytes = zeroedBlock(count: 56 + 16 + 24, alignment: 16)
+    let header = headerBytes.pointer()
+    let vector = heapOffset(header, 56)
+    heapStore<RawPtr>(vector, 0, block)
+    heapStore<U64>(vector, 8, U64(length))
+    heapStore<RawPtr>(header, 16, vector)
+    heapStore<U64>(header, 24, U64(1))
+    return move headerBytes
+}
+
+namespace Message {
+    // `MSG_NOSIGNAL`: a manager that went away is an error, not a signal.
+    let noSignal: U64 = U64(0x4000)
+    let closeOnExec: U64 = U64(0x40000000)
+    // `CMSG_LEN(4)`, `SOL_SOCKET`, `SCM_RIGHTS`.
+    let rightsLength: U64 = U64(20)
+    let socketLevel: U32 = U32(1)
+    let rights: U32 = U32(1)
+}
+
+// One message on `socket`, with `passing` as `SCM_RIGHTS`.
+function sendWithDescriptor(
+    socket: borrow Descriptor,
+    block: RawPtr,
+    length: Number,
+    passing: borrow Descriptor?
+) -> Result<Void, TesseraError> {
+    let headerBytes = messageHeader(block, length)
+    let header = headerBytes.pointer()
+    match passing {
+        Some(descriptor) -> {
+            let control = heapOffset(header, 72)
+            heapStore<U64>(control, 0, Message.rightsLength)
+            heapStore<U32>(control, 8, Message.socketLevel)
+            heapStore<U32>(control, 12, Message.rights)
+            heapStore<U32>(control, 16, U32(descriptor.number))
+            heapStore<RawPtr>(header, 32, control)
+            heapStore<U64>(header, 40, U64(24))
+        }
+        None -> {}
+    }
+    let sent = try socket.sendMessage(header, Message.noSignal)
+    return .Ok
+}
+
+// What one received message brought: its length and the descriptor that
+// came with it.
+struct Received {
+    var length: Number
+    var passed: Descriptor?
+}
+
+// One message into `block`.
+function receiveWithDescriptor(
+    socket: borrow Descriptor,
+    block: RawPtr,
+    length: Number
+) -> Result<Received, TesseraError> {
+    let headerBytes = messageHeader(block, length)
+    let header = headerBytes.pointer()
+    let control = heapOffset(header, 72)
+    heapStore<RawPtr>(header, 32, control)
+    heapStore<U64>(header, 40, U64(24))
+    let got = try socket.receiveMessage(header, Message.closeOnExec)
+    var passed: Descriptor? = .None
+    if heapLoad<U64>(header, 40) >= Message.rightsLength && heapLoad<U32>(
+        control,
+        8
+    ) == Message.socketLevel && heapLoad<U32>(control, 12) == Message.rights {
+        passed = .Some(Descriptor { number: Number(heapLoad<U32>(control, 16)) })
+    }
+    return .Ok(Received { length: got, passed: passed })
+}
+
+// The manager went away: its socket closes, and the next call connects
+// again.
+function managerLost() -> TesseraError {
+    match deviceLibrary.manager {
+        Some(socket) -> socket.close()
+        None -> {}
+    }
+    deviceLibrary.manager = .None
+    return failure(.DeviceLost)
+}
+
+function managerCall(
+    request: borrow ManagerRequest,
+    passing: borrow Descriptor?
+) -> Result<ManagerReply, TesseraError> {
+    let requestBytes = request.encode()
+    return exchange(requestBytes.pointer(), passing)
+}
+
+// Sends the request in `block` (and `passing`) and waits for the reply. A
+// reply whose code is not `Ok` is that failure, and closes anything passed
+// with it.
+function exchange(
+    block: RawPtr,
+    passing: borrow Descriptor?
+) -> Result<ManagerReply, TesseraError> {
+    let socket = try managerSocket()
+    match sendWithDescriptor(socket, block, Wire.bytes, passing) {
+        Ok -> {}
+        Error(failed) -> {
+            absorb failed
+            // Every way a send to the manager fails means it is gone.
+            return .Error(managerLost())
+        }
+    }
+    let replyBytes = zeroedBlock(count: Wire.bytes, alignment: 16)
+    let reply = replyBytes.pointer()
+    let received = match receiveWithDescriptor(socket, reply, Wire.bytes) {
+        Ok(value) -> value
+        Error(failed) -> {
+            absorb failed
+            return .Error(managerLost())
+        }
+    }
+    if received.length == 0 { return .Error(managerLost()) }
+    let answer = errorCodeFrom(heapLoad<U32>(reply, 0))
+    if answer != .Ok {
+        match received.passed {
+            Some(descriptor) -> descriptor.close()
+            None -> {}
+        }
+        return .Error(failure(answer, Number(heapLoad<U64>(reply, 8))))
+    }
+    let payloadBytes = zeroedBlock(count: Wire.bytes - Wire.payload, alignment: 16)
+    copyBytes(payloadBytes.pointer(), heapOffset(reply, Wire.payload), Wire.bytes - Wire.payload)
+    return .Ok(
+        ManagerReply {
+            kind: heapLoad<U32>(reply, 4),
+            detail: heapLoad<U64>(reply, 8),
+            rights: heapLoad<U64>(reply, 16),
+            token: Token { high: heapLoad<U64>(reply, 24), low: heapLoad<U64>(reply, 32) },
+            entry: heapLoad<U64>(reply, 40),
+            flags: heapLoad<U32>(reply, 48),
+            passed: received.passed,
+            payload: move payloadBytes,
+        }
+    )
+}

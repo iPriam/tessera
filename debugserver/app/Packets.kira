@@ -1,0 +1,112 @@
+import Foundation
+
+// gdb-remote framing. A packet is `$data#cc`, `cc` the hex of the sum of the
+// data's bytes; the receiver answers `+`, or `-` to have it sent again, until
+// the debugger turns acknowledgement off. A lone 0x03 asks a running process
+// to stop. In a reply, `#`, `$`, `}` and `*` are sent as `}` and the byte
+// xor 0x20.
+
+namespace Framing {
+    let start: UN8 = 36
+    let end: UN8 = 35
+    let escape: UN8 = 125
+    let repeat: UN8 = 42
+    let acknowledged: UN8 = 43
+    let rejected: UN8 = 45
+    let interrupt: UN8 = 3
+}
+
+enum Inbound {
+    Packet(String)
+    Interrupt
+    // A packet whose checksum did not match, which the host sends again.
+    Corrupt
+}
+
+// What arrived and has not yet made a whole packet.
+struct PacketReader {
+    var pending: [UN8] = []
+}
+
+// Each packet and interrupt in what has arrived so far; a packet cut off
+// stays in the reader for the next read to finish.
+function takeInbound(reader: borrow mut PacketReader, arrived: borrow [UN8]) -> [Inbound] {
+    for byte in arrived { reader.pending.append(byte) }
+    var inbound: [Inbound] = []
+    var at = 0
+    while at < reader.pending.count {
+        let byte = reader.pending[at]
+        if byte == Framing.interrupt {
+            inbound.append(.Interrupt)
+            at += 1
+            continue
+        }
+        if byte != Framing.start {
+            // `+`, `-` and anything between packets.
+            at += 1
+            continue
+        }
+        let found = packetEnd(reader.pending, at + 1)
+        // A packet not yet whole, which the next read finishes.
+        if found.isNone() { break }
+        let closing = found.or(0)
+        if closing + 2 >= reader.pending.count { break }
+        inbound.append(packetAt(reader.pending, at + 1, closing))
+        at = closing + 3
+    }
+    var rest: [UN8] = []
+    for index in at..reader.pending.count { rest.append(reader.pending[index]) }
+    reader.pending = rest
+    return inbound
+}
+
+function packetEnd(bytes: borrow [UN8], from: Number) -> Number? {
+    for index in from..bytes.count {
+        if bytes[index] == Framing.end { return .Some(index) }
+    }
+    return .None
+}
+
+// The packet between `$` and `#`, checked against the two digits after it.
+function packetAt(bytes: borrow [UN8], from: Number, closing: Number) -> Inbound {
+    var sum = 0
+    var data: [UN8] = []
+    for index in from..closing {
+        sum += Number(bytes[index])
+        data.append(bytes[index])
+    }
+    let written = [bytes[closing + 1], bytes[closing + 2]]
+    let expected = match parseHexBytes(textOfBytes(written)) {
+        Ok(value) -> Number(value[0])
+        // Text that is not two hex digits cannot be the check sum it names.
+        Error(reason) -> return .Corrupt
+    }
+    if expected != sum % 256 { return .Corrupt }
+    return match textFromBytes(data) {
+        Some(text) -> .Packet(text)
+        None -> .Corrupt
+    }
+}
+
+function textOfBytes(bytes: borrow [UN8]) -> String {
+    return textFromBytes(bytes).or("")
+}
+
+// `data` framed as a reply.
+function framedReply(data: borrow [UN8]) -> [UN8] {
+    var framed: [UN8] = [Framing.start]
+    var sum = 0
+    for byte in data {
+        if byte == Framing.start || byte == Framing.end || byte == Framing.escape || byte == Framing.repeat {
+            framed.append(Framing.escape)
+            framed.append(byte ^ UN8(32))
+            sum += Number(Framing.escape) + Number(byte ^ UN8(32))
+        } else {
+            framed.append(byte)
+            sum += Number(byte)
+        }
+    }
+    framed.append(Framing.end)
+    for digit in hexByte(sum % 256).utf8() { framed.append(digit) }
+    return framed
+}

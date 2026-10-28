@@ -1,0 +1,35 @@
+Keep the emulator out of App Nap while a guest runs.
+
+macOS naps an application whose windows are not in front: its timers and
+sleeps are coalesced, by up to about a second. The emulator is such an
+application whenever its window is behind another, and everything a guest asks
+of it then waits: venus's renderer polls its command rings with short sleeps,
+and the guest's Vulkan driver waits on each reply, so one synchronous Vulkan
+call took about a second. An application launched in the guest with the
+window behind took 5.6 s to show its first frame, and 0.7 s with the window in
+front.
+
+The application controller begins a user-initiated, latency-critical activity
+once it has launched, and holds it for the life of the process. It still lets
+the machine sleep when idle.
+
+--- a/ui/cocoa.m	2026-10-19 06:41:47
++++ b/ui/cocoa.m	2026-10-19 06:41:56
+@@ -1340,6 +1340,17 @@
+ {
+     COCOA_DEBUG("QemuCocoaAppController: applicationDidFinishLaunching\n");
+     allow_events = true;
++
++    /*
++     * A guest keeps time and answers its devices whether or not this window
++     * is in front. Without an activity macOS naps the process when it is
++     * not, coalescing its timers and sleeps by up to a second, and every
++     * device that polls or sleeps between polls answers that much later.
++     */
++    [[[NSProcessInfo processInfo]
++        beginActivityWithOptions:NSActivityUserInitiatedAllowingIdleSystemSleep |
++                                 NSActivityLatencyCritical
++                          reason:@"A virtual machine is running"] retain];
+ }
+ 
+ - (void)applicationWillTerminate:(NSNotification *)aNotification

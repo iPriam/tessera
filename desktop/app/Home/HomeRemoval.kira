@@ -1,0 +1,106 @@
+import Foundation
+import HomeLayout
+import LibTessera
+import KiraUI
+
+// The question Home asks before an item leaves it, as an iPad asks: Remove
+// "Notes"? It offers Delete App for an application installed from a disk
+// image, Remove from Home Screen, and Cancel.
+
+function removalTitle(item: borrow HomeItem?) -> String {
+    return match item {
+        Some(value) -> "Remove “\(value.name())”?"
+        None -> "Remove from Home Screen?"
+    }
+}
+
+function removalMessage(item: borrow HomeItem?) -> String {
+    return match item {
+        Some(value) -> match value {
+            App -> "Removing from Home Screen will keep the app in your App Library."
+            Folder -> "Removing from Home Screen will keep its apps in your App Library."
+        }
+        None -> "The chosen item is no longer on Home Screen."
+    }
+}
+
+// The question's buttons for `item` at `slot`; each closes the question with
+// `close`.
+function removalActions(
+    item: borrow HomeItem?,
+    slot: borrow HomeSlot,
+    applications: borrow [Application],
+    close: () -> Void
+) -> [Any Widget] {
+    let asked = match item {
+        Some(value) -> value
+        None -> return []
+    }
+    var actions: [Any Widget] = []
+    match removalDeletable(asked, applications) {
+        Some(application) -> {
+            let closed = copy close
+            actions.append(
+                Button(
+                    role = .Destructive,
+                    action = { in
+                        deleteApplication(application)
+                        closed()
+                    }
+                ) {
+                    Text("Delete App")
+                }
+            )
+        }
+        // Only an application installed from a disk image can be deleted.
+        None -> {}
+    }
+    let taken = copy slot
+    let removed = copy close
+    actions.append(
+        Button(
+            action = { in
+                takeOffHome(taken)
+                removed()
+            }
+        ) {
+            Text("Remove from Home Screen")
+        }
+    )
+    actions.append(
+        Button(action = close) {
+            Text("Cancel").fontWeight(.SemiBold)
+        }
+    )
+    return actions
+}
+
+// The application `item` is, when it was installed from a disk image and so
+// can be deleted.
+function removalDeletable(
+    item: borrow HomeItem,
+    applications: borrow [Application]
+) -> Application? {
+    let name = match item {
+        App(value) -> value
+        Folder -> return .None
+    }
+    let application = try applicationNamed(applications, name) otherwise return .None
+    if application.place != .InstalledImage { return .None }
+    return .Some(application)
+}
+
+// Takes the item at `slot` off Home: an application goes to App Library, and
+// a folder's applications with it.
+function takeOffHome(slot: borrow HomeSlot) {
+    var changed = loadArrangement()
+    match changed.itemAt(slot) {
+        Some(found) -> match found {
+            App(name) -> changed.removeFromHome(name)
+            Folder -> changed.removeFolder(slot)
+        }
+        // The item went while the question was open.
+        None -> {}
+    }
+    commitHome(changed)
+}

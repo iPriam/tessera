@@ -1,0 +1,8 @@
+//! The signed machine word of the registry's I64 payload, which the wire layout gives as an unsigned value.
+import Foundation
+import Heap
+
+/// The registry's I64 payload, read as the signed machine word its wire layout holds.
+function registrySignedWord(value: RawPtr) -> Number {
+    return Number(heapLoad<Int>(value, 0))
+}

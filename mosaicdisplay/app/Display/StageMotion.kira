@@ -1,0 +1,263 @@
+import Foundation
+import LibTessera
+import TesseraDisplayClient
+
+// The existing client surface travels between its window and its place in
+// the strip. Its buffer, glass, shadow and identity stay together. A second
+// activation starts at the current presentation, including midway through
+// the first, rather than jumping back to either endpoint.
+//
+// A window going from one frame to another, as a zoom, a mode or Stage
+// Manager moves it, is resized all the way: on each frame of the motion the
+// application is sent the size it is at, and draws itself at that size.
+struct StageMotion {
+    var index: Number
+    var from: Geometry
+    var to: Geometry
+    var fromBadge: Number
+    var toBadge: Number
+    // The size the application was last sent on the way, and when.
+    var sent: Geometry = Geometry { x: 0, y: 0, width: 0, height: 0 }
+    var sentAt: UNumber = 0
+}
+
+// How long a motion waits for a window resized on the way to draw the size
+// it was sent: at most `step` for one size, and `motion` in all, so an
+// application that draws slowly slows the motion down and one that has stopped
+// drawing does not hold it.
+namespace ResizePace {
+    let step: UNumber = 100
+    let motion: UNumber = 300
+}
+
+function stageDestination(server: borrow Server, index: Number) -> Geometry? {
+    if inStrip(server, index) { return stripPicture(server, index) }
+    return .Some(server.clients[index].frame)
+}
+
+function stageProgress(server: borrow Server) -> Number {
+    let elapsed = max(Number(stageTime(server)) - Number(server.stageStarted), 0)
+    let t = clamp(elapsed / StageLayout.duration, 0, 1)
+    return 1 - (1 - t) * (1 - t) * (1 - t)
+}
+
+// A failed clock read freezes a transition at its last observed point rather
+// than inventing a zero timestamp and restarting its motion.
+function stageTime(server: borrow Server) -> UNumber {
+    match nowMillis() {
+        Ok(value) -> return value
+        Error(reason) -> {
+            log warn("the stage clock could not be read; its motion is held", error: errorName(reason))
+            return server.stageTicked
+        }
+    }
+}
+
+function betweenFrames(from: borrow Geometry, to: borrow Geometry, progress: Number) -> Geometry {
+    return Geometry {
+        x: from.x + (to.x - from.x) * progress,
+        y: from.y + (to.y - from.y) * progress,
+        width: from.width + (to.width - from.width) * progress,
+        height: from.height + (to.height - from.height) * progress,
+    }
+}
+
+// Rendering and hit testing read this same presentation geometry.
+function presentedWindow(server: borrow Server, index: Number, progress: Number = -1) -> Geometry? {
+    for motion in server.stageMotion {
+        if motion.index == index {
+            return .Some(
+                betweenFrames(
+                    motion.from,
+                    motion.to,
+                    progress < 0 ? stageProgress(server) : progress
+                )
+            )
+        }
+    }
+    return stageDestination(server, index)
+}
+
+function stageSnapshot(server: borrow Server) -> [StageMotion] {
+    var snapshot: [StageMotion] = []
+    let progress = stageProgress(server)
+    for index in 0..server.clients.count {
+        if !onStage(server.clients[index]) { continue }
+        match presentedWindow(server, index, progress) {
+            Some(frame) -> {
+                let badge = presentedBadge(server, index, progress)
+                snapshot.append(
+                    StageMotion {
+                        index: index,
+                        from: copy frame,
+                        to: frame,
+                        fromBadge: badge,
+                        toBadge: badge
+                    }
+                )
+            }
+            None -> {}
+        }
+    }
+    return snapshot
+}
+
+function animateStage(server: borrow mut Server, before: borrow [StageMotion]) {
+    var motion: [StageMotion] = []
+    for previous in before {
+        if !onStage(server.clients[previous.index]) { continue }
+        match stageDestination(server, previous.index) {
+            Some(target) -> {
+                let badge: Number = inStrip(server, previous.index) ? 1 : 0
+                if !sameFrame(previous.from, target) || previous.fromBadge != badge {
+                    motion.append(
+                        StageMotion {
+                            index: previous.index,
+                            from: previous.from,
+                            to: target,
+                            fromBadge: previous.fromBadge,
+                            toBadge: badge
+                        }
+                    )
+                }
+            }
+            None -> {}
+        }
+    }
+    server.stageMotion = move motion
+    server.stageStarted = stageTime(server)
+    server.stageTicked = server.stageStarted
+    server.stageHeld = 0
+    if server.stageMotion.count == 0 { return }
+    log info("moving the existing stage surfaces", windows: server.stageMotion.count)
+    resizeMoving(server)
+    armStage(server)
+    redraw(server, "a stage transition")
+}
+
+// Only an active transition schedules frames. At rest, the compositor goes
+// back to sleeping on input and client commits.
+function armStage(server: borrow mut Server) {
+    if server.stageTimer.isNone() {
+        match timerCreate(.Monotonic) {
+            Ok(timer) -> server.stageTimer = .Some(timer)
+            Error(reason) -> stopStageWithoutTimer(server, reason)
+        }
+    }
+    let timer = try server.stageTimer otherwise return
+    let armed = match monotonic() {
+        Ok(now) -> timerSet(
+            timer,
+            UNumber(now + 16000000),
+            0,
+            TimerOptions.none,
+            server.port,
+            PortKey.stage
+        )
+        Error(failed) -> .Error(failed)
+    }
+    match armed {
+        Ok -> {}
+        Error(reason) -> stopStageWithoutTimer(server, reason)
+    }
+}
+
+function stopStageWithoutTimer(server: borrow mut Server, reason: borrow TesseraError) {
+    log warn("a stage transition could not schedule a frame", error: errorName(reason))
+    server.stageMotion = []
+}
+
+function stageTick(server: borrow mut Server, fired: borrow Completion) {
+    if fired.error.code != .Ok || server.stageMotion.count == 0 { return }
+    // While a window has not drawn the size it was sent the motion holds
+    // where it is, so what is shown is the application at that size.
+    let now = stageTime(server)
+    let since = now > server.stageTicked ? now - server.stageTicked : UNumber(0)
+    if since > 0 && server.stageHeld + since <= ResizePace.motion && waitingOnResize(server, now) {
+        server.stageStarted = server.stageStarted + since
+        server.stageHeld = server.stageHeld + since
+    }
+    server.stageTicked = now
+    if stageProgress(server) >= 1 {
+        settleMoving(server)
+        server.stageMotion = []
+        let surface = match stageFront(server) {
+            Some(index) -> server.clients[index].surface.raw
+            None -> UNumber(0)
+        }
+        log info("the stage transition settled", surface: surface)
+    }
+    retarget(server)
+    if server.stageMotion.count > 0 {
+        resizeMoving(server)
+        armStage(server)
+    }
+    redraw(server, "a stage transition frame")
+}
+
+// Sends each window moving between two frames of its own the size it is at
+// now, when that is a point or more from the size it was last sent. A window
+// going to or from the strip is a picture of itself there, and keeps its size.
+function resizeMoving(server: borrow mut Server) {
+    let progress = stageProgress(server)
+    for at in 0..server.stageMotion.count {
+        let motion = server.stageMotion[at]
+        if motion.fromBadge != 0 || motion.toBadge != 0 { continue }
+        let now = betweenFrames(motion.from, motion.to, progress)
+        let size = Geometry {
+            x: trunc(now.x + 0.5),
+            y: trunc(now.y + 0.5),
+            width: trunc(now.width + 0.5),
+            height: trunc(now.height + 0.5),
+        }
+        if abs(size.width - motion.sent.width) < 1 && abs(size.height - motion.sent.height) < 1
+            && abs(size.x - motion.sent.x) < 1 && abs(size.y - motion.sent.y) < 1 { continue }
+        if !server.clients[motion.index].alive { continue }
+        match sendConfigureFrame(server, motion.index, size, Relayout.serial) {
+            Ok -> {
+            server.stageMotion[at].sent = move size
+            match nowMillis() {
+                Ok(now) -> server.stageMotion[at].sentAt = now
+                Error(reason) -> log warn("a resized stage window's time could not be read", error: errorName(reason))
+            }
+            }
+            Error(reason) -> configurationFailed(server, motion.index, reason)
+        }
+    }
+}
+
+// Whether a window resized on the way has yet to draw the size it was last
+// sent, and has not been waited on for a whole step.
+function waitingOnResize(server: borrow Server, now: UNumber) -> Bool {
+    let scale = server.display.scanout.scale
+    for motion in server.stageMotion {
+        if motion.fromBadge != 0 || motion.toBadge != 0 || motion.sent.width == 0 { continue }
+        if now > motion.sentAt + ResizePace.step { continue }
+        let client = server.clients[motion.index]
+        if !client.alive { continue }
+        match client.content {
+            Some(drawn) -> {
+                let width = drawn.width / scale - client.margin * 2
+                let height = drawn.height / scale - client.margin * 2
+                if abs(width - motion.sent.width) >= 1 || abs(height - motion.sent.height) >= 1 {
+                    return true
+                }
+            }
+            None -> {}
+        }
+    }
+    return false
+}
+
+// The motion is over: each window resized on the way is sent its own frame.
+function settleMoving(server: borrow mut Server) {
+    for motion in server.stageMotion {
+        if motion.fromBadge != 0 || motion.toBadge != 0 || motion.sent.width == 0 { continue }
+        if !server.clients[motion.index].alive { continue }
+        if sameFrame(motion.sent, server.clients[motion.index].frame) { continue }
+        match sendConfigure(server, motion.index, Relayout.serial) {
+            Ok -> {}
+            Error(reason) -> configurationFailed(server, motion.index, reason)
+        }
+    }
+}

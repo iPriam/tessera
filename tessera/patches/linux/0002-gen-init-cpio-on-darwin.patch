@@ -1,0 +1,44 @@
+Give gen_init_cpio the two Linux interfaces Darwin does not have.
+
+The program that packs a built-in initramfs opens its output with O_LARGEFILE
+and copies file contents with copy_file_range. Neither exists on Darwin: the
+flag is how a 32-bit Linux asks for 64-bit offsets, which Darwin gives
+unconditionally, and the syscall is a kernel-side copy this file already has a
+read/write fallback for two lines below the call.
+
+So the flag becomes zero and the syscall becomes a shim that fails with ENOSYS,
+which is the path the fallback was written for. Both are inside #ifdef __APPLE__.
+
+--- a/usr/gen_init_cpio.c	2026-09-06 14:57:24
++++ b/usr/gen_init_cpio.c	2026-09-06 14:57:25
+@@ -14,7 +14,30 @@
+ #include <ctype.h>
+ #include <limits.h>
+ 
++#ifdef __APPLE__
+ /*
++ * Two Linux-isms this program reaches for, on a host that has neither.
++ *
++ * O_LARGEFILE says "64-bit offsets please" to a 32-bit Linux; Darwin's are
++ * always 64-bit, so the flag has nothing to ask for and zero is what it means
++ * here. copy_file_range is a kernel-side copy with a read/write fallback right
++ * behind it in this file -- the shim reports the failure that fallback already
++ * handles, rather than reimplementing the copy a second time.
++ */
++#define O_LARGEFILE 0
++
++static inline ssize_t copy_file_range(int fd_in, off_t *off_in, int fd_out,
++				      off_t *off_out, size_t len,
++				      unsigned int flags)
++{
++	(void)fd_in; (void)off_in; (void)fd_out;
++	(void)off_out; (void)len; (void)flags;
++	errno = ENOSYS;
++	return -1;
++}
++#endif
++
++/*
+  * Original work by Jeff Garzik
+  *
+  * External file lists, symlink, pipe and fifo support by Thayne Harbaugh

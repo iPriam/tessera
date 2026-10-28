@@ -1,0 +1,67 @@
+import Foundation
+
+// Exact arithmetic on expression text: precedence, percent, sums with a
+// percent, quotients, division by zero, overflow and results below the bound.
+
+@Test
+function multiplicationBindsTighterThanAddition() {
+    expect!(outcome("1+2*3") == "7")
+    expect!(outcome("(1+2)*3") == "9")
+}
+
+@Test
+function subtractionAndDivisionAssociateLeft() {
+    expect!(outcome("10-4-3") == "3")
+    expect!(outcome("100/10/5") == "2")
+}
+
+@Test
+function unaryMinusBindsToItsOperand() {
+    expect!(outcome("-3*2") == "-6")
+    expect!(outcome("2--3") == "5")
+    expect!(outcome("-(2+3)") == "-5")
+}
+
+@Test
+function percentIsAPostfixOfOneHundredth() {
+    expect!(outcome("50%") == "0.5")
+    expect!(outcome("50%*4") == "2")
+    expect!(outcome("(10)%") == "0.1")
+    expect!(outcome("-50%") == "-0.5")
+    expect!(outcome("200*10%") == "20")
+}
+
+@Test
+function sumTakesPercentOfTheRunningTotal() {
+    expect!(outcome("200+10%") == "220")
+    expect!(outcome("200-10%") == "180")
+    expect!(outcome("200+10%+5") == "225")
+    expect!(outcome("5+3%") == "5.15")
+    expect!(outcome("200+10%*2") == "200.2")
+}
+
+@Test
+function quotientRoundsAtEighteenPlaces() {
+    expect!(outcome("1/3") == "0.333333333333333333")
+    expect!(outcome("2/3") == "0.666666666666666667")
+}
+
+@Test
+function divisionByZeroIsAnError() {
+    expect!(outcome("1/0") == "Cannot divide by zero")
+    expect!(outcome("1/(2-2)") == "Cannot divide by zero")
+}
+
+// A product past the bound is refused before it is computed.
+@Test
+function overflowIsRefusedBeforeTheOperation() {
+    expect!(outcome("10000000000*10000000000") == "The result is too large")
+    expect!(outcome("4294967296*4294967296") == "The result is too large")
+    expect!(outcome("9999999999*9999999999999999") == "The result is too large")
+}
+
+@Test
+function resultsBelowTheBoundAreExact() {
+    expect!(outcome("1000000000*1000000000") == "1000000000000000000")
+    expect!(outcome("4294967295*4294967295") == "18446744065119617025")
+}

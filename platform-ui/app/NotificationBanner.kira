@@ -1,0 +1,400 @@
+import Foundation
+import KiraUI
+import AppKit
+import PlatformKit
+import TesseraUI
+
+// Notification banners (roadmap/11-adaptive-desktop.md, "Notifications"): what
+// an application posted, on glass, with its icon, its title and "now" on one
+// line and what it says under them. On a touch screen it comes down at the top
+// in the middle, as an iPhone's and an iPad's do, at the iOS 27 kit's size; on
+// a desktop it comes in at the top trailing corner, below the bar, as a Mac's
+// does. A click or a tap on it opens the application that posted it. The
+// newest is at the top.
+//
+// A banner comes in and goes on the Smooth spring, and the platform moves it
+// itself, by how long it has been shown, rather than leaving it to a
+// transition: the compositor's glass under it (`notificationBannerFrames`)
+// is drawn by the server, beside the platform's surface, and moves by the
+// same reading of the same clock.
+
+// One banner: the application that posted it, what it says, and what
+// choosing it does.
+public struct NotificationBannerItem {
+    let application: String
+    let title: String
+    let body: String
+    let open: () -> Void
+    // How far in it has come, from 0 out of sight to 1 where it stands.
+    let presence: Number
+}
+
+// How a banner is laid out, in points.
+public struct NotificationBannerMetrics {
+    // The banner's width, and the most banners shown at once.
+    let width: Number
+    let shown: Number
+    // The space round the content, the icon's side and the gap after it.
+    let padding: Number
+    let icon: Number
+    let iconGap: Number
+    // The title's and the body's size, and the time's.
+    let text: Number
+    let time: Number
+    // The glass's corner.
+    let corner: Number
+    // How far the banners stand from the top band and the trailing edge, and
+    // the gap between two.
+    let margin: Number
+    let spacing: Number
+}
+
+// The banner for the interface in use: an iPhone's and an iPad's on a touch
+// screen, from the kit's `Notification - Collapsed`, a Mac's on a desktop.
+public function notificationBannerMetrics() -> NotificationBannerMetrics {
+    return match interfaceMode() {
+        AdaptiveDesktop -> NotificationBannerMetrics {
+            width: 344,
+            shown: 3,
+            padding: 12,
+            icon: 32,
+            iconGap: 10,
+            text: 13,
+            time: 11,
+            corner: 20,
+            margin: 10,
+            spacing: 8,
+        }
+        AdaptiveMobile -> NotificationBannerMetrics {
+            width: 377,
+            shown: 1,
+            padding: 14,
+            icon: 38,
+            iconGap: 10,
+            text: 15,
+            time: 13,
+            corner: 24,
+            margin: 8,
+            spacing: 8,
+        }
+    }
+}
+
+let bannerPrimary: RGBAColor = RGBAColor { r: 1.0, g: 1.0, b: 1.0, a: 0.95 }
+let bannerSecondary: RGBAColor = RGBAColor { r: 1.0, g: 1.0, b: 1.0, a: 0.6 }
+
+// One banner, on its own glass when `ownGlass` is set and otherwise over the
+// compositor's (`platformGlass`).
+function notificationBanner(
+    item: borrow NotificationBannerItem,
+    metrics: borrow NotificationBannerMetrics,
+    ownGlass: Bool
+) -> Any Widget {
+    let textWidth = metrics.width - metrics.padding * 2 - metrics.icon - metrics.iconGap
+    let banner = HStack(spacing = .Length(metrics.iconGap), alignment = .Center) {
+        ApplicationIcon(name = copy item.application, side = metrics.icon)
+        VStack(spacing = .None, alignment = .Leading) {
+            HStack(alignment = .Center) {
+                Text(copy item.title)
+                .font(size: resolvedLength(metrics.text), weight: .SemiBold)
+                .textColor(bannerPrimary)
+                Spacer()
+                Text("now")
+                .font(size: resolvedLength(metrics.time))
+                .textColor(bannerSecondary)
+            }
+            .fillWidth()
+            Text(copy item.body)
+            .font(size: resolvedLength(metrics.text))
+            .textColor(bannerPrimary)
+        }
+        .width(resolvedLength(textWidth))
+    }
+    .padding(resolvedLength(metrics.padding))
+    .width(resolvedLength(metrics.width))
+    .height(resolvedLength(bannerHeight(metrics)))
+    if !ownGlass { return banner.onClick(copy item.open) }
+    return banner.glassEffect(.Platform(.NotificationCenter), .Squircle(metrics.corner)).onClick(
+        copy item.open
+    )
+}
+
+// How tall a banner stands: its icon, or its two lines of text where they
+// stand taller, inside its padding.
+function bannerHeight(metrics: borrow NotificationBannerMetrics) -> Number {
+    let lines = ceil(metrics.text * BannerLine.leading) * 2
+    return metrics.padding * 2 + max(metrics.icon, lines)
+}
+
+// The banners over the whole output, below the band `top` points tall along
+// its top, newest first; nothing when there are none. A platform that has
+// the compositor draw their glass (`notificationBannerFrames`) leaves
+// `ownGlass` unset.
+public construct NotificationBanners(
+    items: [NotificationBannerItem],
+    top: Number,
+    ownGlass: Bool
+) extends Widget {
+    body {
+        let metrics = notificationBannerMetrics()
+        let desktop = match interfaceMode() {
+            AdaptiveDesktop -> true
+            AdaptiveMobile -> false
+        }
+        var banners: [Any Widget] = []
+        for item in items {
+            if banners.count >= metrics.shown { break }
+            let away = bannerAway(metrics, top, desktop, item.presence)
+            // Moved each frame by the platform, so the compositor carries the
+            // offset at once rather than easing toward it.
+            banners.append(
+                notificationBanner(item, metrics, ownGlass).offset(
+                    x: resolvedLength(away.x),
+                    y: resolvedLength(away.y)
+                ).animation(.Immediate)
+            )
+        }
+        ZStack(alignment = desktop ? .TopTrailing : .Top) {
+            VStack(
+                spacing = .Length(metrics.spacing),
+                alignment = desktop ? .Trailing : .Center,
+                children = banners
+            )
+            .hugWidth()
+            .edgePadding(EdgeSet.top, resolvedLength(top + metrics.margin))
+            .edgePadding(EdgeSet.trailing, resolvedLength(desktop ? metrics.margin : 0))
+        }
+        .fillWidth()
+        .fillHeight()
+    }
+}
+
+// How far from where it stands a banner `presence` of the way in is drawn:
+// past the trailing edge on a desktop, above the top on a touch screen.
+function bannerAway(
+    metrics: borrow NotificationBannerMetrics,
+    top: Number,
+    desktop: Bool,
+    presence: Number
+) -> Point {
+    let left = 1 - presence
+    if desktop { return Point { x: left * (metrics.width + metrics.margin), y: 0 } }
+    return Point { x: 0, y: -left * (top + metrics.margin + bannerHeight(metrics)) }
+}
+
+// A notification on screen: when its banner came and when it goes, in
+// milliseconds of the realtime clock.
+public struct ShownNotification {
+    let notification: BridgeNotification
+    let since: Number
+    let until: Number
+}
+
+extend ShownNotification {
+    // How far in the banner is at `now`: on its way in for the motion's
+    // length after it came, and on its way out for as long before it goes.
+    function presence(borrow self, now: Number) -> Number {
+        let arriving = animationFraction(.Smooth, (now - self.since) / 1000)
+        let leaving = animationFraction(.Smooth, (now - self.until) / 1000 + BannerTiming.motion)
+        return arriving * (1 - leaving)
+    }
+
+    // Whether the banner is coming in or going at `now`.
+    function moving(borrow self, now: Number) -> Bool {
+        let motion = BannerTiming.motion * 1000
+        return now - self.since < motion || self.until - now < motion
+    }
+}
+
+// Where each of the banners in `shown` stands at `now` on an output
+// `outputWidth` points wide, below the band `top` points tall along its top,
+// newest first, as far in as each has come.
+public function notificationBannerFrames(
+    shown: borrow [ShownNotification],
+    now: Number,
+    top: Number,
+    outputWidth: Number
+) -> [SurfaceFrame] {
+    let metrics = notificationBannerMetrics()
+    let height = bannerHeight(metrics)
+    let desktop = match interfaceMode() {
+        AdaptiveDesktop -> true
+        AdaptiveMobile -> false
+    }
+    let x = desktop ? outputWidth - metrics.margin - metrics.width : trunc(
+        (outputWidth - metrics.width) / 2
+    )
+    var frames: [SurfaceFrame] = []
+    for index in 0..min(shown.count, metrics.shown) {
+        let away = bannerAway(metrics, top, desktop, shown[index].presence(now))
+        frames.append(
+            SurfaceFrame {
+                x: x + away.x,
+                y: top + metrics.margin + index * (height + metrics.spacing) + away.y,
+                width: metrics.width,
+                height: height,
+            }
+        )
+    }
+    return frames
+}
+
+// The part of an output `outputWidth` points wide that the banners in
+// `shown` take at `now`, below the band `top` points tall along its top: what
+// the platform claims the pointer over, with `SetOverlay`, so a click on a
+// banner reaches it while the window in front keeps the keyboard. Empty while
+// none is shown.
+public function notificationBannerArea(
+    shown: borrow [ShownNotification],
+    now: Number,
+    top: Number,
+    outputWidth: Number
+) -> SurfaceFrame {
+    let frames = notificationBannerFrames(shown, now, top, outputWidth)
+    if frames.count == 0 { return emptyFrame() }
+    let last = frames[frames.count - 1]
+    return SurfaceFrame {
+        x: frames[0].x,
+        y: frames[0].y,
+        width: frames[0].width,
+        height: last.y + last.height - frames[0].y,
+    }
+}
+
+// What stays shown once the application at display client `client` was
+// opened from a banner: every banner but its own, which go as the chosen one
+// does on a Mac and an iPhone.
+public function bannersAfterChoosing(
+    shown: borrow [ShownNotification],
+    client: Number
+) -> [ShownNotification] {
+    var kept: [ShownNotification] = []
+    for banner in shown {
+        if banner.notification.client != client { kept.append(copy banner) }
+    }
+    return kept
+}
+
+namespace BannerLine {
+    // How tall a line of a banner's text stands, as a share of its size.
+    let leading: Number = 1.3
+}
+
+namespace BannerTiming {
+    // How long a banner stays, as a Mac's and an iPhone's do.
+    let seconds: Number = 5
+    // How long it takes to come in and to go: the Smooth spring's response
+    // and half again, by when it has settled to within a thousandth.
+    let motion: Number = 0.75
+    // How often it is drawn again while it moves: each frame at 60Hz.
+    let frame: Number = 0.016
+}
+
+// What is shown at `now`: the banners in `shown` that have not gone, under
+// those AppKit has taken since, newest first. Each new one is said once, and
+// a frame is asked for when it goes. While Focus is on at `moment`, what
+// arrives from an application it does not allow is said and not shown, as
+// Do Not Disturb holds a Mac's and an iPad's banners back.
+public function followFocusedNotifications(
+    bridge: borrow BridgeHandle,
+    shown: borrow [ShownNotification],
+    now: Number,
+    focus: borrow FocusChoice,
+    moment: borrow FocusMoment
+) -> [ShownNotification] {
+    let choice = copy focus
+    let at = copy moment
+    let quiet = quietApplications()
+    return followHeldNotifications(
+        bridge,
+        shown,
+        now,
+        { application in return choice.holds(application, at) || quiet.contains(application) }
+    )
+}
+
+// What is shown at `now`, as `followFocusedNotifications` says, with Focus on
+// or off for every application alike (`held`).
+public function followNotifications(
+    bridge: borrow BridgeHandle,
+    shown: borrow [ShownNotification],
+    now: Number,
+    held: Bool
+) -> [ShownNotification] {
+    return followHeldNotifications(bridge, shown, now, { application in return held })
+}
+
+// What is shown at `now`, a banner from an application `holds` says Focus
+// holds back being said and not shown. Every notification that arrives goes
+// into the history, shown or not.
+function followHeldNotifications(
+    bridge: borrow BridgeHandle,
+    shown: borrow [ShownNotification],
+    now: Number,
+    holds: (String) -> Bool
+) -> [ShownNotification] {
+    let arrived = takeNotifications(copy bridge)
+    recordNotifications(arrived, now)
+    var kept: [ShownNotification] = []
+    for at in 0..arrived.count {
+        // The last to arrive is the newest, and goes first.
+        let notification = arrived[arrived.count - 1 - at]
+        if holds(notification.application) {
+            log info(
+                "Focus held a notification back",
+                application: notification.application,
+                title: notification.title
+            )
+            continue
+        }
+        log info(
+            "a notification banner appeared",
+            application: notification.application,
+            title: notification.title,
+            body: notification.body
+        )
+        kept.append(
+            ShownNotification {
+                notification: copy notification,
+                since: now,
+                until: now + BannerTiming.seconds * 1000
+            }
+        )
+    }
+    for banner in shown {
+        if banner.until > now { kept.append(copy banner) }
+    }
+    // Drawn again each frame while one moves, and when the next starts to go.
+    for banner in kept {
+        if banner.moving(now) {
+            redrawAfter(BannerTiming.frame)
+        } else {
+            redrawAfter((banner.until - now) / 1000 - BannerTiming.motion)
+        }
+    }
+    return kept
+}
+
+// The banners `shown` draws as at `now`; choosing one calls `open` with the
+// display client number of the application that posted it.
+public function notificationBannerItems(
+    shown: borrow [ShownNotification],
+    now: Number,
+    open: (Number) -> Void
+) -> [NotificationBannerItem] {
+    var items: [NotificationBannerItem] = []
+    for banner in shown {
+        let client = banner.notification.client
+        let opened = copy open
+        items.append(
+            NotificationBannerItem {
+                application: copy banner.notification.application,
+                title: copy banner.notification.title,
+                body: copy banner.notification.body,
+                open: { in opened(client) },
+                presence: banner.presence(now),
+            }
+        )
+    }
+    return items
+}

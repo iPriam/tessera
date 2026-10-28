@@ -1,0 +1,86 @@
+import Foundation
+import Heap
+
+// Being asked to stop (03 shutdown): init asks, waits out a deadline, then
+// ends the process. A service that waits on a port can hear the request as
+// one more completion and leave through `main`, so its runtime finishes the
+// way it does for any program that returns (the heap report among it).
+//
+// The kernel's request is diverted to a backing the port waits on beside
+// everything else. Call this before making a thread: a thread that does not
+// divert it would still be ended by it. A program launched by this library
+// starts with nothing diverted.
+
+// One completion under `key` on `port` when the process is asked to stop.
+// The request is not consumed: a second watch would see it as well.
+public function processWatchTermination(port: Handle, key: UNumber) -> Result<Void, TesseraError> {
+    let portObject = try resolveObject(port, .Port, Rights.none)
+    let watch = try kernelTerminationWatch()
+    pendingAdd(.Source(sourceReadable(watch)), .Object(portObject), portObject, key)
+    return .Ok
+}
+
+// Asks `process` to stop, as `processWatchTermination` hears it. Requires
+// Manage. A process that does not go is ended with `processKill`.
+public function processAskToStop(process: Handle) -> Result<Void, TesseraError> {
+    let object = try processManaged(process)
+    let backing = try backingOf(object)
+    return kernelProcessAskToStop(backing)
+}
+
+// What happened to the machine: it was asked to stop, someone asked for its
+// attention (Ctrl-Alt-Del), a child ended.
+@Derive(Copy)
+public distinct SystemEvent = UNumber
+
+public namespace SystemEvent {
+    let none: SystemEvent = SystemEvent(0)
+    let stop: SystemEvent = SystemEvent(1)
+    let attention: SystemEvent = SystemEvent(2)
+    let childEnded: SystemEvent = SystemEvent(4)
+}
+
+// One completion under `key` on `port` when any `SystemEvent` is waiting.
+// Read them with `processSystemEvents`, then watch again. For the first
+// process (`tessera.machine`): the requests it hears are the machine's.
+public function processWatchSystem(port: Handle, key: UNumber) -> Result<Void, TesseraError> {
+    if !entitlementHeld("tessera.machine") { return .Error(failure(.NotEntitled)) }
+    let portObject = try resolveObject(port, .Port, Rights.none)
+    let watch = try kernelSystemWatch()
+    pendingAdd(.Source(sourceReadable(watch)), .Object(portObject), portObject, key)
+    return .Ok
+}
+
+// The `SystemEvent` bits that arrived since the last call, taken.
+public function processSystemEvents() -> SystemEvent { return kernelSystemEvents() }
+
+// Collects every process that ended after being left to this one, which
+// no Process handle names. Answers how many.
+public function processReapOrphans() -> Result<UNumber, TesseraError> {
+    if !entitlementHeld("tessera.machine") { return .Error(failure(.NotEntitled)) }
+    var own: [U64] = []
+    for index in 0..library.objects.count {
+        if !library.objects[index].live { continue }
+        match library.objects[index].state {
+            Process(process) -> own.append(process.pid)
+            None, Port, Event, EventPair, Timer, Channel, Memory, Thread, Job, Node, File, Watch, Endpoint, Stream, WakeLock, Presence -> {}
+        }
+    }
+    let reaped = try kernelReapOrphans(own)
+    return .Ok(UNumber(reaped))
+}
+
+// Replaces this process with the program at `path`, started with the
+// arguments in `arguments` (a LaunchInfo Memory, as `Process.launch` takes;
+// none for its path alone) and the Kira runtime's settings. Returns only on
+// failure. For the first process handing the machine to the init of the
+// volume it entered with `machineEnterRoot`, or to a formatter.
+public function processReplace(
+    path: borrow String,
+    arguments: Handle?
+) -> Result<Void, TesseraError> {
+    if path.count == 0 { return .Error(failure(.InvalidArgument)) }
+    if !entitlementHeld("tessera.machine") { return .Error(failure(.NotEntitled)) }
+    let argv = try launchArguments(arguments, path)
+    return kernelProcessReplace(path, argv)
+}

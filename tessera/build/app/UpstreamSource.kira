@@ -1,0 +1,116 @@
+import Foundation
+import Build
+
+// An upstream tarball's tree under its patches, kept in a command's workspace
+// as the kernel's is (Kernel.kira), so the compiler's own dependency tracking
+// decides what a change rebuilds. The tree is unpacked and patched afresh only
+// when the tarball or a patch changed, and then only the files whose contents
+// differ are written over the kept tree: every other file keeps its time, and
+// ninja recompiles what includes the files that changed, not the whole tree.
+// Nothing here runs in the build's own code, so an edit to the build leaves
+// the tree, and what was compiled from it, as it was.
+
+// A release as its project publishes it: the tarball's top directory, where
+// it is downloaded from and its SHA-256.
+struct Upstream {
+    let top: String
+    let url: String
+    let sha256: String
+}
+
+// The stage that brings the tree kept beside the workspace's build
+// directory `directory`, at `<directory>-source`, up to `upstream`'s
+// tarball, downloaded and checked, with `changes` made to it in order.
+function upstreamStage(
+    graph: borrow mut Graph,
+    directory: borrow String,
+    upstream: borrow Upstream,
+    changes: borrow [UpstreamChange]
+) -> CommandStage {
+    let tarball = graph.download(
+        "upstream/\(upstream.top)/\(lastNameOf(upstream.url))",
+        upstream.url,
+        upstream.sha256
+    )
+    return upstreamSourceStage(directory, move tarball, changes)
+}
+
+// Where the stage for the build directory `directory` keeps its tree, as a
+// command's argument.
+function upstreamSource(directory: borrow String) -> Argument {
+    return .Joined([.Workspace, .Text("/\(directory)-source")])
+}
+
+// A change made to the unpacked tree: a file placed at a path in it, or a
+// patch applied with one leading directory stripped.
+enum UpstreamChange {
+    Place(TreePlace)
+    Patch(Artifact)
+}
+
+// The stage that brings `<directory>-source` up to `tarball` with `changes`
+// made to it in order. The build directory is emptied when it was configured
+// from another tree, as CMake and meson refuse to move one.
+function upstreamSourceStage(
+    directory: borrow String,
+    tarball: Artifact,
+    changes: borrow [UpstreamChange]
+) -> CommandStage {
+    var arguments: [Argument] = [
+        .Text("-c"),
+        .Text(upstreamSourceScript()),
+        upstreamSource(directory),
+        .Joined([.Workspace, .Text("/\(directory)")]),
+        .Input(tarball)
+    ]
+    for change in changes {
+        match change {
+            Place(place) -> arguments.append(
+                .Joined([.Text("+\(place.path)="), .Input(copy place.artifact)])
+            )
+            Patch(patch) -> arguments.append(.Input(copy patch))
+        }
+    }
+    return CommandStage { tool: "sh", arguments: arguments }
+}
+
+// Files are copied over by contents, without the tarball's times, so one
+// written over is newer than what was compiled from it.
+// `sh -c` hands it the kept tree's path, the build directory's, the tarball
+// and the changes, as $0, $1, $2 and the rest: a placed file as
+// `+path=file`, a patch as its file.
+function upstreamSourceScript() -> String {
+    let lines = [
+        "set -e",
+        "source=$0 build=$1 tarball=$2",
+        "shift 2",
+        "if [ \"$(cat \"$build.source\" 2> /dev/null)\" != \"$source\" ]; then",
+        "    rm -rf \"$build\"",
+        "    echo \"$source\" > \"$build.source\"",
+        "fi",
+        "changes() {",
+        "    for change in \"$@\"; do",
+        "        case \"$change\" in",
+        "        +*) place=${change#+}; echo \"${place%%=*}\"; cat \"${place#*=}\" ;;",
+        "        *) cat \"$change\" ;;",
+        "        esac",
+        "    done",
+        "}",
+        "stamp=$({ basename \"$tarball\"; changes \"$@\"; } | sha256sum | cut -d' ' -f1)",
+        "if [ \"$(cat \"$source.stamp\" 2> /dev/null)\" = \"$stamp\" ]; then exit 0; fi",
+        "fresh=\"$source.fresh\"",
+        "rm -rf \"$fresh\" \"$source.stamp\"",
+        "mkdir -p \"$fresh\" \"$source\"",
+        "tar -xf \"$tarball\" -C \"$fresh\" --strip-components=1",
+        "for change in \"$@\"; do",
+        "    case \"$change\" in",
+        "    +*) place=${change#+}; mkdir -p \"$fresh/$(dirname \"${place%%=*}\")\"; cp \"${place#*=}\" \"$fresh/${place%%=*}\" ;;",
+        "    *) patch -s -p1 -d \"$fresh\" < \"$change\" ;;",
+        "    esac",
+        "done",
+        "rsync -rlpc --delete \"$fresh/\" \"$source/\"",
+        "rm -rf \"$fresh\"",
+        "echo \"$stamp\" > \"$source.stamp\""
+    ]
+    return textLines(lines)
+}

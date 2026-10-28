@@ -1,0 +1,26 @@
+import KiraUI
+
+// The one-colour glyphs the icons and the menu bar draw, as SVG text: a
+// program has no resources directory to read them from.
+namespace Glyphs {
+    let diskUtility: String = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 64 64\"><path d=\"M14 6 L14 24 A14 14 0 0 0 42 24 L42 6 M28 38 L28 44 A10 10 0 0 0 48 44 L48 40\" stroke=\"#000\" stroke-width=\"5\" fill=\"none\" stroke-linecap=\"round\"/><circle cx=\"48\" cy=\"34\" r=\"7\" fill=\"#000\"/></svg>"
+    let externalDrive: String = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 64 64\"><path d=\"M32 8 L32 56 M32 40 L16 30 L16 22 M32 46 L48 36 L48 26\" stroke=\"#000\" stroke-width=\"5\" fill=\"none\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/><path d=\"M24 12 L32 2 L40 12 Z\" fill=\"#000\"/><circle cx=\"16\" cy=\"18\" r=\"5\" fill=\"#000\"/><rect x=\"43\" y=\"18\" width=\"10\" height=\"10\" fill=\"#000\"/><circle cx=\"32\" cy=\"58\" r=\"5\" fill=\"#000\"/></svg>"
+    let install: String = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 64 64\"><path d=\"M32 8 L32 48 M16 34 L32 50 L48 34\" stroke=\"#000\" stroke-width=\"8\" fill=\"none\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg>"
+    let internalDrive: String = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 64 64\"><path d=\"M10 20 L54 20 A6 6 0 0 1 60 26 L60 44 A6 6 0 0 1 54 50 L10 50 A6 6 0 0 1 4 44 L4 26 A6 6 0 0 1 10 20 Z M4 38 L60 38\" stroke=\"#000\" stroke-width=\"4\" fill=\"none\"/><circle cx=\"50\" cy=\"44\" r=\"3\" fill=\"#000\"/></svg>"
+    let startupDisk: String = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 64 64\"><path d=\"M20 16 A22 22 0 1 0 44 16 M32 6 L32 32\" stroke=\"#000\" stroke-width=\"7\" fill=\"none\" stroke-linecap=\"round\"/></svg>"
+    let terminal: String = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 64 64\"><path d=\"M8 14 L28 30 L8 46 M34 52 L58 52\" stroke=\"#000\" stroke-width=\"7\" fill=\"none\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg>"
+    let tessera: String = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 64 64\"><rect x=\"6\" y=\"6\" width=\"24\" height=\"24\" rx=\"6\" fill=\"#000\"/><rect x=\"34\" y=\"6\" width=\"24\" height=\"24\" rx=\"6\" fill=\"#000\"/><rect x=\"6\" y=\"34\" width=\"24\" height=\"24\" rx=\"6\" fill=\"#000\"/><rect x=\"34\" y=\"34\" width=\"24\" height=\"24\" rx=\"6\" fill=\"#000\"/></svg>"
+}
+
+// The glyph by the name the icons use for it.
+function glyphNamed(name: borrow String) -> String {
+    return match name {
+        "tessera" -> Glyphs.tessera
+        "install" -> Glyphs.install
+        "disk-utility" -> Glyphs.diskUtility
+        "startup-disk" -> Glyphs.startupDisk
+        "external-drive" -> Glyphs.externalDrive
+        "internal-drive" -> Glyphs.internalDrive
+        else -> Glyphs.terminal
+    }
+}

@@ -1,0 +1,29 @@
+import Foundation
+import Build
+
+// The `tests` step: every component whose sources have an `app/Tests`
+// directory, built as a Kira test program for the host and run. A test program
+// links no SDK, so a component that imports Kira UI is tested through a library
+// without one. A failing test fails the step (KiraToolchain.tests).
+function describeTests(
+    graph: borrow mut Graph,
+    context: borrow BuildContext,
+    release: borrow DescribedRelease
+) {
+    var produced: [Artifact] = []
+    for described in release.components {
+        let directory = joinPath(graph.root, described.component.location + "/app/Tests")
+        if !isDirectory(directory) {
+            continue
+        }
+        let settings = KiraSettings { sourceRoot: "..", excluding: checkoutExclusions() }
+        produced.append(context.kira.tests(graph, described.component.location, settings))
+    }
+    graph.step(
+        Step {
+            name: "tests",
+            summary: "the Kira tests of every component with an app/Tests directory, run on the host",
+            produces: produced
+        }
+    )
+}

@@ -1,0 +1,412 @@
+import Foundation
+import KiraUI
+import LibTessera
+import PlatformKit
+
+// The lock screen (roadmap/11-adaptive-desktop.md, 13-security-and-updates.md):
+// the background picture with the date over a large time, the notifications
+// kept since they arrived, and how to open it. It is a cover and not a lock, so it carries no padlock and asks for
+// nothing; its look follows the navigation model, as every PlatformUI
+// component does, never the platform.
+//
+// A platform shows it over everything and takes it away with
+// `lockScreenTransition`, which carries it off as the platform it is on
+// does: on touch the whole screen follows the finger up, as an iPhone's does,
+// and a flick or a lift past `LockScreenLift.opens` of the screen opens it
+// (`open`) while anything less springs back; on a pointer or a controller a
+// dissolve lifts it toward the person.
+
+// The lock screen's measures for one navigation model, in points: the band
+// above the date, the date and the time, and the hint's distance from the
+// bottom edge.
+struct LockScreenMetrics {
+    let top: Number
+    let dateSize: Number
+    let timeSize: Number
+    let hintSize: Number
+    let bottom: Number
+    // How far the time and the date rise as the lock screen opens.
+    let rise: Number
+}
+
+function lockScreenMetrics(navigation: borrow NavigationModel) -> LockScreenMetrics {
+    return match navigation {
+        // An iPhone's: below the status bar, the time large enough to read
+        // across a table.
+        Touch -> LockScreenMetrics {
+            top: 72.0,
+            dateSize: 22.0,
+            timeSize: 104.0,
+            hintSize: 15.0,
+            bottom: 12.0,
+            rise: 0.0,
+        }
+        // A Mac's: the date and the time high on a screen read from a desk.
+        Pointer -> LockScreenMetrics {
+            top: 96.0,
+            dateSize: 26.0,
+            timeSize: 128.0,
+            hintSize: 15.0,
+            bottom: 56.0,
+            rise: 64.0,
+        }
+        // Read from across a room.
+        Directional -> LockScreenMetrics {
+            top: 120.0,
+            dateSize: 32.0,
+            timeSize: 160.0,
+            hintSize: 20.0,
+            bottom: 72.0,
+            rise: 80.0,
+        }
+    }
+}
+
+// How the lock screen says it is opened.
+function lockScreenHint(navigation: borrow NavigationModel) -> String {
+    return match navigation {
+        Touch -> "Swipe up to open"
+        Pointer -> "Click or press any key to open"
+        Directional -> "Press any button to open"
+    }
+}
+
+// The passcode prompt's measures, in points, and the keypad's plates.
+namespace PasscodeLook {
+    let belowTime: Number = 150
+    let prompt: Number = 17
+    let field: Number = 260
+    let key: Number = 64
+    let keyGap: Number = 16
+    let digit: Number = 26
+    let plate: RGBAColor = RGBAColor { r: 1.0, g: 1.0, b: 1.0, a: 0.22 }
+}
+
+// What keeps white type legible over any picture: a soft shadow under it.
+namespace LockScreenInk {
+    let shade: RGBAColor = RGBAColor { r: 0.0, g: 0.0, b: 0.0, a: 0.25 }
+}
+
+// Where the lock screen is in its life: shown, or opening -- the picture's
+// blur settling and the time and date rising away -- before the platform takes
+// it away with `lockScreenTransition`. On touch a finger can pull it down over
+// the open screen from the status bar: it follows the finger, this many points
+// down, and let go short it goes back up.
+public enum LockScreenPhase {
+    Shown
+    Opening
+    Following(Number)
+    Retracting
+}
+
+// How far up, as a share of the screen's height, a lift let go opens the lock
+// screen, counting where the flick would carry it.
+namespace LockScreenLift {
+    let opens: Number = 0.3
+}
+
+// What a lock screen that is not opened by a swipe does when it is.
+public function lockScreenStays() {}
+
+public construct LockScreen(
+    time: String,
+    date: String,
+    navigation: NavigationModel,
+    phase: LockScreenPhase,
+    status: StatusItems = StatusItems {},
+    open: () -> Void = lockScreenStays,
+    notifications: [HistoryGroup] = [],
+    notificationActions: NotificationListActions = NotificationListActions {},
+    // Whether it opens only for the device passcode.
+    passcode: Bool = false,
+) extends Widget {
+    // How far the finger has lifted the screen, in points, and whether it is
+    // still on it.
+    @State var lift: Number = 0.0
+    @State var lifting: Bool = false
+    // The passcode as typed, and what the last one given was found to be.
+    @State var entered: String = ""
+    @State var said: String = ""
+
+    body {
+        if passcode { return self.asking() }
+        if navigation != .Touch { return self.covering() }
+        let height = viewportHeight()
+        let opens = open
+        return self.covering()
+        .offset(x = resolvedLength(0.0), y = resolvedLength(self.offsetIn(height)))
+        .animation(self.tracking() ? .Immediate : lockScreenAnimation(navigation))
+        .gesture(
+            DragGesture(minimumDistance: 0).onChanged { value in
+                lifting = true
+                lift = max(-value.translation.height, 0.0)
+            }.onEnded { value in
+                lifting = false
+                if -value.predictedEndTranslation.height > height * LockScreenLift.opens {
+                    opens()
+                } else {
+                    lift = 0.0
+                }
+            }
+        )
+    }
+
+    // The cover with the passcode asked for under the time: a field, and a
+    // keypad for touch. Nothing lifts it; the right passcode opens it.
+    function asking() -> Any Widget {
+        return ZStack(alignment = .Top) {
+            self.covering()
+            VStack(spacing = .Medium, alignment = .Center) {
+                FixedGap(
+                    width = 0.0,
+                    height = lockScreenMetrics(navigation).top + PasscodeLook.belowTime
+                )
+                Text(said.count > 0 ? copy said : "Enter Passcode")
+                .font(size = resolvedLength(PasscodeLook.prompt), weight = .SemiBold)
+                .foregroundColor(.White)
+                SecureField(title = "Passcode", text = $entered)
+                .onSubmit({ in self.submit() })
+                .maxWidth(resolvedLength(PasscodeLook.field))
+                if navigation == .Touch { self.keypad() }
+            }
+            .fillWidth()
+        }
+        .fillWidth()
+        .fillHeight()
+    }
+
+    // Digits in rows of three, then delete, 0 and OK, as a phone's passcode
+    // pad.
+    function keypad() -> Any Widget {
+        var rows: [Any Widget] = []
+        for row in 0..3 {
+            var keys: [Any Widget] = []
+            for column in 0..3 {
+                let digit = String(row * 3 + column + 1)
+                keys.append(self.padKey(copy digit, { in entered = entered + digit }))
+            }
+            rows.append(
+                HStack(spacing = .Length(PasscodeLook.keyGap), alignment = .Center, children = keys)
+            )
+        }
+        rows.append(
+            HStack(spacing = .Length(PasscodeLook.keyGap), alignment = .Center) {
+                self.padKey("⌫", { in entered = entered.dropLastScalar() })
+                self.padKey("0", { in entered = entered + "0" })
+                self.padKey("OK", { in self.submit() })
+            }
+        )
+        return VStack(spacing = .Length(PasscodeLook.keyGap), alignment = .Center, children = rows)
+    }
+
+    function padKey(title: String, action: () -> Void) -> Any Widget {
+        return Button(action = action) {
+            Text(title)
+            .font(size = resolvedLength(PasscodeLook.digit), weight = .Medium)
+            .foregroundColor(.White)
+            .width(resolvedLength(PasscodeLook.key))
+            .height(resolvedLength(PasscodeLook.key))
+            .background(Circle().fill(PasscodeLook.plate))
+        }
+        .buttonStyle(.Plain)
+    }
+
+    // Tries what was typed: the right passcode opens the lock screen, a wrong
+    // one is said, and too many in a row make it wait.
+    function submit() {
+        let given = copy entered
+        entered = ""
+        match tryPasscode(given, unixMillis()) {
+            Opened -> {
+                said = ""
+                open()
+            }
+            Wrong -> said = "Wrong Passcode"
+            Waiting(until) -> said = "Try again in \(trunc((until - unixMillis()) / 60000) + 1) min"
+        }
+    }
+
+    // How far up the screen is, in points, out of `height`: lifted by the
+    // finger, gone up while it opens, or pulled down from the top.
+    function offsetIn(height: Number) -> Number {
+        return match phase {
+            Shown -> -lift
+            Opening, Retracting -> -height
+            Following(down) -> min(down, height) - height
+        }
+    }
+
+    // Whether a finger moves the screen, which then follows it at once.
+    function tracking() -> Bool {
+        return match phase {
+            Shown -> lifting
+            Following -> true
+            Opening, Retracting -> false
+        }
+    }
+
+    // Whether the screen is opening, its time and date risen away.
+    function leaving() -> Bool {
+        return match phase {
+            Opening -> true
+            Shown, Following, Retracting -> false
+        }
+    }
+
+    // The picture, the time and the date, and the status area.
+    function covering() -> Any Widget {
+        // The picture is as sharp as on the home screen everywhere, as a
+        // Mac's lock screen shows it since macOS 26.
+        return ZStack(alignment = .Top) {
+            Wallpaper(place = .Lock)
+            lockScreenContent(
+                time,
+                date,
+                navigation,
+                notificationList(notifications, notificationActions, passcode ? .Hidden : .Shown)
+            )
+            .offset(
+                x = resolvedLength(0.0),
+                y = resolvedLength(self.leaving() ? -lockScreenMetrics(navigation).rise : 0.0)
+            )
+            .opacity(self.leaving() ? 0.0 : 1.0)
+            .animation(lockScreenAnimation(navigation))
+            // On touch the status bar stands over the lock screen itself.
+            if navigation != .Touch { lockScreenStatus(status, navigation) }
+        }
+        .fillWidth()
+        .fillHeight()
+    }
+}
+
+// The status area along the top, in the band the bar takes when the lock
+// screen is open: its items at the trailing end and no time, which the lock
+// screen shows large. It stays while the lock screen opens.
+function lockScreenStatus(
+    status: borrow StatusItems,
+    navigation: borrow NavigationModel
+) -> Any Widget {
+    return HStack(alignment = .Center) {
+        Spacer()
+        StatusIcons(items = copy status, spacing = lockScreenStatusSpacing(navigation))
+        .foregroundColor(.White)
+    }
+    // The row itself is the band's height, so its items stand in the middle
+    // of it as on the bar.
+    .height(resolvedLength(lockScreenStatusBand(navigation)))
+    .edgePadding(EdgeSet.horizontal, resolvedLength(lockScreenStatusInset(navigation)))
+    .fillWidth()
+}
+
+// The height of the band the status area stands in: the status bar's on
+// touch, the system bar's otherwise.
+function lockScreenStatusBand(navigation: borrow NavigationModel) -> Number {
+    return match navigation {
+        Touch -> statusBarHeight(statusBarTall(viewportWidth(), viewportHeight()))
+        Pointer, Directional -> systemBarHeight()
+    }
+}
+
+// How far in from the trailing edge the status area stands, as on the bar.
+function lockScreenStatusInset(navigation: borrow NavigationModel) -> Number {
+    return match navigation {
+        Touch -> StatusBarMetrics.inset
+        Pointer, Directional -> windowChromeMetrics().edgeInset
+    }
+}
+
+// How far apart status items stand: as on the status bar on touch, as on the
+// system bar otherwise.
+function lockScreenStatusSpacing(navigation: borrow NavigationModel) -> Number {
+    return match navigation {
+        Touch -> StatusBarMetrics.itemSpacing
+        Pointer, Directional -> systemBarStatusSpacing()
+    }
+}
+
+function lockScreenContent(
+    time: borrow String,
+    date: borrow String,
+    navigation: borrow NavigationModel,
+    notifications: Any Widget
+) -> Any Widget {
+    let metrics = lockScreenMetrics(navigation)
+    return VStack(alignment = .Center) {
+        FixedGap(width = 0.0, height = metrics.top)
+        Text(copy date)
+        .font(size = resolvedLength(metrics.dateSize), weight = .SemiBold)
+        .foregroundColor(.White)
+        .shadow(
+            color = LockScreenInk.shade,
+            radius = resolvedLength(8.0),
+            x = resolvedLength(0.0),
+            y = resolvedLength(2.0)
+        )
+        Text(copy time)
+        .font(size = resolvedLength(metrics.timeSize), weight = .Bold)
+        .foregroundColor(.White)
+        .shadow(
+            color = LockScreenInk.shade,
+            radius = resolvedLength(16.0),
+            x = resolvedLength(0.0),
+            y = resolvedLength(2.0)
+        )
+        notifications
+        Spacer()
+        Text(lockScreenHint(navigation))
+        .font(size = resolvedLength(metrics.hintSize), weight = .Medium)
+        .foregroundColor(.White)
+        .opacity(0.8)
+        lockScreenFoot(navigation, metrics.bottom)
+    }
+    .fillWidth()
+    .fillHeight()
+}
+
+// Under the hint: the home indicator on touch, as an iPhone's, else room.
+function lockScreenFoot(navigation: borrow NavigationModel, bottom: Number) -> Any Widget {
+    return match navigation {
+        Touch -> VStack(alignment = .Center) {
+            FixedGap(width = 0.0, height = 14.0)
+            HomeIndicatorBar()
+            FixedGap(width = 0.0, height = bottom)
+        }
+        Pointer, Directional -> FixedGap(width = 0.0, height = bottom)
+    }
+}
+
+// How long the lock screen takes to open before it is taken away, in seconds:
+// on touch the time it takes to go on up and off the top of the screen from
+// where the finger left it.
+public function lockScreenOpeningSeconds(navigation: NavigationModel) -> Number {
+    return match navigation {
+        Touch -> 0.3
+        Pointer, Directional -> 0.5
+    }
+}
+
+// How the lock screen leaves once it has opened, and comes back when the
+// machine locks again.
+public function lockScreenTransition(navigation: NavigationModel) -> Transition {
+    return match navigation {
+        // Comes down from the top, pulled from the status bar or as the
+        // machine locks, and is gone up and off the screen by the time it is
+        // taken away.
+        Touch -> asymmetricTransition(
+            insertion: moveTransition(.Top),
+            removal: identityTransition()
+        )
+        // Its picture is the background's, so it gives way
+        // to what was in front with a dissolve, as a Mac's lock screen does.
+        Pointer, Directional -> opacityTransition()
+    }
+}
+
+// The motion that opens it and carries it away.
+public function lockScreenAnimation(navigation: NavigationModel) -> Animation {
+    return match navigation {
+        // Quick and settling without a bounce, as an iPhone's comes and goes.
+        Touch -> .Spring(SpringAnimation { response: 0.3, dampingFraction: 1.0 })
+        Pointer, Directional -> .EaseInOut(0.5)
+    }
+}

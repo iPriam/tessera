@@ -1,0 +1,433 @@
+//! The links between applications and the running platform.
+//!
+//! PID 1 makes one link for each application and hands one end to the
+//! application and the other to the platform. Each end carries the
+//! application's display client number, which is its surface. An application
+//! holds one link, and the platform holds one per application. A platform
+//! that starts again is handed new links, and each replaces the one with the
+//! same number.
+//!
+//! Over a link the application says what its menus hold and posts its
+//! notifications, and the platform says which item the person chose. A touch
+//! platform also says what its Dock holds, which the home screen draws, and the
+//! home screen says what the person chose in it (see `Dock.kira`). Both ends
+//! keep what they were told, and whoever draws reads it: the platform reads the
+//! menus of the application in front, and the application reads the items to run.
+//!
+//! A message is a sixteen-byte header of four little-endian words, the opcode,
+//! the length, a serial and a detail word, followed by the body. PID 1's service
+//! messages have the same shape.
+
+import Foundation
+import Heap
+import LibTessera
+
+/// The kind of a message sent over a link.
+///
+/// The opcode is the first word of every message header. Its raw value is the
+/// word's value on the wire.
+@Derive(Copy)
+enum LinkOpcode: U32 {
+    /// Application to platform: the menus, as records (Menus.kira). The detail
+    /// word is the body's byte count.
+    Menus = 1
+    /// Platform to application: the detail word is the number of the item chosen.
+    Choose = 2
+    /// Application to platform: a notification, as a record
+    /// (Notifications.kira). The detail word is the body's byte count.
+    Notify = 3
+    /// Home screen to platform: the icons it shows, as records
+    /// (HomeIcons.kira). The detail word is the body's byte count.
+    HomeIcons = 4
+    /// Platform to application: what the Dock holds, as records (Dock.kira).
+    /// The detail word is the body's byte count.
+    Dock = 5
+    /// Home screen to platform: the application chosen in the Dock, by name.
+    /// The detail word is the body's byte count.
+    DockChoose = 6
+}
+
+/// Every opcode, in the order of their raw values.
+let linkOpcodes: [LinkOpcode] = [.Menus, .Choose, .Notify, .HomeIcons, .Dock, .DockChoose]
+
+/// The layout of a link message header: four little-endian words, sixteen bytes in all.
+namespace LinkHeader {
+    /// The size of a message header, in bytes.
+    let bytes: Number = 16
+    /// The offset of the opcode word within the header.
+    let opcodeAt: Number = 0
+    /// The offset of the length word, which is the whole message's byte count.
+    let lengthAt: Number = 4
+    /// The offset of the serial word.
+    let serialAt: Number = 8
+    /// The offset of the detail word, whose meaning the opcode gives.
+    let detailAt: Number = 12
+    /// The serial every message is sent with. PID 1 does not use it for these links.
+    let serial: Number = 0
+}
+
+/// The keys the completions on a link carry: the base, plus the link's
+/// client number. Keys below the base are the caller's own.
+public namespace PlatformLinkKey {
+    /// The first key a link's completion carries; keys below it belong to the caller.
+    let base: Number = 65536
+}
+
+/// Why a link could not be read or written.
+public enum BridgeFailure {
+    /// No link has this client number.
+    NoLink(Number)
+    /// A link's channel failed for the reason given.
+    Broken(TesseraError)
+    /// A message that was not one, and its byte count.
+    Malformed(Number)
+}
+
+/// One end of a link, and what came over it.
+struct LinkEnd {
+    /// The channel this end reads and writes.
+    var channel: Handle
+    /// The display client number of the application this link belongs to.
+    var client: Number
+    /// The application on the other end, as PID 1 named it.
+    var application: String = ""
+    /// Whether a wait for this link's next message is outstanding.
+    var armed: Bool = false
+    /// On the platform's side, the menus the application said it has, and
+    /// the Dock last told it.
+    var menus: [BridgeMenu] = []
+    /// The Dock text last sent on this link, so an unchanged Dock is not sent twice.
+    var dockPublished: String? = .None
+}
+
+/// The process's links, the items the platform chose that are not run yet, and
+/// the menus last sent, so the same menus are not sent twice. On the
+/// platform's side, the notifications that arrived and are not shown yet; on
+/// the application's, those posted before it had a link, sent once it has one.
+struct Bridge {
+    /// The links, one for each application or platform end.
+    var links: [LinkEnd] = []
+    /// The items the platform chose that are not run yet.
+    var chosen: [Number] = []
+    /// The menus last sent, so the same menus are not sent twice.
+    var published: String = ""
+    /// The notifications that arrived and are not shown yet, on the platform's side.
+    var notifications: [BridgeNotification] = []
+    /// The notifications posted before the application had a link, sent once it has one.
+    var unsent: [String] = []
+    /// The home screen's icons last sent, and on the platform's side, those
+    /// it said it shows.
+    var homeIconsPublished: String = ""
+    /// The icons the home screen said it shows, on the platform's side.
+    var homeIcons: [BridgeHomeIcon] = []
+    /// On the application's side, the Dock as the platform last said and
+    /// whether it said so since it was last read; on the platform's, the
+    /// applications the person chose in the home screen's Dock.
+    var dock: [BridgeDockItem]? = .None
+    /// Whether the platform said what the Dock holds since it was last read.
+    var dockChanged: Bool = false
+    /// The applications the person chose in the home screen's Dock, not yet taken.
+    var dockChoices: [String] = []
+}
+
+/// A shared handle on the process's `Bridge`.
+///
+/// A class has reference storage: every copy of the handle reaches the same
+/// bridge. The session loop and the platform's closures both hold one, which a
+/// `borrow mut Bridge` parameter cannot be: a closure does not capture a
+/// borrowed value. Pass `handle.bridge` where a function takes `borrow mut Bridge`.
+public class BridgeHandle {
+    // The bridge every copy of this handle reaches.
+    var bridge: Bridge = Bridge {}
+}
+
+/// A handle on a bridge with no links. A program that reaches AppKit through its
+/// interface sees `BridgeHandle` as an opaque type and must not write the literal,
+/// which would build an empty value instead of the class.
+public function makeBridgeHandle() -> BridgeHandle {
+    return BridgeHandle {}
+}
+
+/// Returns the index of the link whose client number is `client`, or `.None`.
+function linkAt(bridge: borrow Bridge, client: Number) -> Number? {
+    for index in 0..bridge.links.count {
+        if bridge.links[index].client == client { return .Some(index) }
+    }
+    return .None
+}
+
+/// Takes `channel` as the link for `client`, the application PID 1 named
+/// `application`, in place of any link it had.
+public function adoptPlatformLink(
+    handle: BridgeHandle,
+    channel: Handle,
+    client: Number,
+    application: borrow String
+) -> Result<Void, BridgeFailure> {
+    handle.bridge.published = ""
+    handle.bridge.homeIconsPublished = ""
+    let adopted = LinkEnd { channel: channel, client: client, application: copy application }
+    match linkAt(handle.bridge, client) {
+        Some(index) -> {
+            let replaced = handle.bridge.links[index].channel
+            handle.bridge.links[index] = adopted
+            return match handleClose(replaced) {
+                Ok -> .Ok
+                Error(failure) -> .Error(.Broken(failure))
+            }
+        }
+        None -> handle.bridge.links.append(adopted)
+    }
+    return sendUnsent(handle.bridge, channel)
+}
+
+/// Asks `port` for a completion when anything arrives on a link, or a link's
+/// other end goes, on every link not asked for already.
+public function armPlatformLinks(
+    handle: BridgeHandle,
+    port: Handle
+) -> Result<Void, BridgeFailure> {
+    for index in 0..handle.bridge.links.count {
+        if handle.bridge.links[index].armed { continue }
+        let signals = Signals.readable | Signals.peerClosed
+        let key = PlatformLinkKey.base + handle.bridge.links[index].client
+        match objectWaitAsync(handle.bridge.links[index].channel, signals, .Once, port, key) {
+            Ok -> {
+                handle.bridge.links[index].armed = true
+                log debug("waits on a link", client: handle.bridge.links[index].client, key: key)
+            }
+            Error(failure) -> return .Error(.Broken(failure))
+        }
+    }
+    return .Ok
+}
+
+/// Whether a completion with `key` is a link's.
+public function isPlatformLinkKey(key: Number) -> Bool {
+    return key >= PlatformLinkKey.base
+}
+
+/// Takes what arrived on the link a completion with `key` was for. A link
+/// whose other end went is let go.
+public function platformLinkWoke(
+    handle: BridgeHandle,
+    key: Number
+) -> Result<Void, BridgeFailure> {
+    let client = key - PlatformLinkKey.base
+    let index = match linkAt(handle.bridge, client) {
+        Some(value) -> value
+        // A link replaced since it was armed.
+        None -> return .Ok
+    }
+    handle.bridge.links[index].armed = false
+    log debug("a link woke", client: client)
+    while true {
+        let arrived = try readLink(handle.bridge.links[index].channel)
+        match arrived {
+            Message(message) -> try take(handle.bridge, index, message)
+            Nothing -> return .Ok
+            Closed -> {
+                let channel = handle.bridge.links[index].channel
+                var kept: [LinkEnd] = []
+                for link in handle.bridge.links {
+                    if link.client != client { kept.append(link) }
+                }
+                handle.bridge.links = move kept
+                return match handleClose(channel) {
+                    Ok -> .Ok
+                    Error(failure) -> .Error(.Broken(failure))
+                }
+            }
+        }
+    }
+}
+
+/// One message read off a link: its opcode, detail word and body.
+struct LinkMessage {
+    /// The kind of message.
+    var opcode: LinkOpcode
+    /// The detail word, whose meaning the opcode gives.
+    var detail: Number
+    /// The body after the header.
+    var body: String
+}
+
+/// What reading a link found.
+enum LinkRead {
+    /// A message was waiting.
+    Message(LinkMessage)
+    /// Nothing is waiting.
+    Nothing
+    /// The other end went.
+    Closed
+}
+
+/// The next message on `channel`.
+function readLink(channel: Handle) -> Result<LinkRead, BridgeFailure> {
+    let size = match channelPeek(channel) {
+        Ok(value) -> value
+        Error(failure) -> return endOf(failure)
+    }
+    let count = max(size.bytes, LinkHeader.bytes)
+    let block = zeroedBlock(count: count, alignment: 16)
+    let received = match channelRead(
+        channel,
+        Buffer { address: block.pointer(), length: count },
+        0
+    ) {
+        Ok(value) -> value
+        Error(failure) -> return endOf(failure)
+    }
+    if received.bytes < LinkHeader.bytes { return .Error(.Malformed(received.bytes)) }
+    let raw: Number = blockLoad<U32>(block, LinkHeader.opcodeAt)
+    let length: Number = blockLoad<U32>(block, LinkHeader.lengthAt)
+    let detail: Number = blockLoad<U32>(block, LinkHeader.detailAt)
+    let opcode = try caseWithCode(linkOpcodes, raw) otherwise return .Error(
+        .Malformed(received.bytes)
+    )
+    if length != received.bytes { return .Error(.Malformed(received.bytes)) }
+    let text = stringFromCBytes(
+        heapOffset(block.pointer(), LinkHeader.bytes),
+        received.bytes - LinkHeader.bytes
+    )
+    return .Ok(.Message(LinkMessage { opcode: opcode, detail: detail, body: text }))
+}
+
+/// A failed read as what it says of the link.
+function endOf(failure: borrow TesseraError) -> Result<LinkRead, BridgeFailure> {
+    if failure.code == .ShouldWait { return .Ok(.Nothing) }
+    if failure.code == .PeerClosed { return .Ok(.Closed) }
+    return .Error(.Broken(copy failure))
+}
+
+/// Keeps what `message`, from the link at `index`, says.
+function take(
+    bridge: borrow mut Bridge,
+    index: Number,
+    message: borrow LinkMessage
+) -> Result<Void, BridgeFailure> {
+    match message.opcode {
+        Menus -> {
+            let menus = try decodedMenus(message.body) otherwise return .Error(
+                .Malformed(message.body.count)
+            )
+            bridge.links[index].menus = move menus
+        }
+        Choose -> bridge.chosen.append(message.detail)
+        HomeIcons -> {
+            bridge.homeIcons = try decodedHomeIcons(message.body) otherwise return .Error(
+                .Malformed(message.body.count)
+            )
+        }
+        Dock -> {
+            let dock = try decodedDock(message.body) otherwise return .Error(
+                .Malformed(message.body.count)
+            )
+            log info("the platform said what the Dock holds", applications: dock.count)
+            bridge.dock = .Some(move dock)
+            bridge.dockChanged = true
+        }
+        DockChoose -> bridge.dockChoices.append(copy message.body)
+        Notify -> {
+            let (title, body) = match decodedNotification(message.body) {
+                Some(value) -> value
+                None -> return .Error(.Malformed(message.body.count))
+            }
+            log debug("a notification came over a link", client: bridge.links[index].client)
+            bridge.notifications.append(
+                BridgeNotification {
+                    client: bridge.links[index].client,
+                    application: copy bridge.links[index].application,
+                    title: move title,
+                    body: move body,
+                }
+            )
+        }
+    }
+    return .Ok
+}
+
+/// Writes a message with `opcode`, `detail` and `body` on `channel`.
+function writeLink(
+    channel: Handle,
+    opcode: LinkOpcode,
+    detail: Number,
+    body: borrow String
+) -> Result<Void, TesseraError> {
+    let bytes = body.utf8()
+    let total = LinkHeader.bytes + bytes.count
+    let block = zeroedBlock(count: total, alignment: 16)
+    blockStore<U32>(block, LinkHeader.opcodeAt, opcode.rawValue())
+    blockStore<U32>(block, LinkHeader.lengthAt, total)
+    blockStore<U32>(block, LinkHeader.serialAt, LinkHeader.serial)
+    blockStore<U32>(block, LinkHeader.detailAt, detail)
+    for (index, byte) in bytes.enumerated() {
+        blockStore<U8>(block, LinkHeader.bytes + index, byte)
+    }
+    let none: [Handle] = []
+    return channelWrite(channel, Buffer { address: block.pointer(), length: total }, none)
+}
+
+// --- The application's side ---------------------------------------------------
+
+/// Tells the platform what the application's menus hold, when they changed since
+/// they were last told or `force` asks to tell them again: the application
+/// came to the front.
+public function publishMenus(
+    handle: BridgeHandle,
+    menus: borrow [BridgeMenu],
+    force: Bool
+) -> Result<Void, BridgeFailure> {
+    let text = encodedMenus(menus)
+    if !force && text == handle.bridge.published { return .Ok }
+    for link in handle.bridge.links {
+        match writeLink(link.channel, .Menus, text.utf8().count, text) {
+            Ok -> {}
+            Error(failure) -> return .Error(.Broken(failure))
+        }
+    }
+    handle.bridge.published = text
+    return .Ok
+}
+
+/// The items the platform chose since the last call, in the order chosen, now the
+/// caller's to run.
+public function takeChosenItems(handle: BridgeHandle) -> [Number] {
+    let taken = move handle.bridge.chosen
+    handle.bridge.chosen = []
+    return taken
+}
+
+// --- The platform's side ---------------------------------------------------------
+
+/// The menus the application with display client number `client` has, as it
+/// last said; none until it says.
+public function menusOf(handle: BridgeHandle, client: Number) -> [BridgeMenu] {
+    return match linkAt(handle.bridge, client) {
+        Some(index) -> copy handle.bridge.links[index].menus
+        None -> []
+    }
+}
+
+/// The name of the application with display client number `client`, as PID 1
+/// opened it; none when no link has the number.
+public function applicationOf(handle: BridgeHandle, client: Number) -> String? {
+    return match linkAt(handle.bridge, client) {
+        Some(index) -> .Some(copy handle.bridge.links[index].application)
+        None -> .None
+    }
+}
+
+/// Tells the application with display client number `client` that the person
+/// chose its item `number`.
+public function chooseItem(
+    handle: BridgeHandle,
+    client: Number,
+    number: Number
+) -> Result<Void, BridgeFailure> {
+    let index = try linkAt(handle.bridge, client) otherwise return .Error(.NoLink(client))
+    return match writeLink(handle.bridge.links[index].channel, .Choose, number, "") {
+        Ok -> .Ok
+        Error(failure) -> .Error(.Broken(failure))
+    }
+}

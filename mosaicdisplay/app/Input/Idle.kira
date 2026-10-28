@@ -1,0 +1,111 @@
+import Foundation
+import LibTessera
+import TesseraDisplayClient
+
+// The output dims and then blanks when no input has come for the times the
+// platform set with `SetIdle` (roadmap/08-display-server.md, "Input"). One
+// timer is armed for the next time the state could change. Input only notes
+// when it came; a timer that fires before the output has been quiet long
+// enough arms itself again for what is left, so input costs no system call.
+
+namespace IdleTimes {
+    // How dark the dimmed picture is: the alpha of the black laid over it.
+    let shade: Number = 0.5
+    let millisecondsPerSecond: Number = 1000
+}
+
+function makeIdleTimer() -> Handle? {
+    return match timerCreate(.Monotonic) {
+        Ok(timer) -> .Some(timer)
+        Error(failed) -> unavailableIdleTimer(failed)
+    }
+}
+
+function unavailableIdleTimer(reason: borrow TesseraError) -> Handle? {
+    log warn("the output cannot dim or blank without a timer", error: errorName(reason))
+    return .None
+}
+
+// Applies the platform's `SetIdle`. The quiet is counted from now.
+function setIdle(
+    server: borrow mut Server,
+    idle: borrow DisplayIdle
+) -> Result<Void, TesseraError> {
+    server.idle = copy idle
+    let now = try nowMillis()
+    server.lastInput = Number(now)
+    log info("the platform set the idle times", dim: idle.dim, blank: idle.blank)
+    armIdle(server)
+    return .Ok
+}
+
+// What the output turns into next for want of input, and after how many
+// milliseconds of quiet; none when it stays as it is.
+function nextIdleStep(server: borrow Server) -> (DisplayIdleState, Number)? {
+    let dim = Number(server.idle.dim) * IdleTimes.millisecondsPerSecond
+    let blank = Number(server.idle.blank) * IdleTimes.millisecondsPerSecond
+    return match server.idleState {
+        Awake -> {
+            if dim > 0 && (blank == 0 || dim < blank) { return .Some((.Dimmed, dim)) }
+            if blank > 0 { return .Some((.Blanked, blank)) }
+            .None
+        }
+        Dimmed -> blank > 0 ? .Some((.Blanked, blank)) : .None
+        Blanked -> .None
+    }
+}
+
+// Arms the timer for the next step, counted from the last input.
+function armIdle(server: borrow Server) {
+    let timer = try server.idleTimer otherwise return
+    let after = match nextIdleStep(server) {
+        Some(step) -> step.1
+        None -> return
+    }
+    let deadline = (server.lastInput + after) * KeyRepeat.nanosecondsPerMillisecond
+    match timerSet(timer, UNumber(deadline), 0, TimerOptions.none, server.port, PortKey.idle) {
+        Ok -> {}
+        Error(failed) -> log warn("the idle timer could not be armed", error: errorName(failed))
+    }
+}
+
+// The timer fired: the output dims or blanks when it has been quiet long
+// enough, and the timer is armed again for what is left otherwise.
+function idleFired(
+    server: borrow mut Server,
+    fired: borrow Completion
+) -> Result<Void, TesseraError> {
+    if fired.error.code != .Ok { return .Ok }
+    let step = match nextIdleStep(server) {
+        Some(value) -> value
+        None -> return .Ok
+    }
+    let now = try nowMillis()
+    if Number(now) - server.lastInput >= step.1 { changeIdle(server, step.0) }
+    armIdle(server)
+    return .Ok
+}
+
+// Input came: the output wakes if it dimmed or blanked. Whether the output
+// was blanked, when the presses that woke it reach no client.
+function wakeForInput(server: borrow mut Server) -> Result<Bool, TesseraError> {
+    let now = try nowMillis()
+    server.lastInput = Number(now)
+    if server.idleState == .Awake { return .Ok(false) }
+    let blanked = server.idleState == .Blanked
+    changeIdle(server, .Awake)
+    armIdle(server)
+    return .Ok(blanked)
+}
+
+// Puts the output in `state`, tells the platform and draws the picture again.
+function changeIdle(server: borrow mut Server, state: DisplayIdleState) {
+    server.idleState = state
+    server.blankShown = false
+    log info("the output changed for want of input", state: displayIdleStateName(state))
+    match server.platform {
+        Some(platform) -> tell(platform, .IdleChanged(state))
+        None -> {}
+    }
+    redraw(server, "the output's idle state")
+}

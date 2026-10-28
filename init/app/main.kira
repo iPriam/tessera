@@ -1,0 +1,156 @@
+// Tessera's PID 1, in Kira.
+//
+// An init should be small, boring, and never the thing that crashes. It mounts
+// what a userland expects to find already mounted, says what this machine is,
+// starts the services, watches them, and waits to be told to stop. Everything
+// that does anything visible is a service — the display and the keyboard left
+// this program precisely because they were the parts of it that could fail.
+//
+// Every kernel interaction here goes through LibTessera: the machine calls
+// only a system process may make, and the handles every program uses. A new
+// kernel is a new LibTessera backend; this program does not change.
+//
+// These behaviours are driven from the kernel command line:
+//
+//   tessera.autoexit      stop the machine once the services are up, so an
+//                         automated boot test ends on its own.
+//   tessera.system        mount the current system from the btrfs volume and
+//                         hand the machine to the init inside it, which is
+//                         this program again.
+//   tessera.dev           a development machine: boot system/dev, unsealed,
+//                         and run the dev root service.
+//   tessera.handed-over   this init is the system's own: the initramfs's
+//                         init handed the machine to it.
+//   tessera.restart-test  kill the display once, on purpose, so that a boot
+//                         demonstrates supervision rather than asserting it.
+//
+// None is read from /proc/cmdline. The kernel hands an option it does not
+// recognise straight to init as an argument, so reading them costs no file, no
+// descriptor and no system call at all.
+
+import Foundation
+import LibTessera
+
+@Main
+function main() {
+    // Whatever the kernel needs in place before a userland can run on it.
+    match machinePrepare() {
+        Ok -> {}
+        Error(failed) -> log warn("the machine is not fully prepared", error: errorName(failed))
+    }
+    // The serial console is where every service's log events are read, and
+    // the kernel writes to the same line: a kernel message printed while a
+    // service is writing an event lands in the middle of it. Once userland is
+    // up, only what is critical reaches the console; the boot itself, before
+    // this, prints in full.
+    match machineQuietConsole() {
+        Ok -> {}
+        Error(failed) -> log warn(
+            "the kernel console stays at its boot level",
+            error: errorName(failed)
+        )
+    }
+
+    let bootArguments = match processArguments() {
+        Ok(arguments) -> arguments
+        Error(failed) -> {
+            refuseToBoot("the kernel's arguments could not be read (" + errorName(failed) + ")")
+            return
+        }
+    }
+
+    let calls = makeCallPort()
+
+    print("")
+    print("    ╔══════════════════════════════════╗")
+    print("    ║  T E S S E R A                   ║")
+    print("    ╚══════════════════════════════════╝")
+    print("")
+    // The line a boot test greps for. Changing its wording means changing
+    // scripts/run-qemu.sh with it.
+    print("tessera: userland reached, pid 1 is alive")
+    let handedOver = bootFlag(bootArguments, BootFlag.handedOver)
+    if handedOver {
+        // The line a boot test greps for when it boots with a system
+        // volume. Changing its wording means changing scripts/run-qemu.sh
+        // with it.
+        print("tessera: system volume is the root, pid 1 is the system's own init")
+    }
+    print("tessera: this init is a Kira program talking to the kernel through LibTessera")
+    announceWholeFileRead(calls, "/" + SystemFile.release)
+    print("")
+
+    // The handover comes before the services: with a system volume, what runs
+    // on this machine is the business of the init inside it, and this program
+    // is not here any more to supervise anything.
+    if !handedOver && bootFlag(bootArguments, BootFlag.system) {
+        handOverToSystem(calls, bootArguments)
+    }
+
+    // The writable volume, once this program is the running system rather than a
+    // stepping stone to one. On a `tessera.system` boot the handover above never
+    // returns and the init inside the volume owns this; here, this init is the
+    // system, so it is the one that gives the machine somewhere to remember.
+    let dataMounted = match mountDataVolume() {
+        Ok -> true
+        Error(reason) -> {
+            match reason {
+                DiskListFailed(failed) -> log warn(
+                    "the machine would not list its disks",
+                    error: errorName(failed)
+                )
+                // A disk's mount failure is logged with its disk, as it happens.
+                MountFailed(failed) -> {}
+                NoDisk -> {}
+            }
+            log info("no disk holds the volume's data; nothing will be remembered")
+            false
+        }
+    }
+    if dataMounted {
+        match ensureDirectory(calls, "/" + SystemDirectory.systemData) {
+            Ok -> {}
+            Error(failed) -> log warn(
+                "could not create the system data directory",
+                error: errorName(failed)
+            )
+        }
+        bindRootDirectories(calls)
+        announceDirectory(calls, "/" + SystemDirectory.data)
+        announcePersistedDisplayMode(calls)
+        verifyAtomicWrite(calls)
+    }
+    var systemLog = SystemLog {}
+    if dataMounted {
+        match openSystemLog(calls) {
+            Ok(value) -> systemLog = value
+            Error(failed) -> log warn("could not open the system log", error: errorName(failed))
+        }
+    }
+    // A process that dies of a signal leaves a report on the data volume.
+    if dataMounted {
+        match machineReportCrashes("/" + SystemDirectory.programs + "/reportcrash") {
+            Ok -> {}
+            Error(failed) -> log warn("crashes go unreported", error: errorName(failed))
+        }
+    }
+
+    if bootFlag(bootArguments, "tessera.autoexit") {
+        // A boot test: bring the machine up, prove the services started, and
+        // take it down through the same path a shutdown uses.
+        var fleet = startFleet(calls, services(calls, bootArguments), move systemLog)
+        connectDisplayClients(fleet.channels, fleet.services)
+        awaitDisplayMode(calls, fleet.channels, fleet.services)
+        log info("every service is up")
+        if handedOver { markSystemGood(calls) }
+        powerOff(fleet, "tessera.autoexit was set")
+        return
+    }
+
+    superviseForever(
+        calls,
+        bootFlag(bootArguments, "tessera.restart-test"),
+        bootArguments,
+        move systemLog
+    )
+}

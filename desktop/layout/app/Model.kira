@@ -1,0 +1,133 @@
+//! Home's arrangement as data (roadmap/24-home-and-personalisation.md, "Pages
+//! and editing"): its pages in order, each a run of applications and folders
+//! with widgets along its top, and the applications taken off Home, which App
+//! Library still lists. Applications go by the name PID 1 gives them.
+//!
+//! Nothing here reads a file, the screen or the system, so every rule is
+//! tested on any host (`tests/layout_kik`). Desktop keeps the arrangement in
+//! its data folder and draws it.
+
+import Foundation
+
+/// How much a page holds: `perPage` items on a full page, in rows of
+/// `columns`.
+public struct HomeSpace {
+    let perPage: Number
+    let columns: Number
+}
+
+public struct HomeFolder {
+    var name: String
+    var apps: [String] = []
+}
+
+public enum HomeItem {
+    App: String
+    Folder: HomeFolder
+}
+
+public struct HomePage {
+    var items: [HomeItem] = []
+    var hidden: Bool = false
+    // The widgets along its top.
+    var widgets: [HomeWidget] = []
+}
+
+public struct HomeArrangement {
+    var pages: [HomePage] = []
+    var removed: [String] = []
+    // The reset of Home's layout Settings asked for last that this
+    // arrangement follows, none when none was.
+    var reset: String = ""
+}
+
+public namespace HomeFormat {
+    // The first line of an arrangement this Home reads; one written before
+    // it is arranged again from what is installed.
+    let version: String = "version 2"
+}
+
+// Where an item stands: its page, and its place on it.
+public struct HomeSlot {
+    var page: Number
+    var index: Number
+}
+
+extend HomeItem {
+    // The name the item goes by: its application's, or its folder's.
+    function name(borrow self) -> String {
+        return match self {
+            App(app) -> copy app
+            Folder(folder) -> copy folder.name
+        }
+    }
+
+    // Whether the item is the application `app`, or a folder holding it.
+    function holds(borrow self, app: borrow String) -> Bool {
+        return match self {
+            App(name) -> name == app
+            Folder(folder) -> folder.apps.contains(app)
+        }
+    }
+}
+
+/// How many rows of icons a page's widget band takes.
+public namespace HomeWidgetRows {
+    let count: Number = 2
+}
+
+public enum HomeWidgetSize {
+    Small
+    Medium
+}
+
+// A widget on a page: the provider it shows, by name, and its size.
+public struct HomeWidget {
+    var kind: String
+    var size: HomeWidgetSize = .Small
+}
+
+extend HomeWidgetSize {
+    // How many columns of icons it is wide.
+    function columns(borrow self) -> Number {
+        return match self {
+            Small -> 2
+            Medium -> 4
+        }
+    }
+
+    function word(borrow self) -> String {
+        return match self {
+            Small -> "small"
+            Medium -> "medium"
+        }
+    }
+
+    // The next size, as a press while Home is edited changes it.
+    function next(borrow self) -> HomeWidgetSize {
+        return match self {
+            Small -> .Medium
+            Medium -> .Small
+        }
+    }
+}
+
+public function homeWidgetSizeNamed(word: borrow String) -> HomeWidgetSize {
+    return word == "medium" ? .Medium : .Small
+}
+
+// How many columns `widgets` take side by side.
+public function homeWidgetColumns(widgets: borrow [HomeWidget]) -> Number {
+    var used: Number = 0
+    for widget in widgets { used = used + widget.size.columns() }
+    return used
+}
+
+// Whether `widgets` have room beside them for `size` in a row of `columns`.
+public function homeWidgetFits(
+    widgets: borrow [HomeWidget],
+    size: HomeWidgetSize,
+    columns: Number
+) -> Bool {
+    return homeWidgetColumns(widgets) + size.columns() <= columns
+}

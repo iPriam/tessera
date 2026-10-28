@@ -1,0 +1,196 @@
+import Foundation
+import Build
+
+// The Tessera kernel (roadmap/02-kernel-and-syscalls.md): the pinned Linux release under the
+// patches in patches/linux, configured as the architecture's defconfig with
+// the Tessera fragments in kernel/config merged over it, and the uapi headers
+// a userland is built against, installed from the same tree and the same make.
+// The tarball is downloaded from kernel.org and checked against
+// kernel/SHA256.
+//
+// The kernel is built incrementally: its unpacked tree, with kbuild's output
+// directory inside it, is kept in the command's workspace, which the Build
+// library never removes, so a change recompiles what it touches rather than
+// the whole kernel. kbuild's own dependency tracking keeps the kept output
+// correct. The output directory sits directly in the tree, so kbuild names the
+// tree `..` in every command it records and the workspace can move.
+
+struct KernelBuild {
+    // The image QEMU boots.
+    let image: Artifact
+    // The sanitised headers, as `headers_install` writes them.
+    let headers: Artifact
+}
+
+namespace KernelLayout {
+    // The file naming the pinned release.
+    let version: String = "kernel/VERSION"
+    // The SHA-256 of the release's tarball.
+    let digest: String = "kernel/SHA256"
+    // www.kernel.org: the cdn host speaks only TLS 1.2, and the Build
+    // library's Network only TLS 1.3.
+    let mirror: String = "https://www.kernel.org/pub/linux/kernel"
+    let configs: String = "kernel/config"
+    let patches: String = "patches/linux"
+    // Every build of one tree reads as the same build: what a kernel prints
+    // as its build time, user and host. The time is in UTC and after the
+    // epoch: the built-in initramfs's cpio refuses a negative one, which is
+    // what a bare 1970-01-01 is east of Greenwich.
+    let timestamp: String = "2000-01-01 00:00:00 UTC"
+    let builder: String = "tessera"
+}
+
+// The kernel for `context`'s architecture, or what is missing for it.
+function kernelBuild(
+    graph: borrow mut Graph,
+    context: borrow BuildContext
+) -> Result<KernelBuild, String> {
+    let root = graph.root
+    let version = match readFile(joinedPath(root, KernelLayout.version)) {
+        Ok(contents) -> contents.text.trim()
+        Error(failure) -> {
+            absorb failure
+            return .Error("no \(KernelLayout.version)")
+        }
+    }
+    let digest = match readFile(joinedPath(root, KernelLayout.digest)) {
+        Ok(contents) -> contents.text.trim()
+        Error(failure) -> {
+            absorb failure
+            return .Error("no \(KernelLayout.digest)")
+        }
+    }
+    let series = version.split(".")[0]
+    let tarball = graph.download(
+        "kernel/linux-\(version).tar.xz",
+        "\(KernelLayout.mirror)/v\(series).x/linux-\(version).tar.xz",
+        digest
+    )
+    let architecture = context.architecture
+    let none: [String] = []
+    let cross = architecture == context.host.architecture ? "" : architecture.multiarch() + "-"
+    var environment = [
+        EnvironmentEntry { name: "PATH", value: copy context.host.path },
+        EnvironmentEntry { name: "HOME", value: copy context.host.home },
+        EnvironmentEntry { name: "KBUILD_BUILD_TIMESTAMP", value: KernelLayout.timestamp },
+        EnvironmentEntry { name: "KBUILD_BUILD_USER", value: KernelLayout.builder },
+        EnvironmentEntry { name: "KBUILD_BUILD_HOST", value: KernelLayout.builder }
+    ]
+    var variables: [CommandVariable] = []
+    if context.host.darwin {
+        // `LLVM=<dir>/` takes clang, the assembler, ld.lld and the binutils
+        // from the bundle that links the userland. Darwin's `ld` cannot link a
+        // Linux kernel. Host tools such as sorttable include <elf.h> and
+        // <byteswap.h>, which hostHeaders makes, and certs/extract-cert finds
+        // Homebrew's keg-only OpenSSL through pkg-config.
+        environment.append(EnvironmentEntry { name: "LLVM", value: context.host.llvm + "/bin/" })
+        environment.append(EnvironmentEntry { name: "LLVM_IAS", value: "1" })
+        variables.append(
+            CommandVariable {
+                name: "HOSTCFLAGS",
+                value: .Joined([.Text("-I"), .Input(hostHeaders(graph, context))])
+            }
+        )
+        environment.append(
+            EnvironmentEntry {
+                name: "PKG_CONFIG_PATH",
+                value: "/opt/homebrew/opt/openssl@3/lib/pkgconfig"
+            }
+        )
+    }
+    let built = graph.command(
+        CommandAction {
+            label: "kernel \(version) (\(architecture.name()))",
+            tool: "sh",
+            arguments: [
+                .Text("-c"),
+                .Text(kernelScript()),
+                .Input(tarball),
+                .Input(graph.sourceTree(KernelLayout.patches, none)),
+                .Input(graph.source("\(KernelLayout.configs)/tessera-common.config")),
+                .Input(
+                    graph.source("\(KernelLayout.configs)/tessera-\(architecture.name()).config")
+                ),
+                .Output("image"),
+                .Output("uapi"),
+                .Text(architecture.kbuild()),
+                .Text(cross),
+                .Text(architecture.kernelImage()),
+                .Workspace
+            ],
+            environment: environment,
+            variables: variables,
+            outputs: [Output { name: "image" }, Output { name: "uapi", kind: .Tree }],
+            workspace: "kernel-\(architecture.name())"
+        }
+    )
+    return .Ok(KernelBuild { image: built[0], headers: built[1] })
+}
+
+// The headers the kernel's host tools include and Darwin lacks. They are for
+// programs that run on the build host: modpost and sorttable are written
+// against glibc. <elf.h> is glibc's, from the sysroot, and <byteswap.h> three
+// macros over compiler builtins, which Darwin has without the header.
+function hostHeaders(graph: borrow mut Graph, context: borrow BuildContext) -> Artifact {
+    let name = context.architecture.name()
+    let byteswap = graph.write(
+        "\(name)/host-include/byteswap.h",
+        "#ifndef TESSERA_BYTESWAP_H\n#define TESSERA_BYTESWAP_H\n#define bswap_16(x) __builtin_bswap16(x)\n#define bswap_32(x) __builtin_bswap32(x)\n#define bswap_64(x) __builtin_bswap64(x)\n#endif\n",
+        FileMode.data
+    )
+    return graph.tree(
+        "\(name)/host-include",
+        [
+            .Place(
+                TreePlace {
+                    path: "elf.h",
+                    artifact: sysrootFile(graph, context, "usr/include/elf.h"),
+                    mode: FileMode.data
+                }
+            ),
+            .Place(TreePlace { path: "byteswap.h", artifact: byteswap, mode: FileMode.data })
+        ]
+    )
+}
+
+// The kernel's build, as one command: `sh -c` hands it the tarball, the patch
+// directory, the two fragments, the image and header outputs, `ARCH`,
+// `CROSS_COMPILE`, the image's path in the output directory and the kept
+// workspace, as $0 to $9. kbuild's output is the tree's `build` directory. The
+// tree is unpacked and patched again only when the
+// tarball's name or a patch changed, and configured again only when that or a
+// fragment changed; make then rebuilds what changed.
+function kernelScript() -> String {
+    let lines = [
+        "set -e",
+        "tarball=$0 patches=$1 common=$2 fragment=$3 image=$4 headers=$5 arch=$6 cross=$7 built=$8 workspace=$9",
+        "source=\"$workspace/source\" output=\"$workspace/source/build\"",
+        "unpacked=$({ basename \"$tarball\"; cat \"$patches\"/*.patch 2> /dev/null || true; } | sha256sum | cut -d' ' -f1)",
+        "if [ \"$(cat \"$workspace/source.stamp\" 2> /dev/null)\" != \"$unpacked\" ]; then",
+        "    rm -rf \"$source\" \"$workspace/source.stamp\"",
+        "    mkdir -p \"$source\"",
+        "    tar -xf \"$tarball\" -C \"$source\" --strip-components=1",
+        "    for patch in \"$patches\"/*.patch; do [ -e \"$patch\" ] && patch -s -p1 -d \"$source\" < \"$patch\"; done",
+        "    echo \"$unpacked\" > \"$workspace/source.stamp\"",
+        "fi",
+        "if [ \"$(uname -s)\" = Darwin ]; then",
+        "    sdk=$(xcrun --show-sdk-path)",
+        "    export HOSTCFLAGS=\"-isysroot $sdk -I$source/scripts/include $HOSTCFLAGS\" HOSTLDFLAGS=\"-isysroot $sdk\"",
+        "fi",
+        "kernel() { make -s -C \"$source\" O=\"$output\" ARCH=\"$arch\" CROSS_COMPILE=\"$cross\" \"$@\"; }",
+        "configured=$({ echo \"$unpacked $arch\"; cat \"$common\" \"$fragment\"; } | sha256sum | cut -d' ' -f1)",
+        "if [ ! -f \"$output/.config\" ] || [ \"$(cat \"$workspace/config.stamp\" 2> /dev/null)\" != \"$configured\" ]; then",
+        "    mkdir -p \"$output\"",
+        "    rm -f \"$workspace/config.stamp\"",
+        "    kernel defconfig",
+        "    \"$source/scripts/kconfig/merge_config.sh\" -m -O \"$output\" \"$output/.config\" \"$common\" \"$fragment\" > /dev/null",
+        "    kernel olddefconfig",
+        "    echo \"$configured\" > \"$workspace/config.stamp\"",
+        "fi",
+        "kernel -j\"$(nproc)\"",
+        "cp \"$output/$built\" \"$image\"",
+        "kernel INSTALL_HDR_PATH=\"$headers\" headers_install",
+        "test -f \"$headers/include/linux/socket.h\""
+    ]
+    return textLines(lines)
+}

@@ -1,0 +1,260 @@
+import Foundation
+import LibTessera
+import DeviceKit
+
+// The service's state: its ports, its listener, the volumes it found and
+// the disks ejected since it started, the registry watches, the clients
+// still to send their request and those watching. `main` makes it and lends
+// it to everything that runs.
+
+struct Service {
+    var port: Handle
+    // Device opens and block reads wait here, so no other completion is
+    // taken in their place.
+    var openPort: Handle
+    // Namespace calls wait here (`Nodes.kira`).
+    var nodePort: Handle
+    var listener: Handle
+    // Whether mounts are posted as `volumeChanged`: not those the first scan
+    // makes, which nobody could have seen otherwise.
+    var announcing: Bool
+    var volumes: [Volume]
+    // The disks ejected since this service started, which nothing mounts
+    // until they are attached anew.
+    var ejected: [EntryId]
+    var watches: Watches?
+    var waiting: [Waiting]
+    var nextWaiting: Number
+    var watchers: [Handle]
+    // `/Volumes`, once made or found.
+    var volumesDirectory: Handle?
+}
+
+// A connection whose request has not arrived yet. A client writes its
+// request once the broker has handed it the channel, which can be after
+// this service accepts it.
+struct Waiting {
+    var id: Number
+    var channel: Handle
+}
+
+namespace ServiceName {
+    let volume: String = "tessera.volume"
+}
+
+// The keys this service's waits are made under. A waiting connection's key
+// is `waiting` plus its id.
+namespace PortKey {
+    let listener: Number = 1
+    let diskWatch: Number = 2
+    let partitionWatch: Number = 3
+    let termination: Number = 4
+    let waiting: Number = 256
+    // The most completions taken in one wait.
+    let batch: Number = 8
+}
+
+// What a completion key names.
+enum Waker {
+    Listener
+    Termination
+    DiskWatch
+    PartitionWatch
+    Waiting(Number)
+    Unknown
+}
+
+function wakerOf(key: Number) -> Waker {
+    if key == PortKey.listener { return .Listener }
+    if key == PortKey.termination { return .Termination }
+    if key == PortKey.diskWatch { return .DiskWatch }
+    if key == PortKey.partitionWatch { return .PartitionWatch }
+    if key >= PortKey.waiting { return .Waiting(key - PortKey.waiting) }
+    return .Unknown
+}
+
+function failure(code: borrow ErrorCode) -> TesseraError {
+    return TesseraError {
+        code: code,
+        subsystem: .DeviceKit,
+        flags: ErrorFlags.none,
+        detail: UNumber(0)
+    }
+}
+
+// The first completion on `port`, which the one request just made completes.
+function awaitCompletion(port: Handle) -> Result<Completion, TesseraError> {
+    let completions = try portWait(port, 1, Number(Deadline.infinite))
+    if completions.count == 0 { return .Error(failure(.Internal)) }
+    let done = completions[0]
+    if done.error.code != .Ok { return .Error(done.error) }
+    return .Ok(done)
+}
+
+// The ports and the listener, then the watches and the first scan. It
+// listens first: a client that connects meanwhile waits in the backlog.
+function startService() -> Result<Service, TesseraError> {
+    let port = try portCreate(.None)
+    let openPort = try portCreate(.None)
+    let nodePort = try portCreate(.None)
+    match processWatchTermination(port, PortKey.termination) {
+        Ok -> {}
+        Error(failed) -> log warn("cannot hear a request to stop", error: errorName(failed))
+    }
+    let listener = try serviceListen(ServiceName.volume)
+    var service = Service {
+        port: port,
+        openPort: openPort,
+        nodePort: nodePort,
+        listener: listener,
+        announcing: false,
+        volumes: [],
+        ejected: [],
+        watches: .None,
+        waiting: [],
+        nextWaiting: 0,
+        watchers: [],
+        volumesDirectory: .None,
+    }
+    // The watches first: their first read is what the registry holds now,
+    // which the scan then sees, and anything after it is a change.
+    match startWatches(service) {
+        Ok -> {}
+        Error(failed) -> log warn(
+            "cannot watch for disks; disks attached later are not mounted",
+            error: errorName(failed)
+        )
+    }
+    scan(service)
+    service.announcing = true
+    try objectWaitAsync(listener, Signals.readable, .Repeat, port, PortKey.listener)
+    return .Ok(service)
+}
+
+// Takes completions until asked to stop.
+function run(service: borrow mut Service) {
+    while true {
+        match portWait(service.port, PortKey.batch, Number(Deadline.infinite)) {
+            Ok(completions) -> {
+                for completion in completions {
+                    match wakerOf(Number(completion.key)) {
+                        Termination -> {
+                            log info("asked to stop")
+                            return
+                        }
+                        Listener -> accept(service)
+                        DiskWatch -> watchWoke(service, .Disks)
+                        PartitionWatch -> watchWoke(service, .Partitions)
+                        Waiting(id) -> waitingWoke(service, id)
+                        Unknown -> log warn(
+                            "a completion no wait was made for",
+                            key: completion.key
+                        )
+                    }
+                }
+            }
+            Error(failed) -> log warn("port wait failed", error: errorName(failed))
+        }
+    }
+}
+
+// Takes every connection waiting on the listener.
+function accept(service: borrow mut Service) {
+    while true {
+        let channel = match serviceAccept(service.listener) {
+            Ok(value) -> value
+            Error(failed) -> {
+                if failed.code != .ShouldWait {
+                    log warn("a connection could not be taken", error: errorName(failed))
+                }
+                return
+            }
+        }
+        if !serve(service, channel) { wait(service, channel) }
+    }
+}
+
+// Waits for the request on `channel`.
+function wait(service: borrow mut Service, channel: Handle) {
+    let id = service.nextWaiting
+    service.nextWaiting += 1
+    match objectWaitAsync(
+        channel,
+        Signals.readable | Signals.peerClosed,
+        .Once,
+        service.port,
+        PortKey.waiting + id
+    ) {
+        Ok -> service.waiting.append(Waiting { id: id, channel: channel })
+        Error(failed) -> {
+            log warn("a connection cannot be waited on", error: errorName(failed))
+            closeHandle(channel)
+        }
+    }
+}
+
+// The channel of the connection waiting under `id`, if it still waits.
+function waitingChannel(service: borrow Service, id: Number) -> Handle? {
+    for waiting in service.waiting {
+        if waiting.id == id { return .Some(waiting.channel) }
+    }
+    return .None
+}
+
+function waitingWoke(service: borrow mut Service, id: Number) {
+    let channel = try waitingChannel(service, id) otherwise return
+    var kept: [Waiting] = []
+    for waiting in service.waiting {
+        if waiting.id != id { kept.append(waiting) }
+    }
+    service.waiting = kept
+    if !serve(service, channel) { wait(service, channel) }
+}
+
+// Answers the request on `channel` and closes it, unless it is a `Watch`,
+// which keeps it. False when the request is still to come.
+function serve(service: borrow mut Service, channel: Handle) -> Bool {
+    match receive(channel) {
+        Ok(request) -> match request {
+            List -> list(service, channel)
+            Mount(entry) -> mountRequest(service, channel, entry)
+            Unmount(entry) -> unmountRequest(service, channel, entry)
+            Eject(entry) -> ejectRequest(service, channel, entry)
+            Watch -> {
+                watchFrom(service, channel)
+                return true
+            }
+        }
+        Error(failed) -> match failed {
+            Channel(error) -> if error.code == .ShouldWait { return false }
+            UnknownOperation(operation) -> answer(channel, operation, .Unsupported)
+        }
+    }
+    closeHandle(channel)
+    return true
+}
+
+function closeHandle(handle: Handle) {
+    match handleClose(handle) {
+        Ok -> {}
+        Error(failed) -> log warn("a handle could not be closed", error: errorName(failed))
+    }
+}
+
+function closeHandles(handles: borrow [Handle]) {
+    if handles.count == 0 { return }
+    match handleCloseMany(handles) {
+        Ok -> {}
+        Error(failed) -> log warn("handles could not be closed", error: errorName(failed))
+    }
+}
+
+function closeRef(ref: Ref) {
+    match refClose(ref) {
+        Ok -> {}
+        Error(failed) -> log warn(
+            "a device connection could not be closed",
+            error: errorName(failed)
+        )
+    }
+}

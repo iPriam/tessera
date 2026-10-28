@@ -1,0 +1,498 @@
+import Foundation
+import LibTessera
+
+// What PID 1 starts, and how many times it will try.
+
+// One thing this machine runs, and what to do when it stops.
+//
+// A list rather than a dependency graph, for a reason: Tessera has a handful of
+// services and an ordered list is enough; a graph is what gets built when the
+// list was not enough, and it never was.
+//
+// `arguments` is what the program is started with, its own name first, as
+// launchd's `ProgramArguments`; an empty list starts it with its path alone.
+struct Service {
+    var name: String
+    var path: String
+    var arguments: [String]
+    var restart: Bool
+    var displayRole: DisplayRole
+
+    // Whether MosaicDisplay links this service: it draws something.
+    function isDisplayClient(borrow self) -> Bool {
+        match self.displayRole {
+            None -> return false
+            Application, Platform, Desktop, Presence -> return true
+        }
+    }
+
+    // Whether MosaicDisplay gives this service a surface and a number: every
+    // display client but the Presence service, which only answers checks.
+    function hasSurface(borrow self) -> Bool {
+        match self.displayRole {
+            Application, Platform, Desktop -> return true
+            None, Presence -> return false
+        }
+    }
+
+    // Whether this service holds a platform link: an application or the desktop,
+    // whose menus the platform shows in its bar while it is in front.
+    function takesPlatformLink(borrow self) -> Bool {
+        match self.displayRole {
+            Application, Desktop -> return true
+            None, Platform, Presence -> return false
+        }
+    }
+
+    // Whether this is the platform, the other end of every platform link.
+    function isPlatform(borrow self) -> Bool {
+        match self.displayRole {
+            Platform -> return true
+            None, Application, Desktop, Presence -> return false
+        }
+    }
+
+    // Whether PID 1 reads requests on the service's channel: the desktop's,
+    // which opens, installs and uninstalls applications as Finder does; the
+    // platform's, whose Dock opens them as a Mac's does; and Inlay's own,
+    // the system application that does the same from its window. No other
+    // application asks PID 1 for anything.
+    function asksForApplications(borrow self) -> Bool {
+        match self.displayRole {
+            Desktop, Platform -> return true
+            Application -> return self.path == finderExecutable()
+            None, Presence -> return false
+        }
+    }
+
+    function isDesktop(borrow self) -> Bool {
+        match self.displayRole {
+            Desktop -> return true
+            None, Application, Platform, Presence -> return false
+        }
+    }
+}
+
+// Inlay's executable, in the system's applications, which is the system
+// volume's and so is the one built with it.
+function finderExecutable() -> String {
+    return "/" + SystemDirectory.systemApplications + "/Inlay.app/Contents/MacOS/Inlay"
+}
+
+// The page the browser boot loads: a data URL, so it needs no network.
+namespace BrowserTest {
+    let page: String = "data:text/html,<html><body style='margin:0;background:%23336699'><h1 style='color:white;font-family:sans-serif'>Tessera Browser</h1></body></html>"
+}
+
+// What this machine runs, in the order it starts them.
+function services(calls: Handle, bootArguments: borrow [String]) -> [Service] {
+    var services: [Service] = []
+    // The service broker first: every named service checks in with it, and
+    // every client reaches a service by asking it (roadmap/16-libtessera.md
+    // §12). A service that starts before it waits for it.
+    services.append(
+        Service {
+            name: "bootstrap",
+            path: "/" + SystemDirectory.programs + "/bootstrap",
+            arguments: [],
+            restart: true,
+            displayRole: DisplayRole.None,
+        }
+    )
+    // DeviceKit's device manager next: it is the one process that opens
+    // device nodes, and the display server asks it for the display and the
+    // keyboard as it starts (roadmap/17-devicekit.md §20).
+    services.append(
+        Service {
+            name: "devicekitd",
+            path: "/" + SystemDirectory.programs + "/devicekitd",
+            arguments: [],
+            restart: true,
+            displayRole: DisplayRole.None,
+        }
+    )
+    // The services LibTessera's Devices and Power calls and the disk list
+    // are answered by (roadmap/17-devicekit.md §25), each a DeviceKit client
+    // that asks devicekitd for its devices.
+    services.append(
+        Service {
+            name: "devices",
+            path: "/" + SystemDirectory.programs + "/devices",
+            arguments: [],
+            restart: true,
+            displayRole: DisplayRole.None,
+        }
+    )
+    services.append(
+        Service {
+            name: "power",
+            path: "/" + SystemDirectory.programs + "/power",
+            arguments: [],
+            restart: true,
+            displayRole: DisplayRole.None,
+        }
+    )
+    services.append(
+        Service {
+            name: "pasteboard",
+            path: "/" + SystemDirectory.programs + "/pasteboard",
+            arguments: [],
+            restart: true,
+            displayRole: DisplayRole.None,
+        }
+    )
+    // The Trash service: it moves items into the Trash on the data volume
+    // (roadmap/19). Programs the system runs may ask it; apps may not yet.
+    services.append(
+        Service {
+            name: "trash",
+            path: "/" + SystemDirectory.programs + "/trash",
+            arguments: [],
+            restart: true,
+            displayRole: DisplayRole.None,
+        }
+    )
+    // The Presence service, which verifies interaction tokens. It has a display
+    // link only to ask MosaicDisplay whether a token is good.
+    services.append(
+        Service {
+            name: "presence",
+            path: "/" + SystemDirectory.programs + "/presence",
+            arguments: [],
+            restart: true,
+            displayRole: DisplayRole.Presence,
+        }
+    )
+    services.append(
+        Service {
+            name: "volume",
+            path: "/" + SystemDirectory.programs + "/volume",
+            arguments: [],
+            restart: true,
+            displayRole: DisplayRole.None,
+        }
+    )
+    // The machine's settings, which the platforms read as they start and
+    // Settings changes (LibTessera `System/Settings.kira`).
+    services.append(
+        Service {
+            name: "settingsd",
+            path: "/" + SystemDirectory.programs + "/settingsd",
+            arguments: [],
+            restart: true,
+            displayRole: DisplayRole.None,
+        }
+    )
+    services.append(
+        Service {
+            name: "mosaicdisplay",
+            path: "/" + SystemDirectory.programs + "/mosaicdisplay",
+            arguments: [],
+            restart: true,
+            displayRole: DisplayRole.None,
+        }
+    )
+    // Kira UI, which is what everything under `roadmap/10-toolkit.md` is for.
+    // It does not restart: a toolkit that cannot start is not a thing to keep
+    // trying, and the machine is more useful with a splash on it than in a
+    // restart loop.
+    // The Dynamic Platform this machine runs. Each (Adaptive Desktop,
+    // Adaptive Mobile, Console, Media) is its own program against the same
+    // display server, and MosaicDisplay serves each with no change of its
+    // own. Which one is `chosenPlatform`'s, and it is switched while the
+    // machine runs (`Supervise/Platform.kira`).
+    // `tessera.idle-test` has an adaptive platform blank the output after
+    // twenty seconds without input, rather than its own minutes, for a boot
+    // to see it dim, blank and wake.
+    let idleTest = bootFlag(bootArguments, "tessera.idle-test")
+    // `tessera.recovery` is the installer media: Recovery draws the whole
+    // screen and nothing else is shown.
+    let recovery = bootFlag(bootArguments, "tessera.recovery")
+    if recovery {
+        services.append(
+            Service {
+                name: "recovery",
+                path: "/" + SystemDirectory.programs + "/recovery",
+                arguments: [],
+                restart: true,
+                displayRole: DisplayRole.Platform,
+            }
+        )
+        // The Install service, which only the recovery media carries:
+        // Recovery asks it to partition, erase and install.
+        services.append(
+            Service {
+                name: "installer",
+                path: "/" + SystemDirectory.programs + "/installer",
+                arguments: ["installer", "--serve"],
+                restart: true,
+                displayRole: DisplayRole.None,
+            }
+        )
+    } else {
+        services.append(platformService(chosenPlatform(calls, bootArguments), idleTest))
+    }
+    // `tessera.desktop` boots to the desktop, from which applications are
+    // opened, instead of the toolkit's boot check. It is restarted like the
+    // platform: without it nothing can be opened.
+    if bootFlag(bootArguments, "tessera.desktop") {
+        services.append(
+            Service {
+                name: "desktop",
+                path: "/" + SystemDirectory.coreServices + "/Desktop.app/Contents/MacOS/Desktop",
+                arguments: [],
+                restart: true,
+                displayRole: DisplayRole.Desktop,
+            }
+        )
+        // Until the first-run setup is completed, Welcome opens over the
+        // desktop to ask for language, keyboard, time zone and appearance.
+        if !setupCompleted(calls) {
+            services.append(
+                Service {
+                    name: "welcome",
+                    path: "/" + SystemDirectory.systemApplications + "/Welcome.app/Contents/MacOS/Welcome",
+                    arguments: [],
+                    restart: false,
+                    displayRole: DisplayRole.Application,
+                }
+            )
+        }
+    } else if bootFlag(bootArguments, "tessera.browser-test") {
+        // The Browser, on a page that needs no network: a data URL it draws.
+        services.append(
+            Service {
+                name: "browser",
+                path: "/" + SystemDirectory.systemApplications + "/Browser.app/Contents/MacOS/Browser",
+                arguments: ["Browser", BrowserTest.page],
+                restart: false,
+                displayRole: DisplayRole.Application,
+            }
+        )
+    } else if !recovery {
+        services.append(
+            Service {
+                name: "display-check",
+                path: "/" + SystemDirectory.coreServices + "/Display Check.app/Contents/MacOS/Display Check",
+                arguments: [],
+                restart: false,
+                displayRole: DisplayRole.Application,
+            }
+        )
+    }
+    if bootFlag(bootArguments, BootFlag.dev) {
+        for service in developmentServices() { services.append(service) }
+    }
+    if bootFlag(bootArguments, "tessera.multi-client-test") {
+        services.append(
+            Service {
+                name: "display-check-second",
+                path: "/" + SystemDirectory.coreServices + "/Display Check.app/Contents/MacOS/Display Check",
+                arguments: [],
+                restart: false,
+                displayRole: DisplayRole.Application,
+            }
+        )
+    }
+    // diskutil, once, when a boot asks the Volume service to let go of the
+    // scratch disk: `tessera.unmount-test` unmounts it and
+    // `tessera.eject-test` ejects it. It reaches the service through the
+    // broker, which holds it until the service has checked in.
+    if bootFlag(bootArguments, "tessera.unmount-test") {
+        services.append(
+            Service {
+                name: "diskutil",
+                path: "/" + SystemDirectory.programs + "/diskutil",
+                arguments: ["diskutil", "unmount", "scratch"],
+                restart: false,
+                displayRole: DisplayRole.None,
+            }
+        )
+    }
+    // `diskutil activity`, for as long as the machine runs, when a boot
+    // plugs a USB stick in and out and follows what the Volume service
+    // says of it.
+    if bootFlag(bootArguments, "tessera.activity-test") {
+        services.append(
+            Service {
+                name: "diskutil",
+                path: "/" + SystemDirectory.programs + "/diskutil",
+                arguments: ["diskutil", "activity"],
+                restart: false,
+                displayRole: DisplayRole.None,
+            }
+        )
+    }
+    // `diskutil info scratch`, once, which only asks the service for its
+    // list.
+    if bootFlag(bootArguments, "tessera.info-test") {
+        services.append(
+            Service {
+                name: "diskutil",
+                path: "/" + SystemDirectory.programs + "/diskutil",
+                arguments: ["diskutil", "info", "scratch"],
+                restart: false,
+                displayRole: DisplayRole.None,
+            }
+        )
+    }
+    // `pmset -g`, once, which reads the Power service's page.
+    if bootFlag(bootArguments, "tessera.pmset-test") {
+        services.append(
+            Service {
+                name: "pmset",
+                path: "/" + SystemDirectory.programs + "/pmset",
+                arguments: ["pmset", "-g"],
+                restart: false,
+                displayRole: DisplayRole.None,
+            }
+        )
+    }
+    // `caffeinate -i -t 1`, once, which holds a wake lock for a second.
+    if bootFlag(bootArguments, "tessera.caffeinate-test") {
+        services.append(
+            Service {
+                name: "caffeinate",
+                path: "/" + SystemDirectory.programs + "/caffeinate",
+                arguments: ["caffeinate", "-i", "-t", "1"],
+                restart: false,
+                displayRole: DisplayRole.None,
+            }
+        )
+    }
+    // `ioreg -l -c BlockDevice`, once, which reads DeviceKit's registry.
+    if bootFlag(bootArguments, "tessera.ioreg-test") {
+        services.append(
+            Service {
+                name: "ioreg",
+                path: "/" + SystemDirectory.programs + "/ioreg",
+                arguments: ["ioreg", "-l", "-c", "BlockDevice"],
+                restart: false,
+                displayRole: DisplayRole.None,
+            }
+        )
+    }
+    // `diskutil list /dev/vda`, once, which only asks the service for its list.
+    if bootFlag(bootArguments, "tessera.list-test") {
+        services.append(
+            Service {
+                name: "diskutil",
+                path: "/" + SystemDirectory.programs + "/diskutil",
+                arguments: ["diskutil", "list", "/dev/vda"],
+                restart: false,
+                displayRole: DisplayRole.None,
+            }
+        )
+    }
+    // `diskutil eject disc`: the restart boot's CD, whose drive must open
+    // its tray.
+    if bootFlag(bootArguments, "tessera.eject-disc-test") {
+        services.append(
+            Service {
+                name: "diskutil-disc",
+                path: "/" + SystemDirectory.programs + "/diskutil",
+                arguments: ["diskutil", "eject", "disc"],
+                restart: false,
+                displayRole: DisplayRole.None,
+            }
+        )
+    }
+    // `date 010100002030`: sets the clock to 2030, which the Power service
+    // sees and posts as `timeChanged`. It runs under `caffeinate -i`, whose
+    // wake lock is answered by the Power service's own loop: by then the
+    // service watches the clock, which on a slow machine it may not yet do
+    // when date would otherwise run, and the jump would go unseen.
+    if bootFlag(bootArguments, "tessera.date-test") {
+        services.append(
+            Service {
+                name: "date",
+                path: "/" + SystemDirectory.programs + "/caffeinate",
+                arguments: ["caffeinate", "-i", "date", "010100002030"],
+                restart: false,
+                displayRole: DisplayRole.None,
+            }
+        )
+    }
+    if bootFlag(bootArguments, "tessera.eject-test") {
+        services.append(
+            Service {
+                name: "diskutil",
+                path: "/" + SystemDirectory.programs + "/diskutil",
+                arguments: ["diskutil", "eject", "scratch"],
+                restart: false,
+                displayRole: DisplayRole.None,
+            }
+        )
+    }
+    // A service that ends as soon as it starts, restarted as if it mattered,
+    // so that a boot shows the restart policy giving up on it after ten
+    // deaths in ten seconds rather than restarting it forever. `date` with
+    // no arguments says the time and ends, which is all a crash loop needs.
+    if bootFlag(bootArguments, "tessera.crash-loop-test") {
+        services.append(
+            Service {
+                name: "crash-loop",
+                path: "/" + SystemDirectory.programs + "/date",
+                arguments: ["date"],
+                restart: true,
+                displayRole: DisplayRole.None,
+            }
+        )
+    }
+    return services
+}
+
+// `tessera.dev` makes this a development machine: the dev root service
+// installs component builds over the system and asks PID 1 to restart
+// what loads the files they change (roadmap/18-components.md). A
+// machine that is not one never runs it.
+function developmentServices() -> [Service] {
+    var services: [Service] = []
+    services.append(
+        Service {
+            name: "devroot",
+            path: "/" + SystemDirectory.programs + "/devroot",
+            arguments: [],
+            restart: true,
+            displayRole: DisplayRole.None,
+        }
+    )
+    // The debugger's stub on the machine's debug port
+    // (roadmap/14-tooling-and-ports.md).
+    services.append(
+        Service {
+            name: "debugserver",
+            path: "/" + SystemDirectory.programs + "/debugserver",
+            arguments: [],
+            restart: true,
+            displayRole: DisplayRole.None,
+        }
+    )
+    // LLVM's own lldb-server on the machine's LLDB port, behind
+    // debugserver's gate, which waits for a debugger to connect.
+    let gate = "/" + SystemDirectory.programs + "/debugserver"
+    services.append(
+        Service {
+            name: "lldb-server",
+            path: copy gate,
+            arguments: [gate, "--lldb"],
+            restart: true,
+            displayRole: DisplayRole.None,
+        }
+    )
+    return services
+}
+
+// ─── Starting one ───────────────────────────────────────────────────────────
+
+// How often a service may die before this program stops trying: ten deaths
+// within ten seconds (roadmap/03-processes.md, "Restart policy"). A service
+// that fails immediately and forever is said out loud once, not restarted
+// until the machine is switched off; one that dies now and then, however
+// many times over the machine's life, is restarted each time.
+namespace RestartWindow {
+    let deaths: Number = 10
+    let seconds: Number = 10
+}
+
+// ─── Saying things ──────────────────────────────────────────────────────────

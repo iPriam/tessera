@@ -1,0 +1,132 @@
+//! The pasteboard's connections: each read or write request is answered from the clipboard.
+import Foundation
+import LibTessera
+
+// Connections: writes and reads of the item.
+//
+// A write replaces the item and is answered `Ok`. Any program may write,
+// because copying is the person's action. A read returns the item only for
+// an interaction token, which proves a real input event (roadmap/16 §14.1).
+// A read without a token is refused `NoInteraction`. A read with one goes to
+// the Presence service, which verifies it, and the item is sent only when the
+// token is valid. Otherwise the read is refused with Presence's reason.
+
+/// Takes every connection waiting on the listener.
+function accept(service: borrow mut Service) {
+    while true {
+        let channel = match serviceAccept(service.listener) {
+            Ok(value) -> value
+            Error(failed) -> {
+                if failed.code != .ShouldWait {
+                    log warn("a connection could not be taken", error: errorName(failed))
+                }
+                return
+            }
+        }
+        let id = service.nextClient
+        service.nextClient += 1
+        match objectWaitAsync(
+            channel,
+            Signals.readable | Signals.peerClosed,
+            .Repeat,
+            service.port,
+            channelKey(id)
+        ) {
+            Ok -> service.clients.append(Client { id: id, channel: channel })
+            Error(failed) -> {
+                log warn("a connection cannot be waited on", error: errorName(failed))
+                closeHandle(channel)
+            }
+        }
+    }
+}
+
+/// Cancels what is armed under `key`; a closing client may have nothing armed, and then there is nothing to cancel.
+function cancelWaits(port: Handle, key: Number) {
+    match portCancel(port, key) {
+        // The waits are cancelled, and how many there were is not needed.
+        Ok -> {}
+        Error(failed) -> {
+            if failed.code != .NotFound {
+                log warn("a wait could not be cancelled", key, error: errorName(failed))
+            }
+        }
+    }
+}
+
+/// The index of connection `id` in the service's connections, or none when it is not one.
+function clientIndex(service: borrow Service, id: Number) -> Number? {
+    for (index, client) in service.clients.enumerated() {
+        if client.id == id { return .Some(index) }
+    }
+    return .None
+}
+
+/// Closes a connection and forgets it.
+function closeClient(service: borrow mut Service, id: Number) {
+    let index = match clientIndex(service, id) {
+        Some(value) -> value
+        // Already closed; there is no connection left to release.
+        None -> return
+    }
+    cancelWaits(service.port, channelKey(id))
+    closeHandle(service.clients[index].channel)
+    var kept: [Client] = []
+    for other in service.clients {
+        if other.id != id { kept.append(other) }
+    }
+    service.clients = kept
+}
+
+/// Answers one read request on `channel`: reads the item named `item` under the read token, and answers with its text or the reason it could not be read.
+function readRequest(channel: Handle, token: borrow ReadToken, item: borrow String) {
+    let operation = code(Operation.Read)
+    if token.idLow == UNumber(0) && token.idHigh == UNumber(0) {
+        answer(channel, operation, .NoInteraction)
+        return
+    }
+    let check = InteractionToken {
+        idLow: token.idLow,
+        idHigh: token.idHigh,
+        surfaceId: token.surfaceId,
+        issued: UNumber(0),
+    }
+    match presenceVerify(move check) {
+        Ok -> match send(channel, operation, .Ok, item) {
+            Ok -> {}
+            Error(failed) -> log warn("the item could not be sent", error: errorName(failed))
+        }
+        Error(failed) -> answer(channel, operation, failed.code)
+    }
+}
+
+/// Answers everything a connection has sent, and closes it once its peer has gone.
+function serveClient(service: borrow mut Service, id: Number) {
+    while true {
+        let index = match clientIndex(service, id) {
+            Some(value) -> value
+            // A completion can outlive its connection.
+            None -> return
+        }
+        let channel = service.clients[index].channel
+        match receive(channel) {
+            Ok(request) -> match request {
+                Write(text) -> {
+                    service.item = text
+                    // The size only: what was copied is the person's, not the log's.
+                    log info("an item was copied", bytes: text.count)
+                    answer(channel, code(Operation.Write), .Ok)
+                }
+                Read(token) -> readRequest(channel, token, service.item)
+            }
+            Error(failed) -> match failed {
+                Channel(error) -> {
+                    if error.code != .ShouldWait { closeClient(service, id) }
+                    return
+                }
+                UnknownOperation(operation) -> answer(channel, operation, .Unsupported)
+                Refused(refusal) -> answer(channel, code(refusal.operation), refusal.reason)
+            }
+        }
+    }
+}

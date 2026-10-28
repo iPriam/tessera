@@ -1,0 +1,92 @@
+import Foundation
+
+// The output a desktop boot's window opens at on a Mac. QEMU's Cocoa window,
+// patched for HiDPI, shows a pixel of the guest's a pixel of the Mac's screen
+// and grows to the guest's mode, so a mode larger than the screen opens a
+// window that runs off it, with its bar and Dock out of sight, until the
+// window is resized and the guest follows. The first mode is the window the
+// screen can hold instead, in the screen's pixels: the main screen less its
+// menu bar and Dock, less the window's own title bar.
+
+namespace HostScreen {
+    // The visible frame less a Cocoa window's title bar, 32 points, in pixels.
+    let script: String = "ObjC.import('AppKit'); var s = $.NSScreen.mainScreen; "
+        + "var f = s.visibleFrame; var k = s.backingScaleFactor; "
+        + "Math.floor(f.size.width * k) + 'x' + Math.floor((f.size.height - 32) * k)"
+    // The largest of the Mac's screens, whole, in pixels: the most the guest's
+    // output grows to when its window is made full screen on it.
+    let largest: String = "ObjC.import('AppKit'); var a = $.NSScreen.screens; var w = 0; "
+        + "var h = 0; for (var i = 0; i < a.count; i++) { var s = a.objectAtIndex(i); "
+        + "var k = s.backingScaleFactor; var f = s.frame; if (f.size.width * k * f.size.height * k > w * h) "
+        + "{ w = f.size.width * k; h = f.size.height * k } } Math.floor(w) + 'x' + Math.floor(h)"
+    // The pixels a point of the main screen, which is the scale a window's
+    // guest mode is drawn at.
+    let backing: String = "ObjC.import('AppKit'); $.NSScreen.mainScreen.backingScaleFactor"
+}
+
+// The pixels a point the guest's output is drawn at: the Mac's main screen's
+// backing scale on a Mac, where the window is that screen's; elsewhere two
+// for an output 2048 pixels wide or more, as a Retina panel's is, else one.
+function bootOutputScale(host: borrow Host, width: Number) -> Number {
+    if host.darwin {
+        match hostBackingScale() {
+            Some(scale) -> return scale
+            None -> {
+                log warn("the Mac's backing scale could not be asked; taking the width's")
+            }
+        }
+    }
+    return width >= 2048 ? 2 : 1
+}
+
+// The pixels a point the Mac's main screen draws at, 1 or 2, or nothing when
+// the screen cannot be asked.
+function hostBackingScale() -> Number? {
+    let text = try hostText(HostScreen.backing) otherwise return .None
+    let scale = try text.toNumber() otherwise return .None
+    if scale < 1 { return .None }
+    return .Some(scale)
+}
+
+// `WIDTHxHEIGHT` of the window the Mac's main screen holds, or nothing when
+// the screen cannot be asked.
+function hostWindowOutputSize() -> String? {
+    let (width, height) = try hostPixels(HostScreen.script) otherwise return .None
+    // virtio-gpu scans out rows a multiple of eight pixels wide.
+    return .Some("\(width - width % 8)x\(height)")
+}
+
+// The pixels of the Mac's largest screen, or nothing when it cannot be asked.
+function hostLargestScreen() -> (Number, Number)? {
+    return hostPixels(HostScreen.largest)
+}
+
+// What `script` prints, trimmed, or nothing when it cannot be run.
+function hostText(script: borrow String) -> String? {
+    let command = ProcessCommand {
+        program: "/usr/bin/osascript",
+        arguments: ["-l", "JavaScript", "-e", copy script],
+        input: .Null
+    }
+    let result = match command.run([]) {
+        Ok(ran) -> ran
+        Error(failure) -> {
+            log warn("the Mac's screen could not be asked", traceText(failure))
+            return .None
+        }
+    }
+    if !result.succeeded() { return .None }
+    let text = try textFromBytes(result.output) otherwise return .None
+    return .Some(text.trim())
+}
+
+// The `WIDTHxHEIGHT` `script` prints, as two numbers.
+function hostPixels(script: borrow String) -> (Number, Number)? {
+    let text = try hostText(script) otherwise return .None
+    let sides = text.split("x")
+    if sides.count != 2 { return .None }
+    let width = try sides[0].toNumber() otherwise return .None
+    let height = try sides[1].toNumber() otherwise return .None
+    if width <= 0 || height <= 0 { return .None }
+    return .Some((width, height))
+}

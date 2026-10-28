@@ -1,0 +1,8 @@
+construct MosaicDisplay extends Package {
+    let version: String = "0.1.0"
+    let kind: PackageKind = .App
+    let moduleRoot: String = "MosaicDisplay"
+// Ember, which the composition is drawn with and which takes the clients'
+// memory in, and KCoreAnimation, whose batch draws each surface as a quad,
+// are the SDK's frameworks: the manifest names nothing for them.
+}

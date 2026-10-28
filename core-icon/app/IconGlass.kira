@@ -1,0 +1,211 @@
+import Foundation
+import RenderBox
+
+// `FUN_257eac070`: a glyph highlight. `glassHighlight` draws the band along
+// the group's shapes its light falls on, read from the group's distance
+// field; the band is a clip, and what is under it is brightened or darkened
+// through a colour matrix.
+
+// The content image, and how the composite reads it: the image's side in
+// pixels, its size class, whether the chiclet is dim, whether the groups
+// are rendered as a clear mode mask's, and whether a dark tinted icon
+// composites those groups in colour to screen them over its glass.
+struct GlassContext {
+    let side: Number
+    let size: IconSizeClass
+    let dim: Bool
+    let masked: Bool = false
+    let screened: Bool = false
+}
+
+extend GlassContext {
+    // Whether the composite draws a clear mode mask.
+    function drawsMask(borrow self) -> Bool {
+        return masked && !screened
+    }
+
+    // A distance in canvas points as pixels on the content image, never less
+    // than `least` pixels.
+    function pixels(borrow self, distance: Number, least: Number) -> Number {
+        return max(least, distance * side / IconGeometry.canvas)
+    }
+
+    function height(borrow self, spec: borrow HighlightSpec) -> Number {
+        return pixels(spec.distance.at(size), spec.minDistancePixels.at(size))
+    }
+
+    // `FUN_1ccaf72f4`: a highlight with an outset opacity, which only the
+    // darklights have, falls outside the shapes, whatever the chiclet (the
+    // Finder dumps: solid fills from 0.4 to 0.85 grey and blue, translucent
+    // or not, all draw them outside).
+    function outside(borrow self, spec: borrow HighlightSpec) -> Bool {
+        return spec.darklight
+    }
+
+    // How far outside the shapes any highlight reaches.
+    function outset(borrow self) -> Number {
+        var reach: Number = 0
+        for spec in glyphHighlights() {
+            if outside(spec) { reach = max(reach, height(spec)) }
+        }
+        return reach
+    }
+
+    // How far inside the shapes the deepest highlight reaches.
+    function deepest(borrow self) -> Number {
+        var reach: Number = 0
+        for spec in glyphHighlights() {
+            if !outside(spec) { reach = max(reach, height(spec)) }
+        }
+        return reach
+    }
+}
+
+// The Rec. 709 colour difference matrices `VCM` works through, with the
+// four places IconRendering rounds them to.
+namespace YCbCr {
+    let luma: [Number] = [0.2126, 0.7152, 0.0722]
+    let blueDifference: [Number] = [-0.1146, -0.3854, 0.5]
+    let redDifference: [Number] = [0.5, -0.4542, -0.0458]
+    // Red, green and blue from luma, blue and red difference.
+    let toRgb: [Number] = [1, 0, 1.5748, 1, -0.1873, -0.4681, 1, 1.8556, 0]
+}
+
+// A `VCM` as one colour matrix: luma scaled from black to white and offset
+// by black, the colour differences by the saturation.
+function vcmMatrix(vcm: borrow Vcm) -> [Number] {
+    let toRgb = YCbCr.toRgb
+    var matrix: [Number] = []
+    for row in 0..3 {
+        for column in 0..3 {
+            let luma = (vcm.white - vcm.black) * YCbCr.luma[column]
+            let blue = vcm.saturation * YCbCr.blueDifference[column]
+            let red = vcm.saturation * YCbCr.redDifference[column]
+            matrix.append(
+                toRgb[3 * row] * luma + toRgb[3 * row + 1] * blue + toRgb[3 * row + 2] * red
+            )
+        }
+        matrix.appendAll([0, vcm.black])
+    }
+    matrix.appendAll([0, 0, 0, 1, 0])
+    return matrix
+}
+
+function highlightMatrix(spec: borrow HighlightSpec) -> [Number] {
+    return vcmMatrix(spec.darklight ? HighlightMatrices.dark : HighlightMatrices.light)
+}
+
+// `FUN_257eac600`'s arguments for the highlight lit from `longitude`.
+function glassShader(
+    spec: borrow HighlightSpec,
+    longitude: Number,
+    context: borrow GlassContext,
+    field: borrow TextureImage,
+    color: RGBAColor
+) -> Shader {
+    let height = context.height(spec)
+    let outside = context.outside(spec)
+    let spread = spec.spread.at(context.size)
+    let curvature = outside ? 0 : (spec.diffuse ? 1 : EdgeRamp.curvature)
+    let (x, y) = lightDirection(longitude)
+    let arguments: [ShaderArgument] = [
+        .Float(height),
+        .Float(outside ? -height : 0),
+        .Float(spread > SvgAngle.halfTurn ? -1000 : cos(spread)),
+        .Float(1 / spec.bias - 2),
+        .Float(curvature),
+        .Float2(Vector2 { x: x, y: -y }),
+        .Color(color),
+        .Float(-2 * DistanceDefaults.reach * context.side),
+        .Float(0.5),
+        .Image(.Texture(copy field))
+    ]
+    var shader = Shader { library: iconLibrary(), functionName: IconFunctions.glassHighlight }
+    for (index, argument) in arguments.enumerated() { shader.setArgument(copy argument, index) }
+    return shader
+}
+
+function drawGlassHighlight(
+    list: borrow DisplayList,
+    spec: borrow HighlightSpec,
+    longitude: Number,
+    context: borrow GlassContext,
+    field: borrow TextureImage
+) -> Result<Void, IconRenderFailure> {
+    let side = context.side
+    let alpha = context.outside(spec) ? spec.outsetOpacity.at(context.size) : spec.opacity.at(
+        context.size
+    )
+    list.save()
+    list.beginLayer(LayerFlags.none)
+    list.save()
+    let scale = IconGeometry.canvas / side
+    list.scaleBy(scale, scale)
+    list.translateBy(-1, -1)
+    let rect = Rect { x: 1, y: 1, width: side, height: side }
+    var shape = Shape()
+    shape.setRect(copy rect)
+    var fill = Fill()
+    let level = spec.brightness
+    let color = RGBAColor { r: level, g: level, b: level, a: 1 }
+    fill.setShader(glassShader(spec, longitude, context, field, move color), move rect)
+    list.drawShape(shape, fill, alpha, spec.darklight ? .PlusDarker : .PlusLighter)
+    try listDrawn(list.restore())
+    try listDrawn(list.clipLayer(1, .Normal))
+    list.addColorMatrixFilter(highlightMatrix(spec), ColorFilterFlags.none)
+    list.beginLayer(LayerFlags.needsBackground)
+    try listDrawn(list.drawLayer(1, .Normal))
+    return listDrawn(list.restore())
+}
+
+// The group's highlights inside its shapes, or only those outside them.
+function drawGlassHighlights(
+    list: borrow DisplayList,
+    context: borrow GlassContext,
+    field: borrow TextureImage,
+    outsideOnes: Bool
+) -> Result<Void, IconRenderFailure> {
+    for spec in glyphHighlights() {
+        if context.outside(spec) != outsideOnes { continue }
+        for longitude in spec.longitudes {
+            if context.drawsMask() {
+                try drawMaskHighlight(list, spec, longitude, context, field)
+            } else {
+                try drawGlassHighlight(list, spec, longitude, context, field)
+            }
+        }
+    }
+    return .Ok
+}
+
+// A highlight in a clear mode mask: a light screens its brightness into the
+// red, a darklight multiplies the green down toward its brightness.
+function drawMaskHighlight(
+    list: borrow DisplayList,
+    spec: borrow HighlightSpec,
+    longitude: Number,
+    context: borrow GlassContext,
+    field: borrow TextureImage
+) -> Result<Void, IconRenderFailure> {
+    let side = context.side
+    let level = spec.brightness
+    let color = spec.darklight ? RGBAColor { r : 1, g: level, b: 1, a: 1 }: RGBAColor {
+        r: level,
+        g: 0,
+        b: 0,
+        a: 1
+    }
+    let size = context.size
+    let alpha = context.outside(spec) ? spec.outsetOpacity.at(size) : spec.opacity.at(size)
+    list.save()
+    let scale = IconGeometry.canvas / side
+    list.scaleBy(scale, scale)
+    list.translateBy(-1, -1)
+    let rect = Rect { x: 1, y: 1, width: side, height: side }
+    var shape = Shape()
+    shape.setRect(copy rect)
+    var fill = Fill()
+    fill.setShader(glassShader(spec, longitude, context, field, move color), move rect)
+    list.drawShape(shape, fill, alpha, spec.darklight ? .Multiply : .Screen)
+    return listDrawn(list.restore())
+}

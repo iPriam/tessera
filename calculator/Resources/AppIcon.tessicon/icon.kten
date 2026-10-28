@@ -1,0 +1,16 @@
+TessIcon {
+    fill: .Automatic,
+    groups: [
+        Group {
+            name: "Keys",
+            layers: [
+                Layer { name: "1.display", image: "1.display.svg", position: Position { scale: 1, x: 0, y: 0 } }
+            ],
+            lighting: .Individual,
+            specular: .Inside,
+            translucency: Translucency { enabled: false, amount: 0 },
+            shadow: Shadow { kind: .Chromatic, opacity: 0.4 },
+            opacity: 0.95
+        }
+    ]
+}

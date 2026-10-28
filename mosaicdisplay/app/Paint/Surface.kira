@@ -1,0 +1,44 @@
+import Foundation
+
+// Drawing into a buffer that is already mapped.
+//
+// A store per pixel at a pitch, which is the difference from the framebuffer
+// device: a row goes where it belongs rather than after the one before it.
+
+// Fills a buffer with the background and nothing else.
+//
+// What the mode is set on, so that the console's last screen is gone before the
+// splash arrives rather than showing underneath it for a frame. The first row
+// is stored a pixel at a time and copied to every row after it.
+function fillBackground(pixels: RawPtr, pitch: Number, width: Number, height: Number) {
+    if height <= 0 || width <= 0 { return }
+    let ground = grey(Background.level)
+    let bytes = PixelFormat.bytesPerPixel
+    let columns = width
+    for x in 0..columns { heapStore<U32>(pixels, x * bytes, ground) }
+    let stride = pitch
+    let rows = height
+    for y in 1..rows { heapCopyBytes(heapOffset(pixels, y * stride), pixels, columns * bytes) }
+}
+
+// Draws the splash into a buffer: the background, and the tile in the middle
+// of it. Only the tile's square is painted a pixel at a time, and only the
+// pixels an edge crosses are sampled more than once (Sampling.kira).
+function drawSplash(pixels: RawPtr, pitch: Number, width: Number, height: Number) {
+    fillBackground(pixels, pitch, width, height)
+    let side = tileSide(height)
+    if side <= 0 || side > width { return }
+    let painter = splashPainter(side)
+    let left = trunc((width - side) / 2)
+    let top = trunc((height - side) / 2)
+    let bytes = PixelFormat.bytesPerPixel
+    let stride = pitch
+    let span = side
+    for v in 0..span {
+        let row = (top + v) * stride + left * bytes
+        for u in 0..span {
+            let level = splashLevel(painter, u, v)
+            heapStore<U32>(pixels, row + u * bytes, grey(round(level)))
+        }
+    }
+}

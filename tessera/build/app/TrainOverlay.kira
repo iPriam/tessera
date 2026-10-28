@@ -1,0 +1,239 @@
+import Foundation
+import Build
+import Kten
+
+function componentTrainRoot(
+    graph: borrow mut Graph,
+    architecture: Architecture,
+    described: borrow DescribedComponent
+) -> Artifact {
+    let symbols = graph.tree(
+        "\(architecture.name())/\(described.component.name)/train-symbols",
+        [.Place(TreePlace { path: DeveloperSymbols.directory, artifact: copy described.roots.symbols })]
+    )
+    return graph.union(
+        "\(architecture.name())/\(described.component.name)/train-root",
+        [copy described.roots.install, symbols]
+    )
+}
+
+struct TrainOverlayDescription {
+    let roots: [Artifact]
+    let names: [String]
+    let base: [String]
+}
+
+function trainOverlayDescription(
+    graph: borrow mut Graph,
+    context: borrow BuildContext,
+    release: borrow DescribedRelease,
+    digest: borrow String
+) -> Result<TrainOverlayDescription, String> {
+    let snapshot = match loadBuildSnapshot(digest) {
+        Ok(found) -> found
+        Error(failure) -> {
+            return .Error("cannot load overlay base: \(traceText(failure))")
+        }
+    }
+    match validateTrainConfiguration(snapshot.metadata, context) {
+        Ok -> {}
+        Error(problem) -> {
+            return .Error(problem)
+        }
+    }
+    let components = match trainMetadataItems(snapshot.metadata, "components") {
+        Ok(found) -> found
+        Error(problem) -> {
+            return .Error(problem)
+        }
+    }
+    var roots: [Artifact] = []
+    var names: [String] = []
+    var base: [String] = []
+    for described in release.components {
+        var matched: String? = .None
+        for component in components {
+            if trainMetadataText(component, "name") != described.component.name { continue }
+            match trainMetadataNumber(component, "overlay") {
+                Some(index) -> {
+                    if index >= 0 && index == trunc(index) && index < snapshot.artifacts.count {
+                        matched = .Some(copy snapshot.artifacts[index].digest)
+                    }
+                }
+                None -> {}
+            }
+        }
+        match matched {
+            Some(found) -> base.append(found)
+            None -> {
+                return .Error("train has no overlay root for \(described.component.name)")
+            }
+        }
+        names.append(copy described.component.name)
+        roots.append(componentTrainRoot(graph, context.architecture, described))
+    }
+    return .Ok(TrainOverlayDescription { roots: roots, names: names, base: base })
+}
+
+function describeTrainOverlay(
+    graph: borrow mut Graph,
+    context: borrow BuildContext,
+    release: borrow DescribedRelease,
+    digest: borrow String
+) {
+    if digest.count == 0 || !graph.requested("overlay") { return }
+    let description = match trainOverlayDescription(graph, context, release, digest) {
+        Ok(found) -> found
+        Error(problem) -> {
+            graph.problems.append(problem)
+            return
+        }
+    }
+    let host = copy context.host
+    let architecture = copy context.architecture
+    let baseDigest = copy digest
+    graph.step(Step {
+        name: "overlay", summary: "install only component roots differing from the pinned train",
+        produces: description.roots, materialize: false,
+        run: .Some({ run in
+            return installTrainOverlay(host, architecture, baseDigest, description.names, description.base, run)
+        })
+    })
+}
+
+function installTrainOverlay(
+    host: borrow Host,
+    architecture: Architecture,
+    baseDigest: borrow String,
+    names: borrow [String],
+    base: borrow [String],
+    run: borrow StepRun
+) -> Number {
+    var changed: [String] = []
+    for (index, name) in names.enumerated() {
+        if run.digests[index] == base[index] { continue }
+        if imageOnlyComponent(name) {
+            log fault("the overlay changes a component needed before devroot starts; build a derived image", name)
+            return 2
+        }
+        changed.append(copy name)
+    }
+    let appliedPath = host.buildRoot + "/overlay.installed"
+    var previous: [String] = []
+    if fileExists(appliedPath) {
+        match readFile(appliedPath) {
+            Ok(contents) -> {
+                for line in contents.text.split("\n") {
+                    if line.count > 0 {
+                        if !names.contains(line) {
+                            log fault("installed overlay state names an unknown component", line)
+                            return 1
+                        }
+                        previous.append(copy line)
+                    }
+                }
+            }
+            Error(failure) -> {
+                log fault("cannot read installed overlay state", traceText(failure))
+                return 1
+            }
+        }
+    }
+    var removed: [String] = []
+    for name in previous {
+        if !changed.contains(name) { removed.append(copy name) }
+    }
+    if changed.count == 0 && removed.count == 0 {
+        log info("the workspace matches its release train")
+        return 0
+    }
+    let booted = match readFile(host.buildRoot + "/train.base") {
+        Ok(contents) -> contents.text.trim()
+        Error(failure) -> {
+            log fault("boot the pinned train before installing its overlay", traceText(failure))
+            return 1
+        }
+    }
+    if booted != baseDigest {
+        log fault("the running machine belongs to a different release train")
+        return 2
+    }
+    if removed.count > 0 {
+        var arguments = ["uninstall"]
+        for name in removed { arguments.append(copy name) }
+        let result = carryOutDevRoot(host, architecture, names,
+            DevRootSelection { install: [], left: [] },
+            StepRun { paths: [], digests: [], arguments: arguments })
+        if result != 0 { return result }
+        var remaining: [String] = []
+        for name in previous {
+            if !removed.contains(name) { remaining.append(copy name) }
+        }
+        match writeFile(appliedPath, joined(remaining, "\n")) {
+            Ok -> {}
+            Error(failure) -> {
+                log fault("cannot record removed overlay roots", traceText(failure))
+                return 1
+            }
+        }
+    }
+    for name in removed {
+        let archive = host.buildRoot + "/overlay/" + name + ".root"
+        if fileExists(archive) {
+            match removePath(archive) {
+                Ok -> {}
+                Error(failure) -> {
+                    log fault("cannot remove reverted overlay archive", traceText(failure))
+                    return 1
+                }
+            }
+        }
+    }
+    if changed.count == 0 { return 0 }
+    let directory = host.buildRoot + "/overlay"
+    match makePathTree(directory) {
+        Ok -> {}
+        Error(failure) -> {
+            log fault("cannot make overlay archive directory", traceText(failure))
+            return 1
+        }
+    }
+    for (index, name) in names.enumerated() {
+        if !changed.contains(name) { continue }
+        let reference = run.artifacts[index]
+        let root = match resolveBuildArtifact(reference) {
+            Ok(path) -> path
+            Error(failure) -> {
+                log fault("cannot resolve overlay root", traceText(failure))
+                return 1
+            }
+        }
+        let entries = match buildArtifactEntries(reference) {
+            Ok(found) -> found
+            Error(failure) -> {
+                log fault("cannot read overlay root", traceText(failure))
+                return 1
+            }
+        }
+        match packArchive(root, entries, directory + "/" + name + ".root") {
+            Ok -> {}
+            Error(problem) -> {
+                log fault("cannot pack overlay root", problem)
+                return 1
+            }
+        }
+    }
+    var arguments = ["install"]
+    for name in changed { arguments.append(copy name) }
+    let status = carryOutDevRoot(host, architecture, names, DevRootSelection { install: copy changed, left: [] }, StepRun {
+        paths: [directory], digests: [], arguments: arguments
+    })
+    if status != 0 { return status }
+    match writeFile(appliedPath, joined(changed, "\n")) {
+        Ok -> return 0
+        Error(failure) -> {
+            log fault("cannot record installed overlay roots", traceText(failure))
+            return 1
+        }
+    }
+}

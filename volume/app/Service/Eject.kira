@@ -1,0 +1,193 @@
+//! Ejecting and unmounting: a disk's volumes are unmounted, then the medium is ejected.
+import Foundation
+import Heap
+import LibTessera
+import DeviceKit
+
+// Letting go of a volume, and taking it back, when a client asks, as
+// diskarbitrationd does for DADiskUnmount, DADiskMount and DADiskEject.
+//
+// `Unmount` unmounts one volume and removes its mount point. `Mount` mounts
+// it again where the scan would have. `Eject` unmounts every volume on the
+// volume's disk, has the drive let its medium go (`Block.eject`: a CD's
+// tray opens, a USB stick is powered off), and then forgets the disk: it
+// leaves the list, and the service mounts nothing on it again until it is
+// attached anew. A disk with no medium to let go of, such as a virtio
+// disk, is only forgotten. Only mounts under `/Volumes` are this service's
+// to undo; the system and data volumes PID 1 mounted are refused with
+// `AccessDenied`. A mount something still uses is refused with `Busy`, and
+// nothing on that disk is forgotten.
+//
+// A client needs the `tessera.volume` entitlement to reach this service at
+// all, which the broker checks.
+
+/// Whether the mount at `path` is one this service made, so only its own mounts are ejected.
+function ownsMount(path: borrow String) -> Bool {
+    return path.startsWith(VolumesPath.prefix)
+}
+
+/// The error code a refusal reports for `failed`.
+function refusal(failed: borrow TesseraError) -> ErrorCode {
+    return match failed.code {
+        // A file on it is open, or a process works in it.
+        Busy -> .Busy
+        // This process may not unmount.
+        AccessDenied -> .AccessDenied
+        NotEntitled -> .AccessDenied
+        else -> .Internal
+    }
+}
+
+/// Unmounts volume `index` and records that it is unmounted.
+function unmount(service: borrow mut Service, index: Number) -> Result<Void, ErrorCode> {
+    let volume = service.volumes[index]
+    let path = try volume.mountPoint otherwise return .Ok
+    if !ownsMount(path) { return .Error(.AccessDenied) }
+    match volumeUnmount(path, VolumeUnmountOptions.none) {
+        Ok -> {}
+        Error(failed) -> {
+            log warn(
+                "cannot unmount a volume",
+                disk: volume.name,
+                mountPoint: path,
+                error: errorName(failed)
+            )
+            return .Error(refusal(failed))
+        }
+    }
+    // The mount point goes with the mount, as it came.
+    removeMountPoint(service, path)
+    service.volumes[index].mountPoint = .None
+    log info("unmounted a volume", disk: volume.name, mountPoint: path)
+    announce(service, path, false)
+    notify(service, .DescriptionChanged, index)
+    return .Ok
+}
+
+/// Mounts volume `index` again after an unmount, and answers the path it is mounted at.
+function mountAgain(service: borrow mut Service, index: Number) -> Result<String, ErrorCode> {
+    match service.volumes[index].mountPoint {
+        Some(path) -> return .Ok(path)
+        // Not mounted: it is mounted again below.
+        None -> {}
+    }
+    if formatOf(service.volumes[index].content).isNone() { return .Error(.FormatUnsupported) }
+    match volumesDirectory(service) {
+        Ok(directory) -> {}
+        Error(failed) -> return .Error(.Internal)
+    }
+    let table = match mountTable() {
+        Ok(value) -> value
+        Error(failed) -> return .Error(refusal(failed))
+    }
+    match mount(service, index, table) {
+        Ok -> {}
+        Error(failed) -> return .Error(refusal(failed))
+    }
+    let path = try service.volumes[index].mountPoint otherwise return .Error(.Internal)
+    notify(service, .DescriptionChanged, index)
+    return .Ok(path)
+}
+
+/// Releases a medium so it can be ejected: unmounts each of its volumes.
+function releaseMedium(
+    service: borrow Service,
+    disk: EntryId,
+    name: borrow String
+) -> Result<Void, ErrorCode> {
+    let device = match openDevice(service, disk) {
+        Ok(value) -> value
+        Error(failed) -> return .Error(failed.code)
+    }
+    let ejected = blockEject(device)
+    closeRef(device)
+    match ejected {
+        Ok -> {
+            log info("the drive let its medium go", disk: name)
+            return .Ok
+        }
+        Error(failed) -> {
+            if failed.code == .Unsupported { return .Ok }
+            log warn("the drive did not let its medium go", disk: name, error: errorName(failed))
+            return .Error(failed.code)
+        }
+    }
+}
+
+/// The name a disk is reported by, for messages.
+function diskName(service: borrow Service, disk: EntryId) -> String {
+    var name = ""
+    for volume in service.volumes {
+        if sameEntry(volume.disk, disk) && (sameEntry(volume.entry, disk) || name.count == 0) {
+            name = volume.name
+        }
+    }
+    return name
+}
+
+/// Ejects `disk`: releases its volumes, then ejects the medium.
+function eject(service: borrow mut Service, disk: EntryId) -> Result<Void, ErrorCode> {
+    for index in 0..service.volumes.count {
+        if sameEntry(service.volumes[index].disk, disk) { try unmount(service, index) }
+    }
+    let name = diskName(service, disk)
+    try releaseMedium(service, disk, name)
+    var kept: [Volume] = []
+    for index in 0..service.volumes.count {
+        if sameEntry(service.volumes[index].disk, disk) {
+            notify(service, .Disappeared, index)
+        } else {
+            kept.append(service.volumes[index])
+        }
+    }
+    service.volumes = kept
+    service.ejected.append(disk)
+    log info("ejected a disk", disk: name)
+    return .Ok
+}
+
+/// Answers a request on `channel` with its outcome.
+function answerOutcome(channel: Handle, operation: Operation, outcome: Result<Void, ErrorCode>) {
+    match outcome {
+        Ok -> answer(channel, code(operation), .Ok)
+        Error(refused) -> answer(channel, code(operation), refused)
+    }
+}
+
+/// Answers a request to unmount the volume `entry`.
+function unmountRequest(service: borrow mut Service, channel: Handle, entry: EntryId) {
+    match volumeIndex(service, entry) {
+        Some(index) -> answerOutcome(channel, .Unmount, unmount(service, index))
+        None -> answer(channel, code(Operation.Unmount), .NotFound)
+    }
+}
+
+/// Answers a request to eject the disk `entry`.
+function ejectRequest(service: borrow mut Service, channel: Handle, entry: EntryId) {
+    match volumeIndex(service, entry) {
+        Some(index) -> answerOutcome(channel, .Eject, eject(service, service.volumes[index].disk))
+        None -> answer(channel, code(Operation.Eject), .NotFound)
+    }
+}
+
+/// Answers a request to mount the volume `entry`.
+function mountRequest(service: borrow mut Service, channel: Handle, entry: EntryId) {
+    let index = match volumeIndex(service, entry) {
+        Some(value) -> value
+        None -> {
+            answer(channel, code(Operation.Mount), .NotFound)
+            return
+        }
+    }
+    let path = match mountAgain(service, index) {
+        Ok(value) -> value
+        Error(refused) -> {
+            answer(channel, code(Operation.Mount), refused)
+            return
+        }
+    }
+    let block = zeroedBlock(count: VolumeField.textBytes, alignment: 16)
+    storeText(block.pointer(), 0, path, VolumeField.textBytes)
+    let payload = Buffer { address: block.pointer(), length: VolumeField.textBytes }
+    answerWith(channel, code(Operation.Mount), .Ok, 0, payload)
+}

@@ -1,0 +1,188 @@
+import Foundation
+import Build
+
+// The installer (roadmap/05-storage-and-state.md): an initramfs whose PID 1 is
+// the installer component. It puts the btrfs volume on the machine's disk when
+// there is none, lays it out, writes the system image's tree as a read-only
+// `system/<version>` and records it as current; Install.kira boots it.
+// mkfs.btrfs and its libraries are Debian's, from the packages
+// `sysroot/<arch>-btrfs` pins in the same snapshot the sysroot is, so they
+// find the C library every guest program links.
+
+// What the installer mounts: the kernel's file systems, which
+// machinePrepare mounts (libblkid reads /proc), the volume's top at /volume
+// and the system image at /image.
+namespace InstallerLayout {
+    let directories: [String] = ["bin", "dev", "proc", "sys", "tmp", "run", "volume", "image"]
+}
+
+// The installer's root: its skeleton, the runtime, mkfs.btrfs with its
+// libraries, LibTessera and the installer as /init.
+function installerRoot(
+    graph: borrow mut Graph,
+    context: borrow BuildContext,
+    release: borrow DescribedRelease,
+    tools: Artifact
+) -> Artifact {
+    let architecture = context.architecture.name()
+    let base = graph.tree(
+        "\(architecture)/installer-base",
+        directoryParts(InstallerLayout.directories)
+    )
+    var trees = [base, copy release.runtime, tools]
+    for described in release.components {
+        let name = described.component.name
+        if name == "libtessera" || name == "installer" {
+            trees.append(copy described.roots.install)
+        }
+    }
+    return graph.union("\(architecture)/installer-root", trees)
+}
+
+// mkfs.btrfs at bin/mkfs.btrfs, and its libraries beside the C library.
+// Creating a btrfs is btrfs-progs's job, and a Mac cannot build a Linux
+// program, so Debian's is fetched.
+function btrfsTools(
+    graph: borrow mut Graph,
+    context: borrow BuildContext
+) -> Result<Artifact, String> {
+    let name = context.architecture.name()
+    let packages = match debianPackages(graph, "\(name)-btrfs", "btrfs", []) {
+        Ok(trees) -> trees
+        Error(problem) -> return .Error(problem)
+    }
+    let files = graph.union("\(name)/btrfs/files", packages)
+    let directory = runtimeDirectory(context)
+    let laid = graph.native(
+        NativeAction {
+            label: "the btrfs userland (\(name))",
+            code: sourceDigest!("package"),
+            parameters: .Text(copy directory),
+            inputs: [files],
+            outputs: [Output { name: "btrfs", kind: .Tree }],
+            work: { run in return layBtrfsTools(directory, run) }
+        }
+    )
+    return .Ok(copy laid[0])
+}
+
+// Copies mkfs.btrfs to bin/ and every shared library, file or link, into
+// `directory`, flattened: the loader resolves a soname in the directories
+// it is told about, so where a package nested one does not matter.
+function layBtrfsTools(
+    directory: borrow String,
+    run: borrow NativeRun
+) -> Result<Void, BuildFailure> {
+    let output = run.outputs[0]
+    for made in ["\(output)/bin", "\(output)/\(directory)"] {
+        match makePathTree(made) {
+            Ok -> {}
+            Error(failure) -> return .Error(
+                .Failed("\(made) cannot be made: \(traceText(failure))")
+            )
+        }
+    }
+    var formatter = false
+    for entry in run.trees[0] {
+        let file = lastNameOf(entry.path)
+        let source = "\(run.inputs[0])/\(entry.path)"
+        if file == "mkfs.btrfs" && entry.kind == .File {
+            let target = "\(output)/bin/mkfs.btrfs"
+            match copyFile(source, target) {
+                Ok(length) -> {}
+                Error(failure) -> return .Error(
+                    .Failed("mkfs.btrfs cannot be copied: \(traceText(failure))")
+                )
+            }
+            match setFileMode(target, FileMode.program) {
+                Ok -> {}
+                Error(failure) -> return .Error(
+                    .Failed("mkfs.btrfs cannot be made runnable: \(traceText(failure))")
+                )
+            }
+            formatter = true
+        }
+        if !file.startsWith("lib") || !file.contains(".so") { continue }
+        let target = "\(output)/\(directory)/\(file)"
+        match entry.kind {
+            File -> match copyFile(source, target) {
+                Ok(length) -> {}
+                Error(failure) -> return .Error(
+                    .Failed("\(entry.path) cannot be copied: \(traceText(failure))")
+                )
+            }
+            Link -> match makeSymbolicLink(entry.content, target) {
+                Ok -> {}
+                Error(failure) -> return .Error(
+                    .Failed("\(entry.path) cannot be linked: \(traceText(failure))")
+                )
+            }
+            Directory -> {}
+        }
+    }
+    if !formatter { return .Error(.Failed("the Debian packages held no mkfs.btrfs")) }
+    return .Ok
+}
+
+// The installer image: a newc cpio archive of `root`, compressed with zstd as
+// the initramfs is.
+function installerImage(
+    graph: borrow mut Graph,
+    context: borrow BuildContext,
+    root: Artifact
+) -> Artifact {
+    let architecture = context.architecture.name()
+    let archive = graph.cpio("\(architecture)/installer.cpio", root)
+    return graph.zstd("\(architecture)/installer.cpio.zst", archive, 3)
+}
+
+// The recovery media's system: the system, with what installs it beside it, as
+// a Mac's recovery carries the installer a running macOS does not. The
+// installer at bin/installer, mkfs.btrfs with its libraries, and the system
+// image it installs at `RecoveryLayout.payload`. The installed system has none
+// of these: no code path that makes a volume (roadmap/05-storage-and-state.md).
+namespace RecoveryLayout {
+    // The installer reads it from here, in the recovery it runs from.
+    let payload: String = "System/Installation/system.img"
+    // Its fs-verity digest, 32 bytes, whose first eight name the version it
+    // installs: composefs does not answer for a file's digest itself.
+    let digest: String = "System/Installation/system.digest"
+    let installer: String = "bin/installer"
+}
+
+function recoveryRoot(
+    graph: borrow mut Graph,
+    context: borrow BuildContext,
+    release: borrow DescribedRelease,
+    tools: Artifact,
+    system: Artifact
+) -> Artifact {
+    let architecture = context.architecture.name()
+    let digest = graph.verityDigest("\(architecture)/recovery-payload.digest", system)
+    var parts = [
+        TreePart.Place(
+            TreePlace { path: RecoveryLayout.payload, artifact: system, mode: FileMode.data }
+        ),
+        TreePart.Place(
+            TreePlace { path: RecoveryLayout.digest, artifact: digest, mode: FileMode.data }
+        )
+    ]
+    for described in release.components {
+        if described.component.name == "installer" {
+            parts.append(
+                .Place(
+                    TreePlace {
+                        path: RecoveryLayout.installer,
+                        artifact: described.roots.binary,
+                        mode: FileMode.program
+                    }
+                )
+            )
+        }
+    }
+    let installing = graph.tree("\(architecture)/recovery-installing", parts)
+    return graph.union(
+        "\(architecture)/recovery-root",
+        [copy release.systemRoot, tools, installing]
+    )
+}

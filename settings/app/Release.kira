@@ -1,0 +1,45 @@
+import Foundation
+import LibTessera
+
+// The system's version and the machine it runs on, from the release file.
+
+struct Release {
+    let version: String
+    let architecture: String
+}
+
+// The value of `KEY="value"` in `text`, if the key is present.
+function releaseValue(text: borrow String, key: borrow String) -> String? {
+    for line in text.split("\n") {
+        if line.startsWith(key + "=") {
+            var value = line.substring(key.count + 1, line.count)
+            if value.count >= 2 && value.startsWith("\"") && value.endsWith("\"") {
+                value = value.substring(1, value.count - 1)
+            }
+            return .Some(value)
+        }
+    }
+    return .None
+}
+
+// The release file read once; a file that cannot be read is said, and the
+// window shows no version.
+function readRelease() -> Release {
+    let text = match readFile("/" + SystemFile.release) {
+        Ok(contents) -> contents.text
+        Error(failure) -> {
+            log warn("could not read the release file", failure)
+            ""
+        }
+    }
+    return Release {
+        version: match releaseValue(text, "VERSION") {
+            Some(value) -> value
+            None -> ""
+        },
+        architecture: match releaseValue(text, "ARCH") {
+            Some(value) -> value
+            None -> ""
+        }
+    }
+}

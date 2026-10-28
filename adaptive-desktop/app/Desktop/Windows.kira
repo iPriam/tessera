@@ -1,0 +1,219 @@
+import Foundation
+import LibTessera
+import KiraUI
+import PlatformKit
+import TesseraDisplayClient
+import PlatformUI
+
+// Windows on Adaptive Desktop (roadmap/11-adaptive-desktop.md, "The window
+// model"). The compositor owns where they are and which is in front; the
+// platform decides what moves, comes forward, zooms and goes to the Dock, as
+// a Mac's window server and Dock do.
+
+// A press landed on a surface without focus. While the lock screen is up it
+// opens it; otherwise the window it landed on comes to the front and takes
+// the keyboard, as a click on a Mac's window does.
+function surfacePressed(desktop: borrow mut Desktop, surface: DisplaySurfaceId) {
+    if desktop.lock.locked {
+        unlock(desktop)
+        return
+    }
+    desktop.front = .Some(surface)
+    match focus(desktop, surface, "bring a window forward") {
+        Ok(sent) -> if sent { log info("a click brought a window forward", surface: surface.raw) }
+        Error(failed) -> requestFailed("bring a window forward", failed)
+    }
+}
+
+// A window went. When it was in front, the window behind it comes to the
+// front and takes the keyboard, as on a Mac, unless the platform holds the
+// keyboard for its lock screen, its switcher or a menu on the bar, which give
+// it to the window in front when they go.
+function windowGone(desktop: borrow mut Desktop, surface: DisplaySurfaceId) {
+    log info("an application surface went", surface: surface.raw)
+    desktop.state.forget(surface)
+    if desktop.front != .Some(surface) { return }
+    let next = match desktop.state.frontmostSurface(PlatformSurfaceId(surface.raw)) {
+        Some(value) -> DisplaySurfaceId(value.raw)
+        None -> match desktop.desktop {
+            Some(value) -> value
+            None -> {
+                desktop.front = .None
+                return
+            }
+        }
+    }
+    desktop.front = .Some(next)
+    if desktop.lock.locked || desktop.state.switcherOpen || desktop.bar.menu.isSome() { return }
+    match focus(desktop, next, "bring the window behind forward") {
+        Ok(sent) -> if sent { log info("the window behind came forward", surface: next.raw) }
+        Error(failed) -> requestFailed("bring the window behind forward", failed)
+    }
+}
+
+// An application asked for a window action on its own surface.
+function windowRequested(desktop: borrow mut Desktop, request: borrow DisplayWindowRequest) {
+    let channel = match desktop.channel {
+        Some(value) -> value
+        None -> return
+    }
+    if desktop.lock.locked { return }
+    match request.action {
+        Move -> request(sendGrantMove(channel, request.surface), "grant a move")
+        Resize -> request(sendGrantResize(channel, request.surface), "grant a resize")
+        Zoom -> zoom(desktop, channel, request.surface)
+        Minimize -> minimize(desktop, channel, request.surface)
+        // Only a touch screen's windows go home by a swipe.
+        Home, Peek, Unpeek, Fly, Landed -> {}
+    }
+}
+
+// The room a zoomed window fills: the output below the bar and above the
+// Dock.
+function windowRoom(desktop: borrow Desktop) -> SurfaceFrame {
+    let top = Number(systemBarHeight())
+    if desktop.mode == .Stage {
+        let room = stageRoom(desktop.output.width, desktop.output.height, top, desktop.dock)
+        return SurfaceFrame { x: room.x, y: room.y, width: room.width, height: room.height }
+    }
+    return SurfaceFrame {
+        x: 0,
+        y: top,
+        width: desktop.output.width,
+        height: desktop.output.height - top - desktop.dock,
+    }
+}
+
+// The green button: a window fills the room windows have, and zooming it
+// again puts it back where it was.
+function zoom(desktop: borrow mut Desktop, channel: Handle, surface: DisplaySurfaceId) {
+    let frame = match desktop.state.zoomSurface(
+        PlatformSurfaceId(surface.raw),
+        windowRoom(desktop)
+    ) {
+        Ok(value) -> value
+        Error(failure) -> {
+            log warn("a window could not be zoomed", surface: surface.raw, failure)
+            return
+        }
+    }
+    let placement = DisplayPlacement {
+        surface: surface,
+        x: frame.x,
+        y: frame.y,
+        width: UNumber(frame.width),
+        height: UNumber(frame.height),
+    }
+    match sent(sendPlaceSurface(channel, move placement)) {
+        Ok(sent) -> if sent {
+            log info("zoomed a window", surface: surface.raw, width: frame.width, height: frame.height)
+        }
+        Error(failed) -> requestFailed("zoom a window", failed)
+    }
+}
+
+// The yellow button: the window leaves the screen for the Dock, and the one
+// behind it comes to the front.
+function minimize(desktop: borrow mut Desktop, channel: Handle, surface: DisplaySurfaceId) {
+    match sent(sendSetHidden(copy channel, surface, true)) {
+        Ok(sent) -> if !sent { return }
+        Error(failed) -> {
+            requestFailed("minimize a window", failed)
+            return
+        }
+    }
+    match desktop.state.setSurfaceVisibility(PlatformSurfaceId(surface.raw), .Hidden) {
+        Ok -> {}
+        Error(failure) -> log warn(
+            "a minimized window was not tracked",
+            surface: surface.raw,
+            failure
+        )
+    }
+    log info("minimized a window", surface: surface.raw)
+    let next = match desktop.state.frontmostSurface(PlatformSurfaceId(surface.raw)) {
+        Some(value) -> DisplaySurfaceId(value.raw)
+        None -> match desktop.desktop {
+            Some(value) -> value
+            None -> return
+        }
+    }
+    desktop.front = .Some(next)
+    match focus(desktop, next, "bring the next window forward") {
+        Ok(_) -> {}
+        Error(failed) -> requestFailed("bring the next window forward", failed)
+    }
+}
+
+// A window minimized to the Dock comes back, in front.
+function restore(desktop: borrow mut Desktop, surface: DisplaySurfaceId) {
+    let channel = match desktop.channel {
+        Some(value) -> value
+        None -> return
+    }
+    match sent(sendSetHidden(channel, surface, false)) {
+        Ok(sent) -> if !sent { return }
+        Error(failed) -> {
+            requestFailed("restore a window", failed)
+            return
+        }
+    }
+    match desktop.state.setSurfaceVisibility(PlatformSurfaceId(surface.raw), .Visible) {
+        Ok -> {}
+        Error(failure) -> log warn(
+            "a restored window was not tracked",
+            surface: surface.raw,
+            failure
+        )
+    }
+    desktop.front = .Some(surface)
+    match focus(desktop, surface, "bring a restored window forward") {
+        Ok(_) -> {}
+        Error(failed) -> requestFailed("bring a restored window forward", failed)
+    }
+}
+
+// The compositor placed a surface; the platform records where.
+function surfacePlaced(desktop: borrow mut Desktop, placement: borrow DisplayPlacement) {
+    let frame = SurfaceFrame {
+        x: placement.x,
+        y: placement.y,
+        width: Number(placement.width),
+        height: Number(placement.height),
+    }
+    match desktop.state.placeSurface(PlatformSurfaceId(placement.surface.raw), move frame) {
+        Ok -> {}
+        Error(failure) -> log info(
+            "a surface was placed that the platform is not tracking",
+            surface: placement.surface.raw,
+            failure
+        )
+    }
+    keepWindowFrame(desktop, placement)
+    if desktop.mode == .Stage { redrawAfter(0) }
+}
+
+// The person chose a notification banner: the window of the application that
+// posted it comes to the front, back from the Dock if it was minimized there,
+// as on a Mac.
+function bannerChose(desktop: borrow mut Desktop, client: Number) {
+    if desktop.lock.locked { return }
+    desktop.banners = bannersAfterChoosing(desktop.banners, client)
+    let surface = DisplaySurfaceId(client)
+    match desktop.state.visibilityOf(PlatformSurfaceId(client)) {
+        Some(visibility) -> match visibility {
+            Visible -> {
+                desktop.front = .Some(surface)
+                match focus(desktop, surface, "bring forward what posted a notification") {
+                    Ok(sent) -> if sent {
+                        log info("a notification brought its application forward", surface: client)
+                    }
+                    Error(failed) -> requestFailed("bring forward what posted a notification", failed)
+                }
+            }
+            Hidden -> restore(desktop, surface)
+        }
+        // Its window went since it posted.
+        None -> {}
+    }
+}

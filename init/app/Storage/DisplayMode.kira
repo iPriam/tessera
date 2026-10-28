@@ -1,0 +1,72 @@
+import Foundation
+import LibTessera
+
+// Persisted display choice. Four magic/version bytes followed by little-endian
+// u32 width and height. The record is deliberately fixed-width so reading it
+// never needs a text parser during early boot.
+
+namespace DisplayMode {
+    let directory: String = "/" + SystemDirectory.systemData
+    let name: String = "display-mode"
+    let path: String = "/" + SystemDirectory.systemData + "/display-mode"
+}
+
+function appendU32LittleEndian(bytes: borrow mut [UN8], value: Number) {
+    for index in 0..4 { bytes.append(UN8((value >> (8 * index)) & 255)) }
+}
+
+// The `U32` at `offset`, which the caller has checked `bytes` holds.
+function readU32LittleEndian(bytes: borrow [UN8], offset: Number) -> Number {
+    var value: Number = 0
+    for index in 0..4 { value = value | Number(bytes[offset + index]) << (8 * index) }
+    return value
+}
+
+// Remembers the mode MosaicDisplay chose, for the next boot; a failure is
+// logged where it happens, and the mode is chosen again then.
+function persistDisplayMode(calls: Handle, width: Number, height: Number) {
+    if width <= 0 || height <= 0 {
+        log warn("the display mode has no size to remember", width, height)
+        return
+    }
+    // Without a data volume there is no /data/system, and the boot already
+    // said nothing will be remembered.
+    match lookup(calls, DisplayMode.directory, Rights.inspect) {
+        Error(failed) -> {
+            if failed.code != .NotFound {
+                log warn("could not check for the display mode directory", error: errorName(failed))
+            }
+            return
+        }
+        Ok(directory) -> release(directory)
+    }
+    var bytes: [UN8] = [84, 68, 77, 1] // "TDM" + format version 1
+    appendU32LittleEndian(bytes, width)
+    appendU32LittleEndian(bytes, height)
+    match atomicWriteFile(calls, DisplayMode.directory, DisplayMode.name, bytes) {
+        Ok -> log info("persisted the display mode", width, height)
+        Error(failed) -> log warn("could not persist the display mode", error: errorName(failed))
+    }
+}
+
+// Logs the mode the previous boot remembered; a record that is missing or
+// not this format means none was.
+function announcePersistedDisplayMode(calls: Handle) {
+    let bytes = match readWholeFile(calls, DisplayMode.path) {
+        Ok(value) -> value
+        Error(failed) -> {
+            if failed.code != .NotFound {
+                log warn("could not read the previous display mode", error: errorName(failed))
+            }
+            return
+        }
+    }
+    if bytes.count != 12 { return }
+    if bytes[0] != UN8(84) || bytes[1] != UN8(68) || bytes[2] != UN8(77) || bytes[3] != UN8(1) {
+        return
+    }
+    let width = readU32LittleEndian(bytes, 4)
+    let height = readU32LittleEndian(bytes, 8)
+    if width <= 0 || height <= 0 { return }
+    log info("read the previous display mode", width, height)
+}

@@ -1,0 +1,268 @@
+import Foundation
+import LibTessera
+import TesseraUI
+import PlatformKit
+import Calculation
+
+// System search's results (roadmap/26-system-search.md): applications,
+// documents, Settings panes and a calculation, from one query, each kind in
+// its own group and each result keeping what it opens, ranked as PlatformKit
+// ranks names (`SearchRanking.kira`). Every provider answers at once, so the
+// results shown are always the latest query's.
+
+/// What a result is, which is also the group it is shown in.
+public enum SearchGroup {
+    Applications
+    Documents
+    Settings
+    Calculation
+}
+
+/// What choosing a result does.
+public enum SearchTarget {
+    /// Opens the application.
+    Application(Application)
+    /// Opens Settings at the pane.
+    Pane(SettingsPane)
+    /// Shows the document, at this path, in Inlay.
+    Document(String)
+    /// Copies the answer of a calculation.
+    Answer(String)
+}
+
+/// One result: what it says, where it comes from, and what choosing it does.
+public struct SearchResult {
+    /// The result's own name: an application's, a pane's, or the answer.
+    let title: String
+    /// What says where it is from: a pane's place in Settings, or the sum.
+    let detail: String
+    let group: SearchGroup
+    let target: SearchTarget
+}
+
+namespace SearchCalculation {
+    // The characters that make a query a calculation rather than a name.
+    let operators: [String] = ["+", "-", "*", "/", "×", "÷", "%", "^", "(", ")"]
+}
+
+/// The results for `query` among `installed`, grouped: applications, then
+/// documents, then Settings panes, then the calculation. An empty query has
+/// none.
+public function searchResults(
+    query: borrow String,
+    installed: borrow [Application]
+) -> [SearchResult] {
+    let wanted = query.trim().lowercased()
+    if wanted.count == 0 { return [] }
+    var results: [SearchResult] = []
+    for application in ranked(applicationMatches(wanted, installed)) {
+        results.append(copy application)
+    }
+    for document in ranked(documentMatches(wanted)) {
+        results.append(copy document)
+    }
+    for pane in ranked(paneMatches(wanted)) {
+        results.append(copy pane)
+    }
+    match calculationResult(query.trim()) {
+        Some(answer) -> results.append(answer)
+        // The query is no sum, or not one that works out.
+        None -> {}
+    }
+    return results
+}
+
+function applicationMatches(wanted: borrow String, installed: borrow [Application]) -> [(
+    SearchMatch,
+    SearchResult
+)] {
+    var found: [(SearchMatch, SearchResult)] = []
+    for application in installed {
+        match nameMatch(application.name, wanted) {
+            Some(quality) -> found.append(
+                (
+                    quality,
+                    SearchResult {
+                        title: copy application.name,
+                        detail: "Application",
+                        group: .Applications,
+                        target: .Application(copy application)
+                    }
+                )
+            )
+            // The name does not hold the query.
+            None -> {}
+        }
+    }
+    return found
+}
+
+namespace DocumentSearch {
+    // The most entries a search looks at, and how deep it goes, so a large
+    // folder cannot hold the keyboard up.
+    let entries: Number = 2000
+    let depth: Number = 6
+}
+
+// The documents in the person's Documents whose name holds the query, by
+// walking it now, at most `DocumentSearch.entries` entries deep.
+function documentMatches(wanted: borrow String) -> [(SearchMatch, SearchResult)] {
+    var found: [(SearchMatch, SearchResult)] = []
+    var seen: Number = 0
+    collectDocuments("/" + SystemDirectory.documents, wanted, 0, seen, found)
+    return found
+}
+
+function collectDocuments(
+    folder: borrow String,
+    wanted: borrow String,
+    depth: Number,
+    seen: borrow mut Number,
+    found: borrow mut [(SearchMatch, SearchResult)]
+) {
+    if depth > DocumentSearch.depth { return }
+    let listing = match listDirectory(folder) {
+        Ok(value) -> value
+        Error(failure) -> {
+            // A folder that cannot be read holds nothing found.
+            absorb failure
+            return
+        }
+    }
+    for name in listing.entries {
+        if seen >= DocumentSearch.entries { return }
+        if name.startsWith(".") { continue }
+        seen += 1
+        let path = folder + "/" + name
+        match nameMatch(name, wanted) {
+            Some(quality) -> found.append(
+                (
+                    quality,
+                    SearchResult {
+                        title: copy name,
+                        detail: copy folder,
+                        group: .Documents,
+                        target: .Document(copy path)
+                    }
+                )
+            )
+            // The name does not hold the query.
+            None -> {}
+        }
+        if isDirectory(path) { collectDocuments(path, wanted, depth + 1, seen, found) }
+    }
+}
+
+// The folder holding `path`.
+function parentFolder(path: borrow String) -> String {
+    return match path.lastIndexOf("/") {
+        Some(at) -> at == 0 ? "/" : path.substring(0, at)
+        None -> copy path
+    }
+}
+
+/// The name Inlay is installed under.
+public namespace InlayApplication {
+    let name: String = "Inlay"
+}
+
+// Opens Inlay on `folder`.
+function showInInlay(folder: borrow String, installed: borrow [Application]) {
+    for application in installed {
+        if application.name == InlayApplication.name {
+            openApplicationAt(application, folder)
+            return
+        }
+    }
+    log warn("Inlay is not installed to show a document")
+}
+
+// A pane matches by its title, or, less well, by a word it is looked for by.
+function paneMatches(wanted: borrow String) -> [(SearchMatch, SearchResult)] {
+    var found: [(SearchMatch, SearchResult)] = []
+    for pane in allSettingsPanes() {
+        let quality = match nameMatch(pane.title(), wanted) {
+            Some(by) -> by
+            None -> match keywordMatch(pane.keywords(), wanted) {
+                Some(by) -> by
+                None -> continue
+            }
+        }
+        found.append(
+            (
+                quality,
+                SearchResult {
+                    title: pane.title(),
+                    detail: pane.section(),
+                    group: .Settings,
+                    target: .Pane(pane)
+                }
+            )
+        )
+    }
+    return found
+}
+
+// `found` best match first, in the order found among equals, so the order
+// stays put while the query grows.
+function ranked(found: borrow [(SearchMatch, SearchResult)]) -> [SearchResult] {
+    var matches: [SearchMatch] = []
+    for (matched, _) in found { matches.append(matched) }
+    var results: [SearchResult] = []
+    for index in rankedOrder(matches) {
+        let (_, result) = found[index]
+        results.append(copy result)
+    }
+    return results
+}
+
+/// The answer of `query` when it is a calculation that works out, by the
+/// rules Calculator uses, so both give the same answer.
+function calculationResult(query: borrow String) -> SearchResult? {
+    if !holdsOperator(query) { return .None }
+    let value = match calculate(query) {
+        Ok(found) -> found
+        Error(failure) -> {
+            // A query that is not a sum is a name, and searching it is no
+            // failure.
+            absorb failure
+            return .None
+        }
+    }
+    let answer = displayText(value)
+    return .Some(
+        SearchResult {
+            title: copy answer,
+            detail: shownExpression(query) + " =",
+            group: .Calculation,
+            target: .Answer(answer)
+        }
+    )
+}
+
+// Whether `query` holds an operator, which makes it a calculation.
+function holdsOperator(query: borrow String) -> Bool {
+    for symbol in SearchCalculation.operators {
+        if query.contains(symbol) { return true }
+    }
+    return false
+}
+
+/// Does what choosing `result` does: opens the application or the Settings
+/// pane, or copies the answer.
+///
+/// # Errors
+///
+/// The pasteboard's failure when an answer could not be copied.
+public function activateSearchResult(
+    result: borrow SearchResult,
+    installed: borrow [Application]
+) -> Result<Void, TesseraError> {
+    match result.target {
+        Application(application) -> openApplication(application)
+        Pane(pane) -> openSettingsPane(pane, installed)
+        Document(path) -> showInInlay(parentFolder(path), installed)
+        Answer(answer) -> try pasteboardWrite(answer)
+    }
+    return .Ok
+}

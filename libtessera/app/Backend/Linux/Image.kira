@@ -1,0 +1,90 @@
+import Foundation
+import Heap
+
+// A disk image mounted from a file, on Linux: the file is attached to a free
+// loop device, read-only, and the device is mounted.
+//
+// The device is attached with `LO_FLAGS_AUTOCLEAR`, so it lets go of the
+// file by itself once the volume is unmounted and nothing holds it open. It
+// stays attached only while the mount holds it, and nobody has to remember
+// to detach it.
+
+namespace Loop {
+    // `LOOP_CTL_GET_FREE` on `/dev/loop-control`, `LOOP_CONFIGURE` on a device.
+    let getFree: U64 = U64(0x4C82)
+    let configure: U64 = U64(0x4C0A)
+    // `struct loop_config`: the file at 0, its `loop_info64` at 8, whose
+    // `lo_flags` is at 52; 304 bytes in all.
+    let configBytes: Number = 304
+    let flagsOffset: Number = 60
+}
+
+namespace LoopFlag {
+    // `LO_FLAGS_READ_ONLY | LO_FLAGS_AUTOCLEAR`.
+    let readOnlyAutoclear: U32 = U32(5)
+}
+
+// A free loop device, attached read-only to the file at `image` and opened;
+// the device's path and descriptor, or why not.
+function attachImage(image: borrow String) -> Result<KernelLoop, TesseraError> {
+    let control = openat(
+        AtDirectory.current,
+        cStringFrom("/dev/loop-control"),
+        LinuxOpen.readWrite | LinuxOpen.closeOnExec,
+        0
+    )
+    if answerFailed(control) { return .Error(errnoFailure(answerErrno(control))) }
+    let number = ioctl(control, Loop.getFree, nullPointer())
+    kernelRelease(control)
+    if answerFailed(number) { return .Error(errnoFailure(answerErrno(number))) }
+    let device = "/dev/loop" + stringFromUnsigned(U64(number))
+    let loop = openat(
+        AtDirectory.current,
+        cStringFrom(device),
+        LinuxOpen.readOnly | LinuxOpen.closeOnExec,
+        0
+    )
+    if answerFailed(loop) { return .Error(errnoFailure(answerErrno(loop))) }
+    let backing = openat(
+        AtDirectory.current,
+        cStringFrom(image),
+        LinuxOpen.readOnly | LinuxOpen.closeOnExec,
+        0
+    )
+    if answerFailed(backing) {
+        kernelRelease(loop)
+        return .Error(errnoFailure(answerErrno(backing)))
+    }
+    let configBytes = zeroedBlock(count: Loop.configBytes, alignment: 16)
+    let config = configBytes.pointer()
+    heapStore<U32>(config, 0, U32(backing))
+    heapStore<U32>(config, Loop.flagsOffset, LoopFlag.readOnlyAutoclear)
+    let configured = ioctl(loop, Loop.configure, config)
+    kernelRelease(backing)
+    if answerFailed(configured) {
+        kernelRelease(loop)
+        return .Error(errnoFailure(answerErrno(configured)))
+    }
+    return .Ok(KernelLoop { device: device, descriptor: loop })
+}
+
+struct KernelLoop {
+    var device: String
+    var descriptor: Number
+}
+
+// Mounts the image in the file `image`, holding `format`, read-only at
+// `target`. The loop device is let go of once the mount holds it, so the
+// autoclear detaches it when the volume is unmounted.
+function kernelVolumeMountImage(
+    image: borrow String,
+    target: borrow String,
+    format: borrow VolumeFormat,
+    options: VolumeOptions
+) -> Result<Void, TesseraError> {
+    let kind = try formatName(format) otherwise return .Error(failure(.Unsupported))
+    let loop = try attachImage(image)
+    let mounted = mountOne(loop.device, target, kind, mountFlags(options | VolumeOptions.readOnly))
+    kernelRelease(loop.descriptor)
+    return mounted
+}

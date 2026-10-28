@@ -1,0 +1,182 @@
+import Foundation
+import Heap
+import LibTessera
+
+// Restarting what loads a file a dev root changed (roadmap/18-components.md).
+//
+// On a machine booted with `tessera.dev`, the dev root service installs a
+// component's build over the system. A process keeps running the files it
+// loaded, replaced or not, so the service sends PID 1 the paths it changed and
+// PID 1 restarts every service that has one of them mapped: its executable or
+// a framework it links, and starts again every one it gave up on. PID 1 is the one process it cannot restart; a change to
+// /init takes effect at the next boot, and it says so.
+
+// The longest request read: the header and the paths, one a line. The dev root
+// splits a longer list across several requests.
+let restartRequestLimit: Number = 4096
+
+// What one read of the dev root's channel found.
+enum RestartRequest {
+    // The paths it changed.
+    Changed([String])
+    // Nothing that is a request, which has been said.
+    Nothing
+    // The dev root has gone.
+    Closed
+}
+
+function receiveRestartRequest(channel: Handle) -> RestartRequest {
+    let bodyBytes = zeroedBlock(count: restartRequestLimit, alignment: 16)
+    let body = bodyBytes.pointer()
+    let received = match channelRead(
+        channel,
+        Buffer { address: body, length: restartRequestLimit },
+        0
+    ) {
+        Ok(value) -> value
+        Error(failed) -> {
+            if failed.code == .PeerClosed { return .Closed }
+            if failed.code != .ShouldWait {
+                log warn("could not read a request from the dev root", error: errorName(failed))
+            }
+            return .Nothing
+        }
+    }
+    releaseAll(received.handles)
+    let count = received.bytes
+    let length = heapLoad<U32>(body, 12)
+    if count < ServiceMessage.headerBytes || heapLoad<U32>(
+        body,
+        0
+    ) != ServiceOpcode.RestartLoaders.rawValue()
+        || length <= 0 || ServiceMessage.headerBytes + length != count {
+        log warn("the dev root sent a request that is not one", bytes: count)
+        return .Nothing
+    }
+    let lines = textOf(heapOffset(body, ServiceMessage.headerBytes), length).split("\n")
+    var paths: [String] = []
+    for index in 0..lines.count {
+        if lines[index].count > 0 { paths.append(copy lines[index]) }
+    }
+    return .Changed(move paths)
+}
+
+// Whether the process in `slot` has one of `paths` mapped.
+function slotLoadsAny(
+    fleet: borrow Fleet,
+    slot: Number,
+    paths: borrow [String]
+) -> Result<Bool, TesseraError> {
+    for index in 0..paths.count {
+        let loads = try processLoads(fleet.processes[slot], paths[index])
+        if loads { return .Ok(true) }
+    }
+    return .Ok(false)
+}
+
+// Waits until `process` has ended.
+function awaitEnded(calls: Handle, process: Handle) {
+    let armed = objectWaitAsync(process, Signals.terminated, .Once, calls, PortKey.call)
+    match answer(calls, armed) {
+        Ok(_) -> {}
+        Error(failed) -> {
+            log warn("could not wait for a service to end", error: errorName(failed))
+        }
+    }
+}
+
+// Restarts every running service that loads one of `paths`, other than the
+// dev root asking, which loads LibTessera like everything else and would
+// otherwise be ended halfway through its own request. All of them end before
+// any starts, and MosaicDisplay starts last: it links the clients running when
+// it starts and no later ones, so started first it would be linked to clients
+// about to end, and started before them it would be linked to none.
+function restartLoaders(
+    calls: Handle,
+    fleet: borrow mut Fleet,
+    asking: Number,
+    paths: borrow [String],
+    port: Handle
+) {
+    for index in 0..paths.count {
+        if paths[index] == "/init" {
+            log info("a dev root changed PID 1's own program; it takes effect at the next boot")
+        }
+    }
+    var ended: [Number] = []
+    for slot in 0..fleet.services.count {
+        if slot != asking && running(fleet, slot) {
+            match slotLoadsAny(fleet, slot, paths) {
+                Ok(loads) -> {
+                    if loads {
+                        endLoader(calls, fleet, slot)
+                        ended.append(slot)
+                    }
+                }
+                Error(failed) -> log warn(
+                    "could not tell what a service loads; it is not restarted",
+                    service: fleet.services[slot].name,
+                    error: errorName(failed)
+                )
+            }
+        }
+    }
+    // One given up on may have died of what the dev root just replaced.
+    for slot in 0..fleet.services.count {
+        if !running(fleet, slot) && fleet.services[slot].restart && fleet.deaths[slot].failing() {
+            log info("starting again a service given up on", service: fleet.services[slot].name)
+            fleet.deaths[slot] = Deaths {}
+            ended.append(slot)
+        }
+    }
+    var display: Number? = .None
+    for index in 0..ended.count {
+        if fleet.services[ended[index]].name == "mosaicdisplay" {
+            display = .Some(ended[index])
+        } else {
+            restartSlot(calls, fleet, ended[index], port)
+        }
+    }
+    // The display server restarts last, once the clients it serves are back.
+    match display {
+        Some(slot) -> restartSlot(calls, fleet, slot, port)
+        None -> {}
+    }
+    log info(
+        "restarted what loads the files a dev root changed",
+        files: paths.count,
+        services: ended.count
+    )
+}
+
+// Ends the service in `slot` for a restart.
+function endLoader(calls: Handle, fleet: borrow mut Fleet, slot: Number) {
+    log info(
+        "restarting a service that loads a file a dev root changed",
+        service: fleet.services[slot].name
+    )
+    endService(calls, fleet, slot)
+}
+
+// Ends the service in `slot` on purpose, with its channel, so nothing is
+// linked to it until a service starts in it again.
+function endService(calls: Handle, fleet: borrow mut Fleet, slot: Number) {
+    let name = copy fleet.services[slot].name
+    match processKill(fleet.processes[slot]) {
+        Ok -> awaitEnded(calls, fleet.processes[slot])
+        // One that ended already has nothing to wait for.
+        Error(failed) -> log warn(
+            "could not end a service to restart it",
+            service: name,
+            error: errorName(failed)
+        )
+    }
+    // Killed on purpose, so not reaped as a service that was.
+    release(fleet.processes[slot])
+    fleet.processes[slot] = Handle.invalid
+    endJob(fleet, slot)
+    if fleet.channels[slot] != Handle.invalid {
+        release(fleet.channels[slot])
+        fleet.channels[slot] = Handle.invalid
+    }
+}

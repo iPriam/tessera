@@ -1,0 +1,338 @@
+//! The ioreg command's entry point: prints the registry of devices as a tree, or by class.
+import Foundation
+import ArgumentParser
+import Heap
+import LibTessera
+import DeviceKit
+
+// ioreg: DeviceKit's registry as a tree, as macOS's ioreg prints IOKit's.
+//
+// Every entry the caller may see comes from one `Registry.match` with an
+// empty spec, in tree order, each with its parent in the Service plane
+// (roadmap/17-devicekit.md §7). An entry is printed under its parent:
+//
+//     +-o vda  <class BlockDevice, id 0x2000000000003>
+//
+// `-c <class>` prints only the entries of that class, without the tree,
+// as `ioreg -c` does, and `-l` prints each entry's properties under it. It
+// exits 0 when it read the registry, 1 when it could not, and 2 when the
+// command was wrong.
+
+/// The limits ioreg works within: how large a registry list may grow, and how many properties an entry may print.
+namespace Limit {
+    let listBytes: Number = 65536
+    let listTries: Number = 4
+    let nameBytes: Number = 256
+    let propertyBytes: Number = 16384
+    let shownBytes: Number = 32
+    // At most this many levels, so that a loop in the tree cannot hold ioreg.
+    let depth: Number = 64
+}
+
+/// The exit status of ioreg: 0 when it read the registry, 1 when it could not, and 2 when the command was wrong.
+@Derive(Copy)
+enum ExitStatus: Number {
+    Read = 0
+    Unreadable = 1
+    WrongCommand = 2
+}
+
+/// The entry classes ioreg names, in the order DeviceKit numbers them.
+let entryClasses: [EntryClass] = [EntryClass.Unknown, EntryClass.Bus, EntryClass.GpuAdapter, EntryClass.DisplayController, EntryClass.Connector, EntryClass.InputDevice, EntryClass.AudioCard, EntryClass.AudioEndpoint, EntryClass.Camera, EntryClass.Sensor, EntryClass.HapticDevice, EntryClass.PowerSource, EntryClass.ThermalZone, EntryClass.Backlight, EntryClass.BlockDevice, EntryClass.Partition, EntryClass.HidDevice, EntryClass.UsbDevice, EntryClass.UsbInterface, EntryClass.Rtc, EntryClass.Driver]
+
+/// One entry in the registry: its id, its parent, its class and its properties.
+struct Entry {
+    var id: EntryId
+    var entryClass: EntryClass
+    var parent: EntryId?
+}
+
+/// Where the entries are printed: as a tree, or only those of one class.
+enum Layout {
+    Tree
+    Class(EntryClass)
+}
+
+/// What is printed of each entry.
+enum Detail {
+    Entries
+    Properties
+}
+
+/// The name ioreg prints for an entry class.
+function className(entryClass: borrow EntryClass) -> String {
+    return match entryClass {
+        Unknown -> "Unknown"
+        Bus -> "Bus"
+        GpuAdapter -> "GpuAdapter"
+        DisplayController -> "DisplayController"
+        Connector -> "Connector"
+        InputDevice -> "InputDevice"
+        AudioCard -> "AudioCard"
+        AudioEndpoint -> "AudioEndpoint"
+        Camera -> "Camera"
+        Sensor -> "Sensor"
+        HapticDevice -> "HapticDevice"
+        PowerSource -> "PowerSource"
+        ThermalZone -> "ThermalZone"
+        Backlight -> "Backlight"
+        BlockDevice -> "BlockDevice"
+        Partition -> "Partition"
+        HidDevice -> "HidDevice"
+        UsbDevice -> "UsbDevice"
+        UsbInterface -> "UsbInterface"
+        Rtc -> "Rtc"
+        Driver -> "Driver"
+    }
+}
+
+/// The entry class named `name`, or none when there is none by that name.
+function classNamed(name: borrow String) -> EntryClass? {
+    for each in entryClasses {
+        if className(each) == name { return .Some(each) }
+    }
+    return .None
+}
+
+/// The entry class `raw` numbers; a class DeviceKit names that this ioreg does not know prints as Unknown.
+function classOf(raw: UN32) -> EntryClass {
+    for each in entryClasses {
+        if each.rawValue() == raw { return each }
+    }
+    return EntryClass.Unknown
+}
+
+/// The hexadecimal text of `value`.
+function hexText(value: UNumber) -> String {
+    let digits = "0123456789abcdef"
+    if value == UNumber(0) { return "0x0" }
+    var text = ""
+    var rest = value
+    while rest > UNumber(0) {
+        let digit = Number(rest % UNumber(16))
+        text = digits.substring(digit, digit + 1) + text
+        rest = rest / UNumber(16)
+    }
+    return "0x" + text
+}
+
+/// Every entry the caller may see, in tree order; a list that outgrows the buffer is asked for again with the size DeviceKit says it needs.
+function readEntries() -> Result<[Entry], TesseraError> {
+    let specBytes = zeroedBlock(count: 16, alignment: 16)
+    let spec = Buffer { address: specBytes.pointer(), length: 16 }
+    var size = Limit.listBytes
+    for _ in 0..Limit.listTries {
+        let listBytes = zeroedBlock(count: size, alignment: 16)
+        let list = Buffer { address: listBytes.pointer(), length: size }
+        match registryMatch(spec, list) {
+            Ok(count) -> return .Ok(entriesIn(list, count))
+            Error(failed) -> {
+                if failed.code != .BufferTooSmall { return .Error(failed) }
+                size = Number(failed.detail) + 4096
+            }
+        }
+    }
+    return .Error(
+        TesseraError {
+            code: .BufferTooSmall,
+            subsystem: .DeviceKit,
+            flags: ErrorFlags.none,
+            detail: UNumber(size)
+        }
+    )
+}
+
+/// The entry's `name` property, when it has one.
+function nameProperty(id: EntryId) -> String? {
+    let outBytes = zeroedBlock(count: Limit.nameBytes, alignment: 16)
+    let out = Buffer { address: outBytes.pointer(), length: Number(Limit.nameBytes) }
+    let size = match registryProperty(id, "name", out) {
+        Ok(value) -> value
+        Error(failed) -> {
+            if failed.code != .NotFound { log warn("cannot read an entry's name", failed) }
+            return .None
+        }
+    }
+    return nameIn(out, size)
+}
+
+/// The last part of the entry's device node, when it has one.
+function nodeName(id: EntryId) -> String? {
+    let node = match registryNode(id) {
+        Ok(value) -> value
+        Error(failed) -> {
+            if failed.code != .NotFound { log warn("cannot read an entry's node", failed) }
+            return .None
+        }
+    }
+    if node.count == 0 { return .None }
+    return match node.lastIndexOf("/") {
+        Some(slash) -> .Some(node.substring(slash + 1, node.count))
+        None -> .Some(node)
+    }
+}
+
+/// The entry's `name` property, or its device node's name, or its class.
+function entryName(entry: borrow Entry) -> String {
+    match nameProperty(entry.id) {
+        Some(name) -> return name
+        None -> {}
+    }
+    match nodeName(entry.id) {
+        Some(name) -> return name
+        None -> {}
+    }
+    return className(entry.entryClass)
+}
+
+/// The text of a Bytes value, as ioreg prints its first bytes.
+function bytesText(run: borrow ByteRun) -> String {
+    let digits = "0123456789abcdef"
+    var text = "<"
+    for byte in run.shown {
+        let high = trunc(byte / 16)
+        text += digits.substring(high, high + 1) + digits.substring(byte % 16, byte % 16 + 1)
+    }
+    if run.length > run.shown.count { text += "..." }
+    return text + ">"
+}
+
+/// One property's value as ioreg prints it.
+function valueText(value: borrow PropertyValue) -> String {
+    return match value {
+        Flag(on) -> on ? "Yes" : "No"
+        Signed(number) -> String(number)
+        Unsigned(number) -> String(number)
+        Text(text) -> "\"" + text + "\""
+        Bytes(run) -> bytesText(run)
+        List -> "<list>"
+        Short -> "<short>"
+    }
+}
+
+/// Prints the properties of entry `id`, each indented by `indent`.
+function printProperties(id: EntryId, indent: borrow String) -> Result<Void, TesseraError> {
+    let outBytes = zeroedBlock(count: Limit.propertyBytes, alignment: 16)
+    let out = Buffer { address: outBytes.pointer(), length: Number(Limit.propertyBytes) }
+    let used = Number(try registryProperties(id, out))
+    print(indent + "  {")
+    for property in propertiesIn(out, min(used, Limit.propertyBytes)) {
+        print(indent + "    \"" + property.key + "\" = " + valueText(property.value))
+    }
+    print(indent + "  }")
+    return .Ok
+}
+
+/// The position of entry `id` in `entries`, or none when it is not there.
+function indexOf(entries: borrow [Entry], id: EntryId) -> Number? {
+    for (index, entry) in entries.enumerated() {
+        if entry.id == id { return .Some(index) }
+    }
+    return .None
+}
+
+/// How deep `entry` sits in the tree: the number of its ancestors.
+function depthOf(entries: borrow [Entry], entry: borrow Entry) -> Number {
+    var parent = entry.parent
+    for depth in 0..Limit.depth {
+        let id = try parent otherwise return depth
+        let index = try indexOf(entries, id) otherwise return depth
+        parent = entries[index].parent
+    }
+    return Limit.depth
+}
+
+/// The indent `entry` is printed at, when the layout prints it.
+function indentOf(entries: borrow [Entry], entry: borrow Entry, layout: borrow Layout) -> String? {
+    match layout {
+        Tree -> {
+            var indent = ""
+            for _ in 0..depthOf(entries, entry) { indent += "  " }
+            return .Some(indent)
+        }
+        Class(only) -> if entry.entryClass == only { return .Some("") }
+    }
+    return .None
+}
+
+/// Prints one entry at `indent`, with the detail asked for.
+function printEntry(entry: borrow Entry, indent: borrow String, detail: borrow Detail) {
+    print(
+        "\(indent)+-o \(entryName(entry))  <class \(className(entry.entryClass)), id \(hexText(entry.id.raw))>"
+    )
+    match detail {
+        Entries -> {}
+        Properties -> match printProperties(entry.id, indent) {
+            Ok -> {}
+            Error(failed) -> log warn("cannot read an entry's properties", failed)
+        }
+    }
+}
+
+/// The command ioreg takes: its class and layout options and the detail to print.
+function command() -> CommandRouter {
+    let configuration = CommandConfiguration {
+        name: "ioreg",
+        abstract: "DeviceKit's registry as a tree"
+    }
+    return CommandRouter {
+        root: Command {
+            configuration: configuration,
+            arguments: [flag(
+                name: "properties",
+                help: "Print each entry's properties under it"
+            ).short("l"), option(
+                name: "class",
+                help: "Print only the entries of this class, without the tree"
+            ).short("c").placeholder("CLASS"),],
+        },
+    }
+}
+
+/// Runs ioreg: reads the registry and prints it as asked, and returns the exit status.
+function run() -> ExitStatus {
+    let router = command()
+    let tokens = commandLineArguments()
+    let parsed = match router.parse(tokens) {
+        Ok(value) -> value
+        Error(error) -> {
+            router.explain(error, tokens)
+            return error.isCleanExit() ? ExitStatus.Read : ExitStatus.WrongCommand
+        }
+    }
+    var detail = Detail.Entries
+    if parsed.flag("properties") { detail = .Properties }
+    var layout = Layout.Tree
+    match parsed.text("class") {
+        Some(name) -> match classNamed(name) {
+            Some(entryClass) -> layout = .Class(entryClass)
+            None -> {
+                printError("ioreg: no class \(name)")
+                return ExitStatus.WrongCommand
+            }
+        }
+        // Every class, as a tree.
+        None -> {}
+    }
+    let entries = match readEntries() {
+        Ok(value) -> value
+        Error(failed) -> {
+            log warn("cannot read the registry", failed)
+            return ExitStatus.Unreadable
+        }
+    }
+    for entry in entries {
+        match indentOf(entries, entry, layout) {
+            Some(indent) -> printEntry(entry, indent, detail)
+            // Not of the class asked for.
+            None -> {}
+        }
+    }
+    return ExitStatus.Read
+}
+
+/// Runs ioreg and returns its exit status to the shell.
+@Main
+function main() -> Number {
+    return code(run())
+}

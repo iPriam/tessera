@@ -1,0 +1,32 @@
+//! UI tests of the About window: it opens with the system's name and its description.
+import Foundation
+import KiraUI
+import KiraUITesting
+
+/// The window names the system and says what draws it.
+@Test
+function showsTheSystemNameAndItsDrawing() {
+    let app = UITestApp()
+    app.launch()
+
+    expect!(app.staticTexts.matching(identifier: "Tessera").element.exists)
+    expect!(
+        app.staticTexts.matching(
+            identifier: "Kira UI, drawn by Ember on Vulkan, shown by MosaicDisplay"
+        ).element.exists
+    )
+
+    app.terminate()
+}
+
+/// The window names the version and machine the release file gives.
+@Test
+function showsTheVersionAndTheMachine() {
+    let app = UITestApp()
+    app.launch()
+
+    expect!(app.staticTexts.matching(identifier: "Version ").element.exists)
+    expect!(app.staticTexts.matching(identifier: "Running on ").element.exists)
+
+    app.terminate()
+}

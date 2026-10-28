@@ -1,0 +1,378 @@
+Let venus back its memory with a host pointer the driver imports.
+
+venus gives the guest host-visible memory by allocating it in the host's Vulkan
+driver and sharing it out as a dma-buf or an opaque fd. A driver that exports
+neither cannot be used this way at all, and Metal has neither to give:
+MoltenVK's memory lives in MTLBuffers, not in file descriptors. This is the same
+wall the WSL investigation hit through dzn, and it is where a Mac stops with
+RESOURCE_CREATE_BLOB failing and the guest reporting itself out of host memory.
+
+The way past it is to run the sharing the other way round. MoltenVK supports
+VK_EXT_external_memory_host — vkAllocateMemory importing a pointer the caller
+already owns, which underneath is Metal's newBufferWithBytesNoCopy. So the
+renderer allocates the memory itself, as shared memory it holds a descriptor
+for, hands the pointer to the driver, and hands the same descriptor to the guest
+as a VIRGL_RESOURCE_FD_SHM blob. The GPU and the guest then address one set of
+pages rather than two with a copy between them, and on a machine with unified
+memory there is nothing further to pay.
+
+Three parts, and only the first is Darwin-shaped:
+
+- the physical device learns whether the driver imports host pointers, and what
+  alignment it asks of one. Consulted only when the driver exports nothing, so
+  a host that can export is unaffected;
+- the device enables VK_EXT_external_memory_host when it will be used, and
+  vkAllocateMemory takes the new path ahead of the fd paths for host-visible
+  memory. vkr_device_memory remembers the descriptor, the pointer and the size;
+- exporting a blob from such memory hands back the descriptor it was made from,
+  because there is nothing to export: the fd already describes the pages.
+
+Separately: the renderer now asks the loader for portability enumeration when
+the loader offers it. A portability driver is hidden from an instance that has
+not said it accepts one, so without this the host's vkCreateInstance answers
+VK_ERROR_INCOMPATIBLE_DRIVER — which travels back through venus and reaches the
+guest as a Vulkan with no drivers at all. Asked for only when present, so hosts
+with ordinary drivers are unaffected.
+
+Verified on an Apple M1: a Vulkan program in the guest clears an image on the
+GPU and reads the pixels back, through venus, through MoltenVK, on Metal.
+
+--- a/src/venus/vkr_physical_device.h	2025-04-02 14:24:35
++++ b/src/venus/vkr_physical_device.h	2026-09-07 17:18:33
+@@ -23,6 +23,7 @@
+ 
+    bool KHR_external_memory_fd;
+    bool EXT_external_memory_dma_buf;
++   bool EXT_external_memory_host;
+ 
+    bool KHR_external_fence_fd;
+    bool KHR_external_semaphore_fd;
+@@ -31,6 +32,14 @@
+    VkPhysicalDeviceIDProperties id_properties;
+    bool is_dma_buf_fd_export_supported;
+    bool is_opaque_fd_export_supported;
++
++   /* Whether this driver will take memory the renderer already owns, rather
++    * than handing out memory of its own. MoltenVK exports neither a dma_buf nor
++    * an opaque fd — Metal has no such handle — but it imports a host pointer,
++    * which is the same fact read from the other end.
++    */
++   bool is_host_pointer_import_supported;
++   uint64_t min_imported_host_pointer_alignment;
+    void *gbm_device;
+    int udmabuf_dev_fd;
+ 
+--- a/src/venus/vkr_physical_device.c	2025-04-02 14:24:35
++++ b/src/venus/vkr_physical_device.c	2026-09-07 17:18:33
+@@ -225,10 +225,38 @@
+           VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT) &&
+          (props.externalMemoryProperties.exportFromImportedHandleTypes &
+           VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT);
++   }
++
++   /* A driver that exports nothing may still import, and that is enough: the
++    * renderer can own the memory and hand it to the driver, rather than asking
++    * the driver for memory it can then share. What it costs is the alignment
++    * below — the pointer handed over has to satisfy it, which on every host
++    * this matters for is the page size the memory would have anyway.
++    */
++   physical_dev->is_host_pointer_import_supported = false;
++   physical_dev->min_imported_host_pointer_alignment = 0;
++   if (physical_dev->EXT_external_memory_host &&
++       !physical_dev->is_dma_buf_fd_export_supported &&
++       !physical_dev->is_opaque_fd_export_supported) {
++      VkPhysicalDeviceExternalMemoryHostPropertiesEXT host_props = {
++         .sType =
++            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT,
++      };
++      VkPhysicalDeviceProperties2 props2 = {
++         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
++         .pNext = &host_props,
++      };
++      vk->GetPhysicalDeviceProperties2(handle, &props2);
++
++      physical_dev->min_imported_host_pointer_alignment =
++         host_props.minImportedHostPointerAlignment;
++      physical_dev->is_host_pointer_import_supported =
++         host_props.minImportedHostPointerAlignment > 0;
+    }
+ 
+    if (!physical_dev->is_dma_buf_fd_export_supported &&
+-       !physical_dev->is_opaque_fd_export_supported)
++       !physical_dev->is_opaque_fd_export_supported &&
++       !physical_dev->is_host_pointer_import_supported)
+       physical_dev->gbm_device = vkr_physical_device_get_gbm_device();
+ 
+    physical_dev->udmabuf_dev_fd =
+@@ -266,6 +294,8 @@
+          physical_dev->KHR_external_memory_fd = true;
+       else if (!strcmp(props->extensionName, "VK_EXT_external_memory_dma_buf"))
+          physical_dev->EXT_external_memory_dma_buf = true;
++      else if (!strcmp(props->extensionName, "VK_EXT_external_memory_host"))
++         physical_dev->EXT_external_memory_host = true;
+       else if (!strcmp(props->extensionName, "VK_KHR_external_fence_fd"))
+          physical_dev->KHR_external_fence_fd = true;
+ 
+--- a/src/venus/vkr_device.c	2025-04-02 14:24:35
++++ b/src/venus/vkr_device.c	2026-09-07 17:18:33
+@@ -133,6 +133,7 @@
+    ext_count += physical_dev->KHR_external_memory_fd;
+    ext_count += physical_dev->EXT_external_memory_dma_buf;
+    ext_count += physical_dev->KHR_external_fence_fd;
++   ext_count += physical_dev->is_host_pointer_import_supported;
+    if (ext_count > args->pCreateInfo->enabledExtensionCount) {
+       exts = malloc(sizeof(*exts) * ext_count);
+       if (!exts) {
+@@ -149,6 +150,8 @@
+          exts[ext_count++] = "VK_EXT_external_memory_dma_buf";
+       if (physical_dev->KHR_external_fence_fd)
+          exts[ext_count++] = "VK_KHR_external_fence_fd";
++      if (physical_dev->is_host_pointer_import_supported)
++         exts[ext_count++] = "VK_EXT_external_memory_host";
+ 
+       ((VkDeviceCreateInfo *)args->pCreateInfo)->ppEnabledExtensionNames = exts;
+       ((VkDeviceCreateInfo *)args->pCreateInfo)->enabledExtensionCount = ext_count;
+--- a/src/venus/vkr_device_memory.h	2025-04-02 14:24:35
++++ b/src/venus/vkr_device_memory.h	2026-09-07 17:19:11
+@@ -23,6 +23,17 @@
+    /* udmabuf backing non-external mappable memory */
+    int udmabuf_fd;
+ 
++   /* shared memory the renderer allocated and the driver imported.
++    *
++    * The other backings here are memory the driver owns and lends out. This one
++    * is the reverse: the renderer makes it, the driver is given a pointer to it,
++    * and the descriptor is what the guest's window is mapped from — so the GPU
++    * and the guest end up looking at one set of pages rather than at a copy.
++    */
++   int shm_fd;
++   void *host_ptr;
++   size_t host_ptr_size;
++
+    uint64_t allocation_size;
+    uint32_t memory_type_index;
+ 
+--- a/src/venus/vkr_device_memory.c	2025-04-02 14:24:35
++++ b/src/venus/vkr_device_memory.c	2026-09-07 17:19:17
+@@ -5,6 +5,9 @@
+ 
+ #include "vkr_device_memory.h"
+ 
++#include <sys/mman.h>
++
++#include "util/anon_file.h"
+ #include "venus-protocol/vn_protocol_renderer_transport.h"
+ 
+ #include "vkr_device_memory_gen.h"
+@@ -227,6 +230,72 @@
+ 
+ #endif /* ENABLE_MINIGBM_ALLOCATION */
+ 
++/* Allocates shared memory and hands the driver a pointer into it.
++ *
++ * The inverse of every other path in this file. Those ask the driver for memory
++ * and then for a handle to share it by; this one allocates the memory itself and
++ * asks the driver to adopt it. A driver that can do this needs no exportable
++ * memory at all, which is the whole reason it exists: Metal has no dma_buf and
++ * no opaque fd to give, but it will build a buffer over pages that already
++ * exist, and MoltenVK spells that VK_EXT_external_memory_host.
++ *
++ * The descriptor is kept rather than closed, because it is what the guest's
++ * host-visible window is mapped from later. What the GPU writes through the
++ * imported pointer and what the guest reads through its window are then the same
++ * pages, with nothing copied between them.
++ */
++static VkResult
++vkr_host_pointer_get_import_info_from_allocation_info(
++   struct vkr_physical_device *physical_dev,
++   const VkMemoryAllocateInfo *alloc_info,
++   int *out_shm_fd,
++   void **out_host_ptr,
++   size_t *out_host_ptr_size,
++   VkImportMemoryHostPointerInfoEXT *out_import_info)
++{
++   const uint64_t alignment = physical_dev->min_imported_host_pointer_alignment;
++   const size_t size = (size_t)align64(alloc_info->allocationSize, alignment);
++
++   int fd = os_create_anonymous_file(size, "vkr-hostptr");
++   if (fd < 0) {
++      vkr_log("host pointer import: could not create shared memory (%s)",
++              strerror(errno));
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++   }
++
++   void *ptr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++   if (ptr == MAP_FAILED) {
++      vkr_log("host pointer import: could not map shared memory (%s)", strerror(errno));
++      close(fd);
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++   }
++
++   /* mmap answers with page-aligned memory, and every driver that offers this
++    * extension asks for page alignment or less. Checked rather than assumed,
++    * because the failure it prevents is the driver rejecting the import with a
++    * result that says nothing about alignment.
++    */
++   if (alignment && ((uintptr_t)ptr & (alignment - 1))) {
++      vkr_log("host pointer import: mapping at %p is not aligned to %" PRIu64, ptr,
++              alignment);
++      munmap(ptr, size);
++      close(fd);
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++   }
++
++   *out_shm_fd = fd;
++   *out_host_ptr = ptr;
++   *out_host_ptr_size = size;
++   *out_import_info = (VkImportMemoryHostPointerInfoEXT){
++      .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
++      .pNext = alloc_info->pNext,
++      .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
++      .pHostPointer = ptr,
++   };
++
++   return VK_SUCCESS;
++}
++
+ static void
+ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
+                               struct vn_command_vkAllocateMemory *args)
+@@ -273,7 +342,11 @@
+       physical_dev->memory_properties.memoryTypes[mem_type_index].propertyFlags;
+    uint32_t valid_fd_types = 0;
+    int udmabuf_fd = -1;
++   int shm_fd = -1;
++   void *host_ptr = NULL;
++   size_t host_ptr_size = 0;
+    void *gbm_bo = NULL;
++   VkImportMemoryHostPointerInfoEXT local_host_pointer_info;
+    VkExportMemoryAllocateInfo local_export_info;
+    VkExportMemoryAllocateInfo *export_info =
+       vkr_find_struct(alloc_info->pNext, VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO);
+@@ -287,7 +360,19 @@
+          !export_info ||
+          !(export_info->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT);
+       const bool force_udmabuf_import = physical_dev->udmabuf_dev_fd >= 0;
+-      if (!force_udmabuf_import &&
++      if (physical_dev->is_host_pointer_import_supported) {
++         /* Before every fd path below, and only ever reached on a host that has
++          * none of them: a driver that could export was not asked to import.
++          */
++         args->ret = vkr_host_pointer_get_import_info_from_allocation_info(
++            physical_dev, alloc_info, &shm_fd, &host_ptr, &host_ptr_size,
++            &local_host_pointer_info);
++         if (args->ret != VK_SUCCESS)
++            return;
++
++         alloc_info->pNext = &local_host_pointer_info;
++         valid_fd_types = 1 << VIRGL_RESOURCE_FD_SHM;
++      } else if (!force_udmabuf_import &&
+           (physical_dev->is_dma_buf_fd_export_supported ||
+            (physical_dev->is_opaque_fd_export_supported && no_dma_buf_export))) {
+          const VkExternalMemoryHandleTypeFlagBits handle_type =
+@@ -346,6 +431,10 @@
+    if (!mem) {
+       if (local_import_info.fd >= 0)
+          close(local_import_info.fd);
++      if (host_ptr)
++         munmap(host_ptr, host_ptr_size);
++      if (shm_fd >= 0)
++         close(shm_fd);
+       if (gbm_bo)
+          vkr_gbm_bo_destroy(gbm_bo);
+       return;
+@@ -355,6 +444,9 @@
+    mem->property_flags = property_flags;
+    mem->valid_fd_types = valid_fd_types;
+    mem->udmabuf_fd = udmabuf_fd;
++   mem->shm_fd = shm_fd;
++   mem->host_ptr = host_ptr;
++   mem->host_ptr_size = host_ptr_size;
+    mem->gbm_bo = gbm_bo;
+    mem->allocation_size = alloc_info->allocationSize;
+    mem->memory_type_index = mem_type_index;
+@@ -468,6 +560,10 @@
+       vkr_gbm_bo_destroy(mem->gbm_bo);
+    if (mem->udmabuf_fd >= 0)
+       close(mem->udmabuf_fd);
++   if (mem->host_ptr)
++      munmap(mem->host_ptr, mem->host_ptr_size);
++   if (mem->shm_fd >= 0)
++      close(mem->shm_fd);
+ }
+ 
+ bool
+@@ -501,6 +597,27 @@
+                                       : VIRGL_RENDERER_MAP_CACHE_WC;
+    }
+ 
++   /* Memory the renderer allocated and the driver imported is shared by the
++    * descriptor it was made from. There is nothing to export: the fd already
++    * describes the pages the driver is using, so it is dup'ed and handed over as
++    * it stands.
++    */
++   if (mem->shm_fd >= 0) {
++      const int fd = os_dupfd_cloexec(mem->shm_fd);
++      if (fd < 0) {
++         vkr_log("mem shm fd dup failed (%s)", strerror(errno));
++         return false;
++      }
++
++      mem->exported = true;
++      *out_blob = (struct virgl_context_blob){
++         .type = VIRGL_RESOURCE_FD_SHM,
++         .u.fd = fd,
++         .map_info = map_info,
++      };
++      return true;
++   }
++
+    const bool can_export_dma_buf = mem->valid_fd_types & (1 << VIRGL_RESOURCE_FD_DMABUF);
+    const bool can_export_opaque = mem->valid_fd_types & (1 << VIRGL_RESOURCE_FD_OPAQUE);
+    enum virgl_resource_fd_type fd_type;
+--- a/src/venus/vkr_instance.c	2025-04-02 14:24:35
++++ b/src/venus/vkr_instance.c	2026-09-07 18:17:31
+@@ -181,6 +181,43 @@
+    create_info->enabledLayerCount = layer_count;
+    create_info->ppEnabledLayerNames = layer_names;
+ 
++   /* A portability driver is one the loader hides unless it is asked for by
++    * name. MoltenVK is such a driver — Vulkan over Metal is a subset, and the
++    * loader will not enumerate it into an instance that has not said it accepts
++    * one. Without this the host's vkCreateInstance answers
++    * VK_ERROR_INCOMPATIBLE_DRIVER, which travels back through venus and reaches
++    * the guest as a Vulkan that has no drivers at all.
++    *
++    * Asked for only when the loader offers it, so a host with ordinary drivers
++    * is unaffected: the extension is absent there, and requesting it would fail
++    * the call it is meant to make work.
++    */
++   uint32_t instance_ext_count = 0;
++   if (vk->EnumerateInstanceExtensionProperties(NULL, &instance_ext_count, NULL) ==
++          VK_SUCCESS &&
++       instance_ext_count) {
++      VkExtensionProperties *instance_exts =
++         malloc(sizeof(*instance_exts) * instance_ext_count);
++      if (instance_exts) {
++         if (vk->EnumerateInstanceExtensionProperties(NULL, &instance_ext_count,
++                                                      instance_exts) == VK_SUCCESS) {
++            for (uint32_t i = 0; i < instance_ext_count; i++) {
++               if (strcmp(instance_exts[i].extensionName,
++                          VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME))
++                  continue;
++               if (ext_count < ARRAY_SIZE(ext_names)) {
++                  ext_names[ext_count++] =
++                     VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME;
++                  create_info->flags |=
++                     VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
++               }
++               break;
++            }
++         }
++         free(instance_exts);
++      }
++   }
++
+    assert(ext_count <= ARRAY_SIZE(ext_names));
+    create_info->enabledExtensionCount = ext_count;
+    create_info->ppEnabledExtensionNames = ext_names;

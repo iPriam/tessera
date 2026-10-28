@@ -1,0 +1,141 @@
+import Foundation
+import Build
+
+// What a release carries that no component builds: the directories the machine
+// mounts onto, the C library and its loader, and the graphics runtime.
+
+namespace Release {
+    let version: String = "0.1.0"
+}
+
+// The directory skeleton holding `directories`, and /etc/tessera-release:
+// what the machine says it is, which PID 1 hands to every service it starts.
+// A copy in CoreServices is what a confined application reads, with no /etc
+// in its view.
+function platformBase(
+    graph: borrow mut Graph,
+    context: borrow BuildContext,
+    name: borrow String,
+    directories: borrow [String]
+) -> Artifact {
+    let architecture = context.architecture.name()
+    var parts = directoryParts(directories)
+    let release = graph.write(
+        "\(architecture)/\(name)/tessera-release",
+        textLines(
+            [
+                "NAME=\"Tessera\"",
+                "VERSION=\"\(Release.version)\"",
+                "ARCH=\"\(architecture)\""
+            ]
+        ),
+        FileMode.data
+    )
+    parts.append(.Place(TreePlace { path: "etc/tessera-release", artifact: release }))
+    parts.append(
+        .Place(TreePlace { path: "System/Library/CoreServices/SystemVersion", artifact: release })
+    )
+    return graph.tree("\(architecture)/\(name)", parts)
+}
+
+// A directory at each of `directories`, each runnable, as every directory is.
+function directoryParts(directories: borrow [String]) -> [TreePart] {
+    var parts: [TreePart] = []
+    for directory in directories {
+        parts.append(.Directory(TreeDirectory { path: copy directory, mode: FileMode.program }))
+    }
+    return parts
+}
+
+// The C library, its loader and the runtime a C ABI object reaches for, where
+// the ELF headers point and no further: the loader where PT_INTERP names it,
+// and the libraries in `runtimeDirectory`, the first directory Debian's loader
+// searches. The kernel runs the loader PT_INTERP names and refuses one without
+// an execute bit.
+function platformRuntime(graph: borrow mut Graph, context: borrow BuildContext) -> Artifact {
+    let architecture = context.architecture
+    let libraries = "usr/lib/\(architecture.multiarch())"
+    let loader = architecture.loader()
+    var parts: [TreePart] = [
+        .Place(
+            TreePlace {
+                path: "\(architecture.libraryDirectory())/\(loader)",
+                artifact: sysrootFile(graph, context, "\(libraries)/\(loader)"),
+                mode: FileMode.program
+            }
+        )
+    ]
+    let directory = runtimeDirectory(context)
+    let names = [
+        "libc.so.6", "libm.so.6", "libdl.so.2", "libpthread.so.0", "librt.so.1", "libgcc_s.so.1"
+    ]
+    for name in names {
+        parts.append(
+            .Place(
+                TreePlace {
+                    path: "\(directory)/\(name)",
+                    artifact: sysrootFile(graph, context, "\(libraries)/\(name)"),
+                    mode: FileMode.program
+                }
+            )
+        )
+    }
+    return graph.tree("\(architecture.name())/runtime", parts)
+}
+
+// The directory, from the root of a release, holding its C library: where the
+// loader finds a library the release adds beside it.
+function runtimeDirectory(context: borrow BuildContext) -> String {
+    return "lib/\(context.architecture.multiarch())"
+}
+
+// Vulkan, the venus driver and libdrm, from the guest GPU stack, beside the C
+// library where the loader finds them, with the Vulkan loader's ICD manifest
+// naming the driver.
+// The time zones' rules, the host's tz database, where LibTessera's
+// `SystemDirectory.zoneInfo` reads them.
+function platformZoneInfo(graph: borrow mut Graph, context: borrow BuildContext) -> Artifact {
+    let architecture = context.architecture.name()
+    return graph.tree(
+        "\(architecture)/zoneinfo",
+        [.Place(
+            TreePlace {
+                path: "System/Library/ZoneInfo",
+                artifact: graph.sourceTree(hostZoneInfo(), ["posix", "right"])
+            }
+        )]
+    )
+}
+
+function platformGraphics(graph: borrow mut Graph, context: borrow BuildContext) -> Artifact {
+    let architecture = context.architecture.name()
+    let directory = runtimeDirectory(context)
+    let libraries = librariesFrom(
+        graph,
+        "\(architecture)/graphics/libraries",
+        context.sysroot.graphics,
+        directory,
+        ["libvulkan.so.1", "libvulkan_virtio.so", "libdrm.so.2"]
+    )
+    let manifest = "usr/share/vulkan/icd.d/virtio_icd.\(architecture).json"
+    let icd = graph.write(
+        "\(architecture)/graphics/virtio_icd.json",
+        textLines(
+            [
+                "{",
+                "    \"ICD\": {",
+                "        \"api_version\": \"1.3.305\",",
+                "        \"library_path\": \"/\(directory)/libvulkan_virtio.so\"",
+                "    },",
+                "    \"file_format_version\": \"1.0.0\"",
+                "}"
+            ]
+        ),
+        FileMode.data
+    )
+    let placed = graph.tree(
+        "\(architecture)/graphics/manifest",
+        [.Place(TreePlace { path: manifest, artifact: icd, mode: FileMode.data })]
+    )
+    return graph.union("\(architecture)/graphics", [libraries, placed])
+}

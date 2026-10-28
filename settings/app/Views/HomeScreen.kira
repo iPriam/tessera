@@ -1,0 +1,64 @@
+import Foundation
+import KiraUI
+import PlatformUI
+
+// Home Screen & App Library, as an iPad's: where an application installed
+// from now on goes, onto Home or into App Library only.
+construct HomeScreenPane() extends Widget {
+    @State var placement: String = storedSetting(
+        NewApplicationsSetting.key,
+        NewApplicationsSetting.home
+    )
+
+    body {
+        Form {
+            Section {
+                placementRow("Add to Home Screen", NewApplicationsSetting.home)
+                placementRow("App Library Only", NewApplicationsSetting.library)
+            } header: {
+                Text("Newly Installed Apps")
+            } footer: {
+                Text("Every application is in App Library, whether or not it is on Home.")
+            }
+
+            Section {
+                Button(
+                    action = { in
+                        changeSetting(HomeResetSetting.key, .Some(String(unixMillis())))
+                        changeSetting(DockFavouritesSetting.key, .None)
+                        return
+                    }
+                ) {
+                    Text("Reset Home Screen Layout")
+                    .foregroundColor(.Accent)
+                }
+                .buttonStyle(.Plain)
+            } footer: {
+                Text(
+                    "Home and the Dock go back to how they were first arranged. No application is deleted, and no data."
+                )
+            }
+        }
+        .navigationTitle("Home Screen & App Library")
+    }
+
+    // One choice, checked when it is the one made.
+    function placementRow(title: String, value: String) -> Any Widget {
+        let target = copy value
+        return Button(
+            action = { in
+                placement = copy target
+                changeSetting(NewApplicationsSetting.key, .Some(copy target))
+                return
+            }
+        ) {
+            HStack(spacing = .Medium, alignment = .Center) {
+                Text(title)
+                Spacer()
+                Icon(symbol = .Checkmark)
+                .foregroundColor(placement == value ? .Accent : .Clear)
+            }
+        }
+        .buttonStyle(.Plain)
+    }
+}

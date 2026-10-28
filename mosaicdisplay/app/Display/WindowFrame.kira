@@ -1,0 +1,69 @@
+import Foundation
+import Ember
+import KCoreAnimation
+import KiraUI
+
+// A window's frame (roadmap/08-display-server.md, "Surfaces"): MosaicDisplay
+// clips every window's picture to its frame, its corners rounded by the
+// radius the window asked for with `set_margin`, and casts the window's
+// shadow round it, as a Mac's window server does. Nothing a window draws
+// reaches past its frame, whatever its content does while it moves.
+
+// The window inside `frame`, where its buffer is drawn: the buffer less its
+// margin on every side, at the size the buffer is drawn at.
+function windowIn(
+    frame: borrow Geometry,
+    client: borrow Client,
+    content: borrow Content,
+    scale: Number
+) -> Geometry {
+    if client.margin == 0 { return copy frame }
+    let sx = frame.width / max(content.width / scale, 1)
+    let sy = frame.height / max(content.height / scale, 1)
+    return Geometry {
+        x: frame.x + client.margin * sx,
+        y: frame.y + client.margin * sy,
+        width: frame.width - client.margin * 2 * sx,
+        height: frame.height - client.margin * 2 * sy,
+    }
+}
+
+// How much smaller than its own frame `window` draws it: a window in the
+// Stage Manager strip is drawn small, its corners and shadow with it.
+function windowShrink(window: borrow Geometry, client: borrow Client) -> Number {
+    return client.frame.width > 0 ? window.width / client.frame.width : 1
+}
+
+// The shadow a window with rounded corners casts under `window`: deep and
+// soft under the window with focus, and shallower under one behind it.
+function drawWindowShadow(
+    composer: borrow Composer,
+    window: borrow Geometry,
+    corner: Number,
+    focused: Bool,
+    shrink: Number
+) {
+    let radius = focused ? WindowShadow.activeRadius : WindowShadow.inactiveRadius
+    let fall = focused ? WindowShadow.activeFall : WindowShadow.inactiveFall
+    let opacity = focused ? WindowShadow.activeOpacity : WindowShadow.inactiveOpacity
+    let wide: Number = 1000000
+    composer.batch.pushLayerShadowQuad(
+        window.x + window.width * 0.5,
+        window.y + window.height * 0.5 + fall * shrink,
+        window.width * 0.5,
+        window.height * 0.5,
+        1,
+        0,
+        corner * shrink,
+        radius * shrink,
+        Point { x: 0, y: fall * shrink },
+        true,
+        false,
+        RGBAColor { r: 0, g: 0, b: 0, a: opacity },
+        -wide,
+        -wide,
+        wide,
+        wide,
+        WindowShape.continuous
+    )
+}

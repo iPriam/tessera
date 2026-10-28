@@ -1,0 +1,95 @@
+import Foundation
+import LibTessera
+
+// Waiting for one call's answer.
+//
+// LibTessera answers on a port. PID 1's own file and launch calls are
+// answered on a port of their own, so the supervisor's port never hands one
+// of them to the loop that is waiting for a service to end.
+
+// The port PID 1's own calls are answered on, made once at the start and
+// passed as `calls` to everything that makes one.
+function makeCallPort() -> Handle {
+    return match portCreate(.None) {
+        Ok(port) -> port
+        Error(failed) -> {
+            refuseToBoot("PID 1 has no port for its own calls (" + errorName(failed) + ")")
+            Handle.invalid
+        }
+    }
+}
+
+namespace PortKey {
+    // The key every call here is made under.
+    let call: Number = 1
+}
+
+function initFailure(code: ErrorCode) -> TesseraError {
+    return TesseraError {
+        code: code,
+        subsystem: .LibTessera,
+        flags: ErrorFlags.none,
+        detail: UNumber(0)
+    }
+}
+
+// The completion of a call that was just made, or why there is none.
+function answer(
+    calls: Handle,
+    asked: borrow Result<Void, TesseraError>
+) -> Result<Completion, TesseraError> {
+    try asked
+    let waited = try portWait(calls, 1, Deadline.infinite)
+    if waited.count == 0 { return .Error(initFailure(.Internal)) }
+    if waited[0].error.code != .Ok { return .Error(waited[0].error) }
+    return .Ok(waited[0])
+}
+
+// The handle a call answered with in `result0`.
+function answeredHandle(
+    calls: Handle,
+    asked: borrow Result<Void, TesseraError>
+) -> Result<Handle, TesseraError> {
+    let done = try answer(calls, asked)
+    return .Ok(Handle(done.result0))
+}
+
+// Closes `handle`. A close that fails is said; nothing else can be done
+// about it.
+function release(handle: Handle) {
+    match handleClose(handle) {
+        Ok -> {}
+        Error(failed) -> log warn("could not close a handle", error: errorName(failed))
+    }
+}
+
+// Closes every handle in `handles`, as `release` closes one.
+function releaseAll(handles: borrow [Handle]) {
+    if handles.count == 0 { return }
+    match handleCloseMany(handles) {
+        Ok -> {}
+        Error(failed) -> log warn(
+            "could not close the handles a message carried",
+            error: errorName(failed)
+        )
+    }
+}
+
+// Now, on the monotonic clock.
+function now() -> Result<Number, TesseraError> {
+    return timeRead(.Monotonic)
+}
+
+function seconds(count: Number) -> Number { return count * 1000000000 }
+
+// Stops this process using a processor, for good: the machine refused to
+// stop and there is nothing left to do.
+function idleForever() {
+    while true {
+        match threadSleep(Deadline.infinite) {
+            Ok -> {}
+            // Woken early; sleep again.
+            Error(failed) -> absorb failed
+        }
+    }
+}

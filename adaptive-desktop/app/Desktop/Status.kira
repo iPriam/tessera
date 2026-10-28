@@ -1,0 +1,38 @@
+import Foundation
+import LibTessera
+import PlatformUI
+
+// What the status area shows besides the time (roadmap/11-adaptive-desktop.md):
+// Focus as Control Center has it, the network the kernel's interfaces are on,
+// and the battery as the power service reads it, on the bar and on the lock
+// screen alike. A machine without a battery shows the mains; one whose power
+// service has not answered yet shows neither.
+function statusItems(focus: Bool) -> StatusItems {
+    var items = StatusItems { focus: focus }
+    match networkLink() {
+        Some(link) -> items.connection = .Some(
+            match link.medium {
+                Wireless -> .Wireless(link.connected)
+                Wired -> .Wired(link.connected)
+            }
+        )
+        None -> {}
+    }
+    match powerRead() {
+        Ok(info) -> {
+            items.mains = info.batteryPercent == PowerInfo.noBattery
+            if !items.mains {
+                items.battery = .Some(
+                    BatteryLevel {
+                        percent: info.batteryPercent,
+                        charging: info.batteryState == .Charging
+                    }
+                )
+            }
+        }
+        // The power service has not answered yet, or there is none: no
+        // battery is shown, and the next frame asks again.
+        Error(failed) -> log debug("no power state for the status area", error: errorName(failed))
+    }
+    return items
+}

@@ -1,0 +1,151 @@
+import Foundation
+import Heap
+import LibTessera
+
+// A dev root archive, as scripts/devroot.sh packs one from a component's
+// install root. Its first line is `TESSERA-ROOT 1`. Each entry is then a line
+// `<kind> <mode> <size> <path>`, the kind `d` for a directory or `f` for a
+// file, the mode in octal and the size in bytes, followed by that many bytes
+// of the file. A directory comes before what it holds, and a path is absolute
+// and never climbs out with `..`.
+
+enum EntryKind {
+    Directory
+    File
+}
+
+struct ArchiveEntry {
+    let kind: EntryKind
+    let executable: Bool
+    let path: String
+    let offset: Number
+    let size: Number
+}
+
+// An archive's entries, and the bytes they are in.
+struct Archive {
+    let contents: ByteBlock
+    let entries: [ArchiveEntry]
+}
+
+// Why an archive was refused.
+enum ArchiveProblem {
+    NotAnArchive
+    EndsInAnEntry
+    TooFewFields
+    UnacceptablePath(String)
+    SizeNotANumber(String)
+    UnknownKind(String)
+    SizePastEnd(String)
+}
+
+namespace ArchiveFormat {
+    let magic: String = "TESSERA-ROOT 1"
+    let newline: UN8 = 10
+}
+
+function describe(problem: borrow ArchiveProblem) -> String {
+    match problem {
+        NotAnArchive -> return "it is not a dev root archive"
+        EndsInAnEntry -> return "it ends in the middle of an entry"
+        TooFewFields -> return "an entry has too few fields"
+        UnacceptablePath(path) -> return "an entry names a path a root cannot hold: \(path)"
+        SizeNotANumber(path) -> return "an entry's size is not a number: \(path)"
+        UnknownKind(path) -> return "an entry is neither a file nor a directory: \(path)"
+        SizePastEnd(path) -> return "an entry's size runs past the end: \(path)"
+    }
+}
+
+// Where the line starting at `from` ends: its newline, or `limit`.
+function lineEnd(source: RawPtr, from: Number, limit: Number) -> Number {
+    for at in from..limit {
+        if heapLoad<U8>(source, at) == ArchiveFormat.newline { return at }
+    }
+    return limit
+}
+
+// Whether `mode`, in octal, lets its owner run the file.
+function ownerMayRun(mode: borrow String) -> Bool {
+    if mode.count < 3 { return false }
+    match mode.substring(mode.count - 3, mode.count - 2) {
+        "1" -> return true
+        "3" -> return true
+        "5" -> return true
+        "7" -> return true
+        else -> return false
+    }
+}
+
+// Whether `path` names a place a root may write: absolute, with no empty,
+// `.` or `..` part.
+function acceptablePath(path: borrow String) -> Bool {
+    if !path.startsWith("/") || path.count < 2 { return false }
+    if path.contains("//") || path.endsWith("/") { return false }
+    for part in path.substring(1, path.count).split("/") {
+        if part == "." || part == ".." { return false }
+    }
+    return true
+}
+
+function entryKind(field: borrow String) -> EntryKind? {
+    match field {
+        "d" -> return .Some(.Directory)
+        "f" -> return .Some(.File)
+        else -> return .None
+    }
+}
+
+// The entries of the archive held in `block`.
+function readArchive(block: ByteBlock) -> Result<Archive, ArchiveProblem> {
+    let source = block.pointer()
+    let limit = block.count
+    var at = lineEnd(source, 0, limit)
+    if stringFromCBytes(source, at) != ArchiveFormat.magic { return .Error(.NotAnArchive) }
+    at += 1
+    var entries: [ArchiveEntry] = []
+    while at < limit {
+        let end = lineEnd(source, at, limit)
+        if end >= limit { return .Error(.EndsInAnEntry) }
+        let fields = stringFromCBytes(heapOffset(source, at), end - at).split(" ")
+        if fields.count < 4 { return .Error(.TooFewFields) }
+        var path = copy fields[3]
+        for index in 4..fields.count { path = "\(path) \(fields[index])" }
+        if !acceptablePath(path) { return .Error(.UnacceptablePath(path)) }
+        let kind = try entryKind(fields[0]) otherwise return .Error(.UnknownKind(path))
+        let size = try fields[2].toNumber() otherwise return .Error(.SizeNotANumber(path))
+        if size < 0 || size != floor(size) { return .Error(.SizeNotANumber(path)) }
+        if end + 1 + size > limit { return .Error(.SizePastEnd(path)) }
+        entries.append(
+            ArchiveEntry {
+                kind: kind,
+                executable: ownerMayRun(fields[1]),
+                path: move path,
+                offset: end + 1,
+                size: size
+            }
+        )
+        at = end + 1 + size
+    }
+    return .Ok(Archive { contents: move block, entries: move entries })
+}
+
+// The file `entry` of `archive`.
+function entryBytes(archive: borrow Archive, entry: borrow ArchiveEntry) -> Buffer {
+    return Buffer {
+        address: heapOffset(archive.contents.pointer(), entry.offset),
+        length: entry.size
+    }
+}
+
+// The entry for `path` in `archive`, if it has one.
+function archiveEntry(archive: borrow Archive, path: borrow String) -> ArchiveEntry? {
+    for entry in archive.entries {
+        if entry.path == path { return .Some(entry) }
+    }
+    return .None
+}
+
+// The whole archive, as it came.
+function archiveBytes(archive: borrow Archive) -> Buffer {
+    return Buffer { address: archive.contents.pointer(), length: archive.contents.count }
+}

@@ -1,0 +1,193 @@
+//! Focus: a schedule that turns it on and off at local times, and a manual choice that holds over the schedule.
+import Foundation
+
+// Focus (roadmap/23-product-experience.md §4): a schedule that turns it on
+// and off at local times, a choice made in Control Center that holds over the
+// schedule until its next start or end, and the applications whose banners
+// still show while it is on. Nothing here reads a clock or Settings: the
+// platform says what time it is and what was chosen, and asks.
+
+/// When Focus turns itself on: from `start` up to `end`, in minutes after
+/// local midnight. An `end` before `start` runs past midnight.
+public struct FocusSchedule {
+    /// The minute of the day Focus turns on.
+    let start: Number
+    /// The minute of the day Focus turns off.
+    let end: Number
+}
+
+/// A choice made in Control Center: Focus on or off, until the wall clock
+/// reaches `until`, in milliseconds since 1970, or for good with none.
+public struct FocusOverride {
+    /// Whether Focus is on: `true` for on, `false` for off.
+    let on: Bool
+    /// When the choice ends, in milliseconds since 1970, or `.None` for good.
+    let until: Number?
+}
+
+/// Everything Focus is set to.
+public struct FocusChoice {
+    /// The schedule Focus follows, or `.None` for no schedule.
+    var schedule: FocusSchedule? = .None
+    /// The choice made in Control Center, or `.None` for no choice.
+    var manual: FocusOverride? = .None
+    /// The applications whose banners show while Focus is on.
+    var allowed: [String] = []
+}
+
+/// A moment as Focus reads it: the wall clock, in milliseconds since 1970,
+/// and the minute of the local day.
+public struct FocusMoment {
+    /// The wall clock, in milliseconds since 1970.
+    let millis: Number
+    /// The minute of the local day, from midnight.
+    let minute: Number
+}
+
+/// The units of a day for the schedule's times: minutes in a day, and in an hour.
+public namespace FocusDay {
+    /// Minutes in a day.
+    let minutes: Number = 1440
+    /// Milliseconds in a minute.
+    let millisPerMinute: Number = 60000
+    /// Minutes in an hour.
+    let minutesPerHour: Number = 60
+}
+
+extend FocusSchedule {
+    /// Whether the schedule has Focus on at `minute` of the local day.
+    function covers(borrow self, minute: Number) -> Bool {
+        if start == end { return false }
+        if start < end { return minute >= start && minute < end }
+        return minute >= start || minute < end
+    }
+
+    /// How many minutes from `minute` until the schedule next starts or ends.
+    function minutesToBoundary(borrow self, minute: Number) -> Number {
+        return min(minutesUntil(minute, start), minutesUntil(minute, end))
+    }
+}
+
+/// The minutes from `minute` until the day next reaches `target`; a full day
+/// when it is there now.
+function minutesUntil(minute: Number, target: Number) -> Number {
+    let ahead = (target - minute + FocusDay.minutes) % FocusDay.minutes
+    return ahead == 0 ? FocusDay.minutes : ahead
+}
+
+extend FocusChoice {
+    /// Whether Focus is on at `moment`: as Control Center last chose while
+    /// that choice holds, else as the schedule says.
+    function active(borrow self, moment: borrow FocusMoment) -> Bool {
+        match manual {
+            Some(chosen) -> {
+                let holding = match chosen.until {
+                    Some(until) -> moment.millis < until
+                    None -> true
+                }
+                if holding { return chosen.on }
+            }
+            None -> {}
+        }
+        return match schedule {
+            Some(times) -> times.covers(moment.minute)
+            None -> false
+        }
+    }
+
+    /// The choice after Control Center's Focus switch is pressed at `moment`:
+    /// the other way from now, until the schedule next starts or ends, or for
+    /// good with no schedule.
+    function toggled(borrow self, moment: borrow FocusMoment) -> FocusChoice {
+        let until: Number? = match schedule {
+            Some(times) -> .Some(
+                moment.millis + times.minutesToBoundary(moment.minute) * FocusDay.millisPerMinute
+            )
+            None -> .None
+        }
+        var next = copy self
+        next.manual = .Some(FocusOverride { on: !self.active(moment), until: until })
+        return next
+    }
+
+    /// Whether Focus holds back a banner from `application` at `moment`.
+    function holds(borrow self, application: borrow String, moment: borrow FocusMoment) -> Bool {
+        return self.active(moment) && !allowed.contains(application)
+    }
+}
+
+/// `schedule` as Settings keeps it: `22:00-07:00`.
+public function focusScheduleText(schedule: borrow FocusSchedule) -> String {
+    return clockText(schedule.start) + "-" + clockText(schedule.end)
+}
+
+/// The time of day `minute` minutes past midnight, written as HH:MM.
+function clockText(minute: Number) -> String {
+    let hour = trunc(minute / FocusDay.minutesPerHour)
+    let rest = minute % FocusDay.minutesPerHour
+    let padHour = hour < 10 ? "0" : ""
+    let padMinute = rest < 10 ? "0" : ""
+    return "\(padHour)\(hour):\(padMinute)\(rest)"
+}
+
+/// The schedule `text` names, none when it names none.
+public function focusScheduleFrom(text: borrow String) -> FocusSchedule? {
+    let parts = text.split("-")
+    if parts.count != 2 { return .None }
+    let start = match minuteFrom(parts[0]) {
+        Some(value) -> value
+        None -> return .None
+    }
+    let end = match minuteFrom(parts[1]) {
+        Some(value) -> value
+        None -> return .None
+    }
+    return .Some(FocusSchedule { start: start, end: end })
+}
+
+/// The minute of the day `HH:MM` names, none when it names none.
+function minuteFrom(text: borrow String) -> Number? {
+    let parts = text.trim().split(":")
+    if parts.count != 2 || parts[0].count == 0 || parts[1].count != 2 { return .None }
+    let hour = match parseNumber(parts[0]) {
+        Some(value) -> value
+        None -> return .None
+    }
+    let minute = match parseNumber(parts[1]) {
+        Some(value) -> value
+        None -> return .None
+    }
+    if hour < 0 || hour > 23 || minute < 0 || minute > 59 || trunc(hour) != hour || trunc(
+        minute
+    ) != minute {
+        return .None
+    }
+    return .Some(hour * FocusDay.minutesPerHour + minute)
+}
+
+/// `manual` as Settings keeps it: `on` or `off`, then the time it holds
+/// until when it does not hold for good.
+public function focusOverrideText(manual: borrow FocusOverride) -> String {
+    let word = manual.on ? "on" : "off"
+    return match manual.until {
+        Some(until) -> "\(word) \(until)"
+        None -> word
+    }
+}
+
+/// The manual `text` names, none when it names none.
+public function focusOverrideFrom(text: borrow String) -> FocusOverride? {
+    let parts = text.trim().split(" ")
+    let on = match parts[0] {
+        "on" -> true
+        "off" -> false
+        else -> return .None
+    }
+    if parts.count == 1 { return .Some(FocusOverride { on: on, until: .None }) }
+    if parts.count != 2 { return .None }
+    let until = match parseNumber(parts[1]) {
+        Some(value) -> value
+        None -> return .None
+    }
+    return .Some(FocusOverride { on: on, until: .Some(until) })
+}

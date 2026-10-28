@@ -1,0 +1,64 @@
+//! The Dock and menu records' round trips, checked through their encoders.
+import Foundation
+
+// The Dock and home-icon records: each travels as lines of tab-separated
+// fields, and decodes back to what was encoded.
+
+@Test
+function dockRoundTripsItsApplications() {
+    let items = [
+        BridgeDockItem { application: "Notes", running: true, kept: true },
+        BridgeDockItem { application: "Calculator", running: false, kept: false }
+    ]
+    let decoded = match decodedDock(encodedDock(items)) {
+        Some(value) -> value
+        None -> []
+    }
+    expect!(decoded.count == 2)
+    expect!(decoded[0].application == "Notes")
+    expect!(decoded[0].running)
+    expect!(decoded[0].kept)
+    expect!(decoded[1].application == "Calculator")
+    expect!(!decoded[1].running)
+    expect!(!decoded[1].kept)
+}
+
+@Test
+function emptyDockHasNoRecords() {
+    let decoded = match decodedDock("") {
+        Some(value) -> value
+        None -> [BridgeDockItem {}]
+    }
+    expect!(decoded.count == 0)
+}
+
+@Test
+function dockRecordWithTheWrongFieldCountIsRefused() {
+    expect!(!decodedDock("D\tNotes\t1").isSome())
+}
+
+@Test
+function homeIconsRoundTripTheirFrames() {
+    let icons = [
+        BridgeHomeIcon { application: "Clock", x: 12, y: 20, width: 96, height: 96, corner: 22 }
+    ]
+    let decoded = match decodedHomeIcons(encodedHomeIcons(icons)) {
+        Some(value) -> value
+        None -> []
+    }
+    expect!(decoded.count == 1)
+    expect!(decoded[0].application == "Clock")
+    expect!(decoded[0].x == 12)
+    expect!(decoded[0].height == 96)
+    expect!(decoded[0].corner == 22)
+}
+
+@Test
+function notificationRecordRoundTripsTitleAndBody() {
+    let decoded = match decodedNotification(encodedNotification("Timer", "Done\tnow")) {
+        Some(parts) -> parts
+        None -> ("", "")
+    }
+    expect!(decoded.0 == "Timer")
+    expect!(decoded.1 == "Done now")
+}

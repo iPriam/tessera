@@ -1,0 +1,19 @@
+//! The Settings service's entry point: starts the service and returns its exit status.
+// The Settings service, `tessera.settings` (roadmap/16-libtessera.md §14.4):
+// the machine's settings, the appearance, how soon the display sleeps and
+// whatever else the system remembers, kept on the data volume. Anyone reads
+// them; only the system writes them, and Settings is where a person does.
+// The wire is LibTessera's `System/Settings.kira`.
+
+import Foundation
+import LibTessera
+
+/// Runs the Settings service and returns its exit status to the shell.
+@Main
+function main() -> UN8 {
+    match serve(loadStore()) {
+        Ok(status) -> return status
+        Error(failure) -> log fault("the Settings service stopped", error: errorName(failure))
+    }
+    return 1
+}

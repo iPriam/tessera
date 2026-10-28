@@ -1,0 +1,156 @@
+import Foundation
+import Heap
+
+// The kernel tracer, recording while the machine is sampled: what programs
+// count with `traceCounter` (each frame's GPU time, pass by pass, among them)
+// is read from `trace_pipe` at each drain and summed by process and name.
+
+namespace SamplingTrace {
+    let on: String = "/sys/kernel/tracing/tracing_on"
+    let trace: String = "/sys/kernel/tracing/trace"
+    let pipe: String = "/sys/kernel/tracing/trace_pipe"
+    let bufferSize: String = "/sys/kernel/tracing/buffer_size_kb"
+    // Per CPU, enough for the busiest second between two drains.
+    let bufferKilobytes: String = "4096"
+    let marker: String = "/sys/kernel/tracing/trace_marker"
+    let markerLine: String = "tracing_mark_write: "
+    let chunk: Number = 65536
+    // Reads in one drain, so a tracer written faster than it is read cannot
+    // keep the sampler from its rings.
+    let chunks: Number = 16
+    let nonBlocking: Number = 0x800
+}
+
+struct TraceReader {
+    var fd: Number? = .None
+    var partial: String = ""
+    var counters: Map<String, SampledCounter> = Map {}
+}
+
+// Switches the tracer on, emptied; a tracer that cannot be switched on gives
+// no counters, and the sampling goes on without them.
+function traceStart() -> TraceReader {
+    var reader = TraceReader {}
+    match writeSmallFile(
+        AtDirectory.current,
+        SamplingTrace.bufferSize,
+        SamplingTrace.bufferKilobytes
+    ) {
+        Ok -> {}
+        Error(failed) -> log warn("the tracer's buffers keep their size", error: errorName(failed))
+    }
+    let emptied = openat(
+        AtDirectory.current,
+        cStringFrom(SamplingTrace.trace),
+        LinuxOpen.writeOnly | LinuxOpen.truncate | LinuxOpen.closeOnExec,
+        0
+    )
+    if !answerFailed(emptied) { closeBacking(emptied) }
+    match writeSmallFile(AtDirectory.current, SamplingTrace.on, "1") {
+        Ok -> {}
+        Error(failed) -> {
+            log warn(
+                "the tracer could not be switched on; no counters are read",
+                error: errorName(failed)
+            )
+            return reader
+        }
+    }
+    let fd = openat(
+        AtDirectory.current,
+        cStringFrom(SamplingTrace.pipe),
+        LinuxOpen.readOnly | LinuxOpen.closeOnExec | SamplingTrace.nonBlocking,
+        0
+    )
+    if answerFailed(fd) {
+        log warn(
+            "the tracer's pipe could not be opened; no counters are read",
+            error: errorName(errnoFailure(answerErrno(fd)))
+        )
+        return reader
+    }
+    reader.fd = .Some(fd)
+    // A counter of its own, so the report shows the tracer was read even when
+    // nothing else counted.
+    match writeSmallFile(
+        AtDirectory.current,
+        SamplingTrace.marker,
+        "C|\(kernelProcessId())|sample:begun|1"
+    ) {
+        Ok -> {}
+        Error(failed) -> log warn("the tracer could not be written to", error: errorName(failed))
+    }
+    return reader
+}
+
+// Takes every line the tracer holds; an empty pipe answers EAGAIN.
+function traceDrain(reader: borrow mut TraceReader) {
+    let fd = match reader.fd {
+        Some(value) -> value
+        None -> return
+    }
+    let block = zeroedBlock(count: SamplingTrace.chunk, alignment: 16)
+    for _ in 0..SamplingTrace.chunks {
+        let got = read(fd, block.pointer(), U64(SamplingTrace.chunk))
+        if answerFailed(got) || got == 0 { return }
+        let text = reader.partial + stringFromCBytes(block.pointer(), U64(got))
+        let lines = text.split("\n")
+        reader.partial = copy lines[lines.count - 1]
+        for index in 0..lines.count - 1 { traceCount(reader, lines[index]) }
+    }
+}
+
+// One `C|<pid>|<category>:<name>|<value>` line, counted against the process
+// the tracer names: `<command>-<pid>` before the CPU, a pid outside the
+// program's own namespace.
+function traceCount(reader: borrow mut TraceReader, line: borrow String) {
+    let at = match line.indexOf(SamplingTrace.markerLine) {
+        Some(value) -> value
+        None -> return
+    }
+    let fields = line.substring(at + SamplingTrace.markerLine.count, line.count).split("|")
+    if fields.count != 4 || fields[0] != "C" { return }
+    let value = match fields[3].trim().toNumber() {
+        Some(number) -> number
+        None -> return
+    }
+    let bracket = match line.indexOf(" [") {
+        Some(value) -> value
+        None -> return
+    }
+    let task = line.substring(0, bracket).trim()
+    let dash = match task.lastIndexOf("-") {
+        Some(value) -> value
+        None -> return
+    }
+    let pid = match task.substring(dash + 1, task.count).toNumber() {
+        Some(number) -> number
+        None -> return
+    }
+    let key = "\(pid)|\(fields[2])"
+    var counter = match reader.counters.value(key) {
+        Some(known) -> known
+        None -> SampledCounter { pid: pid, name: copy fields[2] }
+    }
+    counter.least = counter.count == 0 ? value : min(counter.least, value)
+    counter.most = counter.count == 0 ? value : max(counter.most, value)
+    counter.count += 1
+    counter.total += value
+    reader.counters.set(move key, move counter)
+}
+
+function traceStop(reader: borrow mut TraceReader) -> [SampledCounter] {
+    match writeSmallFile(AtDirectory.current, SamplingTrace.on, "0") {
+        Ok -> {}
+        Error(failed) -> absorb failed
+    }
+    traceDrain(reader)
+    match reader.fd {
+        Some(fd) -> closeBacking(fd)
+        None -> {}
+    }
+    reader.fd = .None
+    var counters: [SampledCounter] = []
+    for entry in reader.counters.entries() { counters.append(copy entry.value) }
+    return counters
+}

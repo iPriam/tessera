@@ -1,0 +1,138 @@
+//! The Dock of a touch platform: the row of applications the home screen draws
+//! under each page.
+//!
+//! The platform keeps the Dock and says what it holds over every link, whenever
+//! that changes. The home screen draws it, and says over its link which
+//! application the person chose in it, which the platform then brings forward
+//! or opens. Records travel as described on [`DockRecord`].
+
+import Foundation
+import LibTessera
+
+/// One application in the Dock.
+public struct BridgeDockItem {
+    /// The application's name, as PID 1 names it.
+    var application: String = ""
+    /// Whether the application is open.
+    var running: Bool = false
+    /// Whether the Dock keeps the application when it is not open.
+    var kept: Bool = false
+}
+
+/// The record layout of the Dock, as it travels over a link.
+///
+/// One record a line, its fields separated by a tab, the applications in the
+/// Dock's order:
+///
+/// ```text
+/// D <application> <running 0|1> <kept 0|1>
+/// ```
+namespace DockRecord {
+    /// The kind of a Dock record.
+    let kind: String = "D"
+    /// The number of fields in a Dock record, kind included.
+    let fields: Number = 4
+}
+
+/// Encodes `items` as the Dock records, one application a line.
+function encodedDock(items: borrow [BridgeDockItem]) -> String {
+    var lines: [String] = []
+    for item in items {
+        let fields = [DockRecord.kind, recordText(item.application), flag(item.running), flag(
+            item.kept
+        )]
+        lines.append(joined(fields, MenuRecord.field))
+    }
+    return joined(lines, MenuRecord.line)
+}
+
+/// Decodes the Dock records in `text`.
+///
+/// An empty text is an empty Dock. Returns `.None` when a record is not a Dock
+/// record of the right number of fields.
+function decodedDock(text: borrow String) -> [BridgeDockItem]? {
+    var items: [BridgeDockItem] = []
+    if text.count == 0 { return .Some(items) }
+    for line in text.split(MenuRecord.line) {
+        let fields = line.split(MenuRecord.field)
+        if fields.count != DockRecord.fields || fields[0] != DockRecord.kind { return .None }
+        items.append(
+            BridgeDockItem {
+                application: copy fields[1],
+                running: fields[2] == "1",
+                kept: fields[3] == "1",
+            }
+        )
+    }
+    return .Some(items)
+}
+
+// --- The platform's side ---------------------------------------------------------
+
+/// Tells every application on a link what the Dock holds.
+///
+/// A link that was already told the same text is not sent it again.
+///
+/// # Errors
+///
+/// Returns `.Broken` when a link cannot take the message.
+public function publishDock(
+    handle: BridgeHandle,
+    items: borrow [BridgeDockItem]
+) -> Result<Void, BridgeFailure> {
+    let text = encodedDock(items)
+    for index in 0..handle.bridge.links.count {
+        if handle.bridge.links[index].dockPublished == .Some(copy text) { continue }
+        match writeLink(handle.bridge.links[index].channel, .Dock, text.utf8().count, text) {
+            Ok -> handle.bridge.links[index].dockPublished = .Some(copy text)
+            Error(failure) -> return .Error(.Broken(failure))
+        }
+    }
+    return .Ok
+}
+
+/// Returns the applications the person chose in the home screen's Dock since the last call.
+///
+/// The applications are in the order chosen. The caller is then responsible
+/// for bringing each forward or opening it.
+public function takeDockChoices(handle: BridgeHandle) -> [String] {
+    let taken = move handle.bridge.dockChoices
+    handle.bridge.dockChoices = []
+    return taken
+}
+
+// --- The home screen's side ---------------------------------------------------
+
+/// Returns what the Dock holds, as the platform last said.
+///
+/// Returns `.None` while the platform has said nothing. A platform whose Dock
+/// is its own never says anything.
+public function dockFromPlatform(handle: BridgeHandle) -> [BridgeDockItem]? {
+    return copy handle.bridge.dock
+}
+
+/// Returns whether the platform said what the Dock holds since the last call.
+public function takeDockChange(handle: BridgeHandle) -> Bool {
+    let changed = handle.bridge.dockChanged
+    handle.bridge.dockChanged = false
+    return changed
+}
+
+/// Tells the platform the person chose `application` in the Dock.
+///
+/// # Errors
+///
+/// Returns `.Broken` when a link cannot take the message.
+public function chooseInDock(
+    handle: BridgeHandle,
+    application: borrow String
+) -> Result<Void, BridgeFailure> {
+    let text = recordText(application)
+    for link in handle.bridge.links {
+        match writeLink(link.channel, .DockChoose, text.utf8().count, text) {
+            Ok -> {}
+            Error(failure) -> return .Error(.Broken(failure))
+        }
+    }
+    return .Ok
+}

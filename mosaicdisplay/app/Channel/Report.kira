@@ -1,0 +1,33 @@
+import Foundation
+import Heap
+import LibTessera
+import TesseraDisplayClient
+
+// Reports the mode MosaicDisplay chose back to PID 1 over the service channel
+// it was started with. Width and height occupy the header's serial and detail
+// words; this message carries no handle.
+
+function reportDisplayMode(scanout: borrow Scanout) {
+    let body = zeroedBlock(count: ServiceMessage.headerBytes, alignment: 16)
+    heapStore(
+        body.pointer(),
+        ServiceHeader {
+            opcode: ServiceOpcode.DisplayMode.rawValue(),
+            length: UN32(ServiceMessage.headerBytes),
+            serial: UN32(scanout.width),
+            detail: UN32(scanout.height),
+        }
+    )
+    let channel = match serviceChannel() {
+        Ok(value) -> value
+        Error(reason) -> return reportChannelUnavailable(reason)
+    }
+    match writeMessage(channel, body) {
+        Ok -> log info("reported the mode to init", width: scanout.width, height: scanout.height)
+        Error(failed) -> log warn("could not report the selected mode", error: errorName(failed))
+    }
+}
+
+function reportChannelUnavailable(reason: borrow TesseraError) {
+    log warn("could not report the selected mode", error: errorName(reason))
+}

@@ -1,0 +1,16 @@
+import Foundation
+
+// One pixel, in the order the scanout reads it.
+//
+// XRGB8888 on a little-endian machine is blue, green, red and a byte nothing
+// looks at — so a grey is the same level three times over, and the top byte is
+// left at zero.
+function grey(level: Number) -> UN32 {
+    let channel = UN32(level)
+    return channel + channel * UN32(256) + channel * UN32(65536)
+}
+
+namespace Background {
+    // The background, which every frame starts as.
+    let level: Number = 25
+}

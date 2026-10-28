@@ -1,0 +1,155 @@
+import Foundation
+import KiraUI
+import LibTessera
+import FileOperations
+
+// Backup (roadmap/31-backup-and-recovery.md): Documents backed up onto a
+// volume the person chooses, each backup a dated folder under
+// `Tessera Backups` on it, unchanged files linked to the last backup's copy.
+// The newest backups are listed with their items, each restored into
+// Documents beside what is there; the oldest go past the ten newest.
+
+namespace BackupPlace {
+    let folder: String = "Tessera Backups"
+    // The setting naming the volume backups go to, by its path.
+    let destination: String = "backup.destination"
+    let kept: Number = 10
+    // The items of the newest backup the pane lists.
+    let listed: Number = 20
+}
+
+construct BackupPane() extends Widget {
+    @State var said: String = ""
+
+    body {
+        let destination = storedSetting(BackupPlace.destination, "")
+        Form(
+            children: [destinationSection(destination), self.actionSection(
+                destination
+            ), restoreSection(destination, { text in said = text })]
+        )
+        .navigationTitle("Backup")
+    }
+
+    function actionSection(destination: borrow String) -> Any Widget {
+        let target = copy destination
+        var rows: [Any Widget] = [
+            Button(action = { in said = backUpNow(target) }) { Text("Back Up Now") }
+            .disabled(destination.count == 0)
+        ]
+        let snapshots = snapshotsIn(backupRoot(destination))
+        rows.append(
+            LabeledContent(label = "Latest Backup") {
+                Text(snapshots.count > 0 ? backupDate(snapshots[0].name) : "None")
+                .foregroundColor(.Secondary)
+            }
+        )
+        if said.count > 0 { rows.append(Text(copy said).foregroundColor(.Secondary)) }
+        return Section(children: rows, header: Text("Documents"))
+    }
+}
+
+// The writable volumes, the one chosen checked.
+function destinationSection(destination: borrow String) -> Any Widget {
+    var rows: [Any Widget] = []
+    for volume in mountedVolumes() {
+        let writable = match volume.access {
+            Writable -> true
+            ReadOnly, Unknown -> false
+        }
+        if !writable { continue }
+        let path = copy volume.path
+        rows.append(
+            Button(action = { in changeSetting(BackupPlace.destination, .Some(copy path)) }) {
+                HStack(spacing = .Medium, alignment = .Center) {
+                    Text(copy volume.name)
+                    Spacer()
+                    Icon(symbol = .Checkmark).foregroundColor(
+                        volume.path == destination ? .Accent : .Clear
+                    )
+                }
+            }.buttonStyle(.Plain)
+        )
+    }
+    if rows.count == 0 {
+        rows.append(Text("Plug in a volume that can be written to.").foregroundColor(.Secondary))
+    }
+    return Section(children: rows, header: Text("Back Up To"))
+}
+
+// The newest backup's items, each with Restore.
+function restoreSection(destination: borrow String, say: (String) -> Void) -> Any Widget {
+    let snapshots = snapshotsIn(backupRoot(destination))
+    if snapshots.count == 0 { return EmptyView() }
+    let entries = match entriesIn(snapshots[0].path) {
+        Ok(found) -> found
+        Error(failure) -> {
+            log warn("a backup could not be read", failure: traceText(failure))
+            []
+        }
+    }
+    var rows: [Any Widget] = []
+    for (index, entry) in entries.enumerated() {
+        if index >= BackupPlace.listed { break }
+        if entry.name.startsWith(".") { continue }
+        let item = copy entry.path
+        let told = copy say
+        rows.append(
+            LabeledContent(label = copy entry.name) {
+                Button(action = { in told(restoreText(item)) }) { Text("Restore") }
+            }
+        )
+    }
+    return Section(
+        children: rows,
+        header: Text("Restore from \(backupDate(snapshots[0].name))"),
+        footer: Text("A restored item goes into Documents beside what is there now.")
+    )
+}
+
+function backupRoot(destination: borrow String) -> String {
+    return childPath(destination, BackupPlace.folder)
+}
+
+function documentsPath() -> String {
+    return "/" + SystemDirectory.documents
+}
+
+// Backs Documents up onto `destination` now, then keeps the newest; what it
+// did, said to the person.
+function backUpNow(destination: borrow String) -> String {
+    let root = backupRoot(destination)
+    match backUp(documentsPath(), root, unixMillis()) {
+        Ok(summary) -> {
+            match pruneSnapshots(root, BackupPlace.kept) {
+                Ok -> {}
+                Error(failure) -> log warn(
+                    "old backups could not be removed",
+                    failure: traceText(failure)
+                )
+            }
+            log info("backed up Documents", copied: summary.copied, linked: summary.linked)
+            return "Backed up: \(summary.copied) copied, \(summary.linked) unchanged."
+        }
+        Error(failure) -> {
+            log warn("Documents could not be backed up", failure: traceText(failure))
+            return "The backup did not finish; nothing partial is kept."
+        }
+    }
+}
+
+function restoreText(item: borrow String) -> String {
+    match restoreItem(item, documentsPath()) {
+        Ok(path) -> return "Restored as \(lastPathPart(path))."
+        Error(failure) -> {
+            log warn("an item could not be restored", failure: traceText(failure))
+            return "\(lastPathPart(item)) could not be restored."
+        }
+    }
+}
+
+// A backup's folder name as a person reads it: `2026-10-26 14:25 UTC`.
+function backupDate(name: borrow String) -> String {
+    if name.count < 15 { return copy name }
+    return "\(name.substring(0, 4))-\(name.substring(4, 6))-\(name.substring(6, 8)) \(name.substring(9, 11)):\(name.substring(11, 13)) UTC"
+}

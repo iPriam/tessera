@@ -1,0 +1,89 @@
+import Foundation
+import LibTessera
+
+// bootstrap: the service broker behind `System.connectService`
+// (roadmap/16-libtessera.md §12).
+//
+// One thread and one port: the listener, every connection that has not
+// said what it is, every service's check-in connection, which reads when
+// the service posts an event or has gone, every System channel, and the
+// request to stop. A request is answered as soon as it is read, except a
+// `Connect` for a service that has not checked in, which waits for it.
+
+// The keys the broker's own waits complete with; every connection's is at
+// or above `firstConnection`.
+namespace PortKey {
+    let listener: Number = 1
+    let stop: Number = 2
+    let firstConnection: Number = 16
+}
+
+// What a completion on the broker's port means.
+enum Wakeup {
+    Stop
+    Listener
+    Connection(Number)
+}
+
+function wakeup(key: Number) -> Wakeup {
+    if key == PortKey.stop { return .Stop }
+    if key == PortKey.listener { return .Listener }
+    return .Connection(key)
+}
+
+@Main
+function main() {
+    let port = match portCreate(.None) {
+        Ok(value) -> value
+        Error(failed) -> {
+            log fault("cannot make a port", error: errorName(failed))
+            return
+        }
+    }
+    let listener = match brokerListen() {
+        Ok(value) -> value
+        Error(failed) -> {
+            log fault("cannot listen", error: errorName(failed))
+            return
+        }
+    }
+    match processWatchTermination(port, PortKey.stop) {
+        // The stop request is armed, and the port reports it when it arrives.
+        Ok -> {}
+        Error(failed) -> log warn("cannot hear a request to stop", error: errorName(failed))
+    }
+    var broker = Broker { port: port, services: serviceTable() }
+    broker.arm(listener, PortKey.listener)
+    log info("listening", services: broker.services.count)
+    while true {
+        // The port is waited on until a client waiting for a service is due
+        // to give up, so its deadline is kept.
+        match portWait(port, 64, broker.nextDeadline()) {
+            Ok(completions) -> {
+                for completion in completions {
+                    match wakeup(Number(completion.key)) {
+                        Stop -> {
+                            log info("asked to stop")
+                            return
+                        }
+                        Listener -> {
+                            broker.acceptAll(listener)
+                            broker.arm(listener, PortKey.listener)
+                        }
+                        Connection(key) -> broker.ready(key)
+                    }
+                }
+            }
+            Error(failed) -> {
+                if failed.code != .Timeout { log warn("the port failed", error: errorName(failed)) }
+            }
+        }
+        match broker.expire() {
+            Ok -> {}
+            Error(failed) -> {
+                log fault("the broker cannot time client requests", error: errorName(failed))
+                return
+            }
+        }
+    }
+}

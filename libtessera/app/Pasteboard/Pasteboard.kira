@@ -1,0 +1,97 @@
+import Foundation
+import Heap
+
+// The pasteboard (roadmap/23 §5, decision in roadmap/23 §5.1): the one text
+// item the `pasteboard` service holds.
+//
+// `pasteboardWrite` replaces the item. Any program may write, because copying
+// is the person's action, and a write reveals nothing about the item it
+// replaces. `pasteboardRead` returns the item and needs an interaction token,
+// the proof that a real input event reached a front-facing surface (§14.1).
+// The service refuses a read without one with `NoInteraction`. With one, the
+// service asks the Presence service to verify it (§14), and sends the item
+// only when the token is valid. Nothing reads the item silently.
+
+namespace Pasteboard {
+    let service: String = "tessera.pasteboard"
+    // The largest item, in bytes of UTF-8. A longer write is `InvalidArgument`.
+    let maximumBytes: Number = 65536
+}
+
+// What the pasteboard service is asked, as its wire numbers it.
+@Derive(Copy)
+enum PasteboardOperation: U32 {
+    Write = 1
+    Read = 2
+}
+
+// One request on a connection of its own, answered with the service's
+// result. The reply's payload is the item, for a read.
+function pasteboardRequest(
+    operation: PasteboardOperation,
+    a: U64,
+    b: U64,
+    c: U64,
+    payload: RawPtr,
+    length: U64
+) -> Result<DeviceMessage, TesseraError> {
+    let connection = match serviceConnectFd(Pasteboard.service) {
+        Ok(value) -> value
+        Error(failed) -> return .Error(failureIn(.DeviceLost, .Pasteboard))
+    }
+    let operationCode = code(operation)
+    let sent = deviceSend(connection, operationCode, a, b, c, payload, length)
+    if !succeeded(sent) {
+        kernelRelease(connection)
+        return .Error(failureIn(.DeviceLost, .Pasteboard))
+    }
+    let answer = match deviceAwait(connection, .None, operationCode) {
+        Ok(value) -> value
+        Error(failed) -> {
+            kernelRelease(connection)
+            var error = failed
+            error.subsystem = .Pasteboard
+            return .Error(error)
+        }
+    }
+    kernelRelease(connection)
+    if answer.code != U32(0) {
+        let refused = answer.code
+        deviceMessageRelease(answer)
+        return .Error(failureIn(errorCodeFrom(refused), .Pasteboard))
+    }
+    return .Ok(answer)
+}
+
+// Replaces the pasteboard's item with `text`.
+public function pasteboardWrite(text: borrow String) -> Result<Void, TesseraError> {
+    if text.count > Pasteboard.maximumBytes {
+        return .Error(failureIn(.InvalidArgument, .Pasteboard))
+    }
+    let reply = try pasteboardRequest(
+        .Write,
+        U64(0),
+        U64(0),
+        U64(0),
+        text.data,
+        U64(text.count)
+    )
+    deviceMessageRelease(reply)
+    return .Ok
+}
+
+// The pasteboard's item, for a read the person asked for. `token` is the
+// interaction token of that input event.
+public function pasteboardRead(token: InteractionToken) -> Result<String, TesseraError> {
+    let reply = try pasteboardRequest(
+        .Read,
+        token.idLow,
+        token.idHigh,
+        token.surfaceId,
+        nullPointer(),
+        U64(0)
+    )
+    let text = stringFromCBytes(reply.payload, Number(reply.length))
+    deviceMessageRelease(reply)
+    return .Ok(text)
+}

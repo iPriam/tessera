@@ -1,0 +1,19 @@
+import LibTessera
+import KiraUI
+import TesseraUI
+
+// On a touch screen the keyboard types into Home's search field, which asks
+// for it. Kira UI redraws the desktop when /Volumes or /Applications changes, so an image plugged in, or an
+// application installed or uninstalled, shows at once.
+// The time is on the platform's bar. The desktop is drawn edge to edge, under
+// the bar and every window, rather than as a window.
+@Main
+function main() {
+    RunTesseraApplication(
+        "Desktop",
+        { in
+            return DesktopView(applications = installedApplications(), notice = workspaceNotice())
+        },
+        ApplicationOptions { watches: [.Volumes, .Applications], surface: .Desktop, }
+    )
+}

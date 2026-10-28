@@ -1,0 +1,205 @@
+import Foundation
+import Heap
+import LibTessera
+
+// Suspend, wake sources and the real-time clock (17 §15).
+//
+// A wake source is a kernel wakeup source named in `/sys/power/wake_lock`
+// with its timeout. A kernel without that file has no autosleep, so nothing
+// suspends on its own and the source only has to keep `Suspend.enter` from
+// going ahead, which this process checks itself.
+
+namespace PowerFiles {
+    let state: String = "/sys/power/state"
+    let wakeLock: String = "/sys/power/wake_lock"
+    let wakeUnlock: String = "/sys/power/wake_unlock"
+}
+
+namespace WakeSourceLimit {
+    let name: Number = 64
+}
+
+struct WakeSourceRecord {
+    var object: Number
+    var name: String
+    var active: Bool
+    // The monotonic time it lapses; none holds until `deactivate`.
+    var lapses: Number?
+}
+
+function wakeSourceOf(object: Number) -> Result<Number, TesseraError> {
+    for (index, source) in deviceLibrary.wakeSources.enumerated() {
+        if source.object == object { return .Ok(index) }
+    }
+    return .Error(failure(.InvalidHandle))
+}
+
+// Whether the source is active and its timeout has not passed.
+function holding(index: Number, now: Number) -> Bool {
+    let source = deviceLibrary.wakeSources[index]
+    if !source.active { return false }
+    match source.lapses {
+        Some(time) -> {
+            if now >= time {
+                deviceLibrary.wakeSources[index].active = false
+                return false
+            }
+        }
+        None -> {}
+    }
+    return true
+}
+
+// The names of this process's active wake sources, each NUL-terminated;
+// answers how many.
+public function suspendInhibitors(out: borrow Buffer) -> Result<Number, TesseraError> {
+    let now = try monotonicNow()
+    var count: Number = 0
+    var at: Number = 0
+    for index in 0..deviceLibrary.wakeSources.count {
+        if !holding(index, now) { continue }
+        let name = deviceLibrary.wakeSources[index].name
+        try requireRoom(out, at + name.count + 1)
+        copyBytes(heapOffset(out.address, at), name.data, name.count)
+        heapStore<U8>(out.address, (at + name.count), U8(0))
+        at += name.count + 1
+        count++
+    }
+    return .Ok(count)
+}
+
+function stateName(state: borrow SuspendState) -> String {
+    return match state {
+        Idle -> "freeze"
+        Memory -> "mem"
+        Disk -> "disk"
+    }
+}
+
+// Writes `/sys/power/state`, which returns after resume, and answers the
+// time spent suspended: the boot clock's advance over the monotonic clock's.
+function suspendNow(state: borrow SuspendState) -> Result<Answer, TesseraError> {
+    let bootBefore = try timeRead(.Boottime)
+    let monotonicBefore = try monotonicNow()
+    try writeText(PowerFiles.state, stateName(state))
+    let bootAfter = try timeRead(.Boottime)
+    let monotonicAfter = try monotonicNow()
+    let asleep = (bootAfter - bootBefore) - (monotonicAfter - monotonicBefore)
+    return .Ok(Answer { result0: U64(asleep > 0 ? asleep : 0), result1: U64(0) })
+}
+
+// Completes `Suspend` after resume; `Busy` while a wake source is active.
+public function suspendEnter(
+    state: SuspendState,
+    port: Handle,
+    key: UNumber
+) -> Result<Void, TesseraError> {
+    let reply = Reply { port: port, key: key }
+    let now = try monotonicNow()
+    for index in 0..deviceLibrary.wakeSources.count {
+        if holding(index, now) { return reply.post(.Error(failure(.Busy)), .Suspend) }
+    }
+    return reply.post(suspendNow(state), .Suspend)
+}
+
+public function wakeSourceCreate(name: borrow String) -> Result<Ref, TesseraError> {
+    if name.count == 0 || name.count > WakeSourceLimit.name || name.contains(" ") {
+        return .Error(failure(.InvalidArgument))
+    }
+    let object = createObject(.WakeSource, .None, .None)
+    deviceLibrary.objects[object].name = name
+    deviceLibrary.wakeSources.append(
+        WakeSourceRecord { object: object, name: name, active: false, lapses: .None }
+    )
+    return .Ok(mintRef(object, defaultRights(.WakeSource)))
+}
+
+// `timeout`, in nanoseconds; 0 holds until `deactivate`.
+public function wakeSourceActivate(source: Ref, timeout: Number) -> Result<Void, TesseraError> {
+    let object = try resolve(source, .WakeSource, RefRights.write)
+    let index = try wakeSourceOf(object)
+    if timeout < 0 { return .Error(failure(.InvalidArgument)) }
+    let name = deviceLibrary.wakeSources[index].name
+    let line = timeout > 0 ? name + " \(timeout)" : name
+    match writeText(PowerFiles.wakeLock, line) {
+        Ok -> {}
+        Error(failed) -> {
+            match errnoOf(failed) {
+                // No autosleep: nothing to tell the kernel.
+                NoEntry -> {}
+                else -> return .Error(failed)
+            }
+        }
+    }
+    let now = try monotonicNow()
+    deviceLibrary.wakeSources[index].active = true
+    deviceLibrary.wakeSources[index].lapses = timeout > 0 ? .Some(now + timeout) : .None
+    return .Ok
+}
+
+function unlock(index: Number) -> Result<Void, TesseraError> {
+    let source = deviceLibrary.wakeSources[index]
+    deviceLibrary.wakeSources[index].active = false
+    deviceLibrary.wakeSources[index].lapses = .None
+    if !source.active { return .Ok }
+    return match writeText(PowerFiles.wakeUnlock, source.name) {
+        Ok -> .Ok
+        Error(failed) -> {
+            match errnoOf(failed) {
+                NoEntry -> return .Ok
+                else -> return .Error(failed)
+            }
+        }
+    }
+}
+
+public function wakeSourceDeactivate(source: Ref) -> Result<Void, TesseraError> {
+    let object = try resolve(source, .WakeSource, RefRights.write)
+    let index = try wakeSourceOf(object)
+    return unlock(index)
+}
+
+function wakeSourceRelease(object: Number) {
+    var kept: [WakeSourceRecord] = []
+    for (index, source) in deviceLibrary.wakeSources.enumerated() {
+        if source.object != object {
+            kept.append(source)
+            continue
+        }
+        match unlock(index) {
+            Ok -> {}
+            Error(failed) -> log warn(
+                "a wake source was not released from the kernel",
+                name: source.name,
+                error: errorName(failed)
+            )
+        }
+    }
+    deviceLibrary.wakeSources = kept
+}
+
+// The clock's time, as nanoseconds since 1970.
+public function rtcRead(rtc: Ref) -> Result<Number, TesseraError> {
+    let object = try resolveConnection(rtc, .Rtc, RefRights.read)
+    return match try connectionNumber(object, "since_epoch") {
+        Some(seconds) -> .Ok(seconds * Time.nanosecondsPerSecond)
+        None -> .Error(lostConnection(object))
+    }
+}
+
+// Arms the alarm for `at` on the boot clock, to the next whole second; 0
+// clears it. The alarm is armed relative to now, so it lands at the same
+// moment whatever the clock's own idea of the date.
+public function rtcSetWake(rtc: Ref, at: Number) -> Result<Void, TesseraError> {
+    let object = try resolveConnection(rtc, .Rtc, RefRights.write)
+    let directory = try sysfsPath(object)
+    let path = directory + "/wakealarm"
+    let present = try pathPresent(path)
+    if !present { return .Error(failure(.Unsupported)) }
+    try writeText(path, "0")
+    if at == 0 { return .Ok }
+    let now = try timeRead(.Boottime)
+    var seconds = ceil((at - now) / Time.nanosecondsPerSecond)
+    if seconds < 1 { seconds = 1 }
+    return writeText(path, "+\(seconds)")
+}

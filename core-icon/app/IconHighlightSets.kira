@@ -1,0 +1,205 @@
+import Foundation
+
+// `_highlights.glyphsDefault` and `_highlights.chicletDefault`: the lights a
+// group's glyphs and the chiclet's edge are lit by. The bright and dim sets
+// equal the default ones at every size, so the default stands for all three.
+
+// One highlight: how bright, how opaque inside and outside the shape, how far
+// it reaches, how wide its light spreads and how sharply it falls off, and
+// the longitudes of the lights it is lit by.
+struct HighlightSpec {
+    let brightness: Number
+    let opacity: SizeBased
+    let outsetOpacity: SizeBased
+    let distance: SizeBased
+    let minDistancePixels: SizeBased
+    let spread: SizeBased
+    let bias: Number
+    // A diffuse highlight's falloff ignores the curvature setting.
+    let diffuse: Bool
+    let darklight: Bool
+    let longitudes: [Number]
+}
+
+// The longitudes IconRendering lights from: the key light at the top, the
+// fill light opposite, the darklights at either side.
+namespace LightLongitude {
+    let key: Number = 0
+    let fill: Number = SvgAngle.halfTurn
+    let right: Number = SvgAngle.halfTurn / 2
+    let left: Number = -SvgAngle.halfTurn / 2
+}
+
+// The light at `longitude` as a direction, x across and y up the canvas.
+function lightDirection(longitude: Number) -> (Number, Number) {
+    return (sin(longitude), cos(longitude))
+}
+
+// The glyphs' highlights, back to front: key and fill sharp, key and fill
+// diffuse (the fill matching the key), then the darklights.
+function glyphHighlights() -> [HighlightSpec] {
+    let sharpDistance = SizeBased { display: 4, large: 6, medium: 6, small: 6 }
+    let sharpOpacity = SizeBased { display: 1, large: 1, medium: 1, small: 0.3 }
+    let diffuseDistance = SizeBased { display: 16, large: 24, medium: 24, small: 24 }
+    return [
+        glyphSharp(sharpOpacity, sharpDistance, everySize(1.5708), LightLongitude.key),
+        glyphSharp(sharpOpacity, sharpDistance, everySize(1.0472), LightLongitude.fill),
+        glyphDiffuse(diffuseDistance, LightLongitude.key),
+        glyphDiffuse(diffuseDistance, LightLongitude.fill),
+        glyphDarklight(copy sharpDistance)
+    ]
+}
+
+function glyphSharp(
+    opacity: borrow SizeBased,
+    distance: borrow SizeBased,
+    spread: SizeBased,
+    longitude: Number
+) -> HighlightSpec {
+    return HighlightSpec {
+        brightness: 1,
+        opacity: copy opacity,
+        outsetOpacity: everySize(0),
+        distance: copy distance,
+        minDistancePixels: everySize(1),
+        spread: spread,
+        bias: 0.5,
+        diffuse: false,
+        darklight: false,
+        longitudes: [longitude]
+    }
+}
+
+function glyphDiffuse(distance: borrow SizeBased, longitude: Number) -> HighlightSpec {
+    return HighlightSpec {
+        brightness: 1,
+        opacity: everySize(1),
+        outsetOpacity: everySize(0),
+        distance: copy distance,
+        minDistancePixels: everySize(4),
+        spread: everySize(1.0472),
+        bias: 0.08,
+        diffuse: true,
+        darklight: false,
+        longitudes: [longitude]
+    }
+}
+
+function glyphDarklight(distance: SizeBased) -> HighlightSpec {
+    return HighlightSpec {
+        brightness: 0,
+        opacity: SizeBased { display: 1, large: 1, medium: 0.2, small: 0.2 },
+        outsetOpacity: SizeBased { display: 0.9, large: 0.9, medium: 0.2, small: 0.2 },
+        distance: distance,
+        minDistancePixels: everySize(1),
+        spread: SizeBased { display: 1.5708, large: 1.5708, medium: 3.14159, small: 3.14159 },
+        bias: 0.2,
+        diffuse: false,
+        darklight: true,
+        longitudes: [LightLongitude.right, LightLongitude.left]
+    }
+}
+
+// The chiclet's edge highlights, key sharp, key diffuse, fill sharp, fill
+// diffuse and dark; its rim has no opacity at any size, so draws nothing.
+function chicletHighlights() -> [HighlightSpec] {
+    return [
+        standardSharp(LightLongitude.key),
+        standardDiffuse(0.5, LightLongitude.key),
+        standardSharp(LightLongitude.fill),
+        standardDiffuse(0.25, LightLongitude.fill),
+        edgeDarklight(everySize(0.2), everySize(10), 1.0472)
+    ]
+}
+
+function standardSharp(longitude: Number) -> HighlightSpec {
+    let brightness = ChicletBrightness.standard
+    return chicletLight(brightness, everySize(0.2), 10, 2.0944, 0.5, false, longitude)
+}
+
+function standardDiffuse(opacity: Number, longitude: Number) -> HighlightSpec {
+    let brightness = ChicletBrightness.standard
+    return chicletLight(brightness, everySize(opacity), 40, 1.5708, 0.08, true, longitude)
+}
+
+// An edge's darklight, at either side.
+function edgeDarklight(opacity: SizeBased, distance: SizeBased, spread: Number) -> HighlightSpec {
+    return HighlightSpec {
+        brightness: 0,
+        opacity: opacity,
+        outsetOpacity: everySize(0),
+        distance: distance,
+        minDistancePixels: everySize(0),
+        spread: everySize(spread),
+        bias: 0.5,
+        diffuse: false,
+        darklight: true,
+        longitudes: [LightLongitude.right, LightLongitude.left]
+    }
+}
+
+namespace ChicletBrightness {
+    let standard: Number = 1.1
+    let clear: Number = 1
+}
+
+// `_highlights.chicletClear`: a clear or tinted icon's edge.
+function chicletClearHighlights() -> [HighlightSpec] {
+    return matchedEdgeHighlights(everySize(1.25), everySize(0.5))
+}
+
+// `_highlights.chicletScreened`: a dark tinted icon's edge, screened over
+// its glass with the contents.
+function chicletScreenedHighlights() -> [HighlightSpec] {
+    return matchedEdgeHighlights(
+        SizeBased { display: 0.6, large: 0.7, medium: 0.7, small: 0.7 },
+        SizeBased { display: 0.25, large: 0.3, medium: 0.3, small: 0.3 }
+    )
+}
+
+// The clear and screened edges: a sharp and a diffuse light whose fill
+// lights match their key lights, so they light one edge together, and a
+// darklight.
+function matchedEdgeHighlights(
+    sharpOpacity: SizeBased,
+    diffuseOpacity: SizeBased
+) -> [HighlightSpec] {
+    let brightness = ChicletBrightness.clear
+    let key = LightLongitude.key
+    let sharp = chicletLight(brightness, move sharpOpacity, 10, 1.74533, 0.5, false, key)
+    let diffuse = chicletLight(brightness, move diffuseOpacity, 44, 0.785398, 0.5, true, key)
+    return [
+        copy sharp,
+        copy diffuse,
+        litBy(sharp, [LightLongitude.fill]),
+        litBy(diffuse, [LightLongitude.fill]),
+        edgeDarklight(
+            SizeBased { display: 0.25, large: 0.1, medium: 0.1, small: 0 },
+            SizeBased { display: 9, large: 8, medium: 8, small: 9 },
+            1.13446
+        )
+    ]
+}
+
+function chicletLight(
+    brightness: Number,
+    opacity: SizeBased,
+    distance: Number,
+    spread: Number,
+    bias: Number,
+    diffuse: Bool,
+    longitude: Number
+) -> HighlightSpec {
+    return HighlightSpec {
+        brightness: brightness,
+        opacity: opacity,
+        outsetOpacity: everySize(0),
+        distance: everySize(distance),
+        minDistancePixels: everySize(0),
+        spread: everySize(spread),
+        bias: bias,
+        diffuse: diffuse,
+        darklight: false,
+        longitudes: [longitude]
+    }
+}

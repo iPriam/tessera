@@ -1,0 +1,535 @@
+import Foundation
+import LibTessera
+import TesseraDisplayClient
+
+// Windows under the pointer (roadmap/11-adaptive-desktop.md, "The window
+// model"): the compositor owns geometry, stacking and input enforcement; the
+// platform owns the policy that moves, raises, activates and presents.
+//
+// The pointer goes to the focused surface, as every input does
+// (roadmap/08-display-server.md, "Input"), with two exceptions the platform
+// is granted. The bands its bar and dock take are its own, whatever has
+// focus, as a Mac's menu bar and Dock answer a click whatever is in front. And
+// a button going down over a surface that does not have focus goes to no
+// client: the platform is told which surface it landed on, and decides
+// whether it comes to the front.
+//
+// A window moves only when its application asks, from a drag on what it drew
+// as its title bar, while that drag is under way, and the platform grants it.
+// From then until the button goes up the window follows the pointer here,
+// with no round trip per motion, and the application hears nothing of the
+// pointer. Where it lands is sent to it as a `Configure` and to the platform
+// as `SurfacePlaced`.
+
+// A move a surface asked for: the client, where the pointer held it, and
+// whether the platform granted it yet.
+struct Moving {
+    var index: Number
+    var grabX: Number
+    var grabY: Number
+    var granted: Bool
+}
+
+namespace WindowLimits {
+    // How much of a window stays on the output, across, wherever it is
+    // dragged, so it can always be taken again.
+    let keptOnOutput: Number = 64
+}
+
+// Whether the client at `index` takes part in hit-testing: alive, an
+// application or the desktop, shown, and with a frame.
+function hittable(client: borrow Client) -> Bool {
+    return client.alive && client.role != .Platform && !client.hidden && client.frame.width > 0
+}
+
+function contains(frame: borrow Geometry, x: Number, y: Number) -> Bool {
+    return x >= frame.x && y >= frame.y && x < frame.x + frame.width && y < frame.y + frame.height
+}
+
+// The surface the pointer is over, the topmost first; the desktop lies under
+// every application.
+function surfaceUnderPointer(server: borrow Server) -> Number? {
+    var chosen: Number? = .None
+    var chosenDesktop = true
+    var highest = 0
+    for index in 0..server.clients.count {
+        let client = server.clients[index]
+        let frame = match hitFrame(server, index) {
+            Some(value) -> value
+            None -> continue
+        }
+        if hittable(client) && contains(frame, server.pointerX, server.pointerY) {
+            let desktop = client.role == .Desktop
+            let above = chosen.isNone() || (chosenDesktop && !desktop)
+                || (desktop == chosenDesktop && client.zOrder >= highest)
+            if above {
+                chosen = .Some(index)
+                chosenDesktop = desktop
+                highest = client.zOrder
+            }
+        }
+    }
+    return chosen
+}
+
+// The live platform session's client, if there is one.
+function platformIndex(server: borrow Server) -> Number? {
+    for index in 0..server.clients.count {
+        if isPlatform(server.clients[index]) { return .Some(index) }
+    }
+    return .None
+}
+
+// Whether the pointer is over a band the platform's bar or dock takes, or
+// over its overlay.
+function inPlatformBand(server: borrow Server) -> Bool {
+    let height = server.display.scanout.pointHeight()
+    return server.pointerY < server.bar || (
+        server.dock > 0 && server.pointerY >= height - server.dock
+    ) || inOverlay(server)
+}
+
+// Whether the pointer is over the platform's overlay.
+function inOverlay(server: borrow Server) -> Bool {
+    let overlay = server.overlay
+    return server.pointerX >= overlay.x && server.pointerX < overlay.x + overlay.width
+        && server.pointerY >= overlay.y && server.pointerY < overlay.y + overlay.height
+}
+
+// The client the pointer's events go to now: the one a held button went down
+// on, the platform over its bands, while it has focus or while it holds the
+// input, and otherwise the focused surface.
+function pointerTarget(server: borrow Server) -> Number? {
+    if server.buttonsDown > 0 && server.pressedOn.isSome() { return server.pressedOn }
+    let platform = platformIndex(server)
+    if platform.isSome() && (
+        server.inputHeld || server.focus == platform || inPlatformBand(server)
+    ) {
+        return platform
+    }
+    // A waiting window is an activation target, never an input proxy for
+    // the window on the stage. Its content cannot receive the activating
+    // click, pointer motion or scroll while it is in the strip.
+    if server.mode == .Stage && surfaceUnderPointer(server) != server.focus { return .None }
+    return server.focus
+}
+
+// The pointer moved or a button changed: the client it now goes to is told
+// it came, and the one it went from that it left.
+function retarget(server: borrow mut Server) {
+    if server.pointers.count == 0 { return }
+    let target = pointerTarget(server)
+    if target == server.pointerOver { return }
+    match server.pointerOver {
+        Some(index) -> if server.clients[index].alive {
+            tell(server.clients[index].channel, .PointerLeave(server.clients[index].surface))
+        }
+        None -> {}
+    }
+    server.pointerOver = target
+    match target {
+        Some(index) -> tell(
+            server.clients[index].channel,
+            .PointerEnter(server.clients[index].surface)
+        )
+        None -> {}
+    }
+}
+
+// A button went down. Over a surface without focus, outside the platform's
+// bands and with the platform not holding focus, the platform is told and the
+// press goes no further. False when the press is to go to no client.
+function pressLands(server: borrow mut Server) -> Bool {
+    let platform = platformIndex(server)
+    if platform.isSome() && (
+        server.inputHeld || server.focus == platform || inPlatformBand(server)
+    ) {
+        return true
+    }
+    let under = try surfaceUnderPointer(server) otherwise return true
+    if server.focus == .Some(under) { return server.stageMotion.count == 0 }
+    tellPlatforms(server, .SurfacePressed(server.clients[under].surface))
+    log info(
+        "a press landed on a surface without focus",
+        surface: server.clients[under].surface.raw
+    )
+    return false
+}
+
+// An application asked for a window action on its own surface. A move or a
+// resize is held until the platform grants it; every action goes to the platform,
+// which decides.
+function requestWindow(
+    server: borrow mut Server,
+    index: Number,
+    request: borrow DisplayWindowRequest
+) {
+    let client = server.clients[index]
+    if request.surface != client.surface || client.role != .Application {
+        log warn("a client asked for a window action on a surface not its own")
+        return
+    }
+    if server.focus != .Some(index) {
+        log info("a window action was asked for by a surface without focus")
+        return
+    }
+    match request.action {
+        Move -> {
+            if server.buttonsDown == 0 {
+                log info("a move was asked for with no button down")
+                return
+            }
+            server.moving = .Some(
+                Moving {
+                    index: index,
+                    grabX: server.pointerX - client.frame.x,
+                    grabY: server.pointerY - client.frame.y,
+                    granted: false,
+                }
+            )
+        }
+        Resize -> {
+            if server.buttonsDown == 0 || !request.edges.any() {
+                log info("a resize was asked for with no button down or no edge")
+                return
+            }
+            startResizing(server, index, request.edges)
+        }
+        Zoom, Minimize -> {}
+        // Going home is the person's swipe, which only MosaicDisplay sees,
+        // and a window's flight is MosaicDisplay's own.
+        Home, Peek, Unpeek, Fly, Landed -> {
+            log info("an application asked to go home, which only a swipe does")
+            return
+        }
+    }
+    tellPlatforms(
+        server,
+        .WindowRequested(
+            DisplayWindowRequest {
+                surface: request.surface,
+                action: request.action,
+                edges: request.edges
+            }
+        )
+    )
+}
+
+// The platform granted the move `surface` asked for.
+function grantMove(server: borrow mut Server, surface: DisplaySurfaceId) {
+    match server.moving {
+        Some(moving) -> {
+            if server.clients[moving.index].surface != surface {
+                log info("the platform granted a move no surface is making", surface: surface.raw)
+                return
+            }
+            var granted = moving
+            granted.granted = true
+            server.moving = .Some(granted)
+            log info("the platform granted a move", surface: surface.raw)
+        }
+        None -> log info("the platform granted a move that had already ended", surface: surface.raw)
+    }
+}
+
+// Where a moving window goes for the pointer where it is now: held by the
+// point it was taken at, its top below the bar, and some of it on the output.
+function movedFrame(server: borrow Server, moving: borrow Moving) -> Geometry {
+    let frame = server.clients[moving.index].frame
+    let width = server.display.scanout.pointWidth()
+    let height = server.display.scanout.pointHeight()
+    let x = clamp(
+        server.pointerX - moving.grabX,
+        WindowLimits.keptOnOutput - frame.width,
+        width - WindowLimits.keptOnOutput
+    )
+    let y = clamp(
+        server.pointerY - moving.grabY,
+        server.bar,
+        height - max(server.dock, WindowLimits.keptOnOutput)
+    )
+    return Geometry { x: x, y: y, width: frame.width, height: frame.height }
+}
+
+// The pointer moved during a granted move: the window follows it. True when
+// a move took the motion.
+function followMove(server: borrow mut Server) -> Bool {
+    let moving = try server.moving otherwise return false
+    if !moving.granted { return false }
+    let frame = movedFrame(server, moving)
+    if frame.x == server.clients[moving.index].frame.x && frame.y == server.clients[moving.index].frame.y {
+        return true
+    }
+    placeFrame(server, moving.index, frame)
+    redraw(server, "a moving window")
+    return true
+}
+
+// Every button went up: a granted move ends where the window is, the
+// application is told its new place, and so is the platform.
+function endMove(server: borrow mut Server) {
+    let moving = try server.moving otherwise return
+    server.moving = .None
+    if !moving.granted || !server.clients[moving.index].alive { return }
+    match sendConfigure(server, moving.index, Relayout.serial) {
+        Ok -> {}
+        Error(reason) -> configurationFailed(server, moving.index, reason)
+    }
+    if !server.clients[moving.index].alive { return }
+    tellPlaced(server, moving.index)
+}
+
+// The platform placed a surface: it is laid out there, and told.
+function placeSurface(server: borrow mut Server, placement: borrow DisplayPlacement) {
+    let index = match clientOf(server, placement.surface) {
+        Some(value) -> value
+        None -> {
+            log info("the platform placed a surface that is gone", surface: placement.surface.raw)
+            return
+        }
+    }
+    if server.clients[index].role == .Platform || placement.width == 0 || placement.height == 0 {
+        log warn("the platform placed a surface it cannot", surface: placement.surface.raw)
+        return
+    }
+    let before = stageSnapshot(server)
+    placeFrame(
+        server,
+        index,
+        Geometry {
+            x: placement.x,
+            y: placement.y,
+            width: Number(placement.width),
+            height: Number(placement.height),
+        }
+    )
+    match sendConfigure(server, index, Relayout.serial) {
+        Ok -> {}
+        Error(reason) -> configurationFailed(server, index, reason)
+    }
+    if !server.clients[index].alive { return }
+    tellPlaced(server, index)
+    animateStage(server, before)
+    redraw(server, "a placed window")
+}
+
+// The platform hid a surface, or showed it again.
+function setHidden(
+    server: borrow mut Server,
+    visibility: borrow DisplayVisibility
+) -> Result<Void, TesseraError> {
+    let index = match clientOf(server, visibility.surface) {
+        Some(value) -> value
+        None -> return .Ok
+    }
+    if server.clients[index].hidden == visibility.hidden { return .Ok }
+    let before = stageSnapshot(server)
+    server.clients[index].hidden = visibility.hidden
+    log info(
+        "the platform set whether a surface shows",
+        surface: visibility.surface.raw,
+        hidden: visibility.hidden
+    )
+    relayoutStack(server)
+    animateStage(server, before)
+    try flyHome(server, index, visibility.hidden)
+    redraw(server, "a hidden or shown window")
+    return .Ok
+}
+
+// Applies the platform's `SetDock`: the band along the bottom of the output,
+// `height` tall, is the dock's.
+function setDock(server: borrow mut Server, height: UNumber) {
+    let band = Number(height)
+    if band + server.bar >= server.display.scanout.pointHeight() {
+        log warn("the platform asked for a dock that leaves no room", height: band)
+        return
+    }
+    if band == server.dock { return }
+    server.dock = band
+    // The stage keeps the floor it began on (`Server.stageFloor`).
+    if server.mode != .Stage { server.stageFloor = band }
+    // Only freeform windows are laid out above the dock; an application that
+    // fills the screen is told the dock's band as its bottom inset.
+    if server.mode == .Freeform { relayoutAll(server) } else { tellInsets(server) }
+    log info("the platform's dock takes the bottom of the output", height: band)
+}
+
+// The live client whose surface is `surface`.
+function clientOf(server: borrow Server, surface: DisplaySurfaceId) -> Number? {
+    for index in 0..server.clients.count {
+        if server.clients[index].alive && server.clients[index].surface == surface {
+            return .Some(index)
+        }
+    }
+    return .None
+}
+
+// Tells the platform where the client at `index` is.
+function tellPlaced(server: borrow Server, index: Number) {
+    let client = server.clients[index]
+    if client.role == .Platform { return }
+    tellPlatforms(
+        server,
+        .SurfacePlaced(
+            DisplayPlacement {
+                surface: client.surface,
+                x: client.frame.x,
+                y: client.frame.y,
+                width: UNumber(client.frame.width),
+                height: UNumber(client.frame.height),
+            }
+        )
+    )
+}
+
+// The client at `index` has gone: the pointer forgets it held it, was over
+// it, or was moving or resizing it.
+function forgetPointer(server: borrow mut Server, index: Number) {
+    if server.pressedOn == .Some(index) { server.pressedOn = .None }
+    if server.pointerOver == .Some(index) { server.pointerOver = .None }
+    match server.moving {
+        Some(moving) -> if moving.index == index { server.moving = .None }
+        None -> {}
+    }
+    match server.resizing {
+        Some(resizing) -> if resizing.index == index { server.resizing = .None }
+        None -> {}
+    }
+}
+
+// Puts the picture together again without a new frame from any client.
+function redraw(server: borrow mut Server, what: borrow String) {
+    tellHomeScreenFlight(server)
+    if server.redrawOwed { return }
+    server.redrawOwed = true
+    match nowMillis() {
+        Ok(now) -> server.redrawOwedSince = .Some(Number(now))
+        Error(reason) -> {
+            log warn("redraw pacing has no clock reading", error: errorName(reason))
+            server.redrawOwedSince = .None
+        }
+    }
+    server.redrawReason = copy what
+}
+
+// Makes the redraw owed now, unless a flip is still in flight: then it is
+// made once that lands. The frames it shows are told done, and the contents
+// let go of are released, once its own flip lands, or at once when it
+// commits none.
+function flushRedraw(server: borrow mut Server) {
+    if server.display.flipping.isSome() { return }
+    var began: Number? = .None
+    match nowMillis() {
+        Ok(now) -> {
+            let time = Number(now)
+            pacingBegins(server.pacing, time)
+            began = .Some(time)
+        }
+        Error(reason) -> {
+            log warn("redraw pacing has no clock reading", error: errorName(reason))
+        }
+    }
+    server.redrawOwed = false
+    var shown = true
+    match showClients(server) {
+        Ok -> {}
+        Error(reason) -> {
+            log warn(
+                "the screen could not be redrawn",
+                what: server.redrawReason,
+                error: errorName(reason)
+            )
+            shown = false
+        }
+    }
+    match began {
+        Some(started) -> match nowMillis() {
+            Ok(now) -> {
+                let ended = Number(now)
+                pacingShown(server.pacing, ended, ended - started, server.display.flipping.isSome())
+            }
+            Error(reason) -> log warn(
+                "redraw pacing could not be completed",
+                error: errorName(reason)
+            )
+        }
+        None -> {}
+    }
+    let owed = server.framesOwed
+    server.framesOwed = []
+    let released = server.releasing
+    server.releasing = []
+    if server.display.flipping.isSome() {
+        for frame in owed { server.framesFlipping.append(frame) }
+        for content in released { server.releasingFlip.append(content) }
+        return
+    }
+    for frame in owed { finishFrame(server, frame, shown) }
+    for content in released { releaseContent(server.composer, content) }
+}
+
+// The flip in flight landed: what the screen showed before it is let go of,
+// the frames it showed are told done, and a redraw owed meanwhile is made.
+function flipLanded(server: borrow mut Server, landed: borrow Completion) {
+    let serial = match server.display.flipping {
+        Some(value) -> value
+        None -> {
+            log warn("a flip landed that none was waiting for")
+            return
+        }
+    }
+    if landed.error.code != .Ok || landed.aux != UNumber(DeviceCompletion.Flip.rawValue())
+        || landed.result0 != serial {
+        log warn("a flip landed other than the one committed", error: errorName(landed.error))
+    }
+    server.display.flipping = .None
+    match nowMillis() {
+        Ok(now) -> pacingLanded(server.pacing, Number(now))
+        Error(reason) -> log warn("flip pacing could not be measured", error: errorName(reason))
+    }
+    forget(server.display.retiring)
+    server.display.retiring = .None
+    if server.modesetFlipping {
+        server.modesetFlipping = false
+        releaseRetiredTargets(server)
+    }
+    let frames = server.framesFlipping
+    server.framesFlipping = []
+    for frame in frames { finishFrame(server, frame, true) }
+    let released = server.releasingFlip
+    server.releasingFlip = []
+    for content in released { releaseContent(server.composer, content) }
+    // A redraw owed carries the plane with its flip.
+    if server.display.cursorLate {
+        server.display.cursorLate = false
+        if server.redrawOwed { return }
+        match commitCursorPlane(server.display, server.port) {
+            Ok -> {}
+            Error(failed) -> log warn(
+                "the cursor plane could not be committed",
+                error: errorName(failed)
+            )
+        }
+    }
+}
+
+// An application said how far round its window its buffers reach. Only an
+// application's own surface has a margin, of at most `WindowMargin.limit`.
+function setMargin(server: borrow mut Server, index: Number, asked: borrow DisplayMargin) {
+    let client = server.clients[index]
+    if asked.surface != client.surface || client.role != .Application {
+        log warn("a client asked for a margin on a surface not its own application window")
+        return
+    }
+    if asked.margin > WindowMargin.limit {
+        log warn("a client asked for a margin wider than the limit", margin: asked.margin)
+        return
+    }
+    let margin = Number(asked.margin)
+    let corner = Number(asked.corner)
+    if margin == client.staged.margin && corner == client.staged.corner { return }
+    server.clients[index].staged.margin = margin
+    server.clients[index].staged.corner = corner
+    log info("a window's frame", surface: asked.surface.raw, margin: margin, corner: corner)
+}

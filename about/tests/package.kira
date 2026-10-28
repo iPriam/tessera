@@ -1,0 +1,6 @@
+//! The About app's test package: host tests of the release file's parsing.
+construct AboutTests extends Package {
+    let version: String = "0.1.0"
+    let kind: PackageKind = .App
+    let dependencies: [Dependency] = [Dependency { name: "ReleaseText", path: "../ReleaseText" }]
+}

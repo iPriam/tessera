@@ -1,0 +1,240 @@
+import Foundation
+import Heap
+import LibTessera
+
+// Power sources, thermal zones and backlights (17 §15).
+//
+// These connections carry no descriptor: the manager checks the family's
+// entitlement and the caller reads and writes the entry's sysfs attributes,
+// in the connection's sysfs directory.
+
+namespace PowerRecord {
+    // `PowerSourceInfo.percent` for a supply that reports no capacity.
+    let percentUnknown: U32 = U32(0xFFFFFFFF)
+    let microPerUnit: Number = 1000000
+    let tripBytes: Number = 16
+}
+
+// An attribute of the connection's sysfs directory; absent when the driver
+// does not offer it.
+function connectionAttribute(object: Number, name: borrow String) -> Result<String?, TesseraError> {
+    let directory = try sysfsPath(object)
+    return .Ok(attribute(directory + "/" + name))
+}
+
+function connectionNumber(object: Number, name: borrow String) -> Result<Number?, TesseraError> {
+    let directory = try sysfsPath(object)
+    return .Ok(numberAttribute(directory + "/" + name))
+}
+
+// A connection whose entry has gone: its `type` is no longer there.
+function lostConnection(object: Number) -> TesseraError {
+    deviceLibrary.objects[object].state = .Lost
+    return failure(.DeviceLost)
+}
+
+function powerSourceKind(text: borrow String) -> PowerSourceKind {
+    if text.startsWith("USB") { return .Usb }
+    return match text {
+        "Battery" -> .Battery
+        "Mains" -> .Mains
+        "Wireless" -> .Wireless
+        else -> .Unknown
+    }
+}
+
+function chargeState(text: borrow String?) -> ChargeState {
+    return match text.or("") {
+        "Discharging" -> .Discharging
+        "Charging" -> .Charging
+        "Full" -> .Full
+        "Not charging" -> .NotCharging
+        else -> .Unknown
+    }
+}
+
+// Energy is read in µWh; a supply that counts charge instead (µAh) is
+// converted at its present voltage.
+public function powerSourceRead(source: Ref) -> Result<PowerSourceInfo, TesseraError> {
+    let object = try resolveConnection(source, .PowerSource, RefRights.read)
+    let kindAttribute = try connectionAttribute(object, "type")
+    let kindText = try kindAttribute otherwise return .Error(lostConnection(object))
+    let kind = powerSourceKind(kindText)
+    let status = try connectionAttribute(object, "status")
+    let voltage = (try connectionNumber(object, "voltage_now")).or(0)
+    let chargeNow = (try connectionNumber(object, "charge_now")).or(0)
+    let chargeFull = (try connectionNumber(object, "charge_full")).or(0)
+    let currentNow = (try connectionNumber(object, "current_now")).or(0)
+    let energyNow = (try connectionNumber(object, "energy_now")).or(
+        floor(chargeNow * voltage / PowerRecord.microPerUnit)
+    )
+    let energyFull = (try connectionNumber(object, "energy_full")).or(
+        floor(chargeFull * voltage / PowerRecord.microPerUnit)
+    )
+    let powerNow = (try connectionNumber(object, "power_now")).or(
+        floor(currentNow * voltage / PowerRecord.microPerUnit)
+    )
+    let percent = match try connectionNumber(object, "capacity") {
+        Some(value) -> U32(value)
+        None -> PowerRecord.percentUnknown
+    }
+    var online = (try connectionNumber(object, "online")).or(0) != 0
+    if kind == .Battery { online = (try connectionAttribute(object, "present")).or("1") != "0" }
+    let toEmpty = (try connectionNumber(object, "time_to_empty_now")).or(0)
+    let toFull = (try connectionNumber(object, "time_to_full_now")).or(0)
+    return .Ok(
+        PowerSourceInfo {
+            kind: kind,
+            state: chargeState(status),
+            online: online ? U32(1) : U32(0),
+            percent: percent,
+            energyNowUwh: U64(energyNow),
+            energyFullUwh: U64(energyFull),
+            powerNowUw: U64(powerNow),
+            voltageUv: U64(voltage),
+            timeToEmpty: U64(toEmpty * Time.nanosecondsPerSecond),
+            timeToFull: U64(toFull * Time.nanosecondsPerSecond),
+        }
+    )
+}
+
+// `ThermalTrip.type`. An active trip drives a fan rather than a policy.
+enum TripKind: U32 {
+    Active = 0
+    Passive = 1
+    Hot = 2
+    Critical = 3
+}
+
+function tripKind(text: borrow String?) -> TripKind {
+    return match text.or("") {
+        "passive" -> .Passive
+        "hot" -> .Hot
+        "critical" -> .Critical
+        else -> .Active
+    }
+}
+
+// The policy a trip sets once the zone is past it.
+function tripPolicy(kind: borrow TripKind) -> ThermalPolicy {
+    return match kind {
+        Active -> .Nominal
+        Passive -> .Fair
+        Hot -> .Serious
+        Critical -> .Critical
+    }
+}
+
+struct Trip {
+    var milliCelsius: Number
+    var hysteresis: Number
+    var kind: TripKind
+}
+
+// The zone's `trip_point_N_*` attributes, in order.
+function zoneTrips(object: Number) -> Result<[Trip], TesseraError> {
+    var trips: [Trip] = []
+    while true {
+        let name = "trip_point_\(trips.count)"
+        let kind = match try connectionAttribute(object, name + "_type") {
+            Some(text) -> tripKind(.Some(text))
+            None -> break
+        }
+        let limit = try connectionNumber(object, name + "_temp")
+        let hysteresis = try connectionNumber(object, name + "_hyst")
+        trips.append(Trip { milliCelsius: limit.or(0), hysteresis: hysteresis.or(0), kind: kind })
+    }
+    return .Ok(trips)
+}
+
+function thermalKind(text: borrow String) -> ThermalKind {
+    if text.contains("cpu") || text.contains("pkg") || text.contains("soc") { return .Cpu }
+    if text.contains("gpu") { return .Gpu }
+    if text.contains("battery") { return .Battery }
+    if text.contains("skin") { return .Skin }
+    return .Other
+}
+
+// The zone's kind from its `type`, its temperature, and how far past its
+// trips it is: Fair past a passive trip, Serious past hot, Critical past
+// critical.
+public function thermalRead(zone: Ref) -> Result<ThermalInfo, TesseraError> {
+    let object = try resolveConnection(zone, .Thermal, RefRights.read)
+    let kindAttribute = try connectionAttribute(object, "type")
+    let kindText = try kindAttribute otherwise return .Error(lostConnection(object))
+    let temperature = (try connectionNumber(object, "temp")).or(0)
+    let trips = try zoneTrips(object)
+    var level = ThermalPolicy.Nominal
+    for trip in trips {
+        let policy = tripPolicy(trip.kind)
+        if trip.milliCelsius > 0 && temperature >= trip.milliCelsius && code(policy) > code(level) {
+            level = policy
+        }
+    }
+    return .Ok(
+        ThermalInfo {
+            kind: thermalKind(kindText),
+            tripCount: U32(trips.count),
+            milliCelsius: I32(temperature),
+            policyLevel: level
+        }
+    )
+}
+
+// One 16-byte `ThermalTrip` per trip point.
+public function thermalTrips(zone: Ref, out: borrow Buffer) -> Result<Number, TesseraError> {
+    let object = try resolveConnection(zone, .Thermal, RefRights.read)
+    let trips = try zoneTrips(object)
+    try requireRoom(out, trips.count * PowerRecord.tripBytes)
+    for (index, trip) in trips.enumerated() {
+        let at = index * PowerRecord.tripBytes
+        heapStore<U32>(out.address, at, word32Of(trip.milliCelsius))
+        heapStore<U32>(out.address, at + 4, word32Of(trip.hysteresis))
+        heapStore<U32>(out.address, at + 8, code(trip.kind))
+        heapStore<U32>(out.address, at + 12, U32(0))
+    }
+    return .Ok(trips.count)
+}
+
+// `device` is the zone's own numbering of the cooling devices bound to it
+// (`cdevN`); the state is clamped to the device's `max_state`.
+public function thermalSetCoolingState(
+    zone: Ref,
+    device: Number,
+    state: Number
+) -> Result<Void, TesseraError> {
+    let object = try resolveConnection(zone, .Thermal, RefRights.manage)
+    if device < 0 || state < 0 { return .Error(failure(.InvalidArgument)) }
+    let cooling = "cdev\(device)"
+    let maximumAttribute = try connectionNumber(object, cooling + "/max_state")
+    let maximum = try maximumAttribute otherwise return .Error(failure(.NotFound))
+    let chosen = state > maximum ? maximum : state
+    let directory = try sysfsPath(object)
+    return writeText(directory + "/" + cooling + "/cur_state", "\(chosen)")
+}
+
+// The device's `max_brightness`; a device without one has gone.
+function brightnessMaximum(object: Number) -> Result<Number, TesseraError> {
+    return match try connectionNumber(object, "max_brightness") {
+        Some(value) -> value > 0 ? .Ok(value) : .Error(lostConnection(object))
+        None -> .Error(lostConnection(object))
+    }
+}
+
+// Levels are 0 to 65535 over the device's `max_brightness`.
+public function backlightRead(backlight: Ref) -> Result<Number, TesseraError> {
+    let object = try resolveConnection(backlight, .Backlight, RefRights.read)
+    let maximum = try brightnessMaximum(object)
+    let brightness = (try connectionNumber(object, "brightness")).or(0)
+    return .Ok(floor(brightness * Backlight.full / maximum))
+}
+
+public function backlightWrite(backlight: Ref, level: Number) -> Result<Void, TesseraError> {
+    let object = try resolveConnection(backlight, .Backlight, RefRights.write)
+    if level < 0 || level > Backlight.full { return .Error(failure(.OutOfRange)) }
+    let maximum = try brightnessMaximum(object)
+    // Rounded to the nearest step the device has.
+    let raw = round(level * maximum / Backlight.full)
+    let directory = try sysfsPath(object)
+    return writeText(directory + "/brightness", "\(raw)")
+}

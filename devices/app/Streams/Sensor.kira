@@ -1,0 +1,200 @@
+import Foundation
+import Heap
+import LibTessera
+import DeviceKit
+
+// Sensor streams through DeviceKit's Sensor family.
+//
+// A device's sample holds every channel it has; the stream keeps the
+// channels of its own kind as lanes. A slot fills with LibTessera samples:
+// `Vector3F32`, `ScalarF32` or a `u64` count, and goes back when the next
+// would not fit.
+
+namespace SensorDefault {
+    // A slot holds a tenth of a second when nothing says otherwise.
+    let slotsPerSecond: Number = 10
+    // The most DeviceKit samples taken in one read.
+    let readSamples: Number = 32
+    // A DeviceKit sample's timestamp, before its channels.
+    let timestampBytes: Number = 8
+}
+
+function sampleBytesOf(format: borrow SensorSampleFormat) -> Number {
+    return match format {
+        Vector3F32 -> 12
+        ScalarF32 -> 4
+        QuaternionF32 -> 16
+        U64Count -> 8
+    }
+}
+
+function channelBytesOf(format: borrow SensorChannelFormat) -> Number {
+    return match format {
+        U64Count -> 8
+        S16 -> 4
+        S32 -> 4
+    }
+}
+
+// The lanes of one kind in DeviceKit's sample, and the sample's bytes.
+struct SampleLayout {
+    var lanes: [Lane]
+    var bytes: Number
+}
+
+let sensorChannelFormats: [SensorChannelFormat] = [SensorChannelFormat.S16, SensorChannelFormat.S32, SensorChannelFormat.U64Count]
+
+function signedOf(raw: UN32) -> Number {
+    if raw >= UN32(0x80000000) { return Number(raw) - 4294967296 }
+    return Number(raw)
+}
+
+function readLayout(
+    connection: Ref,
+    kind: borrow SensorKind
+) -> Result<SampleLayout, TesseraError> {
+    let room = RegistryRecord.channelRoom * RegistryRecord.channelBytes
+    let records = zeroedBlock(count: room, alignment: 16)
+    let count = try sensorChannels(connection, Buffer { address: records.pointer(), length: room })
+    var lanes: [Lane] = []
+    var at = SensorDefault.timestampBytes
+    for index in 0..count {
+        let record: SensorChannelRecord = heapLoad(
+            records.pointer(),
+            index * RegistryRecord.channelBytes
+        )
+        let format = try caseWithCode(sensorChannelFormats, record.format) otherwise return .Error(
+            failure(.Internal)
+        )
+        if record.kind == kind.rawValue() {
+            lanes.append(Lane { at: at, format: format, exponent: signedOf(record.exponent) })
+        }
+        at += channelBytesOf(format)
+    }
+    return .Ok(SampleLayout { lanes: lanes, bytes: at })
+}
+
+function configureSensor(
+    service: borrow mut Service,
+    stream: Number
+) -> Result<Void, TesseraError> {
+    let connection = service.streams[stream].connection
+    let kind = try service.streams[stream].device.kind otherwise return .Error(failure(.Internal))
+    let descriptor = service.streams[stream].descriptor
+    let rate = try sensorConfigure(
+        connection,
+        descriptor.format.rateHz,
+        UNumber(descriptor.format.maxReportLatency)
+    )
+    let layout = try readLayout(connection, kind)
+    let lanes = layout.lanes
+    if lanes.count == 0 { return .Error(failure(.DeviceLost)) }
+    var produced = lanes.count >= 3 ? SensorSampleFormat.Vector3F32 : SensorSampleFormat.ScalarF32
+    if kind == .StepCounter { produced = .U64Count }
+    // `Vector3F32` is the zero value, which a descriptor that does not say
+    // holds; any other format must be the one the kind gives.
+    let asked = descriptor.format.sensorFormat
+    if asked != produced && asked != .Vector3F32 { return .Error(failure(.FormatUnsupported)) }
+    let sampleBytes = sampleBytesOf(produced)
+    var size = descriptor.bufferSize
+    if size == 0 { size = max(floor(rate / SensorDefault.slotsPerSecond), 1) * sampleBytes }
+    size = floor(size / sampleBytes) * sampleBytes
+    if size == 0 { return .Error(failure(.FormatUnsupported)) }
+    service.streams[stream].lanes = lanes
+    service.streams[stream].rawSample = layout.bytes
+    service.streams[stream].frameBytes = sampleBytes
+    service.streams[stream].descriptor.format.rateHz = rate
+    service.streams[stream].descriptor.format.sensorFormat = produced
+    service.streams[stream].descriptor.bufferSize = size
+    return .Ok
+}
+
+// A lane's value, scaled by its power of ten.
+function laneValue(sample: RawPtr, lane: borrow Lane) -> F32 {
+    let raw = signedOf(heapLoad<U32>(sample, lane.at))
+    var scaled = Number(raw)
+    if lane.exponent < 0 {
+        for step in 0..(0 - lane.exponent) { scaled /= 10 }
+    } else {
+        for step in 0..lane.exponent { scaled *= 10 }
+    }
+    return F32(scaled)
+}
+
+// One `f32` per lane; a lane the device does not have is 0.
+function storeFloats(target: RawPtr, sample: RawPtr, lanes: borrow [Lane], sampleBytes: Number) {
+    let values = floor(sampleBytes / 4)
+    for lane in 0..values {
+        let value = lane < lanes.count ? laneValue(sample, lanes[lane]) : F32(0.0)
+        heapStore<F32>(target, lane * 4, value)
+    }
+}
+
+// Appends one DeviceKit sample to the front slot.
+function appendSample(service: borrow mut Service, stream: Number, sample: RawPtr) {
+    let front = match frontSlot(service, stream) {
+        Some(value) -> value
+        None -> {
+            service.streams[stream].dropped += 1
+            return
+        }
+    }
+    let sampleBytes = service.streams[stream].frameBytes
+    let progress = service.streams[stream].progress
+    let target = heapOffset(service.streams[stream].slots[front].address, progress)
+    let lanes = service.streams[stream].lanes
+    match service.streams[stream].descriptor.format.sensorFormat {
+        U64Count -> heapStore<U64>(target, 0, heapLoad<U64>(sample, lanes[0].at))
+        Vector3F32 -> storeFloats(target, sample, lanes, sampleBytes)
+        ScalarF32 -> storeFloats(target, sample, lanes, sampleBytes)
+        QuaternionF32 -> storeFloats(target, sample, lanes, sampleBytes)
+    }
+    let filled = progress + sampleBytes
+    service.streams[stream].progress = filled
+    if filled + sampleBytes > service.streams[stream].slots[front].size {
+        service.streams[stream].progress = 0
+        done(
+            service,
+            stream,
+            front,
+            .Ok,
+            Number(heapLoad<U64>(sample, 0)),
+            filled,
+            PacketFlags.none
+        )
+    }
+}
+
+// Reads what the device sampled since the last tick. The device is read
+// whether or not a slot is waiting, so its ticks never pile up.
+function stepSensor(service: borrow mut Service, stream: Number) {
+    let raw = service.streams[stream].rawSample
+    let room = raw * SensorDefault.readSamples
+    let block = zeroedBlock(count: room, alignment: 16)
+    while true {
+        let bytes = match sensorRead(
+            service.streams[stream].connection,
+            Buffer { address: block.pointer(), length: room }
+        ) {
+            Ok(value) -> value
+            Error(failed) -> match streamReadFailure(failed) {
+                Wait -> {
+                    arm(service, stream, DeviceEvents.readable)
+                    return
+                }
+                Failed(reason) -> {
+                    fail(service, stream, reason)
+                    return
+                }
+            }
+        }
+        let samples = floor(bytes / raw)
+        if samples == 0 {
+            arm(service, stream, DeviceEvents.readable)
+            return
+        }
+        for index in 0..samples {
+            appendSample(service, stream, heapOffset(block.pointer(), index * raw))
+        }
+    }
+}

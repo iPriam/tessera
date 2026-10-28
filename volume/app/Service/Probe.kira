@@ -1,0 +1,197 @@
+import Foundation
+import Heap
+import LibTessera
+import DeviceKit
+
+// What a volume holds. Its first 68 KiB are read and matched against the
+// signatures this service knows, most specific first: a GPT's header in
+// block 1 (its protective MBR would match MBR too), then the file systems'
+// own, then an MBR's boot signature.
+
+@Derive(Copy)
+enum Content: UN32 {
+    Unknown = 0
+    Gpt = 1
+    Mbr = 2
+    Ext4 = 3
+    Erofs = 4
+    Squashfs = 5
+    Fat = 6
+    Empty = 7
+    Btrfs = 8
+}
+
+namespace Probe {
+    // Enough to reach btrfs's superblock, which is 64 KiB in.
+    let bytes: Number = 69632
+    // A GPT header is in block 1, wherever that is up to a 2048-byte block.
+    let largestGptBlock: Number = 2048
+}
+
+// Where each file system keeps its magic and its label.
+namespace Signature {
+    let ext4MagicAt: Number = 1080
+    let ext4Magic: UN16 = UN16(0xEF53)
+    let ext4LabelAt: Number = 1144
+    let ext4LabelBytes: Number = 16
+    let erofsMagicAt: Number = 1024
+    let erofsMagic: UN32 = UN32(0xE0F5E1E2)
+    let squashfsMagicAt: Number = 0
+    let squashfsMagic: UN32 = UN32(0x73717368)
+    let btrfsMagicAt: Number = 0x10040
+    let btrfsLabelAt: Number = 0x1012B
+    let btrfsLabelBytes: Number = 256
+    let fat32TypeAt: Number = 82
+    let fat16TypeAt: Number = 54
+    let fat32LabelAt: Number = 71
+    let fat16LabelAt: Number = 43
+    let fatLabelBytes: Number = 11
+    // What FAT writes for a volume that has no label.
+    let fatNoLabel: String = "NO NAME"
+    let mbrSignatureAt: Number = 510
+    let mbrSignature: UN16 = UN16(0xAA55)
+}
+
+struct Probed {
+    var content: Content
+    var label: String?
+}
+
+function contentName(content: borrow Content) -> String {
+    return match content {
+        Unknown -> "unknown"
+        Gpt -> "GPT"
+        Mbr -> "MBR"
+        Ext4 -> "ext4"
+        Erofs -> "EROFS"
+        Squashfs -> "SquashFS"
+        Fat -> "FAT"
+        Empty -> "empty"
+        Btrfs -> "btrfs"
+    }
+}
+
+function bytesAre(block: RawPtr, offset: Number, text: borrow String) -> Bool {
+    for index in 0..text.count {
+        if heapLoad<U8>(block, offset + index) != text.charAt(index) { return false }
+    }
+    return true
+}
+
+function isFat32(block: RawPtr) -> Bool { return bytesAre(block, Signature.fat32TypeAt, "FAT32") }
+
+function isEmpty(block: RawPtr) -> Bool {
+    for word in 0..trunc(Probe.bytes / 8) {
+        if heapLoad<U64>(block, word * 8) != UNumber(0) { return false }
+    }
+    return true
+}
+
+function contentOf(block: RawPtr, logicalBlock: Number) -> Content {
+    if logicalBlock <= Probe.largestGptBlock && bytesAre(block, logicalBlock, "EFI PART") {
+        return .Gpt
+    }
+    if heapLoad<U16>(block, Signature.ext4MagicAt) == Signature.ext4Magic { return .Ext4 }
+    if heapLoad<U32>(block, Signature.erofsMagicAt) == Signature.erofsMagic { return .Erofs }
+    if heapLoad<U32>(block, Signature.squashfsMagicAt) == Signature.squashfsMagic {
+        return .Squashfs
+    }
+    if bytesAre(block, Signature.btrfsMagicAt, "_BHRfS_M") { return .Btrfs }
+    if isFat32(block) || bytesAre(block, Signature.fat16TypeAt, "FAT1") { return .Fat }
+    if heapLoad<U16>(block, Signature.mbrSignatureAt) == Signature.mbrSignature { return .Mbr }
+    if isEmpty(block) { return .Empty }
+    return .Unknown
+}
+
+function labelAt(block: RawPtr, offset: Number, bytes: Number) -> String? {
+    let label = stringFromCBytes(heapOffset(block, offset), bytes).trim()
+    if label.count == 0 { return .None }
+    return .Some(label)
+}
+
+// FAT's volume label, which FAT writes as `NO NAME` for a volume without one.
+function fatLabel(block: RawPtr) -> String? {
+    let labelOffset = isFat32(block) ? Signature.fat32LabelAt : Signature.fat16LabelAt
+    match labelAt(block, labelOffset, Signature.fatLabelBytes) {
+        Some(label) -> {
+            if label == Signature.fatNoLabel { return .None }
+            return .Some(label)
+        }
+        None -> return .None
+    }
+}
+
+// The name a file system gives itself, where this service knows where it
+// keeps it: ext4's `s_volume_name`, btrfs's label, FAT's volume label
+// (padded with spaces).
+function labelOf(block: RawPtr, content: borrow Content) -> String? {
+    return match content {
+        Ext4 -> labelAt(block, Signature.ext4LabelAt, Signature.ext4LabelBytes)
+        Btrfs -> labelAt(block, Signature.btrfsLabelAt, Signature.btrfsLabelBytes)
+        Fat -> fatLabel(block)
+        // These carry no label this service reads.
+        Unknown -> .None
+        Gpt -> .None
+        Mbr -> .None
+        Erofs -> .None
+        Squashfs -> .None
+        Empty -> .None
+    }
+}
+
+// Reads the volume's first bytes into page-aligned memory and matches
+// them.
+function readProbe(
+    service: borrow Service,
+    device: Ref,
+    address: RawPtr,
+    logicalBlock: Number
+) -> Result<Probed, TesseraError> {
+    try blockRead(
+        device,
+        0,
+        Buffer { address: address, length: Probe.bytes },
+        service.openPort,
+        OpenKey.read
+    )
+    let done = try awaitCompletion(service.openPort)
+    if Number(done.result0) < Probe.bytes { return .Error(failure(.Underrun)) }
+    let content = contentOf(address, logicalBlock)
+    return .Ok(Probed { content: content, label: labelOf(address, content) })
+}
+
+// What the volume on `device` holds. Its memory is page-aligned, which is
+// aligned for any logical block.
+function probe(
+    service: borrow Service,
+    device: Ref,
+    size: Number,
+    logicalBlock: Number
+) -> Result<Probed, TesseraError> {
+    if size < Probe.bytes { return .Ok(Probed { content: .Unknown, label: .None }) }
+    let mapped = memoryPageRound(Probe.bytes)
+    let memory = try memoryCreate(mapped, MemoryOptions.none)
+    let address = match memoryMap(
+        memory,
+        0,
+        mapped,
+        Protection.read | Protection.write,
+        MapOptions.none,
+        nullPointer()
+    ) {
+        Ok(value) -> value
+        Error(failed) -> {
+            // The mapping's memory is released before the failure is
+            // returned; try would leak it.
+            closeHandle(memory)
+            return .Error(failed)
+        }
+    }
+    let probed = readProbe(service, device, address, logicalBlock)
+    match memoryUnmap(address, mapped) {
+        Ok -> {}
+        Error(failed) -> log warn("probe memory could not be unmapped", error: errorName(failed))
+    }
+    closeHandle(memory)
+    return probed
+}

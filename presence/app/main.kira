@@ -1,0 +1,32 @@
+//! The Presence service's entry point: the service that verifies an interaction token before anything acts on the person's behalf.
+import Foundation
+import LibTessera
+
+// presence: the Presence service (roadmap/16 §14). It verifies an interaction
+// token before anything acts on the person's behalf: MosaicDisplay minted the
+// token for a real hardware event, and only MosaicDisplay can say whether it
+// is still good (Input/Presence.kira in mosaicdisplay).
+//
+// It listens as `tessera.presence`. The display link PID 1 gives it is the
+// channel to MosaicDisplay, on which the checks go.
+
+/// Starts the Presence service: listens for verification requests, takes the display link, and serves until it is asked to stop.
+@Main
+function main() {
+    var service = match startService() {
+        Ok(value) -> value
+        Error(failed) -> {
+            log fault("the service could not start", error: errorName(failed))
+            return
+        }
+    }
+    service.link = takeLink()
+    if service.link.isNone() {
+        log warn("no display link; every verification is refused")
+    }
+    log info("listening")
+    match run(service) {
+        Ok -> {}
+        Error(failed) -> log fault("the service stopped", error: errorName(failed))
+    }
+}

@@ -1,0 +1,377 @@
+import Foundation
+import LibTessera
+
+// The loop PID 1 spends its life in.
+//
+// One port, which hears every service end, the desktop's requests, and the
+// machine's own events. A service that ends is restarted until the limit; a
+// request to stop ends the machine. Nothing here polls and nothing here
+// spins — an idle Tessera is a process asleep on its port.
+
+// A service that ended; restarted when its table entry says so.
+function serviceEnded(calls: Handle, fleet: borrow mut Fleet, slot: Number, port: Handle) {
+    let name = fleet.services[slot].name
+    // What it wrote before it ended comes before the news that it did.
+    handleOutput(fleet, slot, .None)
+    // How it ended has been said; a restart follows either way.
+    match reap(fleet.processes[slot], name, fleet.services[slot].restart) {
+        Ok(clean) -> {}
+        Error(failed) -> log warn(
+            "a service could not be asked how it ended",
+            service: name,
+            error: errorName(failed)
+        )
+    }
+    fleet.processes[slot] = Handle.invalid
+    endJob(fleet, slot)
+    if !fleet.services[slot].restart { return }
+    let endedAt = match now() {
+        Ok(value) -> value
+        Error(failed) -> {
+            log fault(
+                "cannot safely restart a service without the monotonic clock",
+                service: name,
+                error: errorName(failed)
+            )
+            return
+        }
+    }
+    fleet.deaths[slot].note(endedAt)
+    if fleet.deaths[slot].failing() {
+        log fault(
+            "a service died ten times in ten seconds and will not be started again",
+            service: name,
+            starts: fleet.starts[slot]
+        )
+        return
+    }
+    restartSlot(calls, fleet, slot, port)
+}
+
+// Starts the service in `slot` again, and links it as it was linked.
+function restartSlot(calls: Handle, fleet: borrow mut Fleet, slot: Number, port: Handle) {
+    match startSlot(calls, fleet, slot) {
+        Ok -> {}
+        Error(failed) -> {
+            log warn(
+                "could not restart a service",
+                service: fleet.services[slot].name,
+                error: errorName(failed)
+            )
+            return
+        }
+    }
+    watchSlot(fleet, slot, port)
+    // The UI is a client, not part of the display server's lifetime. A
+    // restarted MosaicDisplay gets a new link to the same clients over both
+    // services' channels to PID 1; any other display client gets a link of
+    // its own to the running one.
+    if fleet.services[slot].name == "mosaicdisplay" {
+        connectDisplayClients(fleet.channels, fleet.services)
+    } else if fleet.services[slot].isDisplayClient() {
+        connectLaunchedClient(fleet, slot)
+        // A platform started again is linked to every application; anything else
+        // to the platform that runs.
+        if fleet.services[slot].isPlatform() { connectPlatformLinks(fleet) } else {
+            linkToPlatform(fleet, slot)
+        }
+    }
+}
+
+// The desktop or the dev root asked for something, MosaicDisplay reported
+// the mode it chose, or one of them went.
+function serviceRequested(
+    calls: Handle,
+    fleet: borrow mut Fleet,
+    slot: Number,
+    port: Handle,
+    bootArguments: borrow [String]
+) {
+    if fleet.services[slot].name == "mosaicdisplay" {
+        match receiveDisplayMode(fleet.channels[slot]) {
+            // A display server that went is restarted when its process ends.
+            Closed -> { return }
+            Nothing -> {}
+            // A mode that is not remembered is chosen again at the next boot.
+            Reported(mode) -> {
+                fleet.displayUp = true
+                persistDisplayMode(calls, mode.width, mode.height)
+            }
+        }
+        watchRequests(fleet, slot, port)
+        return
+    }
+    if fleet.services[slot].name == "devroot" {
+        match receiveRestartRequest(fleet.channels[slot]) {
+            Closed -> { return }
+            Nothing -> {}
+            Changed(paths) -> restartLoaders(calls, fleet, slot, paths, port)
+        }
+        watchRequests(fleet, slot, port)
+        return
+    }
+    let request = match receiveLaunchRequest(fleet.channels[slot]) {
+        Asked(value) -> value
+        Nothing -> {
+            watchRequests(fleet, slot, port)
+            return
+        }
+        // A desktop that went is reaped when its process ends.
+        Closed -> return
+    }
+    fleet.consent.refusal = ""
+    let name = requestedName(request.path)
+    log info(
+        "a service asked",
+        service: fleet.services[slot].name,
+        ask: request.ask,
+        application: name
+    )
+    // Switching platforms is the platform's alone. Its new channel is
+    // watched when it starts, and the old one went with it.
+    if request.ask == .SwitchPlatform {
+        answerRequest(request.reply, "")
+        if !fleet.services[slot].isPlatform() {
+            log warn("a service that is not the platform asked to switch it", ask: request.ask)
+            watchRequests(fleet, slot, port)
+            return
+        }
+        switchPlatform(calls, fleet, slot, request.path, port, bootArguments)
+        return
+    }
+    // The platform's Dock only opens applications; installing and
+    // uninstalling are the desktop's, as they are Inlay's.
+    if fleet.services[slot].isPlatform() && request.ask != .Launch {
+        log warn("the platform asked for what only the desktop may", ask: request.ask)
+        answerRequest(request.reply, "")
+        watchRequests(fleet, slot, port)
+        return
+    }
+    var said = ""
+    match request.ask {
+        Install -> {
+            match installApplication(calls, request.path, fleet.consent) {
+                Ok(outcome) -> match outcome {
+                    Installed -> said = name + " is installed in Applications."
+                    Refused -> said = name + " could not be installed."
+                }
+                Error(failed) -> {
+                    log warn(
+                        "could not install an application",
+                        application: name,
+                        error: errorName(failed)
+                    )
+                    said = name + " could not be installed."
+                }
+            }
+        }
+        Uninstall -> {
+            match uninstallApplication(calls, request.path, fleet) {
+                Ok(outcome) -> match outcome {
+                    Removed -> said = name + " is uninstalled. Its documents are kept."
+                    Refused -> said = name + " could not be uninstalled."
+                }
+                Error(failed) -> {
+                    log warn(
+                        "could not uninstall an application",
+                        application: name,
+                        error: errorName(failed)
+                    )
+                    said = name + " could not be uninstalled."
+                }
+            }
+        }
+        // Answered above, and never reaches here.
+        SwitchPlatform -> {}
+        Launch -> {
+            match openApplication(calls, request.path, fleet) {
+                Ok(outcome) -> {
+                    match outcome {
+                        Started(opened) -> {
+                            connectLaunchedClient(fleet, opened)
+                            linkToPlatform(fleet, opened)
+                            watchSlot(fleet, opened, port)
+                        }
+                        // Brought to the front; nothing was started.
+                        AlreadyOpen(_) -> {}
+                    }
+                }
+                Error(failure) -> {
+                    // The reason was logged where opening failed; the
+                    // requester is told only that it did.
+                    absorb failure
+                    said = name + " could not be opened."
+                }
+            }
+        }
+    }
+    if fleet.consent.refusal.count > 0 { said = copy fleet.consent.refusal }
+    answerRequest(request.reply, said)
+    watchRequests(fleet, slot, port)
+}
+
+// Asks for the machine's own events on `port`.
+function watchSystem(port: Handle) {
+    match processWatchSystem(port, systemKey) {
+        Ok -> {}
+        Error(failed) -> log fault(
+            "PID 1 cannot hear the machine's requests",
+            error: errorName(failed)
+        )
+    }
+}
+
+// Whether a service runs in `slot`, if there is one.
+function isRunning(fleet: borrow Fleet, slot: borrow Number?) -> Bool {
+    match slot {
+        Some(at) -> return running(fleet, at)
+        None -> return false
+    }
+}
+
+// Whether `key` was made for what runs in `slot` now, not for a process
+// it has since replaced.
+function isCurrent(fleet: borrow Fleet, key: Number, slot: Number) -> Bool {
+    return slot < fleet.services.count && keyStarts(key) == fleet.starts[slot] && running(
+        fleet,
+        slot
+    )
+}
+
+// Kills the service in `slot` for tessera.restart-test, which demonstrates
+// the restart that follows.
+function killForTest(fleet: borrow Fleet, slot: Number) {
+    log info("tessera.restart-test was set; killing a service", service: fleet.services[slot].name)
+    match processKill(fleet.processes[slot]) {
+        Ok -> {}
+        Error(failed) -> log warn(
+            "could not kill a service for the restart test",
+            service: fleet.services[slot].name,
+            error: errorName(failed)
+        )
+    }
+}
+
+// Starts everything, watches it, and does not return.
+function superviseForever(
+    calls: Handle,
+    killOnce: Bool,
+    bootArguments: borrow [String],
+    systemLog: SystemLog
+) {
+    let port = match portCreate(.None) {
+        Ok(value) -> value
+        Error(failed) -> {
+            refuseToBoot("PID 1 has no port to supervise on (" + errorName(failed) + ")")
+            return
+        }
+    }
+    watchSystem(port)
+
+    var fleet = startFleet(calls, services(calls, bootArguments), move systemLog)
+    connectDisplayClients(fleet.channels, fleet.services)
+    connectPlatformLinks(fleet)
+    for slot in 0..fleet.services.count { watchSlot(fleet, slot, port) }
+    // The services are started: an update that got this far is kept.
+    if bootFlag(bootArguments, BootFlag.handedOver) { markSystemGood(calls) }
+
+    // The fault injection that makes a boot demonstrate supervision rather
+    // than assert it: a real kill of a real service through the real path,
+    // and the restart that follows is not arranged. The broker is killed
+    // too, once the services have had time to check in with it, so the boot
+    // shows them checking in again with the broker init restarts. Eight
+    // quiet seconds is the sign that they have. The display server is killed
+    // once it has reported its mode, so the boot shows it up, then down, then
+    // back.
+    var injected = false
+    let broker = serviceSlot(fleet.services, "bootstrap")
+    var brokerInjected = false
+    while true {
+        match displayServerSlot(fleet.services) {
+            Some(display) -> {
+                if killOnce && !injected && fleet.displayUp && running(fleet, display) {
+                    killForTest(fleet, display)
+                    injected = true
+                }
+            }
+            None -> {}
+        }
+        let brokerPending = killOnce && !brokerInjected && isRunning(fleet, broker)
+        var deadline = Deadline.infinite
+        if brokerPending {
+            match now() {
+                Ok(value) -> deadline = value + seconds(8)
+                Error(failed) -> {
+                    log fault(
+                        "the restart test cannot time the broker check-in",
+                        error: errorName(failed)
+                    )
+                    brokerInjected = true
+                }
+            }
+        }
+
+        match portWait(port, 1, deadline) {
+            Error(failed) -> {
+                if failed.code != .Timeout {
+                    log fault("PID 1's port failed", error: errorName(failed))
+                } else if brokerPending {
+                    match broker {
+                        Some(slot) -> killForTest(fleet, slot)
+                        None -> {}
+                    }
+                    brokerInjected = true
+                }
+            }
+            Ok(done) -> {
+                let key = Number(done[0].key)
+                match keyKind(key) {
+                    System -> {
+                        let events = processSystemEvents()
+                        if events.has(SystemEvent.childEnded) {
+                            // A service that ended is reaped through its
+                            // Process handle, which says how it ended. What
+                            // is left is a process that was left to PID 1;
+                            // how many there were is not news.
+                            match processReapOrphans() {
+                                Ok -> {}
+                                Error(failed) -> log warn(
+                                    "orphans could not be collected",
+                                    error: errorName(failed)
+                                )
+                            }
+                        }
+                        if events.has(SystemEvent.stop) {
+                            powerOff(fleet, "asked to stop")
+                            return
+                        }
+                        if events.has(SystemEvent.attention) {
+                            powerOff(fleet, "Ctrl-Alt-Del was pressed")
+                            return
+                        }
+                        watchSystem(port)
+                    }
+                    Ended -> {
+                        let slot = keySlot(key)
+                        if isCurrent(fleet, key, slot) { serviceEnded(calls, fleet, slot, port) }
+                    }
+                    Request -> {
+                        let slot = keySlot(key)
+                        if isCurrent(fleet, key, slot) {
+                            serviceRequested(calls, fleet, slot, port, bootArguments)
+                        }
+                    }
+                    // Output can outlive the process that wrote it, by as
+                    // much as one wait; only a restart makes it stale.
+                    Output -> {
+                        let slot = keySlot(key)
+                        if slot < fleet.services.count && keyStarts(key) == fleet.starts[slot] {
+                            handleOutput(fleet, slot, .Some(port))
+                        }
+                    }
+                    Unknown -> log warn("PID 1's port answered a key it never made", key)
+                }
+            }
+        }
+    }
+}

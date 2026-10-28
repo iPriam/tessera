@@ -1,0 +1,204 @@
+import Foundation
+
+// Linux's `errno` numbers, read as Tessera errors. Nothing outside this
+// folder sees one: the backend answers `TesseraError`, with the number kept
+// in `detail` (§4).
+
+// A kernel failure, by `errno`. The number is kept in `detail` so a failure
+// the table below does not name is still explainable.
+function errnoFailure(errno: Number) -> TesseraError {
+    return TesseraError {
+        code: errnoCode(errno),
+        subsystem: .Kernel,
+        flags: ErrorFlags.hasBackendCode,
+        detail: U64(errno),
+    }
+}
+
+// The `errno` numbers this backend tells apart. Any other number is still
+// kept in a failure's `detail`.
+@Derive(Copy)
+enum Errno: U32 {
+    // `EPERM`
+    NotPermitted = 1
+    // `ENOENT`
+    NoEntry = 2
+    // `ESRCH`
+    NoProcess = 3
+    // `EINTR`
+    Interrupted = 4
+    // `ENXIO`
+    NoDeviceOrAddress = 6
+    // `E2BIG`
+    ArgumentsTooLong = 7
+    // `EBADF`
+    BadDescriptor = 9
+    // `ECHILD`
+    NoChild = 10
+    // `EAGAIN`
+    Again = 11
+    // `ENOMEM`
+    NoMemory = 12
+    // `EACCES`
+    Access = 13
+    // `EFAULT`
+    BadAddress = 14
+    // `EBUSY`
+    Busy = 16
+    // `EEXIST`
+    Exists = 17
+    // `EXDEV`
+    CrossDevice = 18
+    // `ENODEV`
+    NoDevice = 19
+    // `ENOTDIR`
+    NotDirectory = 20
+    // `EISDIR`
+    IsDirectory = 21
+    // `EINVAL`
+    Invalid = 22
+    // `ENFILE`
+    SystemFileLimit = 23
+    // `EMFILE`
+    ProcessFileLimit = 24
+    // `ETXTBSY`
+    TextBusy = 26
+    // `EFBIG`
+    FileTooBig = 27
+    // `ENOSPC`
+    NoSpace = 28
+    // `ESPIPE`
+    IllegalSeek = 29
+    // `EROFS`
+    ReadOnly = 30
+    // `EMLINK`
+    TooManyLinks = 31
+    // `EPIPE`
+    BrokenPipe = 32
+    // `ERANGE`
+    Range = 34
+    // `EDEADLK`
+    Deadlock = 35
+    // `ENAMETOOLONG`
+    NameTooLong = 36
+    // `ENOSYS`
+    NoSystemCall = 38
+    // `ENOTEMPTY`
+    NotEmpty = 39
+    // `ELOOP`
+    Loop = 40
+    // `ENODATA`
+    NoData = 61
+    // `ETIME`
+    TimerExpired = 62
+    // `EOVERFLOW`
+    Overflow = 75
+    // `ENOTSOCK`
+    NotSocket = 88
+    // `EMSGSIZE`
+    MessageSize = 90
+    // `EPROTONOSUPPORT`
+    ProtocolUnsupported = 93
+    // `ESOCKTNOSUPPORT`
+    SocketTypeUnsupported = 94
+    // `EOPNOTSUPP`
+    OperationUnsupported = 95
+    // `EAFNOSUPPORT`
+    FamilyUnsupported = 97
+    // `EADDRINUSE`
+    AddressInUse = 98
+    // `EADDRNOTAVAIL`
+    AddressNotAvailable = 99
+    // `ENETDOWN`
+    NetworkDown = 100
+    // `ENETUNREACH`
+    NetworkUnreachable = 101
+    // `ECONNABORTED`
+    ConnectionAborted = 103
+    // `ECONNRESET`
+    ConnectionReset = 104
+    // `ENOBUFS`
+    NoBuffers = 105
+    // `EISCONN`
+    Connected = 106
+    // `ENOTCONN`
+    NotConnected = 107
+    // `ETIMEDOUT`
+    TimedOut = 110
+    // `ECONNREFUSED`
+    ConnectionRefused = 111
+    // `EHOSTUNREACH`
+    HostUnreachable = 113
+    // `EALREADY`
+    Already = 114
+    // `EINPROGRESS`
+    InProgress = 115
+    // `EDQUOT`
+    DiskQuota = 122
+    // `ECANCELED`
+    Cancelled = 125
+}
+
+let errnos: [Errno] = [Errno.NotPermitted, Errno.NoEntry, Errno.NoProcess, Errno.Interrupted, Errno.NoDeviceOrAddress, Errno.ArgumentsTooLong, Errno.BadDescriptor, Errno.NoChild, Errno.Again, Errno.NoMemory, Errno.Access, Errno.BadAddress, Errno.Busy, Errno.Exists, Errno.CrossDevice, Errno.NoDevice, Errno.NotDirectory, Errno.IsDirectory, Errno.Invalid, Errno.SystemFileLimit, Errno.ProcessFileLimit, Errno.TextBusy, Errno.FileTooBig, Errno.NoSpace, Errno.IllegalSeek, Errno.ReadOnly, Errno.TooManyLinks, Errno.BrokenPipe, Errno.Range, Errno.Deadlock, Errno.NameTooLong, Errno.NoSystemCall, Errno.NotEmpty, Errno.Loop, Errno.NoData, Errno.TimerExpired, Errno.Overflow, Errno.NotSocket, Errno.MessageSize, Errno.ProtocolUnsupported, Errno.SocketTypeUnsupported, Errno.OperationUnsupported, Errno.FamilyUnsupported, Errno.AddressInUse, Errno.AddressNotAvailable, Errno.NetworkDown, Errno.NetworkUnreachable, Errno.ConnectionAborted, Errno.ConnectionReset, Errno.NoBuffers, Errno.Connected, Errno.NotConnected, Errno.TimedOut, Errno.ConnectionRefused, Errno.HostUnreachable, Errno.Already, Errno.InProgress, Errno.DiskQuota, Errno.Cancelled]
+
+function errnoOf(raw: Number) -> Errno? { return caseWithCode(errnos, raw) }
+
+function isErrno(errno: Number, known: Errno) -> Bool { return errno == code(known) }
+
+// Whether the kernel's answer is a failure with `errno`.
+function failedWith(answer: Number, errno: Errno) -> Bool {
+    return answerFailed(answer) && isErrno(answerErrno(answer), move errno)
+}
+
+function errnoCode(errno: Number) -> ErrorCode {
+    return match errnoOf(errno) {
+        Some(known) -> codeOfErrno(move known)
+        None -> .Internal
+    }
+}
+
+function codeOfErrno(errno: Errno) -> ErrorCode {
+    return match errno {
+        NotPermitted, Access, ReadOnly -> .AccessDenied
+        NoEntry, NoDeviceOrAddress, NoChild, NoDevice, NoData -> .NotFound
+        NoProcess, Interrupted -> .Internal
+        ArgumentsTooLong, FileTooBig, Range, Overflow, MessageSize -> .OutOfRange
+        BadDescriptor -> .InvalidHandle
+        Again, Already, InProgress -> .ShouldWait
+        NoMemory, NoBuffers -> .OutOfMemory
+        BadAddress, Invalid, IllegalSeek -> .InvalidArgument
+        Busy, TextBusy, Deadlock -> .Busy
+        Exists -> .AlreadyExists
+        CrossDevice, NoSystemCall, ProtocolUnsupported, SocketTypeUnsupported, OperationUnsupported, FamilyUnsupported -> .Unsupported
+        NotDirectory, Loop -> .NotDirectory
+        IsDirectory -> .IsDirectory
+        SystemFileLimit, ProcessFileLimit -> .TooManyHandles
+        NoSpace -> .NoSpace
+        TooManyLinks, DiskQuota -> .QuotaExceeded
+        BrokenPipe -> .PeerClosed
+        NameTooLong -> .NameTooLong
+        NotEmpty -> .NotEmpty
+        TimerExpired, TimedOut -> .Timeout
+        AddressInUse -> .AddressInUse
+        AddressNotAvailable -> .AddressNotAvailable
+        NetworkDown, NetworkUnreachable, HostUnreachable -> .Unreachable
+        ConnectionAborted, ConnectionReset -> .ConnectionReset
+        Connected, NotConnected -> .BadState
+        NotSocket -> .WrongType
+        ConnectionRefused -> .ConnectionRefused
+        Cancelled -> .Cancelled
+    }
+}
+
+// A failure on a channel's socket, in the terms a channel reports.
+function channelFailure(errno: Number) -> TesseraError {
+    if isErrno(errno, .Again) { return failure(.ShouldWait) }
+    if isErrno(errno, .BrokenPipe) || isErrno(errno, .ConnectionReset) || isErrno(
+        errno,
+        .NotConnected
+    ) {
+        return failure(.PeerClosed)
+    }
+    if isErrno(errno, .MessageSize) || isErrno(errno, .NoBuffers) { return failure(.OutOfRange) }
+    return errnoFailure(errno)
+}

@@ -1,0 +1,474 @@
+import Foundation
+import Heap
+import LibTessera
+import DeviceKit
+
+// Driver extensions (17 §18.2): the bundles the driver manifests come from.
+//
+// A driver ships as DriverKit's do, as a bundle in
+// `/System/Library/DriverExtensions`: `<name>.dext` holds the executable and
+// an `Info.plist` naming it under `CFBundleExecutable`. The plist's
+// `IOKitPersonalities` dictionary holds one dictionary per personality, each
+// a manifest:
+//
+//     IOProviderClass               the entry class, by DeviceKit's name,
+//                                   such as `UsbDevice`
+//     idVendor, idProduct           the vendor and product it matches
+//     bInterfaceClass,              the kind of interface a matched USB
+//     bInterfaceSubClass,           device must have, each optional
+//     bInterfaceProtocol
+//     IOProbeScore                  higher wins when several match
+//     TesseraMayDetachKernelDriver  it may take an interface from the
+//                                   kernel driver that has it
+//
+// The manager reads every bundle once, when it starts, as kernelmanagerd
+// reads the extensions at boot. A bundle it cannot read, or a personality
+// that names no class it knows, is logged and left out; the rest still
+// load. The plist is the XML form, and only the parts a manifest uses are
+// read: dictionaries, arrays, keys, strings, integers and booleans, with no
+// entities.
+
+// What a plist element is.
+@Derive(Copy)
+enum PlistKind {
+    Dict
+    Array
+    Key
+    Text
+    Integer
+    True
+    False
+}
+
+// One element of a plist: what it is, its text for a key, string or
+// integer, and the dictionary or array it is in, None at the top.
+struct PlistNode {
+    var kind: PlistKind
+    var text: String
+    var parent: Number?
+}
+
+function plistKindOf(tag: borrow String) -> PlistKind? {
+    return match tag {
+        "dict" -> .Some(.Dict)
+        "array" -> .Some(.Array)
+        "key" -> .Some(.Key)
+        "string" -> .Some(.Text)
+        "integer" -> .Some(.Integer)
+        "true" -> .Some(.True)
+        "false" -> .Some(.False)
+        else -> .None
+    }
+}
+
+// Whether an element of this kind holds other elements.
+function isContainer(kind: borrow PlistKind) -> Bool {
+    return match kind {
+        Dict -> true
+        Array -> true
+        Key -> false
+        Text -> false
+        Integer -> false
+        True -> false
+        False -> false
+    }
+}
+
+// Whether an element of this kind holds its text between its tags.
+function hasText(kind: borrow PlistKind) -> Bool {
+    return match kind {
+        Dict -> false
+        Array -> false
+        Key -> true
+        Text -> true
+        Integer -> true
+        True -> false
+        False -> false
+    }
+}
+
+namespace Character {
+    let open: Number = 60 // '<'
+    let close: Number = 62 // '>'
+    let slash: Number = 47 // '/'
+}
+
+function sameParent(node: borrow PlistNode, parent: Number?) -> Bool {
+    return match node.parent {
+        Some(nodeParent) -> match parent {
+            Some(wanted) -> nodeParent == wanted
+            None -> false
+        }
+        None -> parent.isNone()
+    }
+}
+
+function withoutLast(list: borrow [Number]) -> [Number] {
+    var kept: [Number] = []
+    for index in 0..list.count - 1 { kept.append(list[index]) }
+    return kept
+}
+
+// Why a plist cannot be read.
+enum PlistFailure {
+    // A `<` with no `>` after it.
+    UnterminatedTag
+}
+
+// The elements of `text` in document order. A tag Tessera does not read,
+// such as `<plist>` or `<?xml ...?>`, is passed over.
+function parsePlist(text: borrow String) -> Result<[PlistNode], PlistFailure> {
+    var nodes: [PlistNode] = []
+    var open: [Number] = []
+    var position = 0
+    while position < text.count {
+        if text.charAt(position) != Character.open {
+            position += 1
+            continue
+        }
+        var tagEnd = position + 1
+        while tagEnd < text.count && text.charAt(tagEnd) != Character.close { tagEnd += 1 }
+        if tagEnd == text.count { return .Error(.UnterminatedTag) }
+        var tag = text.substring(position + 1, tagEnd)
+        position = tagEnd + 1
+        let closing = tag.startsWith("/")
+        let empty = tag.count > 0 && tag.charAt(tag.count - 1) == Character.slash
+        if closing { tag = tag.substring(1, tag.count) }
+        if empty { tag = tag.substring(0, tag.count - 1) }
+        // `<plist version="1.0">`: the name ends at the first space.
+        let name = match tag.indexOf(" ") {
+            Some(space) -> tag.substring(0, space)
+            None -> tag
+        }
+        let kind = match plistKindOf(name) {
+            Some(value) -> value
+            None -> continue
+        }
+        let parent: Number? = open.count > 0 ? .Some(open[open.count - 1]) : .None
+        if closing {
+            if isContainer(kind) && open.count > 0 { open = withoutLast(open) }
+        } else if isContainer(kind) {
+            nodes.append(PlistNode { kind: kind, text: "", parent: parent })
+            if !empty { open.append(nodes.count - 1) }
+        } else if hasText(kind) {
+            var valueEnd = position
+            if !empty {
+                while valueEnd < text.count && text.charAt(valueEnd) != Character.open {
+                    valueEnd += 1
+                }
+            }
+            nodes.append(
+                PlistNode { kind: kind, text: text.substring(position, valueEnd), parent: parent }
+            )
+            position = valueEnd
+        } else {
+            nodes.append(PlistNode { kind: kind, text: "", parent: parent })
+        }
+    }
+    return .Ok(nodes)
+}
+
+// The first child of `dict` that follows the node at `after`.
+function childAfter(nodes: borrow [PlistNode], dict: Number, after: Number) -> Number? {
+    let start = after + 1
+    for index in start..nodes.count {
+        if sameParent(nodes[index], .Some(dict)) { return .Some(index) }
+    }
+    return .None
+}
+
+// The index of the value under `key` in the dictionary at `dict`: the child
+// that follows the key.
+function plistValue(nodes: borrow [PlistNode], dict: Number, key: borrow String) -> Number? {
+    for index in 0..nodes.count {
+        if nodes[index].kind == .Key && nodes[index].text == key && sameParent(
+            nodes[index],
+            .Some(dict)
+        ) {
+            return childAfter(nodes, dict, index)
+        }
+    }
+    return .None
+}
+
+function plistText(nodes: borrow [PlistNode], dict: Number, key: borrow String) -> String? {
+    return match plistValue(nodes, dict, key) {
+        Some(index) -> .Some(nodes[index].text)
+        None -> .None
+    }
+}
+
+function plistFlag(nodes: borrow [PlistNode], dict: Number, key: borrow String) -> Bool {
+    return match plistValue(nodes, dict, key) {
+        Some(index) -> nodes[index].kind == .True
+        None -> false
+    }
+}
+
+function hexDigit(character: Number) -> Number? {
+    if character >= 48 && character <= 57 { return .Some(character - 48) } // '0'..'9'
+    if character >= 97 && character <= 102 { return .Some(character - 87) } // 'a'..'f'
+    if character >= 65 && character <= 70 { return .Some(character - 55) } // 'A'..'F'
+    return .None
+}
+
+// A plist integer, in decimal or with `0x` in hexadecimal.
+function plistInteger(text: borrow String) -> Number? {
+    var start = 0
+    var negative = false
+    var base = 10
+    if text.startsWith("-") {
+        negative = true
+        start = 1
+    }
+    if text.substring(start, text.count).startsWith("0x") {
+        base = 16
+        start += 2
+    }
+    if start >= text.count { return .None }
+    var value: Number = 0
+    for index in start..text.count {
+        let digit = try hexDigit(text.charAt(index)) otherwise return .None
+        if digit >= base { return .None }
+        value = value * Number(base) + Number(digit)
+    }
+    return .Some(negative ? -value : value)
+}
+
+// The integer under `key`; None when it is absent or not one.
+function plistNumber(nodes: borrow [PlistNode], dict: Number, key: borrow String) -> Number? {
+    let text = try plistText(nodes, dict, key) otherwise return .None
+    return plistInteger(text)
+}
+
+// The interface class, subclass and protocol a personality names, as
+// registry constraints; the ones it leaves out match any.
+function interfaceKind(nodes: borrow [PlistNode], dict: Number) -> [Constraint] {
+    let keys = [
+        ("bInterfaceClass", "interfaceClass"),
+        ("bInterfaceSubClass", "interfaceSubClass"),
+        ("bInterfaceProtocol", "interfaceProtocol"),
+    ]
+    var constraints: [Constraint] = []
+    for (plistKey, registryKey) in keys {
+        match plistText(nodes, dict, plistKey) {
+            Some(_) -> constraints.append(
+                Constraint { key: registryKey, value: U64(plistNumber(nodes, dict, plistKey).or(0)) }
+            )
+            // A key the personality leaves out matches any value, so it adds no constraint.
+            None -> {}
+        }
+    }
+    return constraints
+}
+
+// The class a personality's `IOProviderClass` names, among those Tessera's
+// drivers match.
+function providerClass(name: borrow String) -> EntryClass? {
+    return match name {
+        "UsbDevice" -> .Some(.UsbDevice)
+        "UsbInterface" -> .Some(.UsbInterface)
+        "HidDevice" -> .Some(.HidDevice)
+        else -> .None
+    }
+}
+
+namespace Bundle {
+    let suffix: String = ".dext"
+    let plist: String = "/Info.plist"
+    let plistBytes: Number = 65536
+    let directoryBytes: Number = 8192
+    // `struct linux_dirent64`: the record length @16, the name @19.
+    let recordLengthAt: Number = 16
+    let nameAt: Number = 19
+}
+
+// Reads `block` from `file` up to `bytes` of it, and answers how much was read.
+function readBlock(
+    file: borrow Descriptor,
+    block: borrow ByteBlock,
+    bytes: Number
+) -> Result<Number, TesseraError> {
+    var used: Number = 0
+    while used < bytes {
+        let got = try backendReadAt(
+            file.number,
+            heapOffset(block.pointer(), used),
+            bytes - used,
+            used
+        )
+        if got == 0 { return .Ok(used) }
+        used += got
+    }
+    return .Ok(used)
+}
+
+// The whole of a file of at most 64 KiB.
+function readText(path: borrow String) -> Result<String, TesseraError> {
+    let file = try openPath(path, LinuxOpen.readOnly)
+    let block = zeroedBlock(count: Bundle.plistBytes + 1, alignment: 16)
+    let read = readBlock(file, block, Bundle.plistBytes)
+    // The descriptor is done with either way; the read's outcome is answered below.
+    closeDescriptor(file)
+    let used = try read
+    return .Ok(stringFromCBytes(block.pointer(), used))
+}
+
+// The names in the directory listing under `suffix`.
+function namesIn(
+    listing: borrow Descriptor,
+    block: borrow ByteBlock,
+    suffix: borrow String
+) -> Result<[String], TesseraError> {
+    var names: [String] = []
+    while true {
+        let got = try backendDirectoryRead(listing.number, block.pointer(), Bundle.directoryBytes)
+        if got == 0 { return .Ok(names) }
+        var offset = 0
+        while offset < got {
+            let length = blockLoad<U16>(block, offset + Bundle.recordLengthAt)
+            let name = stringFromCString(
+                CString { address: heapOffset(block.pointer(), offset + Bundle.nameAt) }
+            )
+            if name.count > suffix.count && name.endsWith(suffix) { names.append(name) }
+            if length == 0 { break }
+            offset += length
+        }
+    }
+    return .Ok(names)
+}
+
+// The names in `directory` that end in `suffix`.
+function directoryNames(
+    directory: borrow String,
+    suffix: borrow String
+) -> Result<[String], TesseraError> {
+    let listing = try openPath(directory, LinuxOpen.readOnly)
+    let block = zeroedBlock(count: Bundle.directoryBytes, alignment: 16)
+    let read = namesIn(listing, block, suffix)
+    // The descriptor is done with either way; the listing's outcome is answered below.
+    closeDescriptor(listing)
+    return read
+}
+
+// The top dictionary of a plist; None when there is none.
+function plistRoot(nodes: borrow [PlistNode]) -> Number? {
+    for (index, node) in nodes.enumerated() {
+        if node.kind == .Dict && node.parent.isNone() { return .Some(index) }
+    }
+    return .None
+}
+
+// Why a driver extension is left out. Each one is logged, and the rest of
+// the extensions still load.
+enum BundleFailure {
+    Unreadable(TesseraError)
+    Malformed(PlistFailure)
+    NoDictionary
+    NoPersonalities
+    NoExecutable
+    PersonalitiesNotDictionary
+}
+
+// The nodes of the bundle's plist, read whole.
+function bundleNodes(bundle: borrow String) -> Result<[PlistNode], BundleFailure> {
+    let text = match readText(bundle + Bundle.plist) {
+        Ok(value) -> value
+        Error(failed) -> return .Error(.Unreadable(failed))
+    }
+    let nodes = match parsePlist(text) {
+        Ok(value) -> value
+        Error(failed) -> return .Error(.Malformed(failed))
+    }
+    return .Ok(nodes)
+}
+
+// Logs why the bundle named `name` is left out.
+function reportBundle(name: borrow String, failed: borrow BundleFailure) {
+    match failed {
+        Unreadable(cause) -> log warn(
+            "a driver extension cannot be read; it is left out",
+            bundle: name,
+            error: errorName(cause)
+        )
+        Malformed(_) -> log warn(
+            "a driver extension's plist is malformed; it is left out",
+            bundle: name
+        )
+        NoDictionary -> log warn(
+            "a driver extension's plist has no dictionary; it is left out",
+            bundle: name
+        )
+        NoPersonalities -> log warn(
+            "a driver extension has no personalities; it is left out",
+            bundle: name
+        )
+        NoExecutable -> log warn("a driver extension has no executable; it is left out", bundle: name)
+        PersonalitiesNotDictionary -> log warn(
+            "a driver extension's personalities are not a dictionary; it is left out",
+            bundle: name
+        )
+    }
+}
+
+// Every personality of the bundle at `bundle`, named `name`.
+function loadBundle(
+    bundle: borrow String,
+    name: borrow String
+) -> Result<[Driver], BundleFailure> {
+    let nodes = try bundleNodes(bundle)
+    let root = match plistRoot(nodes) {
+        Some(value) -> value
+        None -> return .Error(.NoDictionary)
+    }
+    let executable = plistText(nodes, root, "CFBundleExecutable").or("")
+    let personalities = match plistValue(nodes, root, "IOKitPersonalities") {
+        Some(value) -> value
+        None -> return .Error(.NoPersonalities)
+    }
+    if executable.count == 0 { return .Error(.NoExecutable) }
+    if nodes[personalities].kind != .Dict { return .Error(.PersonalitiesNotDictionary) }
+    var drivers: [Driver] = []
+    for (index, node) in nodes.enumerated() {
+        if sameParent(node, .Some(personalities)) && node.kind == .Dict {
+            let className = plistText(nodes, index, "IOProviderClass").or("")
+            match providerClass(className) {
+                Some(entryClass) -> drivers.append(
+                    Driver {
+                        name: executable,
+                        program: bundle + "/" + executable,
+                        entryClass: entryClass,
+                        vendorId: U64(plistNumber(nodes, index, "idVendor").or(0)),
+                        productId: U64(plistNumber(nodes, index, "idProduct").or(0)),
+                        interfaceKind: interfaceKind(nodes, index),
+                        score: plistNumber(nodes, index, "IOProbeScore").or(0),
+                        detachKernel: plistFlag(nodes, index, "TesseraMayDetachKernelDriver"),
+                    }
+                )
+                None -> log warn(
+                    "a personality names no class a driver may match; it is left out",
+                    bundle: name,
+                    provider: className
+                )
+            }
+        }
+    }
+    log info("loaded a driver extension", bundle: name, personalities: drivers.count)
+    return .Ok(drivers)
+}
+
+// Every personality of every bundle in the extensions directory. A listing
+// that fails is the caller's to report.
+function loadExtensions() -> Result<[Driver], TesseraError> {
+    let bundles = try directoryNames("/" + SystemDirectory.driverExtensions, Bundle.suffix)
+    var drivers: [Driver] = []
+    for name in bundles {
+        match loadBundle("/" + SystemDirectory.driverExtensions + "/" + name, name) {
+            Ok(loaded) -> {
+                for driver in loaded { drivers.append(driver) }
+            }
+            Error(failed) -> reportBundle(name, failed)
+        }
+    }
+    return .Ok(drivers)
+}

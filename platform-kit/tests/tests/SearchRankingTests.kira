@@ -1,0 +1,35 @@
+import Foundation
+import PlatformKit
+
+function quality(name: String, wanted: String) -> Number {
+    return match nameMatch(name, wanted) {
+        Some(found) -> Number(code(found))
+        None -> -1
+    }
+}
+
+@Test
+function namesRankByHowTheyMatch() {
+    expect!(quality("Notes", "notes") == 0)
+    expect!(quality("Notes", "no") == 1)
+    expect!(quality("Disk Utility", "ut") == 2)
+    expect!(quality("Calculator", "cul") == 3)
+    expect!(quality("Clock", "zz") == -1)
+}
+
+@Test
+function keywordsMatchAsWellAsAnInsideName() {
+    let found = match keywordMatch(["background", "picture"], "back") {
+        Some(found) -> found == .Inside
+        None -> false
+    }
+    expect!(found)
+    expect!(keywordMatch(["picture"], "zz").isNone())
+}
+
+@Test
+function theOrderIsBestFirstAndStableAmongEquals() {
+    let order = rankedOrder([.Inside, .Prefix, .Exact, .Prefix])
+    let expected: [Number] = [2, 1, 3, 0]
+    expect!(order == expected)
+}

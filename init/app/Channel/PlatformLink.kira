@@ -1,0 +1,90 @@
+import Foundation
+import LibTessera
+
+// The platform links PID 1 makes (roadmap/11-adaptive-desktop.md): a channel
+// between an application's AppKit and the running platform, minted when the
+// application is linked to the display server and handed to each end the way
+// display links are. The application's number rides with both ends: it is the
+// surface the platform knows the application by. Its name rides as the body,
+// so the platform knows which application a surface is -- from PID 1, which
+// opened it, and not from the application, which could say anything.
+
+// The slot the running platform is in.
+function runningPlatformSlot(fleet: borrow Fleet) -> Number? {
+    for slot in 0..fleet.services.count {
+        if fleet.services[slot].isPlatform() && running(
+            fleet,
+            slot
+        ) && fleet.channels[slot] != Handle.invalid {
+            return .Some(slot)
+        }
+    }
+    return .None
+}
+
+// Sends one end of a platform link to a service.
+function handPlatformLink(
+    channel: Handle,
+    name: borrow String,
+    link: Handle,
+    number: Number,
+    application: borrow String
+) {
+    match sendMessage(channel, .PlatformLink, UN32(number), [link], application) {
+        Ok -> log info("handed a service a platform link", service: name, client: number)
+        Error(failed) -> {
+            log warn(
+                "could not hand a service a platform link",
+                service: name,
+                error: errorName(failed)
+            )
+            release(link)
+        }
+    }
+}
+
+// Links the application or desktop in `slot` to the running platform. Nothing
+// is linked when no platform runs: a platform that starts later is linked to every
+// application then.
+function linkToPlatform(fleet: borrow Fleet, slot: Number) {
+    if !fleet.services[slot].takesPlatformLink() || !running(
+        fleet,
+        slot
+    ) || fleet.channels[slot] == Handle.invalid {
+        return
+    }
+    let platform = try runningPlatformSlot(fleet) otherwise return
+    let link = match channelCreate() {
+        Ok(value) -> value
+        Error(failed) -> {
+            log warn(
+                "no platform link for an application",
+                application: fleet.services[slot].name,
+                error: errorName(failed)
+            )
+            return
+        }
+    }
+    let number = displayClientNumber(fleet, slot)
+    let application = fleet.services[slot].name
+    handPlatformLink(
+        fleet.channels[platform],
+        fleet.services[platform].name,
+        link.first,
+        number,
+        application
+    )
+    handPlatformLink(
+        fleet.channels[slot],
+        fleet.services[slot].name,
+        link.second,
+        number,
+        application
+    )
+}
+
+// Links every running application and the desktop to the platform: at boot, once
+// every display link is handed, and again when the platform is started again.
+function connectPlatformLinks(fleet: borrow Fleet) {
+    for slot in 0..fleet.services.count { linkToPlatform(fleet, slot) }
+}

@@ -1,0 +1,331 @@
+import Foundation
+import Heap
+
+// Handles in channel messages (§10.1, §10.4).
+//
+// A message on the socket is an 8-byte prefix (`u32` handle count, `u32`
+// reserved), one 48-byte descriptor record per handle, then the payload. The
+// handles' kernel backings travel attached to the same packet, in record
+// order; each record says how many it uses and carries the object type, the
+// rights sent and the state the receiver needs to rebuild the object.
+//
+// Record: `type: u32 @0`, `backings: u32 @4`, `rights: u64 @8`, `objectId: u64 @16`,
+// then 24 type-specific bytes `@24`.
+//
+// Records travel only with the backings they describe (§10.4). A packet that
+// brought no backings and does not start with LibTessera's empty prefix was
+// written by a program as bytes -- a child's standard output, when its parent
+// gave it a channel for that -- and it is all payload, with no handles.
+
+struct RawMessage {
+    var block: RawPtr
+    var length: U64
+    var attached: [Number]
+    // Payload from its first byte: no prefix and no records.
+    var bare: Bool = false
+}
+
+namespace Transfer {
+    let prefixBytes: U64 = U64(8)
+    let recordBytes: U64 = U64(48)
+}
+let channelMaxBytes: U64 = U64(65536)
+let channelMaxHandles: Number = 64
+
+// Whether an object of this type can be sent to another process.
+function transferable(kind: borrow ObjectType) -> Bool {
+    if kind == .Port || kind == .Thread || kind == .Stream || kind == .WakeLock || kind == .Presence || kind == .None {
+        return false
+    }
+    return true
+}
+
+// Writes the record for `object` at `record` and answers its backings.
+function transferDescribe(object: Number, rights: Rights, record: RawPtr) -> [Number] {
+    let kind = kindOf(library.objects[object].state)
+    heapStore<U32>(record, 0, code(kind))
+    heapStore<U64>(record, 8, rights.raw)
+    heapStore<U64>(record, 16, library.objects[object].id)
+    match library.objects[object].state {
+        File(opened) -> heapStore<U64>(record, 24, U64(opened.mode.raw))
+        Timer(timer) -> heapStore<U64>(record, 24, U64(code(timer.clock)))
+        Process(process) -> heapStore<U64>(record, 24, process.pid)
+        Job(job) -> heapStore<U64>(record, 24, U64(job.policy.flags.raw))
+        Watch(watch) -> heapStore<U64>(record, 24, U64(watch.mask.raw))
+        Memory(memory) -> {
+            heapStore<U64>(record, 24, memory.offset)
+            heapStore<U64>(record, 32, memory.size)
+            heapStore<U64>(record, 40, U64(memory.options.raw))
+        }
+        Endpoint(endpoint) -> {
+            heapStore<U32>(record, 24, code(endpoint.family))
+            heapStore<U32>(record, 28, code(endpoint.protocol))
+            heapStore<U32>(record, 32, code(endpoint.state))
+            heapStore<U32>(record, 36, endpoint.timestamps ? U32(1) : U32(0))
+        }
+        None, Port, Event, EventPair, Channel, Thread, Node, Stream, WakeLock, Presence -> {}
+    }
+    return match library.objects[object].backing {
+        Some(backing) -> {
+            heapStore<U32>(record, 4, U32(1))
+            return [backing]
+        }
+        None -> []
+    }
+}
+
+// The state a record of `kind` carries; none for a record naming a case its
+// type does not have.
+function transferState(
+    kind: borrow ObjectType,
+    record: RawPtr,
+    backing: Number
+) -> Result<ObjectState?, TesseraError> {
+    return match kind {
+        File -> .Ok(.Some(.File(FileObject { mode: OpenMode(U32(heapLoad<U64>(record, 24))) })))
+        Timer -> match caseWithCode(clockSources, heapLoad<U64>(record, 24)) {
+            Some(clock) -> .Ok(.Some(.Timer(timerQuiet(clock))))
+            None -> .Ok(.None)
+        }
+        // A listener stays with the process that checked in.
+        Channel -> .Ok(.Some(.Channel(.Plain)))
+        Process -> {
+            let process = try processStarted(heapLoad<U64>(record, 24), U64(0))
+            return .Ok(.Some(.Process(move process)))
+        }
+        Job -> {
+            let watch = try kernelJobWatch(backing)
+            return .Ok(
+                .Some(.Job(jobFresh(U64(0), JobDeny(U32(heapLoad<U64>(record, 24))), watch)))
+            )
+        }
+        Event -> {
+            let event = try eventAround(backing)
+            return .Ok(.Some(move event))
+        }
+        Endpoint -> .Ok(transferEndpoint(record))
+        Memory -> .Ok(
+            .Some(
+                .Memory(
+                    memoryFresh(
+                        heapLoad<U64>(record, 32),
+                        heapLoad<U64>(record, 24),
+                        MemoryOptions(U32(heapLoad<U64>(record, 40))),
+                        U64(0)
+                    )
+                )
+            )
+        )
+        EventPair -> .Ok(.Some(.EventPair(eventPairQuiet())))
+        // The watched node stays behind: a watch received watches what it
+        // watched, but adds no directory created later.
+        Watch -> .Ok(
+            .Some(
+                .Watch(
+                    WatchObject {
+                        pending: U64(0),
+                        mask: WatchMask(U32(heapLoad<U64>(record, 24))),
+                        node: .None,
+                        events: nullPointer(),
+                    }
+                )
+            )
+        )
+        None, Port, Thread, Node, Stream, WakeLock, Presence -> .Ok(plainState(kind))
+    }
+}
+
+function transferEndpoint(record: RawPtr) -> ObjectState? {
+    let family = try caseWithCode(
+        allCases_AddressFamily(),
+        heapLoad<U32>(record, 24)
+    ) otherwise return .None
+    let protocol = try caseWithCode(protocols, heapLoad<U32>(record, 28)) otherwise return .None
+    let state = try caseWithCode(endpointStates, heapLoad<U32>(record, 32)) otherwise return .None
+    var endpoint = endpointFresh(family, protocol, state)
+    endpoint.timestamps = heapLoad<U32>(record, 36) != U32(0)
+    return .Some(.Endpoint(move endpoint))
+}
+
+// Rebuilds the object a record describes around `backing`, and answers a
+// handle to it.
+function transferMaterialize(record: RawPtr, backing: Number) -> Handle {
+    // A record naming a type no case names came from a broken sender; its
+    // backing goes as an untransferable object's does.
+    let kind = match caseWithCode(allCases_ObjectType(), heapLoad<U32>(record, 0)) {
+        Some(value) -> value
+        None -> ObjectType.None
+    }
+    let rights = Rights(heapLoad<U64>(record, 8))
+    if !transferable(kind) {
+        kernelRelease(backing)
+        return Handle.invalid
+    }
+    let read = match transferState(kind, record, backing) {
+        Ok(value) -> value
+        Error(failed) -> {
+            // A message's handles are positional: one the kernel could not
+            // rebuild reads as the invalid handle.
+            absorb failed
+            kernelRelease(backing)
+            return Handle.invalid
+        }
+    }
+    let state = match read {
+        Some(value) -> value
+        None -> {
+            kernelRelease(backing)
+            return Handle.invalid
+        }
+    }
+    let object = objectCreate(move state, backing)
+    // A message's handles are positional: one this process has no room for
+    // reads as the invalid handle, as an untransferable one does.
+    return match handleMint(object, rights) {
+        Ok(handle) -> handle
+        Error(failed) -> {
+            absorb failed
+            objectDestroy(object)
+            return Handle.invalid
+        }
+    }
+}
+
+// The handles sent are checked before anything moves: each must be open and
+// carry `Transfer`.
+function transferCheck(handles: borrow [Handle], channel: Number) -> Result<Void, TesseraError> {
+    if handles.count > channelMaxHandles { return .Error(failure(.OutOfRange)) }
+    for index in 0..handles.count {
+        let slot = try handleSlotOf(handles[index]) otherwise return .Error(failure(.InvalidHandle))
+        if !library.handles[slot].rights.has(Rights.transfer) {
+            return .Error(failure(.AccessDenied))
+        }
+        let object = objectOfSlot(slot)
+        if !transferable(kindOf(library.objects[object].state)) {
+            return .Error(failure(.Unsupported))
+        }
+        if object == channel { return .Error(failure(.InvalidArgument)) }
+    }
+    return .Ok
+}
+
+// Closes the handles a write moved.
+function transferRelease(handles: borrow [Handle]) {
+    for index in 0..handles.count {
+        handleDrop(handles[index])
+    }
+}
+
+// Sends one packet: the prefix and records for `handles`, then `payload`.
+function channelSend(
+    backing: Number,
+    payload: borrow Buffer,
+    handles: borrow [Handle]
+) -> Result<Void, TesseraError> {
+    if payload.length > channelMaxBytes { return .Error(failure(.OutOfRange)) }
+    let header = Transfer.prefixBytes + U64(handles.count) * Transfer.recordBytes
+    let blockBytes = zeroedBlock(count: header, alignment: 16)
+    let block = blockBytes.pointer()
+    heapStore<U32>(block, 0, U32(handles.count))
+    var attached: [Number] = []
+    for index in 0..handles.count {
+        let slot = try resolve(handles[index], .None, Rights.none)
+        let described = transferDescribe(
+            objectOfSlot(slot),
+            library.handles[slot].rights,
+            heapOffset(block, Number(Transfer.prefixBytes + U64(index) * Transfer.recordBytes))
+        )
+        for each in 0..described.count { attached.append(described[each]) }
+    }
+    return kernelPacketSend(
+        backing,
+        block,
+        header,
+        payload.address,
+        payload.length,
+        attached,
+        false
+    )
+}
+
+// Takes the next packet whole, with its backings.
+function channelReceive(backing: Number) -> Result<RawMessage, TesseraError> {
+    let length = try kernelPacketNextLength(backing)
+    if length == U64(0) {
+        if (kernelReady(backing, Ready.readable) & (Ready.hangUp | Ready.readHangUp)) != 0 {
+            return .Error(failure(.PeerClosed))
+        }
+        return .Error(failure(.ShouldWait))
+    }
+    let block = allocateZeroed(memoryLayout(Number(length + U64(8)), 16))
+    if isNull(block) { return .Error(failure(.OutOfMemory)) }
+    return match kernelPacketReceive(backing, block, length, false) {
+        Ok(packet) -> .Ok(
+            RawMessage {
+                block: block,
+                length: packet.bytes,
+                attached: packet.attached,
+                bare: packetIsBare(block, packet.bytes, packet.attached.count)
+            }
+        )
+        Error(failed) -> {
+            deallocate(block)
+            return .Error(failed)
+        }
+    }
+}
+
+// Whether a packet of `length` bytes at `block` that brought `attached`
+// backings is bare payload: one with no backings whose first eight bytes are
+// not the empty prefix, a handle count and a reserved word of zero.
+function packetIsBare(block: RawPtr, length: U64, attached: Number) -> Bool {
+    if attached > 0 { return false }
+    if length < Transfer.prefixBytes { return true }
+    return heapLoad<U32>(block, 0) != U32(0) || heapLoad<U32>(block, 4) != U32(0)
+}
+
+function messageHandleCount(message: borrow RawMessage) -> U32 {
+    if message.bare { return U32(0) }
+    return heapLoad<U32>(message.block, 0)
+}
+
+function messagePayloadOffset(message: borrow RawMessage) -> U64 {
+    if message.bare { return U64(0) }
+    return Transfer.prefixBytes + U64(messageHandleCount(message)) * Transfer.recordBytes
+}
+
+function messagePayloadLength(message: borrow RawMessage) -> U64 {
+    let offset = messagePayloadOffset(message)
+    if message.length < offset { return U64(0) }
+    return message.length - offset
+}
+
+// Turns the message's records and backings into handles in this process.
+function messageHandles(message: borrow RawMessage) -> [Handle] {
+    var handles: [Handle] = []
+    var next = 0
+    let count = Number(messageHandleCount(message))
+    for index in 0..count {
+        let record = heapOffset(
+            message.block,
+            Number(Transfer.prefixBytes + U64(index) * Transfer.recordBytes)
+        )
+        let used = heapLoad<U32>(record, 4)
+        if used >= 1 && next < message.attached.count {
+            handles.append(transferMaterialize(record, message.attached[next]))
+        } else {
+            handles.append(Handle.invalid)
+        }
+        next += used
+    }
+    if next < message.attached.count {
+        for unused in next..message.attached.count { kernelRelease(message.attached[unused]) }
+    }
+    return handles
+}
+
+// Drops a message nobody will read, releasing the backings it carried.
+function messageDiscard(message: borrow RawMessage) {
+    for index in 0..message.attached.count { kernelRelease(message.attached[index]) }
+    deallocate(message.block)
+}
