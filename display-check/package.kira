@@ -4,7 +4,7 @@
 //! Kira UI draws it and puts it on Tessera's display.
 /// The Display Check app package: the boot-test check that draws frames and logs the keys that arrive.
 construct DisplayCheckApp extends Package {
-    let version: String = "0.1.0"
+    let version: String = "26.10.4"
     let kind: PackageKind = .App
     let moduleRoot: String = "DisplayCheck"
 }

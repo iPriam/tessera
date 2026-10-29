@@ -1,7 +1,7 @@
 //! The CCID driver package: finds a smart card reader on USB and publishes it to the device registry.
 /// The Tessera CCID driver package: a smart card reader's driver.
 construct TesseraCcidDriver extends Package {
-    let version: String = "0.1.0"
+    let version: String = "26.10.4"
     let kind: PackageKind = .App
     let moduleRoot: String = "TesseraCcidDriver"
 }

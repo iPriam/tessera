@@ -1,7 +1,7 @@
 // Tessera's build: the graph the Kira Build library runs for `kira build` in
 // this repository (Build/DESIGN.md section 4).
 construct TesseraBuild extends Package {
-    let version: String = "0.1.0"
+    let version: String = "26.10.4"
     let kind: PackageKind = .App
     let dependencies: [Dependency] = [
         Dependency { name: "CoreIcon", path: "../../core-icon" },

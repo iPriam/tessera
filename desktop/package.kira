@@ -4,7 +4,7 @@
 //
 // Kira UI draws it and puts it on Tessera's display.
 construct DesktopApp extends Package {
-    let version: String = "0.1.0"
+    let version: String = "26.10.4"
     let kind: PackageKind = .App
     let moduleRoot: String = "Desktop"
     let dependencies: [Dependency] = [

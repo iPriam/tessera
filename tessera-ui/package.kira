@@ -6,7 +6,7 @@
 //! `RunDynamicPlatform`. A public framework: every application links it.
 /// The Tessera UI library: the home screen, the session and the host that Tessera's applications and platforms share.
 construct TesseraUI extends Package {
-    let version: String = "0.1.0"
+    let version: String = "26.10.4"
     let kind: PackageKind = .Library
     let moduleRoot: String = "TesseraUI"
     let dependencies: [Dependency] = [

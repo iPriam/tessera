@@ -10,11 +10,11 @@
 // Xcode's asset compiler does, and Icon Composer renders the one it edits on
 // the machine, both to the pixel the system shows.
 construct CoreIconLibrary extends Package {
-    let version: String = "0.1.0"
+    let version: String = "26.10.4"
     let kind: PackageKind = .Library
     let moduleRoot: String = "CoreIcon"
     let dependencies: [Dependency] = [
-        Dependency { name: "RenderBox", path: "../krenderbox" },
-        Dependency { name: "Ember", path: "../ember" }
+        Dependency { name: "RenderBox", path: "../../kira-packages/krenderbox" },
+        Dependency { name: "Ember", path: "../../kira-packages/ember" }
     ]
 }

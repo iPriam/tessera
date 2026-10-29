@@ -2,7 +2,7 @@
 // its `KEY="value"` release file. Kept apart from the About app so the parsing
 // runs in host tests, with no system file or platform library in reach.
 construct ReleaseText extends Package {
-    let version: String = "0.1.0"
+    let version: String = "26.10.4"
     let kind: PackageKind = .Library
     let moduleRoot: String = "ReleaseText"
 }

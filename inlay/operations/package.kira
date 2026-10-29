@@ -1,6 +1,6 @@
 // FileOperations: what Inlay does to files and folders, on Foundation's file
 // calls alone, so its rules are tested on any host (tests/operations_kik).
 construct FileOperations extends Package {
-    let version: String = "0.1.0"
+    let version: String = "26.10.4"
     let kind: PackageKind = .Library
 }

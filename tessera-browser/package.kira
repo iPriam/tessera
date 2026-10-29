@@ -5,7 +5,7 @@
 // The web process draws each frame into a linear DMA-BUF; this application
 // imports that memory through Ember and shows it as a texture in its window.
 construct BrowserApp extends Package {
-    let version: String = "0.1.0"
+    let version: String = "26.10.4"
     let kind: PackageKind = .App
     let assets: [String] = ["Resources/AppIcon.tessicon"]
     let moduleRoot: String = "Browser"

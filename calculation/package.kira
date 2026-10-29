@@ -1,7 +1,7 @@
 // Calculation: exact decimal arithmetic on expression text, the rules every
 // caller shares (README.md). Calculator and system search both use it.
 construct CalculationLibrary extends Package {
-    let version: String = "0.1.0"
+    let version: String = "26.10.4"
     let kind: PackageKind = .Library
     let moduleRoot: String = "Calculation"
 }

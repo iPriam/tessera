@@ -5,7 +5,7 @@
 // Kira UI draws it and puts it on Tessera's display; it runs as the
 // platform, as Media does.
 construct RecoveryApp extends Package {
-    let version: String = "0.1.0"
+    let version: String = "26.10.4"
     let kind: PackageKind = .App
     // The icons of what it offers, which CoreIcon draws when the system is
     // built, into usr/share/recovery.

@@ -3,7 +3,7 @@
 //! Kira UI draws it and puts it on Tessera's display.
 /// The Clock app package: the time, the stopwatch and the timers.
 construct ClockApp extends Package {
-    let version: String = "0.1.0"
+    let version: String = "26.10.4"
     let kind: PackageKind = .App
     // Its icon, light and dark, which the platform shows wherever the
     // application is.

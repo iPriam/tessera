@@ -1,7 +1,7 @@
 //! The `date` package: the command that prints or sets Tessera's time.
 /// The Tessera date package: the time command.
 construct TesseraDate extends Package {
-    let version: String = "0.1.0"
+    let version: String = "26.10.4"
     let kind: PackageKind = .App
     let moduleRoot: String = "TesseraDate"
     let dependencies: [Dependency] = [Dependency {
